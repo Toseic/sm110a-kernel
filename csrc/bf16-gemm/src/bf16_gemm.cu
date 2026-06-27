@@ -13,7 +13,7 @@ constexpr int BLOCK_N = 256;
 constexpr int BLOCK_K = 64;
 constexpr int WARP_SIZE = 32;
 constexpr int WARP_NUM = 4;
-constexpr int STAGE_NUM = 4;
+constexpr int STAGE_NUM = 2;
 
 constexpr int MMA_K = 16;
 
@@ -166,8 +166,10 @@ __global__ void bf16_gemm_kernel(
     __shared__ int tmem_addr[1];
     __shared__ uint64_t tma_mbars[STAGE_NUM];
     __shared__ uint64_t mma_mbars[STAGE_NUM];
+    __shared__ uint64_t mainlooop_mbars[1];
     const int _base_tma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(tma_mbars));
     const int _base_mma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(mma_mbars));
+    const int mainloop_mbar_addr = static_cast<int>(__cvta_generic_to_shared(mainlooop_mbars));
 
     if (tid == 0) {
         // init mbarrier
@@ -180,6 +182,8 @@ __global__ void bf16_gemm_kernel(
                 "mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(_base_mma_mbar_addr + 8 * s), "r"(1)
                 : "memory");
         }
+        asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(mainloop_mbar_addr), "r"(1)
+            : "memory");
 
         asm volatile("fence.mbarrier_init.release.cluster;");
     }
@@ -191,112 +195,118 @@ __global__ void bf16_gemm_kernel(
     }
     __syncthreads();
 
-    int tma_phase[STAGE_NUM] = {};
-    int mma_phase[STAGE_NUM] = {};
+    int phase=0;
     const int taddr = tmem_addr[0];
 
     // tma load
     auto load = [&](int iter_k, bool wait_mma) {
-        if (warp_id == 0 && elect_sync()) {
-            const int stage_id = iter_k % STAGE_NUM;
-            // (optional) wait for mma done
-            if (wait_mma) {
-                const int mma_mbar_addr = _base_mma_mbar_addr + 8 * stage_id;
-                mbarrier_wait(mma_mbar_addr, mma_phase[stage_id]);
-                mma_phase[stage_id] ^= 1;
-            }
-            const int A_smem = smem + stage_id * (A_size + B_size);
-            const int B_smem = A_smem + A_size;
-            const int tma_mbar_addr = _base_tma_mbar_addr + 8 * stage_id;
-
-            // tma issue
-            constexpr int cp_size = A_size + B_size;
-            asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;" ::"r"(
-                             tma_mbar_addr),
-                "r"(cp_size)
-                : "memory");
-            for (int k = 0; k < BLOCK_K / 64; k++) {
-                const int off_k = iter_k * BLOCK_K + k * 64;
-                tma_3d_gmem2smem(A_smem, &A_tmap, 0, off_m, off_k / 64, tma_mbar_addr);
-                tma_3d_gmem2smem(B_smem, &B_tmap, 0, off_n, off_k / 64, tma_mbar_addr);
+        // if (warp_id == 0 && elect_sync()) {
+        const int stage_id = iter_k % STAGE_NUM;
+        // (optional) wait for mma done
+        if (wait_mma) {
+            const int mma_mbar_addr = _base_mma_mbar_addr + 8 * stage_id;
+            mbarrier_wait(mma_mbar_addr, phase ^ 1);
+            if (stage_id == STAGE_NUM - 1) {
+                phase ^= 1;
             }
         }
+        const int A_smem = smem + stage_id * (A_size + B_size);
+        const int B_smem = A_smem + A_size;
+        const int tma_mbar_addr = _base_tma_mbar_addr + 8 * stage_id;
+
+        // tma issue
+        constexpr int cp_size = A_size + B_size;
+        asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;" ::"r"(
+                         tma_mbar_addr),
+            "r"(cp_size)
+            : "memory");
+        for (int k = 0; k < BLOCK_K / 64; k++) {
+            const int off_k = iter_k * BLOCK_K + k * 64;
+            tma_3d_gmem2smem(A_smem + k * BLOCK_M * 64 * sizeof(nv_bfloat16),
+                &A_tmap,
+                0,
+                off_m,
+                off_k / 64,
+                tma_mbar_addr);
+            tma_3d_gmem2smem(B_smem + k * BLOCK_N * 64 * sizeof(nv_bfloat16),
+                &B_tmap,
+                0,
+                off_n,
+                off_k / 64,
+                tma_mbar_addr);
+        }
+        // }
     };
 
     // mma compute
     auto compute = [&](int iter_k, bool wait_tma) {
-        if (warp_id == 0 && elect_sync()) {
-            const int stage_id = iter_k % STAGE_NUM;
-            // (optional) wait for tma done
-            if (wait_tma) {
-                const int tma_mbar_addr = _base_tma_mbar_addr + 8 * stage_id;
-                mbarrier_wait(tma_mbar_addr, tma_phase[stage_id]);
-                tma_phase[stage_id] ^= 1;
+        // if (warp_id == 0 && elect_sync()) {
+        const int stage_id = iter_k % STAGE_NUM;
+        // (optional) wait for tma done
+        if (wait_tma) {
+            const int tma_mbar_addr = _base_tma_mbar_addr + 8 * stage_id;
+            mbarrier_wait(tma_mbar_addr, phase );
+                if (stage_id == STAGE_NUM - 1) {
+                phase ^= 1;
             }
-
-            const int A_smem = smem + stage_id * (A_size + B_size);
-            const int B_smem = A_smem + A_size;
-            const int mma_mbar_addr = _base_mma_mbar_addr + 8 * stage_id;
-
-            auto make_desc = [](int addr) -> uint64_t {
-                constexpr int SBO = 8 * 128;
-                return desc_encode(addr) | (desc_encode(SBO) << 32ULL) | (1ULL << 46ULL) |
-                       (2ULL << 61ULL);
-            };
-
-            // https://github.com/deepseek-ai/DeepGEMM/blob/9b680f42/deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm.cuh#L289
-            asm volatile("tcgen05.fence::after_thread_sync;");
-
-            tcgen05_mma_f16<1>(taddr, make_desc(A_smem), make_desc(B_smem), i_desc, iter_k);
-            for (int k2 = 1; k2 < 64 / MMA_K; k2++) {
-                uint64_t a_desc = make_desc(A_smem + k2 * 32);
-                uint64_t b_desc = make_desc(B_smem + k2 * 32);
-                tcgen05_mma_f16<1>(taddr, a_desc, b_desc, i_desc, 1);
-            }
-            for (int k1 = 1; k1 < BLOCK_K / 64; k1++) {
-                for (int k2 = 0; k2 < 64 / MMA_K; k2++) {
-                    uint64_t a_desc = make_desc(A_smem + k1 * BLOCK_M * 128 + k2 * 32);
-                    uint64_t b_desc = make_desc(B_smem + k1 * BLOCK_N * 128 + k2 * 32);
-                    tcgen05_mma_f16(taddr, a_desc, b_desc, i_desc, 1);
-                }
-            }
-
-            asm volatile(
-                "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];" ::"r"(
-                    mma_mbar_addr)
-                : "memory");
         }
+
+        const int A_smem = smem + stage_id * (A_size + B_size);
+        const int B_smem = A_smem + A_size;
+        const int mma_mbar_addr = _base_mma_mbar_addr + 8 * stage_id;
+
+        auto make_desc = [](int addr) -> uint64_t {
+            constexpr int SBO = 8 * 128;
+            return desc_encode(addr) | (desc_encode(SBO) << 32ULL) | (1ULL << 46ULL) |
+                   (2ULL << 61ULL);
+        };
+
+        // https://github.com/deepseek-ai/DeepGEMM/blob/9b680f42/deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm.cuh#L289
+        asm volatile("tcgen05.fence::after_thread_sync;");
+
+        tcgen05_mma_f16<1>(taddr, make_desc(A_smem), make_desc(B_smem), i_desc, iter_k);
+        for (int k2 = 1; k2 < 64 / MMA_K; k2++) {
+            uint64_t a_desc = make_desc(A_smem + k2 * 32);
+            uint64_t b_desc = make_desc(B_smem + k2 * 32);
+            tcgen05_mma_f16<1>(taddr, a_desc, b_desc, i_desc, 1);
+        }
+        for (int k1 = 1; k1 < BLOCK_K / 64; k1++) {
+            for (int k2 = 0; k2 < 64 / MMA_K; k2++) {
+                uint64_t a_desc = make_desc(A_smem + k1 * BLOCK_M * 128 + k2 * 32);
+                uint64_t b_desc = make_desc(B_smem + k1 * BLOCK_N * 128 + k2 * 32);
+                tcgen05_mma_f16(taddr, a_desc, b_desc, i_desc, 1);
+            }
+        }
+
+        asm volatile(
+            "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];" ::"r"(
+                mma_mbar_addr)
+            : "memory");
+        // }
     };
 
-    // prefetch
-    for (int i = 0; i < STAGE_NUM; ++i) {
-        load(i, false);
-    }
-
     // main loop
-    for (int iter_k = STAGE_NUM; iter_k < K / BLOCK_K; ++iter_k) {
-        compute(iter_k - STAGE_NUM, true);
-        load(iter_k, true);
-    }
-
-    // left mma
-    for (int i = K / BLOCK_K - STAGE_NUM; i < K / BLOCK_K; ++i) {
-        compute(i, true);
-    }
-
-    // wait for left mma
     if (warp_id == 0 && elect_sync()) {
-        for (int i = K / BLOCK_K - STAGE_NUM; i < K / BLOCK_K; ++i) {
-            const int stage_id = i % STAGE_NUM;
-            const int mma_mbar_addr = _base_mma_mbar_addr + 8 * stage_id;
-            mbarrier_wait(mma_mbar_addr, mma_phase[stage_id]);
-            mma_phase[stage_id] ^= 1;
+        for (int iter_k = 0; iter_k < K / BLOCK_K; ++iter_k) {
+            load(iter_k, true);
         }
+    }
+
+    if (warp_id == 1 && elect_sync()) {
+        for (int iter_k = 0; iter_k < K / BLOCK_K; ++iter_k) {
+            compute(iter_k, true);
+        }
+        asm volatile(
+            "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];" ::"r"(
+                mainloop_mbar_addr)
+            : "memory");
     }
 
     __syncthreads();
+    mbarrier_wait(mainloop_mbar_addr, 0);
     // epilogue
     asm volatile("tcgen05.fence::after_thread_sync;");
+
 
     for (int n = 0; n < BLOCK_N / 8; n++) {
         float tmp[8];
@@ -358,8 +368,9 @@ void launch_bf16_gemm(
 
     auto kernel = bf16_gemm_kernel;
 
-    if (smem_size > 48 * 1024)
+    if (smem_size > 48 * 1024) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    }
 
     kernel<<<grid, TB_SIZE, smem_size>>>(A_tmap, B_tmap, C_ptr, M, N, K);
 }
