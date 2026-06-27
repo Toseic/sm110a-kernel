@@ -8,13 +8,14 @@
 namespace {
 
 constexpr int BLOCK_M = 128;
-constexpr int BLOCK_N = 128;
+constexpr int BLOCK_N = 256;
 constexpr int BLOCK_K = 64;
 constexpr int WARP_SIZE = 32;
+constexpr int WARP_NUM = 4;
 
 constexpr int MMA_K = 16;
 
-constexpr int TB_SIZE = 128;
+constexpr int TB_SIZE = WARP_SIZE * WARP_NUM;
 
 template <int CTA_GROUP = 1>
 __device__ inline void tma_3d_gmem2smem(
@@ -109,7 +110,6 @@ __device__ inline constexpr uint64_t desc_encode(
     return (x & 0x3'FFFFULL) >> 4ULL;
 };
 
-
 inline void init_2D_tmap(
     CUtensorMap *tmap,
     const nv_bfloat16 *ptr,
@@ -201,10 +201,10 @@ __global__ void bf16_gemm_kernel(
                              mbar_addr),
                 "r"(cp_size)
                 : "memory");
-            for (int k = 0; k < BLOCK_K / 8; k++) {
-                const int off_k = iter_k * BLOCK_K + k * 8;
-                tma_2d_gmem2smem(A_smem + k * BLOCK_M * 16, &A_tmap, off_k, off_m, mbar_addr);
-                tma_2d_gmem2smem(B_smem + k * BLOCK_N * 16, &B_tmap, off_k, off_n, mbar_addr);
+            for (int k = 0; k < BLOCK_K / 64; k++) {
+                const int off_k = iter_k * BLOCK_K + k * 64;
+                tma_2d_gmem2smem(A_smem + k * BLOCK_M * 128, &A_tmap, off_k, off_m, mbar_addr);
+                tma_2d_gmem2smem(B_smem + k * BLOCK_N * 128, &B_tmap, off_k, off_n, mbar_addr);
             }
         }
 
@@ -216,22 +216,25 @@ __global__ void bf16_gemm_kernel(
 
         // tcgen05 mma
         if (warp_id == 0 && elect_sync()) {
-            auto make_desc = [](int addr, int height) -> uint64_t {
-                const int LBO = height * 16;
-                constexpr int SBO = 8 * 16;
-                return desc_encode(addr) | (desc_encode(LBO) << 16ULL) |
-                       (desc_encode(SBO) << 32ULL) | (1ULL << 46ULL);
+            auto make_desc = [](int addr) -> uint64_t {
+                constexpr int SBO = 8 * 128;
+                return desc_encode(addr) | (desc_encode(SBO) << 32ULL) | (1ULL << 46ULL) |
+                       (2ULL << 61ULL);
             };
-            tcgen05_mma_f16<1>(taddr,
-                make_desc(A_smem, BLOCK_M),
-                make_desc(B_smem, BLOCK_N),
-                i_desc,
-                iter_k);
-            for (int k = 1; k < BLOCK_K / MMA_K; k++) {
-                uint64_t a_desc = make_desc(A_smem + k * BLOCK_M * 32, BLOCK_M);
-                uint64_t b_desc = make_desc(B_smem + k * BLOCK_N * 32, BLOCK_N);
+            tcgen05_mma_f16<1>(taddr, make_desc(A_smem), make_desc(B_smem), i_desc, iter_k);
+            for (int k2 = 1; k2 < 64 / MMA_K; k2++) {
+                uint64_t a_desc = make_desc(A_smem + k2 * 32);
+                uint64_t b_desc = make_desc(B_smem + k2 * 32);
                 tcgen05_mma_f16<1>(taddr, a_desc, b_desc, i_desc, 1);
             }
+            for (int k1 = 1; k1 < BLOCK_K / 64; k1++) {
+                for (int k2 = 0; k2 < 64 / MMA_K; k2++) {
+                    uint64_t a_desc = make_desc(A_smem + k1 * BLOCK_M * 128 + k2 * 32);
+                    uint64_t b_desc = make_desc(B_smem + k1 * BLOCK_N * 128 + k2 * 32);
+                    tcgen05_mma_f16(taddr, a_desc, b_desc, i_desc, 1);
+                }
+            }
+
             asm volatile(
                 "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];" ::"r"(
                     mbar_addr)
@@ -291,17 +294,18 @@ void launch_bf16_gemm(
 
     CUtensorMap A_tmap, B_tmap;
 
-    init_2D_tmap(&A_tmap, A_ptr, M, K, BLOCK_M, 8, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
-    init_2D_tmap(&B_tmap, B_ptr, M, K, BLOCK_N, 8, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
+    init_2D_tmap(&A_tmap, A_ptr, M, K, BLOCK_M, 64, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B);
+    init_2D_tmap(&B_tmap, B_ptr, N, K, BLOCK_N, 64, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B);
 
-    const int smem_size = (BLOCK_M + BLOCK_N) * BLOCK_K * sizeof(nv_bfloat16);
+    constexpr int mbarrier_smem = 256;
+    const int smem_size = (BLOCK_M + BLOCK_N) * BLOCK_K * sizeof(nv_bfloat16) + mbarrier_smem;
 
     int grid = (M / BLOCK_M) * (N / BLOCK_N);
 
     auto kernel = bf16_gemm_kernel;
 
-    // if (smem_size > 48'000)
-    //     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    if (smem_size > 48*1024)
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
 
     kernel<<<grid, TB_SIZE, smem_size>>>(A_tmap, B_tmap, C_ptr, M, N, K);
 }
