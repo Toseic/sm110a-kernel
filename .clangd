@@ -1,0 +1,4 @@
+CompileFlags:
+  Add:
+    - "-I/home/bifrost/Documents/code/sm110a-kernel/include"
+    - "-I/usr/local/cuda/include"

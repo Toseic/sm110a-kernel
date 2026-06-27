@@ -1,0 +1,14 @@
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 0
+
+BreakFunctionDeclarationParameters: true
+BreakFunctionDefinitionParameters: true
+
+PackParameters:
+  BinPack: AlwaysOnePerLine
+
+AlignAfterOpenBracket: false
+ContinuationIndentWidth: 4
