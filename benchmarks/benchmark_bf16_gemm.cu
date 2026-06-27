@@ -11,7 +11,7 @@
 namespace {
 
 struct Options {
-  int warmup = 5;
+  int warmup = 20;
   int iters = 20;
   bool run_check = true;
   bool run_accuracy = true;

@@ -39,6 +39,21 @@ __device__ inline void tma_3d_gmem2smem(
         : "memory");
 }
 
+__device__ inline void tma_2d_gmem2smem(
+    int dst,
+    const void *tmap_ptr,
+    int x,
+    int y,
+    int mbar_addr) {
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0], "
+                 "[%1, {%2, %3}], [%4];" ::"r"(dst),
+        "l"(tmap_ptr),
+        "r"(x),
+        "r"(y),
+        "r"(mbar_addr)
+        : "memory");
+}
+
 // https://github.com/NVIDIA/cutlass/blob/v4.2.1/include/cutlass/arch/barrier.h#L408
 __device__ inline void mbarrier_wait(
     int mbar_addr,
@@ -94,33 +109,32 @@ __device__ inline constexpr uint64_t desc_encode(
     return (x & 0x3'FFFFULL) >> 4ULL;
 };
 
-void init_3D_tmap(
+
+inline void init_2D_tmap(
     CUtensorMap *tmap,
     const nv_bfloat16 *ptr,
     uint64_t global_height,
     uint64_t global_width,
     uint32_t shared_height,
-    uint32_t shared_width) {
+    uint32_t shared_width,
+    CUtensorMapSwizzle swizzle) {
 
-    constexpr uint32_t rank = 3;
-
-    uint64_t global_dim[rank] = {8, global_height, global_width / 8};
-
-    uint64_t global_strides[rank - 1] = {global_width * sizeof(nv_bfloat16), 16};
-
-    uint32_t box_dim[rank] = {8, shared_height, shared_width / 8};
-    uint32_t element_strides[rank] = {1, 1, 1};
+    constexpr uint32_t rank = 2;
+    uint64_t globalDim[rank] = {global_width, global_height};
+    uint64_t globalStrides[rank - 1] = {global_width * sizeof(nv_bfloat16)}; // in bytes
+    uint32_t boxDim[rank] = {shared_width, shared_height};
+    uint32_t elementStrides[rank] = {1, 1};
 
     auto err = cuTensorMapEncodeTiled(tmap,
         CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
         rank,
         (void *)ptr,
-        global_dim,
-        global_strides,
-        box_dim,
-        element_strides,
+        globalDim,
+        globalStrides,
+        boxDim,
+        elementStrides,
         CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
+        swizzle,
         CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
         CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 }
@@ -182,15 +196,16 @@ __global__ void bf16_gemm_kernel(
     for (int iter_k = 0; iter_k < K / BLOCK_K; ++iter_k) {
         if (warp_id == 0 && elect_sync()) {
             // tma issue
-            const int off_k = iter_k * BLOCK_K;
-
             constexpr int cp_size = (BLOCK_M + BLOCK_N) * BLOCK_K * sizeof(nv_bfloat16);
             asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;" ::"r"(
                              mbar_addr),
                 "r"(cp_size)
                 : "memory");
-            tma_3d_gmem2smem(A_smem, &A_tmap, 0, off_m, off_k / 8, mbar_addr);
-            tma_3d_gmem2smem(B_smem, &B_tmap, 0, off_n, off_k / 8, mbar_addr);
+            for (int k = 0; k < BLOCK_K / 8; k++) {
+                const int off_k = iter_k * BLOCK_K + k * 8;
+                tma_2d_gmem2smem(A_smem + k * BLOCK_M * 16, &A_tmap, off_k, off_m, mbar_addr);
+                tma_2d_gmem2smem(B_smem + k * BLOCK_N * 16, &B_tmap, off_k, off_n, mbar_addr);
+            }
         }
 
         mbarrier_wait(mbar_addr, phase);
@@ -276,8 +291,8 @@ void launch_bf16_gemm(
 
     CUtensorMap A_tmap, B_tmap;
 
-    init_3D_tmap(&A_tmap, A_ptr, M, K, BLOCK_M, BLOCK_K);
-    init_3D_tmap(&B_tmap, B_ptr, N, K, BLOCK_N, BLOCK_K);
+    init_2D_tmap(&A_tmap, A_ptr, M, K, BLOCK_M, 8, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
+    init_2D_tmap(&B_tmap, B_ptr, M, K, BLOCK_N, 8, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
 
     const int smem_size = (BLOCK_M + BLOCK_N) * BLOCK_K * sizeof(nv_bfloat16);
 
