@@ -2,13 +2,16 @@ BasedOnStyle: LLVM
 IndentWidth: 4
 TabWidth: 4
 UseTab: Never
-ColumnLimit: 0
 
-BreakFunctionDeclarationParameters: true
+ColumnLimit: 100
+
 BreakFunctionDefinitionParameters: true
 
-PackParameters:
-  BinPack: AlwaysOnePerLine
+BinPackArguments: false
+BinPackParameters: false
+AllowAllArgumentsOnNextLine: false
+AllowAllParametersOfDeclarationOnNextLine: false
 
 AlignAfterOpenBracket: false
 ContinuationIndentWidth: 4
+PenaltyBreakBeforeFirstCallParameter: 0

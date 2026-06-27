@@ -34,6 +34,34 @@ constexpr int kAccuracyK = 512;
 constexpr int kAccuracyWarmup = 2;
 constexpr int kAccuracyIters = 5;
 
+float benchmark_bf16_gemm(const __nv_bfloat16* d_a, const __nv_bfloat16* d_b,
+                          __nv_bfloat16* d_c, int m, int n, int k, int warmup,
+                          int iters) {
+  for (int i = 0; i < warmup; ++i) {
+    launch_bf16_gemm(d_a, d_b, d_c, m, n, k);
+  }
+  CHECK_CUDA(cudaGetLastError());
+  CHECK_CUDA(cudaDeviceSynchronize());
+
+  cudaEvent_t start;
+  cudaEvent_t stop;
+  CHECK_CUDA(cudaEventCreate(&start));
+  CHECK_CUDA(cudaEventCreate(&stop));
+
+  CHECK_CUDA(cudaEventRecord(start));
+  for (int i = 0; i < iters; ++i) {
+    launch_bf16_gemm(d_a, d_b, d_c, m, n, k);
+  }
+  CHECK_CUDA(cudaEventRecord(stop));
+  CHECK_CUDA(cudaEventSynchronize(stop));
+
+  float elapsed_ms = 0.0f;
+  CHECK_CUDA(cudaEventElapsedTime(&elapsed_ms, start, stop));
+  CHECK_CUDA(cudaEventDestroy(start));
+  CHECK_CUDA(cudaEventDestroy(stop));
+  return elapsed_ms / static_cast<float>(iters);
+}
+
 float benchmark_cublas_lt(cublasLtHandle_t handle, const __nv_bfloat16* d_a,
                           const __nv_bfloat16* d_b, __nv_bfloat16* d_c, int m,
                           int n, int k, int warmup, int iters, void* workspace,
@@ -50,7 +78,21 @@ float benchmark_cublas_lt(cublasLtHandle_t handle, const __nv_bfloat16* d_a,
   CHECK_CUBLAS(cublasLtMatmulDescCreate(&operation_desc,
                                         CUBLAS_COMPUTE_32F_FAST_16BF,
                                         CUDA_R_32F));
-  CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_16BF, n, k, n));
+  // Inputs are k-major in memory. The kernel does C(M, N) = A(M, K) * B(K, N)
+  // where A and B are both stored with K as the fastest-changing dimension.
+  // cuBLASLt is column-major, so:
+  //   d_a (K-major (M, K)) is seen as a (K, M) col-major view = A^T.
+  //   d_b (K-major (K, N)) is seen as a (K, N) col-major view = B.
+  // To produce C (N, M) col-major = C^T, we compute
+  //   C^T = op(A_cm) * op(B_cm) = B^T * A^T = (A * B)^T,
+  // i.e. transA = T on the (K, N) layout that backs d_b.
+  const cublasOperation_t trans_a = CUBLAS_OP_T;
+  const cublasOperation_t trans_b = CUBLAS_OP_N;
+  CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(
+      operation_desc, CUBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)));
+  CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(
+      operation_desc, CUBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)));
+  CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_16BF, k, n, k));
   CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_16BF, k, m, k));
   CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_16BF, n, m, n));
   CHECK_CUBLAS(cublasLtMatmulPreferenceCreate(&preference));

@@ -1,6 +1,7 @@
 CUDA_HOME ?= /usr/local/cuda
 NVCC ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?= sm_110a
+COMPUTE_CUDA_ARCH ?= compute_110a
 BENCH ?= bf16_gemm
 BENCH_ARGS ?=
 
@@ -10,8 +11,8 @@ BENCH_DIR := benchmarks
 INC_DIR := include
 BUILD_DIR := build
 
-NVCCFLAGS := -std=c++17 -O3 -lineinfo -arch=$(CUDA_ARCH) -I$(INC_DIR)
-LDFLAGS := -lcublas -lcublasLt
+NVCCFLAGS := -std=c++17 -O3 -lineinfo -gencode arch=$(COMPUTE_CUDA_ARCH),code=$(CUDA_ARCH) -I$(INC_DIR)
+LDFLAGS := -lcublas -lcublasLt -lcuda
 
 COMMON_SOURCES := $(wildcard $(SRC_DIR)/*.cu)
 BENCH_SOURCES := $(wildcard $(BENCH_DIR)/benchmark_*.cu)
