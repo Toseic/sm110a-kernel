@@ -1,3 +1,4 @@
+#include <cassert>
 #include <cstdint>
 #include <cudaTypedefs.h> // required for CUtensorMap
 #include <cuda_bf16.h>
@@ -12,6 +13,7 @@ constexpr int BLOCK_N = 256;
 constexpr int BLOCK_K = 64;
 constexpr int WARP_SIZE = 32;
 constexpr int WARP_NUM = 4;
+constexpr int STAGE_NUM = 4;
 
 constexpr int MMA_K = 16;
 
@@ -24,10 +26,10 @@ __device__ inline void tma_3d_gmem2smem(
     int x,
     int y,
     int z,
-    int mbar_addr) {
+    int _base_tma_mbar_addr) {
     // when CTA_GROUP=1, we can use .shared::cta instead.
     // but .shared::cluster doesn't seem to be slower, so always use it unconditionally here.
-    // .cta_group::2 allows mbar_addr and dst to be in different CTA's smem.
+    // .cta_group::2 allows _base_tma_mbar_addr and dst to be in different CTA's smem.
     asm volatile(
         "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::%6 "
         "[%0], [%1, {%2, %3, %4}], [%5];" ::"r"(dst),
@@ -35,31 +37,15 @@ __device__ inline void tma_3d_gmem2smem(
         "r"(x),
         "r"(y),
         "r"(z),
-        "r"(mbar_addr),
+        "r"(_base_tma_mbar_addr),
         "n"(CTA_GROUP)
         : "memory");
 }
 
-__device__ inline void tma_2d_gmem2smem(
-    int dst,
-    const void *tmap_ptr,
-    int x,
-    int y,
-    int mbar_addr) {
-    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0], "
-                 "[%1, {%2, %3}], [%4];" ::"r"(dst),
-        "l"(tmap_ptr),
-        "r"(x),
-        "r"(y),
-        "r"(mbar_addr)
-        : "memory");
-}
-
-// https://github.com/NVIDIA/cutlass/blob/v4.2.1/include/cutlass/arch/barrier.h#L408
 __device__ inline void mbarrier_wait(
     int mbar_addr,
     int phase) {
-    uint32_t ticks = 0x989680; // this is optional
+    uint32_t ticks = 0x989680;
     asm volatile("{\n\t"
                  ".reg .pred P1;\n\t"
                  "LAB_WAIT:\n\t"
@@ -69,7 +55,8 @@ __device__ inline void mbarrier_wait(
                  "DONE:\n\t"
                  "}" ::"r"(mbar_addr),
         "r"(phase),
-        "r"(ticks));
+        "r"(ticks)
+        : "memory");
 }
 
 // https://github.com/NVIDIA/cutlass/blob/v4.3.1/include/cute/arch/mma_sm100_umma.hpp#L86
@@ -110,7 +97,7 @@ __device__ inline constexpr uint64_t desc_encode(
     return (x & 0x3'FFFFULL) >> 4ULL;
 };
 
-inline void init_2D_tmap(
+inline void init_3D_tmap(
     CUtensorMap *tmap,
     const nv_bfloat16 *ptr,
     uint64_t global_height,
@@ -119,20 +106,23 @@ inline void init_2D_tmap(
     uint32_t shared_width,
     CUtensorMapSwizzle swizzle) {
 
-    constexpr uint32_t rank = 2;
-    uint64_t globalDim[rank] = {global_width, global_height};
-    uint64_t globalStrides[rank - 1] = {global_width * sizeof(nv_bfloat16)}; // in bytes
-    uint32_t boxDim[rank] = {shared_width, shared_height};
-    uint32_t elementStrides[rank] = {1, 1};
+    constexpr uint32_t rank = 3;
+
+    uint64_t global_dim[rank] = {64, global_height, global_width / 64};
+
+    uint64_t global_strides[rank - 1] = {global_width * sizeof(nv_bfloat16), 128};
+
+    uint32_t box_dim[rank] = {64, shared_height, shared_width / 64};
+    uint32_t element_strides[rank] = {1, 1, 1};
 
     auto err = cuTensorMapEncodeTiled(tmap,
         CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
         rank,
         (void *)ptr,
-        globalDim,
-        globalStrides,
-        boxDim,
-        elementStrides,
+        global_dim,
+        global_strides,
+        box_dim,
+        element_strides,
         CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
         swizzle,
         CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
@@ -159,10 +149,11 @@ __global__ void bf16_gemm_kernel(
     const int off_n = bid_n * BLOCK_N;
 
     // set up smem
-    extern __shared__ __align__(1024) char smem[];
     // A: [BLOCK_M, BLOCK_K]  B: [BLOCK_N, BLOCK_K]
-    const int A_smem = static_cast<int>(__cvta_generic_to_shared(smem));
-    const int B_smem = A_smem + BLOCK_M * BLOCK_K * sizeof(nv_bfloat16);
+    extern __shared__ __align__(1024) char _smem_ptr[];
+    const int smem = static_cast<int>(__cvta_generic_to_shared(_smem_ptr));
+    constexpr int A_size = BLOCK_M * BLOCK_K * sizeof(nv_bfloat16);
+    constexpr int B_size = BLOCK_N * BLOCK_K * sizeof(nv_bfloat16);
 
     constexpr uint32_t i_desc = (1U << 4U)                         // dtype=FP32
                                 | (1U << 7U)                       // atype=BF16
@@ -172,16 +163,27 @@ __global__ void bf16_gemm_kernel(
         ;
 
     // setup Mbarrier
-#pragma nv_diag_suppress static_var_with_dynamic_init
-    __shared__ uint64_t mbars[1];
     __shared__ int tmem_addr[1];
-    const int mbar_addr = static_cast<int>(__cvta_generic_to_shared(mbars));
+    __shared__ uint64_t tma_mbars[STAGE_NUM];
+    __shared__ uint64_t mma_mbars[STAGE_NUM];
+    const int _base_tma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(tma_mbars));
+    const int _base_mma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(mma_mbars));
 
     if (tid == 0) {
         // init mbarrier
-        asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(mbar_addr), "r"(1));
+        for (int s = 0; s < STAGE_NUM; ++s) {
+            asm volatile(
+                "mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(_base_tma_mbar_addr + 8 * s), "r"(1)
+                : "memory");
+
+            asm volatile(
+                "mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(_base_mma_mbar_addr + 8 * s), "r"(1)
+                : "memory");
+        }
+
         asm volatile("fence.mbarrier_init.release.cluster;");
-    } else if (warp_id == 1) {
+    }
+    if (warp_id == 1) {
         const int addr = static_cast<int>(__cvta_generic_to_shared(tmem_addr));
         asm volatile(
             "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" ::"r"(addr),
@@ -189,38 +191,62 @@ __global__ void bf16_gemm_kernel(
     }
     __syncthreads();
 
-    int phase = 0;
+    int tma_phase[STAGE_NUM] = {};
+    int mma_phase[STAGE_NUM] = {};
     const int taddr = tmem_addr[0];
 
-    // main loop
-    for (int iter_k = 0; iter_k < K / BLOCK_K; ++iter_k) {
+    // tma load
+    auto load = [&](int iter_k, bool wait_mma) {
         if (warp_id == 0 && elect_sync()) {
+            const int stage_id = iter_k % STAGE_NUM;
+            // (optional) wait for mma done
+            if (wait_mma) {
+                const int mma_mbar_addr = _base_mma_mbar_addr + 8 * stage_id;
+                mbarrier_wait(mma_mbar_addr, mma_phase[stage_id]);
+                mma_phase[stage_id] ^= 1;
+            }
+            const int A_smem = smem + stage_id * (A_size + B_size);
+            const int B_smem = A_smem + A_size;
+            const int tma_mbar_addr = _base_tma_mbar_addr + 8 * stage_id;
+
             // tma issue
-            constexpr int cp_size = (BLOCK_M + BLOCK_N) * BLOCK_K * sizeof(nv_bfloat16);
+            constexpr int cp_size = A_size + B_size;
             asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;" ::"r"(
-                             mbar_addr),
+                             tma_mbar_addr),
                 "r"(cp_size)
                 : "memory");
             for (int k = 0; k < BLOCK_K / 64; k++) {
                 const int off_k = iter_k * BLOCK_K + k * 64;
-                tma_2d_gmem2smem(A_smem + k * BLOCK_M * 128, &A_tmap, off_k, off_m, mbar_addr);
-                tma_2d_gmem2smem(B_smem + k * BLOCK_N * 128, &B_tmap, off_k, off_n, mbar_addr);
+                tma_3d_gmem2smem(A_smem, &A_tmap, 0, off_m, off_k / 64, tma_mbar_addr);
+                tma_3d_gmem2smem(B_smem, &B_tmap, 0, off_n, off_k / 64, tma_mbar_addr);
             }
         }
+    };
 
-        mbarrier_wait(mbar_addr, phase);
-        phase ^= 1;
-
-        // https://github.com/deepseek-ai/DeepGEMM/blob/9b680f42/deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm.cuh#L289
-        asm volatile("tcgen05.fence::after_thread_sync;");
-
-        // tcgen05 mma
+    // mma compute
+    auto compute = [&](int iter_k, bool wait_tma) {
         if (warp_id == 0 && elect_sync()) {
+            const int stage_id = iter_k % STAGE_NUM;
+            // (optional) wait for tma done
+            if (wait_tma) {
+                const int tma_mbar_addr = _base_tma_mbar_addr + 8 * stage_id;
+                mbarrier_wait(tma_mbar_addr, tma_phase[stage_id]);
+                tma_phase[stage_id] ^= 1;
+            }
+
+            const int A_smem = smem + stage_id * (A_size + B_size);
+            const int B_smem = A_smem + A_size;
+            const int mma_mbar_addr = _base_mma_mbar_addr + 8 * stage_id;
+
             auto make_desc = [](int addr) -> uint64_t {
                 constexpr int SBO = 8 * 128;
                 return desc_encode(addr) | (desc_encode(SBO) << 32ULL) | (1ULL << 46ULL) |
                        (2ULL << 61ULL);
             };
+
+            // https://github.com/deepseek-ai/DeepGEMM/blob/9b680f42/deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm.cuh#L289
+            asm volatile("tcgen05.fence::after_thread_sync;");
+
             tcgen05_mma_f16<1>(taddr, make_desc(A_smem), make_desc(B_smem), i_desc, iter_k);
             for (int k2 = 1; k2 < 64 / MMA_K; k2++) {
                 uint64_t a_desc = make_desc(A_smem + k2 * 32);
@@ -237,13 +263,38 @@ __global__ void bf16_gemm_kernel(
 
             asm volatile(
                 "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];" ::"r"(
-                    mbar_addr)
+                    mma_mbar_addr)
                 : "memory");
         }
-        mbarrier_wait(mbar_addr, phase);
-        phase ^= 1; // flip the phase
+    };
+
+    // prefetch
+    for (int i = 0; i < STAGE_NUM; ++i) {
+        load(i, false);
     }
 
+    // main loop
+    for (int iter_k = STAGE_NUM; iter_k < K / BLOCK_K; ++iter_k) {
+        compute(iter_k - STAGE_NUM, true);
+        load(iter_k, true);
+    }
+
+    // left mma
+    for (int i = K / BLOCK_K - STAGE_NUM; i < K / BLOCK_K; ++i) {
+        compute(i, true);
+    }
+
+    // wait for left mma
+    if (warp_id == 0 && elect_sync()) {
+        for (int i = K / BLOCK_K - STAGE_NUM; i < K / BLOCK_K; ++i) {
+            const int stage_id = i % STAGE_NUM;
+            const int mma_mbar_addr = _base_mma_mbar_addr + 8 * stage_id;
+            mbarrier_wait(mma_mbar_addr, mma_phase[stage_id]);
+            mma_phase[stage_id] ^= 1;
+        }
+    }
+
+    __syncthreads();
     // epilogue
     asm volatile("tcgen05.fence::after_thread_sync;");
 
@@ -292,19 +343,22 @@ void launch_bf16_gemm(
     int N,
     int K) {
 
+    assert(STAGE_NUM <= (K / BLOCK_K));
+
     CUtensorMap A_tmap, B_tmap;
 
-    init_2D_tmap(&A_tmap, A_ptr, M, K, BLOCK_M, 64, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B);
-    init_2D_tmap(&B_tmap, B_ptr, N, K, BLOCK_N, 64, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B);
+    init_3D_tmap(&A_tmap, A_ptr, M, K, BLOCK_M, 64, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B);
+    init_3D_tmap(&B_tmap, B_ptr, N, K, BLOCK_N, 64, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B);
 
     constexpr int mbarrier_smem = 256;
-    const int smem_size = (BLOCK_M + BLOCK_N) * BLOCK_K * sizeof(nv_bfloat16) + mbarrier_smem;
+    const int smem_size =
+        (BLOCK_M + BLOCK_N) * BLOCK_K * STAGE_NUM * sizeof(nv_bfloat16) + mbarrier_smem;
 
     int grid = (M / BLOCK_M) * (N / BLOCK_N);
 
     auto kernel = bf16_gemm_kernel;
 
-    if (smem_size > 48*1024)
+    if (smem_size > 48 * 1024)
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
 
     kernel<<<grid, TB_SIZE, smem_size>>>(A_tmap, B_tmap, C_ptr, M, N, K);
