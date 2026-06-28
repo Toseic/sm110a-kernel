@@ -13,6 +13,7 @@ namespace {
 struct Options {
   int warmup = 20;
   int iters = 20;
+  int samples = 7;
   bool run_check = true;
   bool run_accuracy = true;
   bool single_shape = false;
@@ -21,9 +22,16 @@ struct Options {
   int k = 0;
 };
 
+struct TimingStats {
+  float min_ms = 0.0f;
+  float median_ms = 0.0f;
+  float max_ms = 0.0f;
+  int measured_iters = 0;
+};
+
 struct Result {
-  float naive_ms = 0.0f;
-  float cublas_lt_ms = 0.0f;
+  TimingStats naive;
+  TimingStats cublas_lt;
   float max_abs_diff_lt = 0.0f;
 };
 
@@ -32,11 +40,35 @@ constexpr int kAccuracyM = 512;
 constexpr int kAccuracyN = 512;
 constexpr int kAccuracyK = 512;
 constexpr int kAccuracyWarmup = 2;
-constexpr int kAccuracyIters = 5;
+constexpr int kAccuracyIters = 20;
+constexpr int kTargetSampleMs = 50;
 
-float benchmark_bf16_gemm(const __nv_bfloat16* d_a, const __nv_bfloat16* d_b,
-                          __nv_bfloat16* d_c, int m, int n, int k, int warmup,
-                          int iters) {
+TimingStats summarize_samples(std::vector<float> samples, int measured_iters) {
+  std::sort(samples.begin(), samples.end());
+  TimingStats stats;
+  stats.min_ms = samples.front();
+  stats.median_ms = samples[samples.size() / 2];
+  stats.max_ms = samples.back();
+  stats.measured_iters = measured_iters;
+  return stats;
+}
+
+int calibrate_iters(float initial_ms, int requested_iters) {
+  if (initial_ms <= 0.0f) {
+    return requested_iters;
+  }
+  const float total_ms = initial_ms * static_cast<float>(requested_iters);
+  if (total_ms >= static_cast<float>(kTargetSampleMs)) {
+    return requested_iters;
+  }
+  const float scale = static_cast<float>(kTargetSampleMs) / total_ms;
+  return std::max(requested_iters,
+                  static_cast<int>(std::ceil(requested_iters * scale)));
+}
+
+float benchmark_bf16_gemm_once(const __nv_bfloat16* d_a,
+                               const __nv_bfloat16* d_b, __nv_bfloat16* d_c,
+                               int m, int n, int k, int warmup, int iters) {
   for (int i = 0; i < warmup; ++i) {
     launch_bf16_gemm(d_a, d_b, d_c, m, n, k);
   }
@@ -62,10 +94,11 @@ float benchmark_bf16_gemm(const __nv_bfloat16* d_a, const __nv_bfloat16* d_b,
   return elapsed_ms / static_cast<float>(iters);
 }
 
-float benchmark_cublas_lt(cublasLtHandle_t handle, const __nv_bfloat16* d_a,
-                          const __nv_bfloat16* d_b, __nv_bfloat16* d_c, int m,
-                          int n, int k, int warmup, int iters, void* workspace,
-                          std::size_t workspace_size) {
+float benchmark_cublas_lt_once(cublasLtHandle_t handle,
+                               const __nv_bfloat16* d_a,
+                               const __nv_bfloat16* d_b, __nv_bfloat16* d_c,
+                               int m, int n, int k, int warmup, int iters,
+                               void* workspace, std::size_t workspace_size) {
   const float alpha = 1.0f;
   const float beta = 0.0f;
 
@@ -145,6 +178,20 @@ float benchmark_cublas_lt(cublasLtHandle_t handle, const __nv_bfloat16* d_a,
   return elapsed_ms / static_cast<float>(iters);
 }
 
+template <typename Fn>
+TimingStats benchmark_with_stats(Fn&& benchmark_once, const Options& options) {
+  const float probe_ms = benchmark_once(options.warmup, options.iters);
+  const int measured_iters = calibrate_iters(probe_ms, options.iters);
+
+  std::vector<float> samples;
+  samples.reserve(options.samples);
+  samples.push_back(benchmark_once(options.warmup, measured_iters));
+  for (int sample = 1; sample < options.samples; ++sample) {
+    samples.push_back(benchmark_once(0, measured_iters));
+  }
+  return summarize_samples(std::move(samples), measured_iters);
+}
+
 Options parse_options(int argc, char** argv) {
   Options options;
   for (int i = 1; i < argc; ++i) {
@@ -167,6 +214,8 @@ Options parse_options(int argc, char** argv) {
       options.warmup = require_value("--warmup");
     } else if (arg == "--iters") {
       options.iters = require_value("--iters");
+    } else if (arg == "--samples") {
+      options.samples = require_value("--samples");
     } else if (arg == "--no-accuracy") {
       options.run_accuracy = false;
     } else if (arg == "--skip-check") {
@@ -182,6 +231,14 @@ Options parse_options(int argc, char** argv) {
       (options.m <= 0 || options.n <= 0 || options.k <= 0)) {
     std::cerr << "--m, --n, --k must all be provided for single-shape mode"
               << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if (options.samples <= 0) {
+    std::cerr << "--samples must be positive" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if (options.iters <= 0) {
+    std::cerr << "--iters must be positive" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   return options;
@@ -242,12 +299,19 @@ Result run_case(int m, int n, int k, cublasLtHandle_t lt_handle,
                         cudaMemcpyHostToDevice));
 
   Result result;
-  result.naive_ms = benchmark_bf16_gemm(
-      d_a, d_b, d_naive, m, n, k, options.warmup, options.iters);
-  result.cublas_lt_ms =
-      benchmark_cublas_lt(lt_handle, d_a, d_b, d_cublas_lt, m, n, k,
-                          options.warmup, options.iters, lt_workspace,
-                          kCublasLtWorkspaceBytes);
+  result.naive = benchmark_with_stats(
+      [&](int warmup, int iters) {
+        return benchmark_bf16_gemm_once(d_a, d_b, d_naive, m, n, k, warmup,
+                                        iters);
+      },
+      options);
+  result.cublas_lt = benchmark_with_stats(
+      [&](int warmup, int iters) {
+        return benchmark_cublas_lt_once(lt_handle, d_a, d_b, d_cublas_lt, m, n,
+                                        k, warmup, iters, lt_workspace,
+                                        kCublasLtWorkspaceBytes);
+      },
+      options);
 
   if (options.run_check) {
     CHECK_CUDA(cudaMemcpy(h_naive.data(), d_naive,
@@ -275,23 +339,25 @@ Result run_case(int m, int n, int k, cublasLtHandle_t lt_handle,
 
 void print_header() {
   std::cout << std::left << std::setw(8) << "M" << std::setw(8) << "N"
-            << std::setw(8) << "K" << std::setw(14) << "Naive(ms)"
-            << std::setw(14) << "Naive TF/s" << std::setw(16)
-            << "cuBLASLt(ms)" << std::setw(16) << "cuBLASLt TF/s"
-            << std::setw(14) << "LtSpeedup" << std::setw(14) << "DiffLt"
-            << std::endl;
+            << std::setw(8) << "K" << std::setw(16) << "NaiveMed(ms)"
+            << std::setw(16) << "Naive TF/s" << std::setw(16) << "LtMed(ms)"
+            << std::setw(16) << "Lt TF/s" << std::setw(14) << "LtSpeedup"
+            << std::setw(14) << "DiffLt" << std::endl;
 }
 
 void print_result(int m, int n, int k, const Result& result) {
-  const double naive_tflops = tflops_from_ms(m, n, k, result.naive_ms);
-  const double cublas_lt_tflops = tflops_from_ms(m, n, k, result.cublas_lt_ms);
-  const double lt_speedup = result.naive_ms / result.cublas_lt_ms;
+  const double naive_tflops =
+      tflops_from_ms(m, n, k, result.naive.median_ms);
+  const double cublas_lt_tflops =
+      tflops_from_ms(m, n, k, result.cublas_lt.median_ms);
+  const double lt_speedup = result.naive.median_ms / result.cublas_lt.median_ms;
 
   std::cout << std::left << std::setw(8) << m << std::setw(8) << n
-            << std::setw(8) << k << std::setw(14) << std::fixed
-            << std::setprecision(4) << result.naive_ms << std::setw(14)
-            << std::setprecision(3) << naive_tflops << std::setw(16)
-            << std::setprecision(4) << result.cublas_lt_ms << std::setw(16)
+            << std::setw(8) << k << std::setw(16) << std::fixed
+            << std::setprecision(4) << result.naive.median_ms
+            << std::setw(16) << std::setprecision(3) << naive_tflops
+            << std::setw(16) << std::setprecision(4)
+            << result.cublas_lt.median_ms << std::setw(16)
             << std::setprecision(3) << cublas_lt_tflops << std::setw(14)
             << std::setprecision(2) << lt_speedup << std::setw(14)
             << std::setprecision(6) << result.max_abs_diff_lt << std::endl;
