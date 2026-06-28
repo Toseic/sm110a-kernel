@@ -299,6 +299,37 @@ __global__ __cluster_dims__(CLUSTER_M, 1, 1) void bf16_gemm_kernel(
             : "memory");
     };
 
+    auto epilogue = [&]() {
+        for (int n = 0; n < BLOCK_N / 8; n++) {
+            float tmp[8];
+            const int row = cta_rank * 128 + warp_id * 32;
+            const int col = n * 8;
+            const int addr = taddr + (row << 16) + col;
+            asm volatile(
+                "tcgen05.ld.sync.aligned.32x32b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                : "=f"(tmp[0]),
+                "=f"(tmp[1]),
+                "=f"(tmp[2]),
+                "=f"(tmp[3]),
+                "=f"(tmp[4]),
+                "=f"(tmp[5]),
+                "=f"(tmp[6]),
+                "=f"(tmp[7])
+                : "r"(addr));
+
+            // wait
+            asm volatile("tcgen05.wait::ld.sync.aligned;");
+
+            nv_bfloat162 out[4];
+            for (int i = 0; i < 4; i++) {
+                out[i] = __float22bfloat162_rn({tmp[i * 2], tmp[i * 2 + 1]});
+            }
+            nv_bfloat16 *out_ptr = C_ptr + (off_m + tid) * N + (off_n + n * 8);
+
+            reinterpret_cast<int4 *>(out_ptr)[0] = reinterpret_cast<int4 *>(out)[0];
+        }
+    };
+
     // main loop
     if (warp_id == 0 && elect_sync()) {
         for (int iter_k = 0; iter_k < K / BLOCK_K; ++iter_k) {
@@ -324,33 +355,7 @@ __global__ __cluster_dims__(CLUSTER_M, 1, 1) void bf16_gemm_kernel(
     // epilogue
     asm volatile("tcgen05.fence::after_thread_sync;");
 
-    for (int n = 0; n < BLOCK_N / 8; n++) {
-        float tmp[8];
-        const int row = cta_rank * 128 + warp_id * 32;
-        const int col = n * 8;
-        const int addr = taddr + (row << 16) + col;
-        asm volatile("tcgen05.ld.sync.aligned.32x32b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-            : "=f"(tmp[0]),
-            "=f"(tmp[1]),
-            "=f"(tmp[2]),
-            "=f"(tmp[3]),
-            "=f"(tmp[4]),
-            "=f"(tmp[5]),
-            "=f"(tmp[6]),
-            "=f"(tmp[7])
-            : "r"(addr));
-
-        // wait
-        asm volatile("tcgen05.wait::ld.sync.aligned;");
-
-        nv_bfloat162 out[4];
-        for (int i = 0; i < 4; i++) {
-            out[i] = __float22bfloat162_rn({tmp[i * 2], tmp[i * 2 + 1]});
-        }
-        nv_bfloat16 *out_ptr = C_ptr + (off_m + tid) * N + (off_n + n * 8);
-
-        reinterpret_cast<int4 *>(out_ptr)[0] = reinterpret_cast<int4 *>(out)[0];
-    }
+    epilogue();
 
     __syncthreads();
     if (warp_id == 0) {
@@ -368,7 +373,8 @@ void launch_bf16_gemm(
     __nv_bfloat16 *C_ptr,
     int M,
     int N,
-    int K) {
+    int K,
+    cudaStream_t stream) {
 
     assert(STAGE_NUM <= (K / BLOCK_K));
 
@@ -395,5 +401,5 @@ void launch_bf16_gemm(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     }
 
-    kernel<<<grid, TB_SIZE, smem_size>>>(A_tmap, B_tmap, C_ptr, M, N, K);
+    kernel<<<grid, TB_SIZE, smem_size, stream>>>(A_tmap, B_tmap, C_ptr, M, N, K);
 }

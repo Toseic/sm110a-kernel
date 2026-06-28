@@ -1,26 +1,24 @@
-# Makefile
+# Python Entry Points
 
 ```bash
-make
-make bench
-make bench-list
-make clean
+python3 -c "import sm110a_kernel"
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_bf16_gemm.py
 ```
 
 Override architecture when needed:
 
 ```bash
-make CUDA_ARCH=sm_90a
+CUDA_ARCH=sm_90a COMPUTE_CUDA_ARCH=compute_90a \
+python3 -c "import sm110a_kernel"
 ```
 
-Pass benchmark arguments through `BENCH_ARGS`:
+Pass benchmark arguments directly to the benchmark script:
 
 ```bash
-make bench BENCH=bf16_gemm
-make bench-list
-make bench BENCH_ARGS="--no-accuracy"
-make bench BENCH_ARGS="--m 4096 --n 4096 --k 4096 --warmup 5 --iters 20"
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_bf16_gemm.py
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_bf16_gemm.py --no-accuracy
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_bf16_gemm.py --m 4096 --n 4096 --k 4096 --warmup 5 --iters 20
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_bf16_gemm.py --baseline cublaslt
 ```
 
-Add new benchmarks as `benchmarks/benchmark_<name>.cu` so `make bench-list`
-and `make bench BENCH=<name>` pick them up automatically.
+Add new benchmarks as `benchmarks/benchmark_<name>.py`.
