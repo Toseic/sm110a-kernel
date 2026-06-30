@@ -12,9 +12,10 @@ constexpr int BLOCK_M = 128;
 constexpr int BLOCK_N = 256;
 constexpr int BLOCK_K = 64;
 constexpr int WARP_SIZE = 32;
-constexpr int WARP_NUM = 4;
-constexpr int STAGE_NUM = 2;
+constexpr int WARP_NUM = 6;
+constexpr int STAGE_NUM = 7;
 constexpr int MMA_K = 16;
+constexpr int SM_NUM = 20;
 
 constexpr int CLUSTER_M = 2;
 
@@ -136,7 +137,10 @@ inline void init_3D_tmap(
         CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 }
 
-__global__ __cluster_dims__(CLUSTER_M, 1, 1) void bf16_gemm_kernel(
+__global__ 
+__cluster_dims__(CLUSTER_M, 1, 1) 
+__launch_bounds__(TB_SIZE) 
+void bf16_gemm_kernel(
     const __grid_constant__ CUtensorMap A_tmap,
     const __grid_constant__ CUtensorMap B_tmap,
     __nv_bfloat16 *C_ptr,
@@ -145,15 +149,13 @@ __global__ __cluster_dims__(CLUSTER_M, 1, 1) void bf16_gemm_kernel(
     int K) {
 
     const int tid = threadIdx.x;
-    const int bid = blockIdx.x;
+    const int _bid = blockIdx.x;
+    const int grid_x = gridDim.x;
     const int warp_id = tid / WARP_SIZE;
 
+    const int grid_m = M / BLOCK_M;
     const int grid_n = N / BLOCK_N;
-    const int bid_m = bid / (grid_n * CLUSTER_M) * CLUSTER_M + (bid % CLUSTER_M);
-    const int bid_n = (bid / CLUSTER_M) % grid_n;
-
-    const int off_m = bid_m * BLOCK_M;
-    const int off_n = bid_n * BLOCK_N;
+    const int grid_size = grid_m * grid_n;
 
     // set up cta rank
     int cta_rank;
@@ -178,27 +180,34 @@ __global__ __cluster_dims__(CLUSTER_M, 1, 1) void bf16_gemm_kernel(
     __shared__ int tmem_addr[1];
     __shared__ uint64_t tma_mbars[STAGE_NUM];
     __shared__ uint64_t mma_mbars[STAGE_NUM];
-    __shared__ uint64_t mainlooop_mbars[1];
+    __shared__ uint64_t mainlooop_mbars[2];
+    __shared__ uint64_t epilogue_mbars[2];
     const int _base_tma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(tma_mbars));
     const int _base_mma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(mma_mbars));
-    const int mainloop_mbar_addr = static_cast<int>(__cvta_generic_to_shared(mainlooop_mbars));
+    const int _base_mainloop_mbar_addr =
+        static_cast<int>(__cvta_generic_to_shared(mainlooop_mbars));
+    const int _base_epilogue_mbar_addr = static_cast<int>(__cvta_generic_to_shared(epilogue_mbars));
 
+    // init mbarrier
     if (tid == 0) {
-        // init mbarrier
         for (int s = 0; s < STAGE_NUM; ++s) {
             mbarrier_init(_base_tma_mbar_addr + 8 * s, CLUSTER_M);
             mbarrier_init(_base_mma_mbar_addr + 8 * s, 1);
         }
-
-        mbarrier_init(mainloop_mbar_addr, 1);
+        for (int s = 0; s < 2; ++s) {
+            mbarrier_init(_base_mainloop_mbar_addr + 8 * s, 1);
+            mbarrier_init(_base_epilogue_mbar_addr + 8 * s, 4 * CLUSTER_M);
+        }
 
         asm volatile("fence.mbarrier_init.release.cluster;");
     }
+    // alloc tmem
     if (warp_id == 1) {
+        static_assert(BLOCK_N * 2 <= 512);
         const int addr = static_cast<int>(__cvta_generic_to_shared(tmem_addr));
         asm volatile(
             "tcgen05.alloc.cta_group::%2.sync.aligned.shared::cta.b32 [%0], %1;" ::"r"(addr),
-            "r"(BLOCK_N),
+            "r"(BLOCK_N * 2),
             "n"(CLUSTER_M));
     }
 
@@ -209,20 +218,14 @@ __global__ __cluster_dims__(CLUSTER_M, 1, 1) void bf16_gemm_kernel(
         __syncthreads();
     }
 
-    int phase = 0;
     const int taddr = tmem_addr[0];
 
     // tma load
-    auto load = [&](int iter_k, bool wait_mma) {
-        const int stage_id = iter_k % STAGE_NUM;
-        // (optional) wait for mma done: //TODO: remove this logic
-        if (wait_mma) {
-            const int mma_mbar_addr = _base_mma_mbar_addr + 8 * stage_id;
-            mbarrier_wait(mma_mbar_addr, phase ^ 1);
-            if (stage_id == STAGE_NUM - 1) {
-                phase ^= 1;
-            }
-        }
+    auto load = [&](int iter_k, int mma_phase, int stage_id, int off_m, int off_n) {
+        // const int stage_id = iter_k % STAGE_NUM;
+        const int mma_mbar_addr = _base_mma_mbar_addr + 8 * stage_id;
+        mbarrier_wait(mma_mbar_addr, mma_phase);
+
         const int A_smem = smem + stage_id * (A_size + B_size);
         const int B_smem = A_smem + A_size;
         const int tma_mbar_addr = (_base_tma_mbar_addr + 8 * stage_id) & 0xFEFFFFFF;
@@ -252,16 +255,9 @@ __global__ __cluster_dims__(CLUSTER_M, 1, 1) void bf16_gemm_kernel(
     };
 
     // mma compute
-    auto compute = [&](int iter_k, bool wait_tma) {
-        const int stage_id = iter_k % STAGE_NUM;
-        // (optional) wait for tma done
-        if (wait_tma) {
-            const int tma_mbar_addr = _base_tma_mbar_addr + 8 * stage_id;
-            mbarrier_wait(tma_mbar_addr, phase);
-            if (stage_id == STAGE_NUM - 1) {
-                phase ^= 1;
-            }
-        }
+    auto compute = [&](int iter_k, int mainloop_stage, int tma_phase, int stage_id) {
+        const int tma_mbar_addr = _base_tma_mbar_addr + 8 * stage_id;
+        mbarrier_wait(tma_mbar_addr, tma_phase);
 
         const int A_smem = smem + stage_id * (A_size + B_size);
         const int B_smem = A_smem + A_size;
@@ -275,18 +271,23 @@ __global__ __cluster_dims__(CLUSTER_M, 1, 1) void bf16_gemm_kernel(
 
         // https://github.com/deepseek-ai/DeepGEMM/blob/9b680f42/deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm.cuh#L289
         asm volatile("tcgen05.fence::after_thread_sync;");
+        const int this_taddr = taddr + mainloop_stage * BLOCK_N;
 
-        tcgen05_mma_f16<CLUSTER_M>(taddr, make_desc(A_smem), make_desc(B_smem), i_desc, iter_k);
+        tcgen05_mma_f16<CLUSTER_M>(this_taddr,
+            make_desc(A_smem),
+            make_desc(B_smem),
+            i_desc,
+            iter_k);
         for (int k2 = 1; k2 < 64 / MMA_K; k2++) {
             uint64_t a_desc = make_desc(A_smem + k2 * 32);
             uint64_t b_desc = make_desc(B_smem + k2 * 32);
-            tcgen05_mma_f16<CLUSTER_M>(taddr, a_desc, b_desc, i_desc, 1);
+            tcgen05_mma_f16<CLUSTER_M>(this_taddr, a_desc, b_desc, i_desc, 1);
         }
         for (int k1 = 1; k1 < BLOCK_K / 64; k1++) {
             for (int k2 = 0; k2 < 64 / MMA_K; k2++) {
                 uint64_t a_desc = make_desc(A_smem + k1 * BLOCK_M * 128 + k2 * 32);
-                uint64_t b_desc = make_desc(B_smem + k1 * BLOCK_N * 128 + k2 * 32);
-                tcgen05_mma_f16<CLUSTER_M>(taddr, a_desc, b_desc, i_desc, 1);
+                uint64_t b_desc = make_desc(B_smem + k1 * (BLOCK_N / CLUSTER_M) * 128 + k2 * 32);
+                tcgen05_mma_f16<CLUSTER_M>(this_taddr, a_desc, b_desc, i_desc, 1);
             }
         }
 
@@ -299,11 +300,11 @@ __global__ __cluster_dims__(CLUSTER_M, 1, 1) void bf16_gemm_kernel(
             : "memory");
     };
 
-    auto epilogue = [&]() {
+    auto epilogue = [&](int mainloop_stage, int off_m, int off_n) {
         for (int n = 0; n < BLOCK_N / 8; n++) {
             float tmp[8];
             const int row = cta_rank * 128 + warp_id * 32;
-            const int col = n * 8;
+            const int col = n * 8 + mainloop_stage * BLOCK_N;
             const int addr = taddr + (row << 16) + col;
             asm volatile(
                 "tcgen05.ld.sync.aligned.32x32b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
@@ -330,37 +331,100 @@ __global__ __cluster_dims__(CLUSTER_M, 1, 1) void bf16_gemm_kernel(
         }
     };
 
-    // main loop
-    if (warp_id == 0 && elect_sync()) {
-        for (int iter_k = 0; iter_k < K / BLOCK_K; ++iter_k) {
-            load(iter_k, true);
+    auto compute_bid = [&](int bid) -> std::tuple<int, int, int, int> {
+        const int bid_m = bid / (grid_n * CLUSTER_M) * CLUSTER_M + (bid % CLUSTER_M);
+        const int bid_n = (bid / CLUSTER_M) % grid_n;
+
+        const int off_m = bid_m * BLOCK_M;
+        const int off_n = bid_n * BLOCK_N;
+        return {bid_m, bid_n, off_m, off_n};
+    };
+
+    // load warp
+    if (warp_id == 4 && elect_sync()) {
+        int mma_stage = 0;
+        int mma_phase = 1;
+        for (int bid = _bid; bid < grid_size; bid += grid_x) {
+            auto [bid_m, bid_n, off_m, off_n] = compute_bid(bid);
+            for (int iter_k = 0; iter_k < K / BLOCK_K; ++iter_k) {
+                load(iter_k, mma_phase, mma_stage, off_m, off_n);
+                mma_stage = (mma_stage + 1) % STAGE_NUM;
+                if (mma_stage == 0) {
+                    mma_phase ^= 1;
+                }
+            }
         }
     }
 
-    if (cta_rank == 0 && warp_id == 1 && elect_sync()) {
-        for (int iter_k = 0; iter_k < K / BLOCK_K; ++iter_k) {
-            compute(iter_k, true);
-        }
+    // mma warp
+    if (cta_rank == 0 && warp_id == 5 && elect_sync()) {
+        int tma_phase = 0;
+        int tma_stage = 0;
 
-        constexpr int16_t cta_mask = (1 << CLUSTER_M) - 1;
-        asm volatile("tcgen05.commit.cta_group::%2.mbarrier::arrive::one.shared::cluster.multicast:"
-                     ":cluster.b64 [%0], %1;" ::"r"(mainloop_mbar_addr),
-            "h"(cta_mask),
-            "n"(CLUSTER_M)
-            : "memory");
+        int mainloop_stage = 0;
+        int epilogue_phase = 1;
+
+        for (int bid = _bid; bid < grid_size; bid += grid_x) {
+            mbarrier_wait(_base_epilogue_mbar_addr + mainloop_stage * 8, epilogue_phase);
+
+            for (int iter_k = 0; iter_k < K / BLOCK_K; ++iter_k) {
+                compute(iter_k, mainloop_stage, tma_phase, tma_stage);
+                tma_stage = (tma_stage + 1) % STAGE_NUM;
+                if (tma_stage == 0) {
+                    tma_phase ^= 1;
+                }
+            }
+
+            constexpr int16_t cta_mask = (1 << CLUSTER_M) - 1;
+            asm volatile(
+                "tcgen05.commit.cta_group::%2.mbarrier::arrive::one.shared::cluster.multicast:"
+                ":cluster.b64 [%0], %1;" ::"r"(_base_mainloop_mbar_addr + 8 * mainloop_stage),
+                "h"(cta_mask),
+                "n"(CLUSTER_M)
+                : "memory");
+
+            mainloop_stage = (mainloop_stage + 1) % 2;
+            if (mainloop_stage == 0) {
+                epilogue_phase ^= 1;
+            }
+        }
     }
 
-    __syncthreads();
-    mbarrier_wait(mainloop_mbar_addr, 0);
     // epilogue
-    asm volatile("tcgen05.fence::after_thread_sync;");
 
-    epilogue();
+    if (warp_id < 4) {
+        int mainloop_stage = 0;
+        int mainloop_phase = 0;
 
-    __syncthreads();
+        for (int bid = _bid; bid < grid_size; bid += grid_x) {
+            mbarrier_wait(_base_mainloop_mbar_addr + 8 * mainloop_stage, mainloop_phase);
+
+            asm volatile("tcgen05.fence::after_thread_sync;");
+            auto [bid_m, bid_n, off_m, off_n] = compute_bid(bid);
+            epilogue(mainloop_stage, off_m, off_n);
+
+            if (elect_sync()) {
+                const int mbar_addr = (_base_epilogue_mbar_addr + mainloop_stage * 8) & 0xFEFFFFFF;
+                asm volatile(
+                    "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];" ::"r"(mbar_addr)
+                    : "memory");
+            }
+            mainloop_stage = (mainloop_stage + 1) % 2;
+            if (mainloop_stage == 0) {
+                mainloop_phase ^= 1;
+            }
+        }
+    }
+
+    if constexpr (CLUSTER_M > 1) {
+        asm volatile("barrier.cluster.arrive.release.aligned;");
+        asm volatile("barrier.cluster.wait.acquire.aligned;");
+    } else {
+        __syncthreads();
+    }
     if (warp_id == 0) {
         asm volatile("tcgen05.dealloc.cta_group::%2.sync.aligned.b32 %0, %1;" ::"r"(taddr),
-            "r"(BLOCK_N),
+            "r"(BLOCK_N * 2),
             "n"(CLUSTER_M));
     }
 }
@@ -375,8 +439,6 @@ void launch_bf16_gemm(
     int N,
     int K,
     cudaStream_t stream) {
-
-    assert(STAGE_NUM <= (K / BLOCK_K));
 
     CUtensorMap A_tmap, B_tmap;
 
@@ -393,7 +455,7 @@ void launch_bf16_gemm(
     const int smem_size =
         (BLOCK_M + BLOCK_N / CLUSTER_M) * BLOCK_K * STAGE_NUM * sizeof(nv_bfloat16) + mbarrier_smem;
 
-    int grid = (M / BLOCK_M) * (N / BLOCK_N);
+    int grid = SM_NUM;
 
     auto kernel = bf16_gemm_kernel;
 
