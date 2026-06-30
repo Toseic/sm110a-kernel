@@ -48,7 +48,7 @@ def parse_args():
     parser.add_argument(
         "--baseline",
         choices=("torch", "cublaslt"),
-        default="torch",
+        default="cublaslt",
     )
     args = parser.parse_args()
 
