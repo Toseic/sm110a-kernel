@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+from datetime import datetime
 import math
 import statistics
 import sys
@@ -12,7 +13,14 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from sm110a_kernel import bf16_gemm_out, cublaslt_gemm_out, cublaslt_gemm_out_batched
+from sm110a_kernel import (
+    bf16_gemm_out,
+    bf16_gemm_profile,
+    cublaslt_gemm_out,
+    cublaslt_gemm_out_batched,
+    make_profiler_buffer,
+    write_trace,
+)
 
 
 DEFAULT_SHAPES = [
@@ -28,6 +36,19 @@ DEFAULT_SHAPES = [
 ACCURACY_SHAPE = (512, 512, 512)
 TARGET_SAMPLE_MS = 50.0
 CUBLASLT_WORKSPACE_BYTES = 32 * 1024 * 1024
+DEFAULT_PROFILE_NUM_ENTRIES = 100_000
+DEFAULT_PROFILE_NUM_BLOCKS = 20
+DEFAULT_PROFILE_OUTPUT_DIR = ROOT / "profiles"
+BF16_GEMM_PROFILER_TAGS = (
+    "SETUP",
+    "ISSUE_TMA",
+    "ISSUE_MMA",
+    "WAIT_TMA",
+    "WAIT_MMA",
+    "WAIT_MAINLOOP",
+    "WAIT_EPILOGUE",
+    "EPILOGUE",
+)
 
 
 def parse_args():
@@ -50,6 +71,12 @@ def parse_args():
         choices=("torch", "cublaslt"),
         default="cublaslt",
     )
+    parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--profile-output", default=str(DEFAULT_PROFILE_OUTPUT_DIR))
+    parser.add_argument("--profile-num-blocks", type=int, default=DEFAULT_PROFILE_NUM_BLOCKS)
+    parser.add_argument(
+        "--profile-num-entries", type=int, default=DEFAULT_PROFILE_NUM_ENTRIES
+    )
     args = parser.parse_args()
 
     single_shape = args.m > 0 or args.n > 0 or args.k > 0
@@ -59,6 +86,12 @@ def parse_args():
         raise SystemExit("--iters must be positive")
     if args.samples <= 0:
         raise SystemExit("--samples must be positive")
+    if args.profile and not single_shape:
+        raise SystemExit("--profile requires --m, --n, --k")
+    if args.profile_num_blocks <= 0:
+        raise SystemExit("--profile-num-blocks must be positive")
+    if args.profile_num_entries <= 0:
+        raise SystemExit("--profile-num-entries must be positive")
     return args, single_shape
 
 
@@ -254,12 +287,48 @@ def run_accuracy_check(args):
     print()
 
 
+def run_profile(args):
+    output_path = Path(args.profile_output)
+    if output_path.suffixes[-2:] != [".json", ".gz"] and output_path.suffix != ".json":
+        output_path.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = output_path / (
+            f"bf16_gemm_profile"
+            f"_m{args.m}_n{args.n}_k{args.k}"
+            f"_blocks{args.profile_num_blocks}"
+            f"_entries{args.profile_num_entries}"
+            f"_{timestamp}.json.gz"
+        )
+    else:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    a = torch.randn(args.m, args.k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(args.k, args.n, device="cuda", dtype=torch.bfloat16)
+    profiler = make_profiler_buffer(
+        args.profile_num_blocks, args.profile_num_entries, device=a.device
+    )
+
+    for _ in range(args.warmup):
+        bf16_gemm_profile(a, b, profiler, args.profile_num_entries)
+    torch.cuda.synchronize()
+
+    profiler.zero_()
+    bf16_gemm_profile(a, b, profiler, args.profile_num_entries)
+    torch.cuda.synchronize()
+    write_trace(profiler, output_path, tags=BF16_GEMM_PROFILER_TAGS)
+    print(f"[profile] wrote {output_path}")
+
+
 def main():
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
 
     args, single_shape = parse_args()
     torch.manual_seed(1234)
+    if args.profile:
+        run_profile(args)
+        return
+
     actual_blas = None
     if args.baseline == "torch":
         actual_blas = configure_torch_blas(args.torch_blas)

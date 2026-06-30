@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 
 #include "bf16_gemm.h"
+#include "profiler.h"
 
 namespace {
 
@@ -137,7 +138,8 @@ inline void init_3D_tmap(
         CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 }
 
-__global__ 
+template <bool DO_PROFILE>
+__global__
 __cluster_dims__(CLUSTER_M, 1, 1) 
 __launch_bounds__(TB_SIZE) 
 void bf16_gemm_kernel(
@@ -146,7 +148,9 @@ void bf16_gemm_kernel(
     __nv_bfloat16 *C_ptr,
     int M,
     int N,
-    int K) {
+    int K,
+    int64_t *profiler_ptr,
+    int num_entries) {
 
     const int tid = threadIdx.x;
     const int _bid = blockIdx.x;
@@ -156,6 +160,14 @@ void bf16_gemm_kernel(
     const int grid_m = M / BLOCK_M;
     const int grid_n = N / BLOCK_N;
     const int grid_size = grid_m * grid_n;
+
+    Profiler profiler;
+    if constexpr (DO_PROFILE) {
+        if (elect_sync()) {
+            profiler.init(num_entries, profiler_ptr, _bid * WARP_NUM + warp_id);
+            profiler.start(ProfilerTag::Setup);
+        }
+    }
 
     // set up cta rank
     int cta_rank;
@@ -217,6 +229,11 @@ void bf16_gemm_kernel(
     } else {
         __syncthreads();
     }
+    if constexpr (DO_PROFILE) {
+        if (elect_sync()) {
+            profiler.stop();
+        }
+    }
 
     const int taddr = tmem_addr[0];
 
@@ -224,7 +241,13 @@ void bf16_gemm_kernel(
     auto load = [&](int iter_k, int mma_phase, int stage_id, int off_m, int off_n) {
         // const int stage_id = iter_k % STAGE_NUM;
         const int mma_mbar_addr = _base_mma_mbar_addr + 8 * stage_id;
+        if constexpr (DO_PROFILE) {
+            profiler.start(ProfilerTag::WaitMMA);
+        }
         mbarrier_wait(mma_mbar_addr, mma_phase);
+        if constexpr (DO_PROFILE) {
+            profiler.stop();
+        }
 
         const int A_smem = smem + stage_id * (A_size + B_size);
         const int B_smem = A_smem + A_size;
@@ -233,6 +256,9 @@ void bf16_gemm_kernel(
         // tma issue
         constexpr int cp_size = A_size + B_size;
 
+        if constexpr (DO_PROFILE) {
+            profiler.start(ProfilerTag::IssueTMA);
+        }
         asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;" ::"r"(
                          tma_mbar_addr),
             "r"(cp_size)
@@ -252,12 +278,21 @@ void bf16_gemm_kernel(
                 off_k / 64,
                 tma_mbar_addr);
         }
+        if constexpr (DO_PROFILE) {
+            profiler.stop();
+        }
     };
 
     // mma compute
     auto compute = [&](int iter_k, int mainloop_stage, int tma_phase, int stage_id) {
         const int tma_mbar_addr = _base_tma_mbar_addr + 8 * stage_id;
+        if constexpr (DO_PROFILE) {
+            profiler.start(ProfilerTag::WaitTMA);
+        }
         mbarrier_wait(tma_mbar_addr, tma_phase);
+        if constexpr (DO_PROFILE) {
+            profiler.stop();
+        }
 
         const int A_smem = smem + stage_id * (A_size + B_size);
         const int B_smem = A_smem + A_size;
@@ -273,6 +308,9 @@ void bf16_gemm_kernel(
         asm volatile("tcgen05.fence::after_thread_sync;");
         const int this_taddr = taddr + mainloop_stage * BLOCK_N;
 
+        if constexpr (DO_PROFILE) {
+            profiler.start(ProfilerTag::IssueMMA);
+        }
         tcgen05_mma_f16<CLUSTER_M>(this_taddr,
             make_desc(A_smem),
             make_desc(B_smem),
@@ -298,6 +336,9 @@ void bf16_gemm_kernel(
             "h"(cta_mask),
             "n"(CLUSTER_M)
             : "memory");
+        if constexpr (DO_PROFILE) {
+            profiler.stop();
+        }
     };
 
     auto epilogue = [&](int mainloop_stage, int off_m, int off_n) {
@@ -365,7 +406,13 @@ void bf16_gemm_kernel(
         int epilogue_phase = 1;
 
         for (int bid = _bid; bid < grid_size; bid += grid_x) {
+            if constexpr (DO_PROFILE) {
+                profiler.start(ProfilerTag::WaitEpilogue);
+            }
             mbarrier_wait(_base_epilogue_mbar_addr + mainloop_stage * 8, epilogue_phase);
+            if constexpr (DO_PROFILE) {
+                profiler.stop();
+            }
 
             for (int iter_k = 0; iter_k < K / BLOCK_K; ++iter_k) {
                 compute(iter_k, mainloop_stage, tma_phase, tma_stage);
@@ -397,11 +444,14 @@ void bf16_gemm_kernel(
         int mainloop_phase = 0;
 
         for (int bid = _bid; bid < grid_size; bid += grid_x) {
+            if constexpr (DO_PROFILE) if (elect_sync()) profiler.start(ProfilerTag::WaitMainloop);
             mbarrier_wait(_base_mainloop_mbar_addr + 8 * mainloop_stage, mainloop_phase);
-
             asm volatile("tcgen05.fence::after_thread_sync;");
+            if constexpr (DO_PROFILE) if (elect_sync()) profiler.stop();
             auto [bid_m, bid_n, off_m, off_n] = compute_bid(bid);
+            if constexpr (DO_PROFILE) if (elect_sync()) profiler.start(ProfilerTag::Epilogue);
             epilogue(mainloop_stage, off_m, off_n);
+            if constexpr (DO_PROFILE) if (elect_sync()) profiler.stop();
 
             if (elect_sync()) {
                 const int mbar_addr = (_base_epilogue_mbar_addr + mainloop_stage * 8) & 0xFEFFFFFF;
@@ -427,17 +477,25 @@ void bf16_gemm_kernel(
             "r"(BLOCK_N * 2),
             "n"(CLUSTER_M));
     }
+    if constexpr (DO_PROFILE) {
+        if (elect_sync()) {
+            profiler.flush();
+        }
+    }
 }
 
 } // namespace
 
-void launch_bf16_gemm(
+template <bool DO_PROFILE>
+void launch_bf16_gemm_impl(
     const __nv_bfloat16 *A_ptr,
     const __nv_bfloat16 *B_ptr,
     __nv_bfloat16 *C_ptr,
     int M,
     int N,
     int K,
+    int64_t *profiler_ptr,
+    int num_entries,
     cudaStream_t stream) {
 
     CUtensorMap A_tmap, B_tmap;
@@ -457,11 +515,35 @@ void launch_bf16_gemm(
 
     int grid = SM_NUM;
 
-    auto kernel = bf16_gemm_kernel;
+    auto kernel = bf16_gemm_kernel<DO_PROFILE>;
 
     if (smem_size > 48 * 1024) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     }
 
-    kernel<<<grid, TB_SIZE, smem_size, stream>>>(A_tmap, B_tmap, C_ptr, M, N, K);
+    kernel<<<grid, TB_SIZE, smem_size, stream>>>(A_tmap, B_tmap, C_ptr, M, N, K, profiler_ptr, num_entries);
+}
+
+void launch_bf16_gemm(
+    const __nv_bfloat16 *A_ptr,
+    const __nv_bfloat16 *B_ptr,
+    __nv_bfloat16 *C_ptr,
+    int M,
+    int N,
+    int K,
+    cudaStream_t stream) {
+    launch_bf16_gemm_impl<false>(A_ptr, B_ptr, C_ptr, M, N, K, nullptr, 0, stream);
+}
+
+void launch_bf16_gemm_profile(
+    const __nv_bfloat16 *A_ptr,
+    const __nv_bfloat16 *B_ptr,
+    __nv_bfloat16 *C_ptr,
+    int M,
+    int N,
+    int K,
+    int64_t *profiler_ptr,
+    int num_entries,
+    cudaStream_t stream) {
+    launch_bf16_gemm_impl<true>(A_ptr, B_ptr, C_ptr, M, N, K, profiler_ptr, num_entries, stream);
 }

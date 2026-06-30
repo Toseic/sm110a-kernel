@@ -35,6 +35,13 @@ def _load_extension():
 
 _EXT = _load_extension()
 
+from .profiler import (
+    PROFILER_WARPS_PER_BLOCK,
+    make_profiler_buffer,
+    profiler_events,
+    write_trace,
+)
+
 
 def bf16_gemm(a, b):
     return _EXT.bf16_gemm(a, b)
@@ -42,6 +49,10 @@ def bf16_gemm(a, b):
 
 def bf16_gemm_out(a, b, out):
     return _EXT.bf16_gemm_out(a, b, out)
+
+
+def bf16_gemm_profile(a, b, profiler, num_entries):
+    return _EXT.bf16_gemm_profile(a, b, profiler, num_entries)
 
 
 def cublaslt_gemm(a, b):
