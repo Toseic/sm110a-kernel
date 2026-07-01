@@ -18,6 +18,7 @@ constexpr int STAGE_NUM = 3;
 constexpr int MMA_K = 16;
 constexpr int SM_NUM = 20;
 constexpr int CLUSTER_M = 2;
+constexpr bool PREFETCH_TMA_DESC = true;
 constexpr int TB_SIZE = WARP_SIZE * WARP_NUM;
 
 constexpr int _dtype_bytes = 2;
@@ -113,6 +114,12 @@ __device__ inline void mbarrier_init(
     int mbar_addr,
     int count) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(mbar_addr), "r"(count));
+}
+
+__device__ inline void prefetch_tensormap(
+    const void *desc) {
+    uint64_t ptr = reinterpret_cast<uint64_t>(desc);
+    asm volatile("prefetch.tensormap [%0];" ::"l"(ptr) : "memory");
 }
 
 inline void init_3D_tmap(
@@ -231,6 +238,13 @@ void bf16_gemm_kernel(
             "r"(BLOCK_N * 2),
             "n"(CLUSTER_M));
     }
+    // prefetch tma desc
+    if constexpr (PREFETCH_TMA_DESC) {
+        if (warp_id == 0 && elect_sync()) {
+            prefetch_tensormap(&A_tmap);
+            prefetch_tensormap(&B_tmap);
+        }
+    }
 
     if constexpr (CLUSTER_M > 1) {
         asm volatile("barrier.cluster.arrive.release.aligned;");
@@ -280,7 +294,8 @@ void bf16_gemm_kernel(
                 off_m,
                 off_k / 64,
                 tma_mbar_addr);
-            tma_3d_gmem2smem<CLUSTER_M>(B_smem + k * (BLOCK_N / CLUSTER_M) * 64 * sizeof(nv_bfloat16),
+            tma_3d_gmem2smem<CLUSTER_M>(
+                B_smem + k * (BLOCK_N / CLUSTER_M) * 64 * sizeof(nv_bfloat16),
                 &B_tmap,
                 0,
                 off_n + cta_rank * (BLOCK_N / CLUSTER_M),
@@ -381,7 +396,7 @@ void bf16_gemm_kernel(
         }
     };
 
-    auto compute_bid = [&](int bid) -> std::tuple< int, int> {
+    auto compute_bid = [&](int bid) -> std::tuple<int, int> {
         constexpr int MACRO_M_SIZE = BLOCK_M * MACRO_SWIZZLE_M;
         constexpr int MACRO_N_SIZE = BLOCK_N * MACRO_SWIZZLE_N;
 
@@ -390,7 +405,7 @@ void bf16_gemm_kernel(
 
         auto _compute_bid_in_macro = [&](int macro_block_m_idx,
                                          int macro_block_n_idx,
-                                         int macro_lane) -> std::tuple< int, int> {
+                                         int macro_lane) -> std::tuple<int, int> {
             const int base_m = macro_block_m_idx * MACRO_M_SIZE;
             const int base_n = macro_block_n_idx * MACRO_N_SIZE;
 
@@ -404,7 +419,7 @@ void bf16_gemm_kernel(
             const int off_m = base_m + macro_bid_m * BLOCK_M;
             const int off_n = base_n + macro_bid_n * BLOCK_N;
 
-            return { off_m, off_n};
+            return {off_m, off_n};
         };
 
         if constexpr (MACRO_SWIZZLE_M_FAST) {
@@ -452,7 +467,7 @@ void bf16_gemm_kernel(
         int mma_stage = 0;
         int mma_phase = 1;
         for (int bid = _bid; bid < grid_size; bid += grid_x) {
-            auto [ off_m, off_n] = compute_bid(bid);
+            auto [off_m, off_n] = compute_bid(bid);
             for (int iter_k = 0; iter_k < K / BLOCK_K; ++iter_k) {
                 load(iter_k, mma_phase, mma_stage, off_m, off_n);
                 mma_stage = (mma_stage + 1) % STAGE_NUM;
