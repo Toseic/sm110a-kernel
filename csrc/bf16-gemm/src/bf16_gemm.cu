@@ -11,10 +11,10 @@ namespace {
 
 constexpr int BLOCK_M = 128;
 constexpr int BLOCK_N = 256;
-constexpr int BLOCK_K = 64;
+constexpr int BLOCK_K = 128;
 constexpr int WARP_SIZE = 32;
 constexpr int WARP_NUM = 6;
-constexpr int STAGE_NUM = 7;
+constexpr int STAGE_NUM = 3;
 constexpr int MMA_K = 16;
 constexpr int SM_NUM = 20;
 constexpr int CLUSTER_M = 2;
@@ -26,8 +26,8 @@ constexpr int _L2_per_tilen = _dtype_bytes * BLOCK_N * BLOCK_K;
 constexpr int _thor_L2_size = 32 * 1024 * 1024;
 constexpr int _MACRO_SWIZZLE_SUM = _thor_L2_size / (_L2_per_tilem + _L2_per_tilen);
 
-constexpr int MACRO_SWIZZLE_M = 4;
-constexpr int MACRO_SWIZZLE_N = 4;
+constexpr int MACRO_SWIZZLE_M = 8;
+constexpr int MACRO_SWIZZLE_N = 8;
 constexpr int MACRO_SWIZZLE_SIZE = MACRO_SWIZZLE_M * MACRO_SWIZZLE_N;
 constexpr bool MACRO_SWIZZLE_M_FAST = true;
 
@@ -143,7 +143,7 @@ inline void init_3D_tmap(
         element_strides,
         CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
         swizzle,
-        CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
         CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 }
 
@@ -280,7 +280,7 @@ void bf16_gemm_kernel(
                 off_m,
                 off_k / 64,
                 tma_mbar_addr);
-            tma_3d_gmem2smem<CLUSTER_M>(B_smem + k * BLOCK_N * 64 * sizeof(nv_bfloat16),
+            tma_3d_gmem2smem<CLUSTER_M>(B_smem + k * (BLOCK_N / CLUSTER_M) * 64 * sizeof(nv_bfloat16),
                 &B_tmap,
                 0,
                 off_n + cta_rank * (BLOCK_N / CLUSTER_M),
