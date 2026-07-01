@@ -17,10 +17,19 @@ constexpr int WARP_NUM = 6;
 constexpr int STAGE_NUM = 7;
 constexpr int MMA_K = 16;
 constexpr int SM_NUM = 20;
-
 constexpr int CLUSTER_M = 2;
-
 constexpr int TB_SIZE = WARP_SIZE * WARP_NUM;
+
+constexpr int _dtype_bytes = 2;
+constexpr int _L2_per_tilem = _dtype_bytes * BLOCK_M * BLOCK_K;
+constexpr int _L2_per_tilen = _dtype_bytes * BLOCK_N * BLOCK_K;
+constexpr int _thor_L2_size = 32 * 1024 * 1024;
+constexpr int _MACRO_SWIZZLE_SUM = _thor_L2_size / (_L2_per_tilem + _L2_per_tilen);
+
+constexpr int MACRO_SWIZZLE_M = 4;
+constexpr int MACRO_SWIZZLE_N = 4;
+constexpr int MACRO_SWIZZLE_SIZE = MACRO_SWIZZLE_M * MACRO_SWIZZLE_N;
+constexpr bool MACRO_SWIZZLE_M_FAST = true;
 
 template <int CTA_GROUP = 1>
 __device__ inline void tma_3d_gmem2smem(
@@ -372,13 +381,70 @@ void bf16_gemm_kernel(
         }
     };
 
-    auto compute_bid = [&](int bid) -> std::tuple<int, int, int, int> {
-        const int bid_m = bid / (grid_n * CLUSTER_M) * CLUSTER_M + (bid % CLUSTER_M);
-        const int bid_n = (bid / CLUSTER_M) % grid_n;
+    auto compute_bid = [&](int bid) -> std::tuple< int, int> {
+        constexpr int MACRO_M_SIZE = BLOCK_M * MACRO_SWIZZLE_M;
+        constexpr int MACRO_N_SIZE = BLOCK_N * MACRO_SWIZZLE_N;
 
-        const int off_m = bid_m * BLOCK_M;
-        const int off_n = bid_n * BLOCK_N;
-        return {bid_m, bid_n, off_m, off_n};
+        const int macro_m_num = (M + MACRO_M_SIZE - 1) / MACRO_M_SIZE;
+        const int macro_n_num = (N + MACRO_N_SIZE - 1) / MACRO_N_SIZE;
+
+        auto _compute_bid_in_macro = [&](int macro_block_m_idx,
+                                         int macro_block_n_idx,
+                                         int macro_lane) -> std::tuple< int, int> {
+            const int base_m = macro_block_m_idx * MACRO_M_SIZE;
+            const int base_n = macro_block_n_idx * MACRO_N_SIZE;
+
+            const int _real_macro_m = min(MACRO_M_SIZE, M - base_m) / BLOCK_M;
+            const int _real_macro_n = min(MACRO_N_SIZE, N - base_n) / BLOCK_N;
+
+            const int macro_bid_m =
+                macro_lane / (_real_macro_n * CLUSTER_M) * CLUSTER_M + (macro_lane % CLUSTER_M);
+            const int macro_bid_n = (macro_lane / CLUSTER_M) % _real_macro_n;
+
+            const int off_m = base_m + macro_bid_m * BLOCK_M;
+            const int off_n = base_n + macro_bid_n * BLOCK_N;
+
+            return { off_m, off_n};
+        };
+
+        if constexpr (MACRO_SWIZZLE_M_FAST) {
+            const int full_n_band_size = grid_m * MACRO_SWIZZLE_N;
+
+            const int macro_block_n_idx = bid / full_n_band_size;
+            const int bid_in_n_band = bid - macro_block_n_idx * full_n_band_size;
+
+            const int real_macro_n =
+                min(MACRO_SWIZZLE_N, grid_n - macro_block_n_idx * MACRO_SWIZZLE_N);
+
+            const int macro_m_block_size = MACRO_SWIZZLE_M * real_macro_n;
+
+            const int macro_block_m_idx = bid_in_n_band / macro_m_block_size;
+            const int macro_lane = bid_in_n_band % macro_m_block_size;
+
+            return _compute_bid_in_macro(macro_block_m_idx, macro_block_n_idx, macro_lane);
+        } else {
+            const int full_m_band_size = grid_n * MACRO_SWIZZLE_M;
+
+            const int macro_block_m_idx = bid / full_m_band_size;
+            const int bid_in_m_band = bid - macro_block_m_idx * full_m_band_size;
+
+            const int real_macro_m =
+                min(MACRO_SWIZZLE_M, grid_m - macro_block_m_idx * MACRO_SWIZZLE_M);
+
+            const int macro_n_block_size = real_macro_m * MACRO_SWIZZLE_N;
+
+            const int macro_block_n_idx = bid_in_m_band / macro_n_block_size;
+            const int macro_lane = bid_in_m_band % macro_n_block_size;
+
+            return _compute_bid_in_macro(macro_block_m_idx, macro_block_n_idx, macro_lane);
+        }
+
+        // const int bid_m = bid / (grid_n * CLUSTER_M) * CLUSTER_M + (bid % CLUSTER_M);
+        // const int bid_n = (bid / CLUSTER_M) % grid_n;
+
+        // const int off_m = bid_m * BLOCK_M;
+        // const int off_n = bid_n * BLOCK_N;
+        // return {bid_m, bid_n, off_m, off_n};
     };
 
     // load warp
@@ -386,7 +452,7 @@ void bf16_gemm_kernel(
         int mma_stage = 0;
         int mma_phase = 1;
         for (int bid = _bid; bid < grid_size; bid += grid_x) {
-            auto [bid_m, bid_n, off_m, off_n] = compute_bid(bid);
+            auto [ off_m, off_n] = compute_bid(bid);
             for (int iter_k = 0; iter_k < K / BLOCK_K; ++iter_k) {
                 load(iter_k, mma_phase, mma_stage, off_m, off_n);
                 mma_stage = (mma_stage + 1) % STAGE_NUM;
@@ -444,14 +510,22 @@ void bf16_gemm_kernel(
         int mainloop_phase = 0;
 
         for (int bid = _bid; bid < grid_size; bid += grid_x) {
-            if constexpr (DO_PROFILE) if (elect_sync()) profiler.start(ProfilerTag::WaitMainloop);
+            if constexpr (DO_PROFILE)
+                if (elect_sync())
+                    profiler.start(ProfilerTag::WaitMainloop);
             mbarrier_wait(_base_mainloop_mbar_addr + 8 * mainloop_stage, mainloop_phase);
             asm volatile("tcgen05.fence::after_thread_sync;");
-            if constexpr (DO_PROFILE) if (elect_sync()) profiler.stop();
-            auto [bid_m, bid_n, off_m, off_n] = compute_bid(bid);
-            if constexpr (DO_PROFILE) if (elect_sync()) profiler.start(ProfilerTag::Epilogue);
+            if constexpr (DO_PROFILE)
+                if (elect_sync())
+                    profiler.stop();
+            auto [off_m, off_n] = compute_bid(bid);
+            if constexpr (DO_PROFILE)
+                if (elect_sync())
+                    profiler.start(ProfilerTag::Epilogue);
             epilogue(mainloop_stage, off_m, off_n);
-            if constexpr (DO_PROFILE) if (elect_sync()) profiler.stop();
+            if constexpr (DO_PROFILE)
+                if (elect_sync())
+                    profiler.stop();
 
             if (elect_sync()) {
                 const int mbar_addr = (_base_epilogue_mbar_addr + mainloop_stage * 8) & 0xFEFFFFFF;
@@ -500,6 +574,10 @@ void launch_bf16_gemm_impl(
 
     CUtensorMap A_tmap, B_tmap;
 
+    static_assert(MACRO_SWIZZLE_M * MACRO_SWIZZLE_N <= _MACRO_SWIZZLE_SUM);
+    assert(M % (CLUSTER_M * BLOCK_M) == 0);
+    assert(N % BLOCK_N == 0);
+
     init_3D_tmap(&A_tmap, A_ptr, M, K, BLOCK_M, 64, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B);
     init_3D_tmap(&B_tmap,
         B_ptr,
@@ -521,7 +599,14 @@ void launch_bf16_gemm_impl(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     }
 
-    kernel<<<grid, TB_SIZE, smem_size, stream>>>(A_tmap, B_tmap, C_ptr, M, N, K, profiler_ptr, num_entries);
+    kernel<<<grid, TB_SIZE, smem_size, stream>>>(A_tmap,
+        B_tmap,
+        C_ptr,
+        M,
+        N,
+        K,
+        profiler_ptr,
+        num_entries);
 }
 
 void launch_bf16_gemm(
