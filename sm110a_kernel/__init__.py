@@ -20,6 +20,7 @@ def _load_extension():
         sources=[
             str(root / "csrc/bf16-gemm/src/torch_binding.cpp"),
             str(root / "csrc/bf16-gemm/src/bf16_gemm.cu"),
+            str(root / "csrc/bf16-gemm/src/bf16_gemm_dynamic_schedule.cu"),
         ],
         extra_include_paths=[str(root / "include")],
         extra_cuda_cflags=[
@@ -53,6 +54,18 @@ def bf16_gemm_out(a, b, out):
 
 def bf16_gemm_profile(a, b, profiler, num_entries):
     return _EXT.bf16_gemm_profile(a, b, profiler, num_entries)
+
+
+def bf16_gemm_dynamic_schedule(a, b):
+    return _EXT.bf16_gemm_dynamic_schedule(a, b)
+
+
+def bf16_gemm_dynamic_schedule_out(a, b, out):
+    return _EXT.bf16_gemm_dynamic_schedule_out(a, b, out)
+
+
+def bf16_gemm_dynamic_schedule_profile(a, b, profiler, num_entries):
+    return _EXT.bf16_gemm_dynamic_schedule_profile(a, b, profiler, num_entries)
 
 
 def cublaslt_gemm(a, b):
