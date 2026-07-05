@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from sm110a_kernel import bf16_grouped_m_gemm_out
+from sm110a_kernel import GroupedMConfig, bf16_grouped_m_gemm_out
 
 
 TARGET_SAMPLE_MS = 50.0
@@ -20,6 +20,18 @@ EXPERTS = 256
 N = 6144
 K = 4096
 TOKENS_PER_EXPERT_VALUES = (32, 64, 128, 256, 512, 1024)
+GROUPED_M_CONFIGS = tuple(
+    GroupedMConfig(
+        tile_m=128,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        epilogue_tile_n=32,
+        cluster_m=cluster_m,
+    )
+    for tile_n in (128, 256)
+    for tile_k in (64, 128)
+    for cluster_m in (1, 2)
+)
 
 
 def parse_args():
@@ -147,12 +159,49 @@ def benchmark_grouped_baseline(a, b, tokens_per_expert, out, args):
     )
 
 
-def benchmark_grouped_kernel(a, b, layout, out, args):
+def benchmark_grouped_kernel(a, b, layout, out, config, args):
+    # Compile and launch once before recording CUDA events. This also rejects a
+    # configuration that cannot launch on the current device.
+    bf16_grouped_m_gemm_out(a, b, layout, out, config=config)
+    torch.cuda.synchronize()
     return benchmark_with_stats(
-        lambda: bf16_grouped_m_gemm_out(a, b, layout, out),
+        lambda: bf16_grouped_m_gemm_out(
+            a, b, layout, out, config=config
+        ),
         args.warmup,
         args.iters,
         args.samples,
+    )
+
+
+def compatible_configs(n, k):
+    return tuple(
+        config
+        for config in GROUPED_M_CONFIGS
+        if n % config.tile_n == 0 and k % config.tile_k == 0
+    )
+
+
+def benchmark_best_grouped_kernel(a, b, layout, out, args):
+    configs = compatible_configs(b.size(1), a.size(1))
+    if not configs:
+        raise RuntimeError(
+            f"no grouped M config supports N={b.size(1)}, K={a.size(1)}"
+        )
+
+    results = []
+    for config in configs:
+        stats = benchmark_grouped_kernel(
+            a, b, layout, out, config, args
+        )
+        results.append((stats, config))
+    return min(results, key=lambda result: result[0]["median_ms"])
+
+
+def format_config(config):
+    return (
+        f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
+        f"/e{config.epilogue_tile_n}/c{config.cluster_m}"
     )
 
 
@@ -165,7 +214,7 @@ def print_header():
         f"{'Tok/E':<8}{'Pad/E':<8}{'M':<10}{'E':<8}{'N':<8}{'K':<8}"
         f"{'KernelMed(ms)':<16}{'Kernel TF/s':<16}"
         f"{'BaselineMed(ms)':<16}{'Baseline TF/s':<16}"
-        f"{'Speedup':<12}{'MaxDiff':<12}"
+        f"{'Speedup':<12}{'MaxDiff':<12}{'BestConfig':<28}"
     )
 
 
@@ -178,6 +227,7 @@ def print_result(
     kernel_stats,
     baseline_stats,
     diff,
+    best_config,
 ):
     valid_m = experts * tokens_per_expert
     kernel_tflops = tflops_from_ms(valid_m, n, k, kernel_stats["median_ms"])
@@ -190,7 +240,7 @@ def print_result(
         f"{experts:<8}{n:<8}{k:<8}"
         f"{kernel_stats['median_ms']:<16.4f}{kernel_tflops:<16.3f}"
         f"{baseline_stats['median_ms']:<16.4f}{baseline_tflops:<16.3f}"
-        f"{speedup:<12.2f}{diff:<12.6f}"
+        f"{speedup:<12.2f}{diff:<12.6f}{format_config(best_config):<28}"
     )
 
 
@@ -207,6 +257,10 @@ def main():
         f"[workload] experts={EXPERTS} n={N} k={K} "
         f"tokens_per_expert={TOKENS_PER_EXPERT_VALUES}"
     )
+    print(
+        "[autotune] configs="
+        + ", ".join(format_config(config) for config in GROUPED_M_CONFIGS)
+    )
 
     b = torch.empty((EXPERTS, N, K), device="cuda", dtype=torch.bfloat16)
     b.uniform_(-1.0, 1.0)
@@ -216,11 +270,6 @@ def main():
         a, layout, out_kernel, out_baseline = make_workload(
             tokens_per_expert, b
         )
-        cluster_m = 1 if tokens_per_expert <= 128 else 2
-        grouped_m_tile = cluster_m * 128
-        padded_tokens = (
-            math.ceil(tokens_per_expert / grouped_m_tile) * grouped_m_tile
-        )
         baseline_stats = benchmark_grouped_baseline(
             a,
             b,
@@ -228,9 +277,22 @@ def main():
             out_baseline,
             args,
         )
-        kernel_stats = benchmark_grouped_kernel(a, b, layout, out_kernel, args)
+        kernel_stats, best_config = benchmark_best_grouped_kernel(
+            a, b, layout, out_kernel, args
+        )
+        grouped_m_tile = best_config.cluster_m * best_config.tile_m
+        padded_tokens = (
+            math.ceil(tokens_per_expert / grouped_m_tile) * grouped_m_tile
+        )
         diff = 0.0
         if args.check:
+            bf16_grouped_m_gemm_out(
+                a,
+                b,
+                layout,
+                out_kernel,
+                config=best_config,
+            )
             run_grouped_baseline(a, b, tokens_per_expert, out_baseline)
             diff = max_valid_abs_diff(out_baseline, out_kernel)
         print_result(
@@ -242,6 +304,7 @@ def main():
             kernel_stats,
             baseline_stats,
             diff,
+            best_config,
         )
 
 

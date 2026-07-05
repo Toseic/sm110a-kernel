@@ -6,6 +6,22 @@
 
 #include "bf16_grouped_m_gemm.h"
 
+#ifndef SM110A_GROUPED_TILE_M
+#define SM110A_GROUPED_TILE_M 128
+#endif
+#ifndef SM110A_GROUPED_TILE_N
+#define SM110A_GROUPED_TILE_N 256
+#endif
+#ifndef SM110A_GROUPED_TILE_K
+#define SM110A_GROUPED_TILE_K 128
+#endif
+#ifndef SM110A_GROUPED_EPILOGUE_TILE_N
+#define SM110A_GROUPED_EPILOGUE_TILE_N 32
+#endif
+#ifndef SM110A_GROUPED_CLUSTER_M
+#define SM110A_GROUPED_CLUSTER_M 2
+#endif
+
 namespace {
 
 constexpr int kMmaK = 16;
@@ -34,22 +50,27 @@ struct KernelConfig {
     static_assert(kTileK % 64 == 0);
     static_assert(kTileK % kMmaK == 0);
     static constexpr int kClusterTileM = kClusterM * kTileM;
-    // A single-CTA MMA needs the full B tile, so use two stages to stay within
-    // the per-CTA shared-memory limit. The two-CTA variant can afford three.
-    static constexpr int kStageCount = kClusterM == 1 ? 2 : 3;
     static constexpr int kASmemBytes =
         kTileM * kTileK * sizeof(nv_bfloat16);
     static constexpr int kBSmemBytes =
         (kTileN / kClusterM) * kTileK * sizeof(nv_bfloat16);
-    static constexpr int kStageSmemBytes = kASmemBytes + kBSmemBytes;
-    static constexpr int kMainloopSmemBytes =
-        kStageCount * kStageSmemBytes;
+    static constexpr int kPerStageSmemBytes = kASmemBytes + kBSmemBytes;
     static constexpr int kEpilogueStageBytes =
         kTileM * kEpilogueTileN * sizeof(nv_bfloat16);
     static constexpr int kEpilogueSmemBytes =
         kEpilogueStageCount * kEpilogueStageBytes;
+    // Pack as many pipeline stages as shared memory allows (up to 4).
+    // Blackwell has ~228 KB of SMEM per CTA; we leave a small margin.
+    static constexpr int kMaxSmemBytes = 227 * 1024;
+    static constexpr int kStageCount =
+        (4 * kPerStageSmemBytes + kEpilogueSmemBytes <= kMaxSmemBytes) ? 4 :
+        (3 * kPerStageSmemBytes + kEpilogueSmemBytes <= kMaxSmemBytes) ? 3 : 2;
+    static constexpr int kMainloopSmemBytes =
+        kStageCount * kPerStageSmemBytes;
     static constexpr int kDynamicSmemBytes =
         kMainloopSmemBytes + kEpilogueSmemBytes;
+    // Backward-compat alias used inside the kernel function body.
+    static constexpr int kStageSmemBytes = kPerStageSmemBytes;
 };
 
 struct ExpertTileTask {
@@ -1152,21 +1173,12 @@ void launch_bf16_grouped_m_gemm(
         return;
     }
 
-    // A launch uses one cluster shape for every expert. Select it from the
-    // average group size; each expert is padded independently into that shape.
-    constexpr int kTileM = 128;
-    constexpr int kTileN = 256;
-    constexpr int kTileK = 128;
-    constexpr int kEpilogueTileN = 32;
-    constexpr int kSmallMThreshold = kTileM;
-    const int average_rows_per_expert = m / experts;
-    if (average_rows_per_expert <= kSmallMThreshold) {
-        launch_bf16_grouped_m_gemm_impl<
-            kTileM, kTileN, kTileK, kEpilogueTileN, 1>(
-            d_a, d_b, d_grouped_layout, d_c, m, experts, n, k, stream);
-    } else {
-        launch_bf16_grouped_m_gemm_impl<
-            kTileM, kTileN, kTileK, kEpilogueTileN, 2>(
-            d_a, d_b, d_grouped_layout, d_c, m, experts, n, k, stream);
-    }
+    // The JIT compiler emits exactly one template instance per configuration.
+    launch_bf16_grouped_m_gemm_impl<
+        SM110A_GROUPED_TILE_M,
+        SM110A_GROUPED_TILE_N,
+        SM110A_GROUPED_TILE_K,
+        SM110A_GROUPED_EPILOGUE_TILE_N,
+        SM110A_GROUPED_CLUSTER_M>(
+        d_a, d_b, d_grouped_layout, d_c, m, experts, n, k, stream);
 }

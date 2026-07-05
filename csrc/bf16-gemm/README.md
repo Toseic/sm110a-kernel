@@ -62,6 +62,33 @@ Grouped M benchmark:
 /home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_bf16_grouped_m_gemm.py
 ```
 
+The grouped M kernel is compiled on its first Python call. The default
+configuration selects `cluster_m=1` for at most 128 average rows per expert and
+`cluster_m=2` otherwise. A configuration can also be precompiled or supplied
+explicitly:
+
+```python
+from sm110a_kernel import (
+    GroupedMConfig,
+    bf16_grouped_m_gemm_out,
+    compile_bf16_grouped_m_gemm,
+)
+
+config = GroupedMConfig(
+    tile_m=128,
+    tile_n=256,
+    tile_k=128,
+    epilogue_tile_n=32,
+    cluster_m=2,
+)
+compile_bf16_grouped_m_gemm(config)  # optional warm-up
+bf16_grouped_m_gemm_out(a, b, grouped_layout, out, config=config)
+```
+
+Compiled modules are reused in-process and through PyTorch's extension cache
+across processes. Set `SM110A_JIT_CACHE_DIR` to choose the disk cache directory,
+or `SM110A_JIT_VERBOSE=1` to print compilation commands.
+
 The grouped M kernel uses the following K-major interface:
 
 - `A`: `[M, K]`
@@ -83,6 +110,7 @@ baseline.
 - `../../benchmarks/benchmark_bf16_gemm.py`: Python benchmark driver
 - `../../benchmarks/benchmark_bf16_gemm_dynamic_schedule.py`: Python benchmark driver for the dynamic schedule entry point
 - `../../benchmarks/benchmark_bf16_grouped_m_gemm.py`: Python benchmark driver for grouped M GEMM
-- `../../sm110a_kernel/__init__.py`: lazy JIT loader for the CUDA extension
+- `../../sm110a_kernel/__init__.py`: Python API and core extension loader
+- `../../sm110a_kernel/jit.py`: configuration-specialized grouped M JIT loader
 - `include/common.h`: shared CUDA/cuBLAS helpers
 - `include/bf16_gemm.h`: reusable BF16 GEMM declarations
