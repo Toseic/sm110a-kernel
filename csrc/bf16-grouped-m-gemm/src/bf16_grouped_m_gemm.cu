@@ -442,6 +442,7 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
     constexpr int kStageSmemBytes = Config::kStageSmemBytes;
     constexpr int kMainloopSmemBytes = Config::kMainloopSmemBytes;
     constexpr int kEpilogueStageBytes = Config::kEpilogueStageBytes;
+    constexpr int kMmaStepsPerStage = kTileK / kMmaK;
     const int tid = threadIdx.x;
     const int warp_id = tid / kWarpSize;
     int cta_rank;
@@ -725,29 +726,42 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
                     base_tma_mbar_addr + consumer_stage * sizeof(uint64_t);
                 const int mma_mbar_addr =
                     base_mma_mbar_addr + consumer_stage * sizeof(uint64_t);
-                const int a_smem =
-                    mainloop_smem + consumer_stage * kStageSmemBytes;
-                const int b_smem = a_smem + kASmemBytes;
 
                 mbarrier_wait(tma_mbar_addr, consumer_tma_phase);
                 asm volatile(
                     "tcgen05.fence::after_thread_sync;" ::: "memory");
-                for (int mma_k = 0; mma_k < kTileK / kMmaK; ++mma_k) {
-                    const int k_slab = mma_k / (64 / kMmaK);
-                    const int k_in_slab = mma_k % (64 / kMmaK);
-                    const int a_byte_offset =
-                        k_slab * kTileM * 64 * sizeof(nv_bfloat16) +
-                        k_in_slab * kMmaK * sizeof(nv_bfloat16);
-                    const int b_byte_offset =
-                        k_slab * (kTileN / kClusterM) * 64 *
-                            sizeof(nv_bfloat16) +
-                        k_in_slab * kMmaK * sizeof(nv_bfloat16);
-                    const int accumulate = tile_k != 0 || mma_k != 0;
-                    tcgen05_mma_bf16<kClusterM>(stage_tmem_addr,
-                        make_k_major_128b_desc(a_smem + a_byte_offset),
-                        make_k_major_128b_desc(b_smem + b_byte_offset),
-                        instruction_desc,
-                        accumulate);
+                {
+                    const int a_smem =
+                        mainloop_smem +
+                        consumer_stage * kStageSmemBytes;
+                    const int b_smem = a_smem + kASmemBytes;
+                    for (int mma_k = 0; mma_k < kMmaStepsPerStage;
+                         ++mma_k) {
+                        const int k_slab =
+                            mma_k / (64 / kMmaK);
+                        const int k_in_slab =
+                            mma_k % (64 / kMmaK);
+                        const int a_byte_offset =
+                            k_slab * kTileM * 64 *
+                                sizeof(nv_bfloat16) +
+                            k_in_slab * kMmaK *
+                                sizeof(nv_bfloat16);
+                        const int b_byte_offset =
+                            k_slab * (kTileN / kClusterM) *
+                                64 * sizeof(nv_bfloat16) +
+                            k_in_slab * kMmaK *
+                                sizeof(nv_bfloat16);
+                        const int accumulate =
+                            tile_k != 0 || mma_k != 0;
+                        tcgen05_mma_bf16<kClusterM>(
+                            stage_tmem_addr,
+                            make_k_major_128b_desc(
+                                a_smem + a_byte_offset),
+                            make_k_major_128b_desc(
+                                b_smem + b_byte_offset),
+                            instruction_desc,
+                            accumulate);
+                    }
                 }
                 tcgen05_commit<kClusterM>(mma_mbar_addr);
 
