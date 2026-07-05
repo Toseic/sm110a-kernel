@@ -21,6 +21,7 @@ def _load_extension():
             str(root / "csrc/bf16-gemm/src/torch_binding.cpp"),
             str(root / "csrc/bf16-gemm/src/bf16_gemm.cu"),
             str(root / "csrc/bf16-gemm/src/bf16_gemm_dynamic_schedule.cu"),
+            str(root / "csrc/bf16-grouped-m-gemm/src/bf16_grouped_m_gemm.cu"),
         ],
         extra_include_paths=[str(root / "include")],
         extra_cuda_cflags=[
@@ -78,3 +79,11 @@ def cublaslt_gemm_out(a, b, out, workspace):
 
 def cublaslt_gemm_out_batched(a, b, out, workspace, iters):
     return _EXT.cublaslt_gemm_out_batched(a, b, out, workspace, iters)
+
+
+def bf16_grouped_m_gemm(a, b, grouped_layout):
+    return _EXT.bf16_grouped_m_gemm(a, b, grouped_layout)
+
+
+def bf16_grouped_m_gemm_out(a, b, grouped_layout, out):
+    return _EXT.bf16_grouped_m_gemm_out(a, b, grouped_layout, out)
