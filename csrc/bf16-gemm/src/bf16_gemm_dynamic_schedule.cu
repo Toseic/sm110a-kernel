@@ -7,6 +7,9 @@
 #include "bf16_gemm.h"
 #include "profiler.h"
 
+// TODO: 2026-07-05 will add clc dynamic schedule logic into this
+
+
 namespace {
 
 constexpr int BLOCK_M = 128;
@@ -18,7 +21,6 @@ constexpr int STAGE_NUM = 3;
 constexpr int MMA_K = 16;
 constexpr int EPILOGUE_BLOCK_N = 32;
 constexpr int EPILOGUE_STAGE_NUM = 2;
-constexpr int SM_NUM = 20;
 constexpr int CLUSTER_M = 2;
 constexpr bool PREFETCH_TMA_DESC = true;
 constexpr int TB_SIZE = WARP_SIZE * WARP_NUM;
@@ -215,18 +217,16 @@ void bf16_gemm_dynamic_schedule_kernel(
     int num_entries) {
 
     const int tid = threadIdx.x;
-    const int _bid = blockIdx.x;
-    const int grid_x = gridDim.x;
     const int warp_id = tid / WARP_SIZE;
+    const int cluster_bid = blockIdx.x / CLUSTER_M;
 
-    const int grid_m = M / BLOCK_M;
+    const int grid_m = M / (BLOCK_M * CLUSTER_M);
     const int grid_n = N / BLOCK_N;
-    const int grid_size = grid_m * grid_n;
 
     Profiler profiler;
     if constexpr (DO_PROFILE) {
         if (elect_sync()) {
-            profiler.init(num_entries, profiler_ptr, _bid * WARP_NUM + warp_id);
+            profiler.init(num_entries, profiler_ptr, cluster_bid * WARP_NUM + warp_id);
             profiler.start(ProfilerTag::Setup);
         }
     }
@@ -509,11 +509,9 @@ void bf16_gemm_dynamic_schedule_kernel(
     };
 
     auto compute_bid = [&](int bid) -> std::tuple<int, int> {
-        constexpr int MACRO_M_SIZE = BLOCK_M * MACRO_SWIZZLE_M;
+        constexpr int CLUSTER_BLOCK_M = BLOCK_M * CLUSTER_M;
+        constexpr int MACRO_M_SIZE = CLUSTER_BLOCK_M * MACRO_SWIZZLE_M;
         constexpr int MACRO_N_SIZE = BLOCK_N * MACRO_SWIZZLE_N;
-
-        const int macro_m_num = (M + MACRO_M_SIZE - 1) / MACRO_M_SIZE;
-        const int macro_n_num = (N + MACRO_N_SIZE - 1) / MACRO_N_SIZE;
 
         auto _compute_bid_in_macro = [&](int macro_block_m_idx,
                                          int macro_block_n_idx,
@@ -521,14 +519,12 @@ void bf16_gemm_dynamic_schedule_kernel(
             const int base_m = macro_block_m_idx * MACRO_M_SIZE;
             const int base_n = macro_block_n_idx * MACRO_N_SIZE;
 
-            const int _real_macro_m = min(MACRO_M_SIZE, M - base_m) / BLOCK_M;
             const int _real_macro_n = min(MACRO_N_SIZE, N - base_n) / BLOCK_N;
 
-            const int macro_bid_m =
-                macro_lane / (_real_macro_n * CLUSTER_M) * CLUSTER_M + (macro_lane % CLUSTER_M);
-            const int macro_bid_n = (macro_lane / CLUSTER_M) % _real_macro_n;
+            const int macro_bid_m = macro_lane / _real_macro_n;
+            const int macro_bid_n = macro_lane % _real_macro_n;
 
-            const int off_m = base_m + macro_bid_m * BLOCK_M;
+            const int off_m = base_m + macro_bid_m * CLUSTER_BLOCK_M;
             const int off_n = base_n + macro_bid_n * BLOCK_N;
 
             return {off_m, off_n};
@@ -565,27 +561,18 @@ void bf16_gemm_dynamic_schedule_kernel(
 
             return _compute_bid_in_macro(macro_block_m_idx, macro_block_n_idx, macro_lane);
         }
-
-        // const int bid_m = bid / (grid_n * CLUSTER_M) * CLUSTER_M + (bid % CLUSTER_M);
-        // const int bid_n = (bid / CLUSTER_M) % grid_n;
-
-        // const int off_m = bid_m * BLOCK_M;
-        // const int off_n = bid_n * BLOCK_N;
-        // return {bid_m, bid_n, off_m, off_n};
     };
 
     // load warp
     if (warp_id == 4 && elect_sync()) {
         int mma_stage = 0;
         int mma_phase = 1;
-        for (int bid = _bid; bid < grid_size; bid += grid_x) {
-            auto [off_m, off_n] = compute_bid(bid);
-            for (int iter_k = 0; iter_k < K / BLOCK_K; ++iter_k) {
-                load(iter_k, mma_phase, mma_stage, off_m, off_n);
-                mma_stage = (mma_stage + 1) % STAGE_NUM;
-                if (mma_stage == 0) {
-                    mma_phase ^= 1;
-                }
+        auto [off_m, off_n] = compute_bid(cluster_bid);
+        for (int iter_k = 0; iter_k < K / BLOCK_K; ++iter_k) {
+            load(iter_k, mma_phase, mma_stage, off_m, off_n);
+            mma_stage = (mma_stage + 1) % STAGE_NUM;
+            if (mma_stage == 0) {
+                mma_phase ^= 1;
             }
         }
     }
@@ -598,35 +585,33 @@ void bf16_gemm_dynamic_schedule_kernel(
         int mainloop_stage = 0;
         int epilogue_phase = 1;
 
-        for (int bid = _bid; bid < grid_size; bid += grid_x) {
-            if constexpr (DO_PROFILE) {
-                profiler.start(ProfilerTag::WaitEpilogue);
-            }
-            mbarrier_wait(_base_epilogue_mbar_addr + mainloop_stage * 8, epilogue_phase);
-            if constexpr (DO_PROFILE) {
-                profiler.stop();
-            }
+        if constexpr (DO_PROFILE) {
+            profiler.start(ProfilerTag::WaitEpilogue);
+        }
+        mbarrier_wait(_base_epilogue_mbar_addr + mainloop_stage * 8, epilogue_phase);
+        if constexpr (DO_PROFILE) {
+            profiler.stop();
+        }
 
-            for (int iter_k = 0; iter_k < K / BLOCK_K; ++iter_k) {
-                compute(iter_k, mainloop_stage, tma_phase, tma_stage);
-                tma_stage = (tma_stage + 1) % STAGE_NUM;
-                if (tma_stage == 0) {
-                    tma_phase ^= 1;
-                }
+        for (int iter_k = 0; iter_k < K / BLOCK_K; ++iter_k) {
+            compute(iter_k, mainloop_stage, tma_phase, tma_stage);
+            tma_stage = (tma_stage + 1) % STAGE_NUM;
+            if (tma_stage == 0) {
+                tma_phase ^= 1;
             }
+        }
 
-            constexpr int16_t cta_mask = (1 << CLUSTER_M) - 1;
-            asm volatile(
-                "tcgen05.commit.cta_group::%2.mbarrier::arrive::one.shared::cluster.multicast:"
-                ":cluster.b64 [%0], %1;" ::"r"(_base_mainloop_mbar_addr + 8 * mainloop_stage),
-                "h"(cta_mask),
-                "n"(CLUSTER_M)
-                : "memory");
+        constexpr int16_t cta_mask = (1 << CLUSTER_M) - 1;
+        asm volatile(
+            "tcgen05.commit.cta_group::%2.mbarrier::arrive::one.shared::cluster.multicast:"
+            ":cluster.b64 [%0], %1;" ::"r"(_base_mainloop_mbar_addr + 8 * mainloop_stage),
+            "h"(cta_mask),
+            "n"(CLUSTER_M)
+            : "memory");
 
-            mainloop_stage = (mainloop_stage + 1) % 2;
-            if (mainloop_stage == 0) {
-                epilogue_phase ^= 1;
-            }
+        mainloop_stage = (mainloop_stage + 1) % 2;
+        if (mainloop_stage == 0) {
+            epilogue_phase ^= 1;
         }
     }
 
@@ -636,27 +621,25 @@ void bf16_gemm_dynamic_schedule_kernel(
         int mainloop_stage = 0;
         int mainloop_phase = 0;
 
-        for (int bid = _bid; bid < grid_size; bid += grid_x) {
-            if constexpr (DO_PROFILE)
-                if (elect_sync())
-                    profiler.start(ProfilerTag::WaitMainloop);
-            mbarrier_wait(_base_mainloop_mbar_addr + 8 * mainloop_stage, mainloop_phase);
-            asm volatile("tcgen05.fence::after_thread_sync;");
-            if constexpr (DO_PROFILE)
-                if (elect_sync())
-                    profiler.stop();
-            auto [off_m, off_n] = compute_bid(bid);
-            if constexpr (DO_PROFILE)
-                if (elect_sync())
-                    profiler.start(ProfilerTag::Epilogue);
-            epilogue(mainloop_stage, off_m, off_n);
-            if constexpr (DO_PROFILE)
-                if (elect_sync())
-                    profiler.stop();
-            mainloop_stage = (mainloop_stage + 1) % 2;
-            if (mainloop_stage == 0) {
-                mainloop_phase ^= 1;
-            }
+        if constexpr (DO_PROFILE)
+            if (elect_sync())
+                profiler.start(ProfilerTag::WaitMainloop);
+        mbarrier_wait(_base_mainloop_mbar_addr + 8 * mainloop_stage, mainloop_phase);
+        asm volatile("tcgen05.fence::after_thread_sync;");
+        if constexpr (DO_PROFILE)
+            if (elect_sync())
+                profiler.stop();
+        auto [off_m, off_n] = compute_bid(cluster_bid);
+        if constexpr (DO_PROFILE)
+            if (elect_sync())
+                profiler.start(ProfilerTag::Epilogue);
+        epilogue(mainloop_stage, off_m, off_n);
+        if constexpr (DO_PROFILE)
+            if (elect_sync())
+                profiler.stop();
+        mainloop_stage = (mainloop_stage + 1) % 2;
+        if (mainloop_stage == 0) {
+            mainloop_phase ^= 1;
         }
     }
 
@@ -717,7 +700,9 @@ void launch_bf16_gemm_dynamic_schedule_impl(
         (BLOCK_M + BLOCK_N / CLUSTER_M) * BLOCK_K * STAGE_NUM * sizeof(nv_bfloat16) +
         epilogue_smem_size + mbarrier_smem;
 
-    int grid = SM_NUM;
+    const int grid_m = M / (BLOCK_M * CLUSTER_M);
+    const int grid_n = N / BLOCK_N;
+    const int grid = grid_m * grid_n * CLUSTER_M;
 
     auto kernel = bf16_gemm_dynamic_schedule_kernel<DO_PROFILE>;
 
