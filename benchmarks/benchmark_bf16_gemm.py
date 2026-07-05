@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
-from datetime import datetime
 import math
-import statistics
 import sys
 from pathlib import Path
 
@@ -13,13 +11,21 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from common import (
+    EARLY_STOP_RATIO,
+    benchmark_once,
+    benchmark_with_stats,
+    benchmark_with_stats_batched,
+    calibrate_iters,
+    quick_probe,
+    summarize_samples,
+    tflops_from_ms,
+)
 from sm110a_kernel import (
+    Bf16GemmConfig,
     bf16_gemm_out,
-    bf16_gemm_profile,
     cublaslt_gemm_out,
     cublaslt_gemm_out_batched,
-    make_profiler_buffer,
-    write_trace,
 )
 
 
@@ -35,20 +41,17 @@ DEFAULT_SHAPES = [
     (256, 32768, 4096),
 ]
 ACCURACY_SHAPE = (512, 512, 512)
-TARGET_SAMPLE_MS = 50.0
 CUBLASLT_WORKSPACE_BYTES = 32 * 1024 * 1024
-DEFAULT_PROFILE_NUM_ENTRIES = 100_000
-DEFAULT_PROFILE_NUM_BLOCKS = 20
-DEFAULT_PROFILE_OUTPUT_DIR = ROOT / "profiles"
-BF16_GEMM_PROFILER_TAGS = (
-    "SETUP",
-    "ISSUE_TMA",
-    "ISSUE_MMA",
-    "WAIT_TMA",
-    "WAIT_MMA",
-    "WAIT_MAINLOOP",
-    "WAIT_EPILOGUE",
-    "EPILOGUE",
+BF16_GEMM_CONFIGS = tuple(
+    Bf16GemmConfig(
+        tile_m=128,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        cluster_m=cluster_m,
+    )
+    for tile_n in (128, 256)
+    for tile_k in (64, 128)
+    for cluster_m in (1, 2)
 )
 
 
@@ -60,6 +63,8 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--samples", type=int, default=7)
+    parser.add_argument("--debug", action="store_true",
+                        help="Print per-config sweep details")
     parser.add_argument("--no-accuracy", action="store_true")
     parser.add_argument("--skip-check", action="store_true")
     parser.add_argument(
@@ -72,12 +77,6 @@ def parse_args():
         choices=("torch", "cublaslt"),
         default="cublaslt",
     )
-    parser.add_argument("--profile", action="store_true")
-    parser.add_argument("--profile-output", default=str(DEFAULT_PROFILE_OUTPUT_DIR))
-    parser.add_argument("--profile-num-blocks", type=int, default=DEFAULT_PROFILE_NUM_BLOCKS)
-    parser.add_argument(
-        "--profile-num-entries", type=int, default=DEFAULT_PROFILE_NUM_ENTRIES
-    )
     args = parser.parse_args()
 
     single_shape = args.m > 0 or args.n > 0 or args.k > 0
@@ -87,87 +86,24 @@ def parse_args():
         raise SystemExit("--iters must be positive")
     if args.samples <= 0:
         raise SystemExit("--samples must be positive")
-    if args.profile and not single_shape:
-        raise SystemExit("--profile requires --m, --n, --k")
-    if args.profile_num_blocks <= 0:
-        raise SystemExit("--profile-num-blocks must be positive")
-    if args.profile_num_entries <= 0:
-        raise SystemExit("--profile-num-entries must be positive")
     return args, single_shape
 
 
-def tflops_from_ms(m, n, k, elapsed_ms):
-    flops = 2.0 * m * n * k
-    return flops / (elapsed_ms * 1.0e-3) / 1.0e12
+def compatible_configs(m, n, k):
+    return tuple(
+        config
+        for config in BF16_GEMM_CONFIGS
+        if n % config.tile_n == 0
+        and k % config.tile_k == 0
+        and m % (config.tile_m * config.cluster_m) == 0
+    )
 
 
-def calibrate_iters(initial_ms, requested_iters):
-    if initial_ms <= 0.0:
-        return requested_iters
-    total_ms = initial_ms * requested_iters
-    if total_ms >= TARGET_SAMPLE_MS:
-        return requested_iters
-    scale = TARGET_SAMPLE_MS / total_ms
-    return max(requested_iters, math.ceil(requested_iters * scale))
-
-
-def summarize_samples(samples, measured_iters):
-    samples = sorted(samples)
-    return {
-        "min_ms": samples[0],
-        "median_ms": statistics.median(samples),
-        "max_ms": samples[-1],
-        "measured_iters": measured_iters,
-    }
-
-
-def benchmark_once(fn, warmup, iters):
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        fn()
-    end.record()
-    end.synchronize()
-    return start.elapsed_time(end) / iters
-
-
-def benchmark_once_batched(fn, warmup, iters):
-    for _ in range(warmup):
-        fn(1)
-    torch.cuda.synchronize()
-
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    fn(iters)
-    end.record()
-    end.synchronize()
-    return start.elapsed_time(end) / iters
-
-
-def benchmark_with_stats(fn, warmup, iters, samples):
-    probe_ms = benchmark_once(fn, warmup, iters)
-    measured_iters = calibrate_iters(probe_ms, iters)
-
-    timings = [benchmark_once(fn, warmup, measured_iters)]
-    for _ in range(1, samples):
-        timings.append(benchmark_once(fn, 0, measured_iters))
-    return summarize_samples(timings, measured_iters)
-
-
-def benchmark_with_stats_batched(fn, warmup, iters, samples):
-    probe_ms = benchmark_once_batched(fn, warmup, iters)
-    measured_iters = calibrate_iters(probe_ms, iters)
-
-    timings = [benchmark_once_batched(fn, warmup, measured_iters)]
-    for _ in range(1, samples):
-        timings.append(benchmark_once_batched(fn, 0, measured_iters))
-    return summarize_samples(timings, measured_iters)
+def format_config(config):
+    return (
+        f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
+        f"/c{config.cluster_m}"
+    )
 
 
 def run_case(m, n, k, args):
@@ -206,15 +142,62 @@ def run_case(m, n, k, args):
     else:
         raise SystemExit(f"unsupported --baseline value: {args.baseline}")
 
-    kernel_stats = benchmark_with_stats(
-        lambda: bf16_gemm_out(a, b, out_kernel),
-        args.warmup,
-        args.iters,
-        args.samples,
-    )
+    # Autotune with early stopping
+    configs = compatible_configs(m, n, k)
+    if not configs:
+        raise RuntimeError(
+            f"no JIT config supports M={m}, N={n}, K={k}"
+        )
+
+    best_config = None
+    best_stats = None
+    best_probe_ms = None
+
+    for config in configs:
+        # Compile + brief warmup
+        bf16_gemm_out(a, b, out_kernel, config=config)
+        torch.cuda.synchronize()
+
+        # Quick probe for early-stop decision
+        probe_ms = quick_probe(
+            lambda: bf16_gemm_out(a, b, out_kernel, config=config)
+        )
+
+        if best_probe_ms is not None and probe_ms > best_probe_ms * EARLY_STOP_RATIO:
+            if args.debug:
+                print(f"  {format_config(config):<20} probe={probe_ms:.4f}ms"
+                      f" — skip (>{best_probe_ms * EARLY_STOP_RATIO:.4f})")
+            continue
+
+        # Proper warmup before detailed measurement
+        for _ in range(args.warmup):
+            bf16_gemm_out(a, b, out_kernel, config=config)
+        torch.cuda.synchronize()
+
+        stats = benchmark_with_stats(
+            lambda: bf16_gemm_out(a, b, out_kernel, config=config),
+            args.warmup,
+            args.iters,
+            args.samples,
+        )
+        tflops = tflops_from_ms(m, n, k, stats["min_ms"])
+        marker = ""
+        if best_stats is None or stats["min_ms"] < best_stats["min_ms"]:
+            best_stats = stats
+            best_config = config
+            best_probe_ms = probe_ms
+            marker = " *"
+        if args.debug:
+            print(f"  {format_config(config):<20} min={stats['min_ms']:.4f}ms"
+                  f" median={stats['median_ms']:.4f}ms"
+                  f" {tflops:.1f} TF/s{marker}")
+    if args.debug:
+        print(f"  -> best: {format_config(best_config)}")
+    kernel_stats = best_stats
+
     max_abs_diff = 0.0
     if not args.skip_check:
-        bf16_gemm_out(a, b, out_kernel)
+        bf16_gemm_out(a, b, out_kernel, config=best_config)
         if args.baseline == "torch":
             baseline_fn()
         else:
@@ -223,7 +206,7 @@ def run_case(m, n, k, args):
             (out_kernel.float() - out_baseline.float()).abs().max().item()
         )
 
-    return kernel_stats, baseline_stats, max_abs_diff, baseline_name
+    return kernel_stats, baseline_stats, max_abs_diff, baseline_name, best_config
 
 
 def configure_torch_blas(preferred_blas):
@@ -255,69 +238,39 @@ def print_header_for(baseline_name):
         f"{'M':<8}{'N':<8}{'K':<8}"
         f"{'KernelMed(ms)':<16}{'Kernel TF/s':<16}"
         f"{baseline_name + 'Med(ms)':<16}{baseline_name + ' TF/s':<16}"
-        f"{baseline_name + 'Speedup':<14}{'Diff' + baseline_name:<14}"
+        f"{baseline_name + 'Speedup':<14}{'Diff':<12}{'BestConfig':<22}"
     )
 
 
-def print_result(m, n, k, kernel_stats, baseline_stats, max_abs_diff):
+def print_result(m, n, k, kernel_stats, baseline_stats, max_abs_diff, best_config):
     kernel_tflops = tflops_from_ms(m, n, k, kernel_stats["median_ms"])
     baseline_tflops = tflops_from_ms(m, n, k, baseline_stats["median_ms"])
-    baseline_speedup = kernel_stats["median_ms"] / baseline_stats["median_ms"]
+    baseline_speedup = baseline_stats["median_ms"] / kernel_stats["median_ms"]
     print(
         f"{m:<8}{n:<8}{k:<8}"
         f"{kernel_stats['median_ms']:<16.4f}{kernel_tflops:<16.3f}"
         f"{baseline_stats['median_ms']:<16.4f}{baseline_tflops:<16.3f}"
-        f"{baseline_speedup:<14.2f}{max_abs_diff:<14.6f}"
+        f"{baseline_speedup:<14.2f}{max_abs_diff:<12.6f}{format_config(best_config):<22}"
     )
 
 
 def run_accuracy_check(args):
     print("[accuracy] small shape with correctness check")
+    print("[autotune] sweeping over configs")
     accuracy_args = argparse.Namespace(
         warmup=2,
         iters=20,
         samples=7,
         skip_check=False,
         baseline=args.baseline,
+        debug=args.debug,
     )
-    kernel_stats, baseline_stats, max_abs_diff, baseline_name = run_case(
+    kernel_stats, baseline_stats, max_abs_diff, baseline_name, best_config = run_case(
         *ACCURACY_SHAPE, args=accuracy_args
     )
     print_header_for(baseline_name)
-    print_result(*ACCURACY_SHAPE, kernel_stats, baseline_stats, max_abs_diff)
+    print_result(*ACCURACY_SHAPE, kernel_stats, baseline_stats, max_abs_diff, best_config)
     print()
-
-
-def run_profile(args):
-    output_path = Path(args.profile_output)
-    if output_path.suffixes[-2:] != [".json", ".gz"] and output_path.suffix != ".json":
-        output_path.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = output_path / (
-            f"bf16_gemm_profile"
-            f"_m{args.m}_n{args.n}_k{args.k}"
-            f"_blocks{args.profile_num_blocks}"
-            f"_entries{args.profile_num_entries}"
-            f"_{timestamp}.json.gz"
-        )
-    else:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    a = torch.randn(args.m, args.k, device="cuda", dtype=torch.bfloat16)
-    b = torch.randn(args.k, args.n, device="cuda", dtype=torch.bfloat16)
-    profiler = make_profiler_buffer(
-        args.profile_num_blocks, args.profile_num_entries, device=a.device
-    )
-
-    for _ in range(args.warmup):
-        bf16_gemm_profile(a, b, profiler, args.profile_num_entries)
-    torch.cuda.synchronize()
-
-    profiler.zero_()
-    bf16_gemm_profile(a, b, profiler, args.profile_num_entries)
-    torch.cuda.synchronize()
-    write_trace(profiler, output_path, tags=BF16_GEMM_PROFILER_TAGS)
-    print(f"[profile] wrote {output_path}")
 
 
 def main():
@@ -326,9 +279,6 @@ def main():
 
     args, single_shape = parse_args()
     torch.manual_seed(1234)
-    if args.profile:
-        run_profile(args)
-        return
 
     actual_blas = None
     if args.baseline == "torch":
@@ -343,14 +293,23 @@ def main():
     else:
         print("[baseline] direct cuBLASLt binding")
         baseline_name = "Lt"
+
+    print("[autotune] configs: "
+          + ", ".join(format_config(c) for c in BF16_GEMM_CONFIGS))
+    print()
+
     print_header_for(baseline_name)
     if single_shape:
-        kernel_stats, baseline_stats, max_abs_diff, _ = run_case(args.m, args.n, args.k, args)
-        print_result(args.m, args.n, args.k, kernel_stats, baseline_stats, max_abs_diff)
+        kernel_stats, baseline_stats, max_abs_diff, _, best_config = run_case(
+            args.m, args.n, args.k, args
+        )
+        print_result(args.m, args.n, args.k, kernel_stats, baseline_stats, max_abs_diff, best_config)
     else:
         for shape in DEFAULT_SHAPES:
-            kernel_stats, baseline_stats, max_abs_diff, _ = run_case(*shape, args)
-            print_result(*shape, kernel_stats, baseline_stats, max_abs_diff)
+            kernel_stats, baseline_stats, max_abs_diff, _, best_config = run_case(
+                *shape, args
+            )
+            print_result(*shape, kernel_stats, baseline_stats, max_abs_diff, best_config)
 
 
 if __name__ == "__main__":

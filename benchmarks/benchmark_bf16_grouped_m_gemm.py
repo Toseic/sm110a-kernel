@@ -2,7 +2,6 @@
 
 import argparse
 import math
-import statistics
 import sys
 from pathlib import Path
 
@@ -12,10 +11,12 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from common import (
+    benchmark_with_stats,
+    summarize_samples,
+    tflops_from_ms,
+)
 from sm110a_kernel import GroupedMConfig, bf16_grouped_m_gemm_out
-
-
-TARGET_SAMPLE_MS = 50.0
 EXPERTS = 256
 N = 6144
 K = 4096
@@ -74,56 +75,6 @@ def configure_torch_blas(preferred_blas):
         raise SystemExit(f"unsupported --torch-blas value: {preferred_blas}")
 
     return str(torch.backends.cuda.preferred_blas_library()).split(".")[-1]
-
-
-def tflops_from_ms(m, n, k, elapsed_ms):
-    flops = 2.0 * m * n * k
-    return flops / (elapsed_ms * 1.0e-3) / 1.0e12
-
-
-def calibrate_iters(initial_ms, requested_iters):
-    if initial_ms <= 0.0:
-        return requested_iters
-    total_ms = initial_ms * requested_iters
-    if total_ms >= TARGET_SAMPLE_MS:
-        return requested_iters
-    scale = TARGET_SAMPLE_MS / total_ms
-    return max(requested_iters, math.ceil(requested_iters * scale))
-
-
-def summarize_samples(samples, measured_iters):
-    samples = sorted(samples)
-    return {
-        "min_ms": samples[0],
-        "median_ms": statistics.median(samples),
-        "max_ms": samples[-1],
-        "measured_iters": measured_iters,
-    }
-
-
-def benchmark_once(fn, warmup, iters):
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        fn()
-    end.record()
-    end.synchronize()
-    return start.elapsed_time(end) / iters
-
-
-def benchmark_with_stats(fn, warmup, iters, samples):
-    probe_ms = benchmark_once(fn, warmup, iters)
-    measured_iters = calibrate_iters(probe_ms, iters)
-
-    timings = [benchmark_once(fn, warmup, measured_iters)]
-    for _ in range(1, samples):
-        timings.append(benchmark_once(fn, 0, measured_iters))
-    return summarize_samples(timings, measured_iters)
 
 
 def build_layout(tokens_per_expert, experts):
