@@ -9,7 +9,7 @@ Use this skill when the user wants the current repository changes committed.
 
 ## Default behavior
 
-Unless the user gave more specific instructions, commit all current changes in the repository.
+Unless the user gave more specific instructions, commit all current changes in the repository on the **current branch** — do not create a new branch, switch branches, or otherwise move the work elsewhere. The user can always ask to commit on a different branch if they want to.
 
 If the working tree contains unrelated themes, split them into separate commits by topic instead of forcing everything into one commit.
 
