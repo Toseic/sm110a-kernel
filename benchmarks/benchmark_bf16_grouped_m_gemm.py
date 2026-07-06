@@ -17,6 +17,8 @@ from common import (
     tflops_from_ms,
 )
 from sm110a_kernel import GroupedMConfig, bf16_grouped_m_gemm_out
+from sm110a_kernel.jit import compile_bf16_grouped_m_gemm_configs
+
 EXPERTS = 256
 N = 6144
 K = 4096
@@ -26,11 +28,12 @@ GROUPED_M_CONFIGS = tuple(
         tile_m=128,
         tile_n=tile_n,
         tile_k=tile_k,
-        epilogue_tile_n=32,
+        epilogue_tile_n=epilogue_tile_n,
         cluster_m=cluster_m,
     )
     for tile_n in (128, 256)
     for tile_k in (64, 128)
+    for epilogue_tile_n in (32, 64, 128)
     for cluster_m in (1, 2)
 )
 
@@ -41,6 +44,11 @@ def parse_args():
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--samples", type=int, default=3)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="print per-config performance after the benchmark",
+    )
     parser.add_argument(
         "--torch-blas",
         choices=("default", "cublas", "cublaslt"),
@@ -146,7 +154,10 @@ def benchmark_best_grouped_kernel(a, b, layout, out, args):
             a, b, layout, out, config, args
         )
         results.append((stats, config))
-    return min(results, key=lambda result: result[0]["median_ms"])
+    best_stats, best_config = min(
+        results, key=lambda result: result[0]["median_ms"]
+    )
+    return best_stats, best_config, results
 
 
 def format_config(config):
@@ -195,6 +206,25 @@ def print_result(
     )
 
 
+def print_debug_results(results, experts, n, k):
+    print()
+    print("[debug] per-config performance")
+    print(
+        f"{'Tok/E':<8}{'Config':<28}{'Median(ms)':<14}"
+        f"{'TFLOPS':<14}{'Best':<6}"
+    )
+    for tokens_per_expert, stats, config, is_best in results:
+        valid_m = experts * tokens_per_expert
+        tflops = tflops_from_ms(
+            valid_m, n, k, stats["median_ms"]
+        )
+        print(
+            f"{tokens_per_expert:<8}{format_config(config):<28}"
+            f"{stats['median_ms']:<14.4f}{tflops:<14.3f}"
+            f"{'*' if is_best else '':<6}"
+        )
+
+
 def main():
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
@@ -212,10 +242,14 @@ def main():
         "[autotune] configs="
         + ", ".join(format_config(config) for config in GROUPED_M_CONFIGS)
     )
+    compile_bf16_grouped_m_gemm_configs(
+        compatible_configs(N, K)
+    )
 
     b = torch.empty((EXPERTS, N, K), device="cuda", dtype=torch.bfloat16)
     b.uniform_(-1.0, 1.0)
     print_header()
+    debug_results = []
 
     for tokens_per_expert in TOKENS_PER_EXPERT_VALUES:
         a, layout, out_kernel, out_baseline = make_workload(
@@ -228,9 +262,21 @@ def main():
             out_baseline,
             args,
         )
-        kernel_stats, best_config = benchmark_best_grouped_kernel(
-            a, b, layout, out_kernel, args
-        )
+        (
+            kernel_stats,
+            best_config,
+            config_results,
+        ) = benchmark_best_grouped_kernel(a, b, layout, out_kernel, args)
+        if args.debug:
+            debug_results.extend(
+                (
+                    tokens_per_expert,
+                    stats,
+                    config,
+                    config == best_config,
+                )
+                for stats, config in config_results
+            )
         grouped_m_tile = best_config.cluster_m * best_config.tile_m
         padded_tokens = (
             math.ceil(tokens_per_expert / grouped_m_tile) * grouped_m_tile
@@ -257,6 +303,9 @@ def main():
             diff,
             best_config,
         )
+
+    if args.debug:
+        print_debug_results(debug_results, EXPERTS, N, K)
 
 
 if __name__ == "__main__":

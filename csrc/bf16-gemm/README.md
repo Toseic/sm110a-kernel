@@ -78,12 +78,14 @@ config = GroupedMConfig(
     tile_m=128,
     tile_n=256,
     tile_k=128,
-    epilogue_tile_n=32,
+    epilogue_tile_n=64,
     cluster_m=2,
 )
 compile_bf16_grouped_m_gemm(config)  # optional warm-up
 bf16_grouped_m_gemm_out(a, b, grouped_layout, out, config=config)
 ```
+
+`epilogue_tile_n` supports `32`, `64`, and `128`.
 
 Compiled modules are reused in-process and through PyTorch's extension cache
 across processes. Set `SM110A_JIT_CACHE_DIR` to choose the disk cache directory,

@@ -21,6 +21,9 @@
 #ifndef SM110A_GROUPED_CLUSTER_M
 #define SM110A_GROUPED_CLUSTER_M 2
 #endif
+#ifndef SM110A_GROUPED_ENABLE_CLC
+#define SM110A_GROUPED_ENABLE_CLC 0
+#endif
 
 namespace {
 
@@ -28,7 +31,6 @@ constexpr int kMmaK = 16;
 constexpr int kWarpSize = 32;
 constexpr int kWarpCount = 6;
 constexpr int kBlockThreads = kWarpSize * kWarpCount;
-constexpr int kEpilogueStageCount = 2;
 constexpr int kTmemStageCount = 2;
 // Two tiles amortize setup without letting persistent workers drift across
 // unrelated experts and destroy the cross-cluster A reuse.
@@ -45,6 +47,10 @@ template <
 struct KernelConfig {
     static_assert(kClusterM == 1 || kClusterM == 2);
     static_assert(kTileM == 4 * kWarpSize);
+    static_assert(
+        kEpilogueTileN == 32 ||
+        kEpilogueTileN == 64 ||
+        kEpilogueTileN == 128);
     static_assert(kTileN % kEpilogueTileN == 0);
     static_assert(kTileN % kClusterM == 0);
     static_assert(kTileK % 64 == 0);
@@ -57,14 +63,20 @@ struct KernelConfig {
     static constexpr int kPerStageSmemBytes = kASmemBytes + kBSmemBytes;
     static constexpr int kEpilogueStageBytes =
         kTileM * kEpilogueTileN * sizeof(nv_bfloat16);
+    // A 128-column epilogue stage occupies 32 KiB. Keeping one such stage
+    // leaves enough shared memory for two mainloop stages in the largest
+    // supported configuration.
+    static constexpr int kEpilogueStageCount =
+        kEpilogueTileN == 128 ? 1 : 2;
     static constexpr int kEpilogueSmemBytes =
         kEpilogueStageCount * kEpilogueStageBytes;
-    // Pack as many pipeline stages as shared memory allows (up to 4).
-    // Blackwell has ~228 KB of SMEM per CTA; we leave a small margin.
+    // Pack as many mainloop pipeline stages as shared memory allows for this
+    // configuration. Blackwell has ~228 KB of SMEM per CTA; leave a small
+    // margin for statically allocated barriers and bookkeeping.
     static constexpr int kMaxSmemBytes = 227 * 1024;
     static constexpr int kStageCount =
-        (4 * kPerStageSmemBytes + kEpilogueSmemBytes <= kMaxSmemBytes) ? 4 :
-        (3 * kPerStageSmemBytes + kEpilogueSmemBytes <= kMaxSmemBytes) ? 3 : 2;
+        (kMaxSmemBytes - kEpilogueSmemBytes) / kPerStageSmemBytes;
+    static_assert(kStageCount >= 2);
     static constexpr int kMainloopSmemBytes =
         kStageCount * kPerStageSmemBytes;
     static constexpr int kDynamicSmemBytes =
@@ -237,6 +249,9 @@ __device__ inline void tma_store_3d(
         "r"(z),
         "r"(src_smem)
         : "memory");
+}
+
+__device__ inline void tma_store_commit_group() {
     asm volatile("cp.async.bulk.commit_group;" ::: "memory");
 }
 
@@ -396,8 +411,14 @@ inline bool init_c_tensor_map(
     uint64_t global_stride[rank - 1] = {
         n * sizeof(nv_bfloat16),
         m * n * sizeof(nv_bfloat16)};
-    uint32_t box_dim[rank] = {kEpilogueTileN, kTileM, 1};
+    constexpr int kStoreTileN =
+        kEpilogueTileN < 64 ? kEpilogueTileN : 64;
+    uint32_t box_dim[rank] = {kStoreTileN, kTileM, 1};
     uint32_t element_stride[rank] = {1, 1, 1};
+    constexpr CUtensorMapSwizzle kSwizzle =
+        kStoreTileN == 32
+        ? CU_TENSOR_MAP_SWIZZLE_64B
+        : CU_TENSOR_MAP_SWIZZLE_128B;
 
     return cuTensorMapEncodeTiled(tensor_map,
                CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
@@ -408,7 +429,7 @@ inline bool init_c_tensor_map(
                box_dim,
                element_stride,
                CU_TENSOR_MAP_INTERLEAVE_NONE,
-               CU_TENSOR_MAP_SWIZZLE_64B,
+               kSwizzle,
                CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
                CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
@@ -442,6 +463,16 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
     constexpr int kStageSmemBytes = Config::kStageSmemBytes;
     constexpr int kMainloopSmemBytes = Config::kMainloopSmemBytes;
     constexpr int kEpilogueStageBytes = Config::kEpilogueStageBytes;
+    constexpr int kEpilogueStageCount = Config::kEpilogueStageCount;
+    constexpr int kEpilogueStoreTileN =
+        kEpilogueTileN < 64 ? kEpilogueTileN : 64;
+    constexpr int kEpilogueStoreTiles =
+        kEpilogueTileN / kEpilogueStoreTileN;
+    constexpr int kChunksPerStoreTile = kEpilogueStoreTileN / 8;
+    constexpr int kSwizzlePhaseMask =
+        kEpilogueStoreTileN == 32 ? 3 : 7;
+    constexpr int kStoreTileBytes =
+        kTileM * kEpilogueStoreTileN * sizeof(nv_bfloat16);
     constexpr int kMmaStepsPerStage = kTileK / kMmaK;
     const int tid = threadIdx.x;
     const int warp_id = tid / kWarpSize;
@@ -571,10 +602,16 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
                     __float22bfloat162_rn({values[2 * i], values[2 * i + 1]});
             }
 
-            const int chunk = tid * (kEpilogueTileN / 8) + n_group;
+            const int store_tile = n_group / kChunksPerStoreTile;
+            const int chunk_in_store =
+                tid * kChunksPerStoreTile +
+                n_group % kChunksPerStoreTile;
             const int swizzled_chunk =
-                (chunk & ~7) + ((chunk & 7) ^ ((chunk >> 3) & 3));
-            reinterpret_cast<int4 *>(stage_smem)[swizzled_chunk] =
+                (chunk_in_store & ~7) +
+                ((chunk_in_store & 7) ^
+                    ((chunk_in_store >> 3) & kSwizzlePhaseMask));
+            reinterpret_cast<int4 *>(
+                stage_smem + store_tile * kStoreTileBytes)[swizzled_chunk] =
                 reinterpret_cast<int4 *>(packed)[0];
         }
     };
@@ -832,6 +869,9 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
 
             tmem_to_smem(epilogue_mainloop_stage, 0, 0);
             asm volatile("bar.sync 1, 128;" ::: "memory");
+            if constexpr (kEpilogueBlockCount == 1) {
+                release_tmem();
+            }
 
             for (int n_block = 0; n_block < kEpilogueBlockCount;
                  ++n_block) {
@@ -843,11 +883,19 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
                     tile_col + n_block * kEpilogueTileN;
                 if (valid_rows == kTileM) {
                     if (tid == 0) {
-                        tma_store_3d(stage_smem,
-                            &c_tensor_map,
-                            block_col,
-                            cta_row,
-                            0);
+                        for (int store_tile = 0;
+                             store_tile < kEpilogueStoreTiles;
+                             ++store_tile) {
+                            tma_store_3d(
+                                stage_smem +
+                                    store_tile * kStoreTileBytes,
+                                &c_tensor_map,
+                                block_col +
+                                    store_tile * kEpilogueStoreTileN,
+                                cta_row,
+                                0);
+                        }
+                        tma_store_commit_group();
                     }
                 } else if (tid < valid_rows) {
                     char *stage_smem_ptr =
@@ -856,14 +904,21 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
                     for (int n_group = 0;
                          n_group < kEpilogueTileN / 8;
                          ++n_group) {
-                        const int chunk =
-                            tid * (kEpilogueTileN / 8) + n_group;
+                        const int store_tile =
+                            n_group / kChunksPerStoreTile;
+                        const int chunk_in_store =
+                            tid * kChunksPerStoreTile +
+                            n_group % kChunksPerStoreTile;
                         const int swizzled_chunk =
-                            (chunk & ~7) +
-                            ((chunk & 7) ^ ((chunk >> 3) & 3));
+                            (chunk_in_store & ~7) +
+                            ((chunk_in_store & 7) ^
+                                ((chunk_in_store >> 3) &
+                                    kSwizzlePhaseMask));
                         const int4 value =
                             reinterpret_cast<int4 *>(
-                                stage_smem_ptr)[swizzled_chunk];
+                                stage_smem_ptr +
+                                store_tile * kStoreTileBytes)[
+                                    swizzled_chunk];
                         const int output_offset =
                             (cta_row + tid) * n +
                             block_col + n_group * 8;
@@ -873,11 +928,13 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
                 }
 
                 if (n_block + 1 < kEpilogueBlockCount) {
-                    if (n_block > 0) {
+                    if (kEpilogueStageCount == 1 || n_block > 0) {
                         if (tid == 0) {
                             asm volatile(
-                                "cp.async.bulk.wait_group.read 1;"
-                                ::: "memory");
+                                "cp.async.bulk.wait_group.read %0;"
+                                :
+                                : "n"(kEpilogueStageCount - 1)
+                                : "memory");
                         }
                         asm volatile("bar.sync 1, 128;" ::: "memory");
                     }
@@ -1062,12 +1119,15 @@ void launch_bf16_grouped_m_gemm_impl(
         m / experts >=
         kPersistentTileCount * kClusterTileM;
     if (use_persistent) {
+#if SM110A_GROUPED_ENABLE_CLC
         const char *clc_env = std::getenv("SM110A_GROUPED_M_CLC");
         const bool use_dynamic_clc =
             clc_env != nullptr && clc_env[0] == '1';
+#endif
         const int persistent_clusters =
             (max_cluster_tiles + kPersistentTileCount - 1) /
             kPersistentTileCount;
+#if SM110A_GROUPED_ENABLE_CLC
         if (use_dynamic_clc) {
             auto kernel =
                 bf16_grouped_m_gemm_kernel<
@@ -1100,6 +1160,7 @@ void launch_bf16_grouped_m_gemm_impl(
             cudaFreeAsync(workspace, stream);
             return;
         }
+#endif
 
         auto kernel = bf16_grouped_m_gemm_kernel<
             kTileM, kTileN, kTileK, kEpilogueTileN, kClusterM, true>;
@@ -1194,5 +1255,19 @@ void launch_bf16_grouped_m_gemm(
         SM110A_GROUPED_TILE_K,
         SM110A_GROUPED_EPILOGUE_TILE_N,
         SM110A_GROUPED_CLUSTER_M>(
+        d_a, d_b, d_grouped_layout, d_c, m, experts, n, k, stream);
+}
+
+extern "C" void sm110a_bf16_grouped_m_gemm_launch(
+    const __nv_bfloat16 *d_a,
+    const __nv_bfloat16 *d_b,
+    const int32_t *d_grouped_layout,
+    __nv_bfloat16 *d_c,
+    int m,
+    int experts,
+    int n,
+    int k,
+    cudaStream_t stream) {
+    launch_bf16_grouped_m_gemm(
         d_a, d_b, d_grouped_layout, d_c, m, experts, n, k, stream);
 }

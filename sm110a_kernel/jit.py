@@ -9,7 +9,14 @@ import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import Optional
+from typing import Iterable, Optional
+
+from .jit_runtime import (
+    LoadedCudaLibrary,
+    SplitCudaJit,
+    jit_build_directory,
+    source_digest,
+)
 
 
 @dataclass(frozen=True)
@@ -25,8 +32,8 @@ class GroupedMConfig:
             raise ValueError("tile_m must be 128 for the current four-warp mainloop")
         if self.cluster_m not in (1, 2):
             raise ValueError("cluster_m must be 1 or 2")
-        if self.epilogue_tile_n <= 0:
-            raise ValueError("epilogue_tile_n must be positive")
+        if self.epilogue_tile_n not in (32, 64, 128):
+            raise ValueError("epilogue_tile_n must be 32, 64, or 128")
         if self.tile_n <= 0 or self.tile_n % self.epilogue_tile_n:
             raise ValueError("tile_n must be positive and divisible by epilogue_tile_n")
         if self.tile_n % self.cluster_m:
@@ -38,8 +45,42 @@ class GroupedMConfig:
 _ROOT = Path(__file__).resolve().parent.parent
 _SOURCE_DIR = _ROOT / "csrc/bf16-grouped-m-gemm/src"
 _INCLUDE_DIR = _ROOT / "include"
-_MODULE_CACHE: dict[str, ModuleType] = {}
-_CACHE_LOCK = threading.Lock()
+
+
+class _GroupedMModule:
+    """Config-specific facade backed by one shared Torch binding."""
+
+    def __init__(
+        self,
+        binding: ModuleType,
+        library: LoadedCudaLibrary,
+        config: GroupedMConfig,
+    ) -> None:
+        self._binding = binding
+        self._library = library
+        self._launcher_address = library.entry_address
+        self._config = config
+
+    def bf16_grouped_m_gemm(self, a, b, grouped_layout):
+        return self._binding.bf16_grouped_m_gemm(
+            a,
+            b,
+            grouped_layout,
+            self._launcher_address,
+            self._config.tile_n,
+            self._config.tile_k,
+        )
+
+    def bf16_grouped_m_gemm_out(self, a, b, grouped_layout, out):
+        return self._binding.bf16_grouped_m_gemm_out(
+            a,
+            b,
+            grouped_layout,
+            out,
+            self._launcher_address,
+            self._config.tile_n,
+            self._config.tile_k,
+        )
 
 
 def _default_config(a, b) -> GroupedMConfig:
@@ -49,107 +90,77 @@ def _default_config(a, b) -> GroupedMConfig:
     return GroupedMConfig(cluster_m=1 if average_rows_per_expert <= 128 else 2)
 
 
-def _source_digest() -> str:
-    digest = hashlib.sha256()
-    paths = [
-        _SOURCE_DIR / "torch_binding.cpp",
-        _SOURCE_DIR / "bf16_grouped_m_gemm.cu",
+def _grouped_m_kernel_cflags(
+    config: GroupedMConfig,
+    enable_clc,
+) -> tuple[str, ...]:
+    return (
+        f"-DSM110A_GROUPED_TILE_M={config.tile_m}",
+        f"-DSM110A_GROUPED_TILE_N={config.tile_n}",
+        f"-DSM110A_GROUPED_TILE_K={config.tile_k}",
+        f"-DSM110A_GROUPED_EPILOGUE_TILE_N={config.epilogue_tile_n}",
+        f"-DSM110A_GROUPED_CLUSTER_M={config.cluster_m}",
+        f"-DSM110A_GROUPED_ENABLE_CLC={int(enable_clc)}",
+    )
+
+
+def _make_grouped_m_module(
+    binding: ModuleType,
+    library: LoadedCudaLibrary,
+    config: GroupedMConfig,
+) -> _GroupedMModule:
+    return _GroupedMModule(binding, library, config)
+
+
+_GROUPED_M_JIT = SplitCudaJit[GroupedMConfig, _GroupedMModule](
+    name="sm110a_grouped_m",
+    root=_ROOT,
+    binding_sources=(_SOURCE_DIR / "torch_binding.cpp",),
+    kernel_sources=(_SOURCE_DIR / "bf16_grouped_m_gemm.cu",),
+    kernel_dependencies=(
         _INCLUDE_DIR / "bf16_grouped_m_gemm.h",
         _INCLUDE_DIR / "common.h",
-    ]
-    for path in paths:
-        digest.update(str(path.relative_to(_ROOT)).encode())
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
-
-
-def _module_name(
-    config: GroupedMConfig,
-    cuda_arch: str,
-    torch_version: str,
-    torch_cuda_version: Optional[str],
-) -> str:
-    signature = repr(
-        (
-            asdict(config),
-            cuda_arch,
-            os.environ.get("COMPUTE_CUDA_ARCH", "compute_110a"),
-            torch_version,
-            torch_cuda_version,
-            sys.implementation.cache_tag,
-            _source_digest(),
-        )
-    )
-    suffix = hashlib.sha256(signature.encode()).hexdigest()[:16]
-    return f"sm110a_grouped_m_jit_{suffix}"
+    ),
+    kernel_symbol="sm110a_bf16_grouped_m_gemm_launch",
+    config_key=lambda config: config,
+    variant_key=lambda: (
+        os.environ.get("SM110A_GROUPED_M_CLC", "0") == "1"
+    ),
+    kernel_cflags=_grouped_m_kernel_cflags,
+    make_facade=_make_grouped_m_module,
+    include_paths=(_INCLUDE_DIR,),
+)
 
 
 def compile_bf16_grouped_m_gemm(
     config: Optional[GroupedMConfig] = None,
-) -> ModuleType:
+) -> _GroupedMModule:
     """Compile or load one grouped-M kernel configuration."""
     config = config or GroupedMConfig()
     if not isinstance(config, GroupedMConfig):
         raise TypeError("config must be a GroupedMConfig")
     config.validate()
+    return _GROUPED_M_JIT.compile(config)
 
-    try:
-        import torch
-        from torch.utils.cpp_extension import load
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "JIT compilation requires PyTorch with CUDA support installed."
-        ) from exc
 
-    with _CACHE_LOCK:
-        cuda_arch = os.environ.get("CUDA_ARCH", "sm_110a")
-        compute_arch = os.environ.get("COMPUTE_CUDA_ARCH", "compute_110a")
-        name = _module_name(
-            config, cuda_arch, torch.__version__, torch.version.cuda
-        )
-        cached = _MODULE_CACHE.get(name)
-        if cached is not None:
-            return cached
-
-        build_directory = None
-        cache_root = os.environ.get("SM110A_JIT_CACHE_DIR")
-        if cache_root:
-            build_path = Path(cache_root).expanduser().resolve() / name
-            build_path.mkdir(parents=True, exist_ok=True)
-            build_directory = str(build_path)
-
-        definitions = [
-            f"-DSM110A_GROUPED_TILE_M={config.tile_m}",
-            f"-DSM110A_GROUPED_TILE_N={config.tile_n}",
-            f"-DSM110A_GROUPED_TILE_K={config.tile_k}",
-            f"-DSM110A_GROUPED_EPILOGUE_TILE_N={config.epilogue_tile_n}",
-            f"-DSM110A_GROUPED_CLUSTER_M={config.cluster_m}",
-        ]
-        module = load(
-            name=name,
-            sources=[
-                str(_SOURCE_DIR / "torch_binding.cpp"),
-                str(_SOURCE_DIR / "bf16_grouped_m_gemm.cu"),
-            ],
-            extra_include_paths=[str(_INCLUDE_DIR)],
-            extra_cuda_cflags=[
-                "-O3",
-                "-lineinfo",
-                f"-gencode=arch={compute_arch},code={cuda_arch}",
-                *definitions,
-            ],
-            extra_cflags=["-O3", "-std=c++17", *definitions],
-            extra_ldflags=["-lcuda"],
-            build_directory=build_directory,
-            verbose=os.environ.get("SM110A_JIT_VERBOSE", "0") == "1",
-        )
-        _MODULE_CACHE[name] = module
-        return module
+def compile_bf16_grouped_m_gemm_configs(
+    configs: Iterable[GroupedMConfig],
+    max_workers: Optional[int] = None,
+) -> tuple[_GroupedMModule, ...]:
+    """Compile grouped-M configs and the shared binding concurrently."""
+    configs = tuple(configs)
+    if not configs:
+        return ()
+    for config in configs:
+        if not isinstance(config, GroupedMConfig):
+            raise TypeError("configs must contain GroupedMConfig values")
+        config.validate()
+    return _GROUPED_M_JIT.compile_many(configs, max_workers)
 
 
 def get_bf16_grouped_m_gemm_module(
     a, b, config: Optional[GroupedMConfig] = None
-) -> ModuleType:
+) -> _GroupedMModule:
     return compile_bf16_grouped_m_gemm(config or _default_config(a, b))
 
 
@@ -158,6 +169,8 @@ def get_bf16_grouped_m_gemm_module(
 # ---------------------------------------------------------------------------
 
 _BF16_SOURCE_DIR = _ROOT / "csrc/bf16-gemm/src"
+_MODULE_CACHE: dict[str, ModuleType] = {}
+_CACHE_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -191,18 +204,16 @@ def _bf16_default_config(a, b) -> Bf16GemmConfig:
 
 
 def _bf16_source_digest() -> str:
-    digest = hashlib.sha256()
-    paths = [
-        _BF16_SOURCE_DIR / "bf16_gemm_jit_binding.cpp",
-        _BF16_SOURCE_DIR / "bf16_gemm.cu",
-        _INCLUDE_DIR / "bf16_gemm.h",
-        _INCLUDE_DIR / "common.h",
-        _INCLUDE_DIR / "profiler.h",
-    ]
-    for path in paths:
-        digest.update(str(path.relative_to(_ROOT)).encode())
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
+    return source_digest(
+        (
+            _BF16_SOURCE_DIR / "bf16_gemm_jit_binding.cpp",
+            _BF16_SOURCE_DIR / "bf16_gemm.cu",
+            _INCLUDE_DIR / "bf16_gemm.h",
+            _INCLUDE_DIR / "common.h",
+            _INCLUDE_DIR / "profiler.h",
+        ),
+        _ROOT,
+    )
 
 
 def _bf16_module_name(
@@ -253,13 +264,6 @@ def compile_bf16_gemm(
         if cached is not None:
             return cached
 
-        build_directory = None
-        cache_root = os.environ.get("SM110A_JIT_CACHE_DIR")
-        if cache_root:
-            build_path = Path(cache_root).expanduser().resolve() / name
-            build_path.mkdir(parents=True, exist_ok=True)
-            build_directory = str(build_path)
-
         definitions = [
             f"-DSM110A_BF16_TILE_M={config.tile_m}",
             f"-DSM110A_BF16_TILE_N={config.tile_n}",
@@ -281,7 +285,7 @@ def compile_bf16_gemm(
             ],
             extra_cflags=["-O3", "-std=c++17", *definitions],
             extra_ldflags=["-lcuda"],
-            build_directory=build_directory,
+            build_directory=jit_build_directory(name),
             verbose=os.environ.get("SM110A_JIT_VERBOSE", "0") == "1",
         )
         _MODULE_CACHE[name] = module
