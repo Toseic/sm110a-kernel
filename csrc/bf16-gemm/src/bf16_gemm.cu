@@ -54,9 +54,8 @@ struct KernelConfig {
     static constexpr int kEpilogueSmemBytes = kEpilogueStageCount * kEpilogueStageBytes;
     static constexpr int kMaxSmemBytes = 227 * 1024;
     static constexpr int kStageCount =
-        (4 * kPerStageSmemBytes + kEpilogueSmemBytes <= kMaxSmemBytes)  ? 4
-        : (3 * kPerStageSmemBytes + kEpilogueSmemBytes <= kMaxSmemBytes) ? 3
-                                                                          : 2;
+        (kMaxSmemBytes - kEpilogueSmemBytes) / kPerStageSmemBytes;
+    static_assert(kStageCount >= 2);
     static constexpr int kMainloopSmemBytes = kStageCount * kPerStageSmemBytes;
     static constexpr int kDynamicSmemBytes = kMainloopSmemBytes + kEpilogueSmemBytes;
 };

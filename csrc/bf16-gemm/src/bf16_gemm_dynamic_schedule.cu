@@ -8,7 +8,7 @@
 #include "profiler.h"
 
 // TODO: 2026-07-05 will add clc dynamic schedule logic into this
-
+// FIXME: accuracy issue
 
 namespace {
 
@@ -17,13 +17,23 @@ constexpr int BLOCK_N = 256;
 constexpr int BLOCK_K = 128;
 constexpr int WARP_SIZE = 32;
 constexpr int WARP_NUM = 6;
-constexpr int STAGE_NUM = 3;
 constexpr int MMA_K = 16;
 constexpr int EPILOGUE_BLOCK_N = 32;
 constexpr int EPILOGUE_STAGE_NUM = 2;
 constexpr int CLUSTER_M = 2;
 constexpr bool PREFETCH_TMA_DESC = true;
 constexpr int TB_SIZE = WARP_SIZE * WARP_NUM;
+constexpr int A_SIZE = BLOCK_M * BLOCK_K * sizeof(nv_bfloat16);
+constexpr int B_SIZE = (BLOCK_N / CLUSTER_M) * BLOCK_K * sizeof(nv_bfloat16);
+constexpr int PER_STAGE_SMEM_BYTES = A_SIZE + B_SIZE;
+constexpr int EPILOGUE_STAGE_BYTES =
+    BLOCK_M * EPILOGUE_BLOCK_N * sizeof(nv_bfloat16);
+constexpr int EPILOGUE_SMEM_BYTES =
+    EPILOGUE_STAGE_NUM * EPILOGUE_STAGE_BYTES;
+constexpr int MAX_SMEM_BYTES = 227 * 1024;
+constexpr int STAGE_NUM =
+    (MAX_SMEM_BYTES - EPILOGUE_SMEM_BYTES) / PER_STAGE_SMEM_BYTES;
+static_assert(STAGE_NUM >= 2);
 
 constexpr int _dtype_bytes = 2;
 constexpr int _L2_per_tilem = _dtype_bytes * BLOCK_M * BLOCK_K;
@@ -239,9 +249,7 @@ void bf16_gemm_dynamic_schedule_kernel(
     // A: [BLOCK_M, BLOCK_K]  B: [BLOCK_N, BLOCK_K]
     extern __shared__ __align__(1024) char _smem_ptr[];
     const int smem = static_cast<int>(__cvta_generic_to_shared(_smem_ptr));
-    constexpr int A_size = BLOCK_M * BLOCK_K * sizeof(nv_bfloat16);
-    constexpr int B_size = (BLOCK_N / CLUSTER_M) * BLOCK_K * sizeof(nv_bfloat16);
-    constexpr int mainloop_smem_size = STAGE_NUM * (A_size + B_size);
+    constexpr int mainloop_smem_size = STAGE_NUM * PER_STAGE_SMEM_BYTES;
     nv_bfloat16 *epilogue_smem =
         reinterpret_cast<nv_bfloat16 *>(_smem_ptr + mainloop_smem_size);
 
@@ -322,12 +330,12 @@ void bf16_gemm_dynamic_schedule_kernel(
             profiler.stop();
         }
 
-        const int A_smem = smem + stage_id * (A_size + B_size);
-        const int B_smem = A_smem + A_size;
+        const int A_smem = smem + stage_id * PER_STAGE_SMEM_BYTES;
+        const int B_smem = A_smem + A_SIZE;
         const int tma_mbar_addr = (_base_tma_mbar_addr + 8 * stage_id) & 0xFEFFFFFF;
 
         // tma issue
-        constexpr int cp_size = A_size + B_size;
+        constexpr int cp_size = PER_STAGE_SMEM_BYTES;
 
         if constexpr (DO_PROFILE) {
             profiler.start(ProfilerTag::IssueTMA);
@@ -361,8 +369,8 @@ void bf16_gemm_dynamic_schedule_kernel(
             profiler.stop();
         }
 
-        const int A_smem = smem + stage_id * (A_size + B_size);
-        const int B_smem = A_smem + A_size;
+        const int A_smem = smem + stage_id * PER_STAGE_SMEM_BYTES;
+        const int B_smem = A_smem + A_SIZE;
         const int mma_mbar_addr = _base_mma_mbar_addr + 8 * stage_id;
 
         auto make_desc = [](int addr) -> uint64_t {
@@ -694,11 +702,9 @@ void launch_bf16_gemm_dynamic_schedule_impl(
     init_2D_tmap(&C_tmap, C_ptr, M, N, BLOCK_M, EPILOGUE_BLOCK_N);
 
     constexpr int mbarrier_smem = 256;
-    constexpr int epilogue_smem_size =
-        EPILOGUE_STAGE_NUM * BLOCK_M * EPILOGUE_BLOCK_N * sizeof(nv_bfloat16);
+    constexpr int mainloop_smem_size = STAGE_NUM * PER_STAGE_SMEM_BYTES;
     const int smem_size =
-        (BLOCK_M + BLOCK_N / CLUSTER_M) * BLOCK_K * STAGE_NUM * sizeof(nv_bfloat16) +
-        epilogue_smem_size + mbarrier_smem;
+        mainloop_smem_size + EPILOGUE_SMEM_BYTES + mbarrier_smem;
 
     const int grid_m = M / (BLOCK_M * CLUSTER_M);
     const int grid_n = N / BLOCK_N;
