@@ -97,12 +97,12 @@ def _cached_bf16_module(a, b, config):
     return mod
 
 
-def bf16_gemm(a, b, config=None):
-    return _cached_bf16_module(a, b, config).bf16_gemm(a, b)
+def bf16_gemm(a, b, config=None, swap_ab=False):
+    return _cached_bf16_module(a, b, config).bf16_gemm(a, b, swap_ab)
 
 
-def bf16_gemm_out(a, b, out, config=None):
-    return _cached_bf16_module(a, b, config).bf16_gemm_out(a, b, out)
+def bf16_gemm_out(a, b, out, config=None, swap_ab=False):
+    return _cached_bf16_module(a, b, config).bf16_gemm_out(a, b, out, swap_ab)
 
 
 from .jit import (

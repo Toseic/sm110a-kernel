@@ -179,6 +179,7 @@ class Bf16GemmConfig:
     tile_n: int = 256
     tile_k: int = 128
     cluster_m: int = 2
+    epilogue_block_n: int = 32
 
     def validate(self) -> None:
         if self.tile_m != 128:
@@ -187,12 +188,24 @@ class Bf16GemmConfig:
             raise ValueError("cluster_m must be 1 or 2")
         if self.tile_n <= 0:
             raise ValueError("tile_n must be positive")
-        if self.tile_n % 32:
-            raise ValueError("tile_n must be divisible by 32 (kEpilogueBlockN)")
+        if self.epilogue_block_n not in (32, 64, 128):
+            raise ValueError("epilogue_block_n must be one of 32, 64, or 128")
+        if self.tile_n % self.epilogue_block_n:
+            raise ValueError("tile_n must be divisible by epilogue_block_n")
         if self.tile_n % self.cluster_m:
             raise ValueError("tile_n must be divisible by cluster_m")
         if self.tile_k <= 0 or self.tile_k % 64:
             raise ValueError("tile_k must be a positive multiple of 64")
+        epilogue_smem = (
+            2 * self.tile_m * self.epilogue_block_n * 2
+        )
+        mainloop_stage_smem = (
+            self.tile_m + self.tile_n // self.cluster_m
+        ) * self.tile_k * 2
+        if (227 * 1024 - epilogue_smem) // mainloop_stage_smem < 2:
+            raise ValueError(
+                "configuration leaves room for fewer than two mainloop stages"
+            )
 
 
 def _bf16_default_config(a, b) -> Bf16GemmConfig:
@@ -269,6 +282,7 @@ def compile_bf16_gemm(
             f"-DSM110A_BF16_TILE_N={config.tile_n}",
             f"-DSM110A_BF16_TILE_K={config.tile_k}",
             f"-DSM110A_BF16_CLUSTER_M={config.cluster_m}",
+            f"-DSM110A_BF16_EPILOGUE_BLOCK_N={config.epilogue_block_n}",
         ]
         module = load(
             name=name,

@@ -19,6 +19,9 @@
 #ifndef SM110A_BF16_CLUSTER_M
 #define SM110A_BF16_CLUSTER_M 2
 #endif
+#ifndef SM110A_BF16_EPILOGUE_BLOCK_N
+#define SM110A_BF16_EPILOGUE_BLOCK_N 32
+#endif
 
 namespace {
 
@@ -26,7 +29,6 @@ constexpr int kMmaK = 16;
 constexpr int kWarpSize = 32;
 constexpr int kWarpCount = 6;
 constexpr int kBlockThreads = kWarpSize * kWarpCount;
-constexpr int kEpilogueBlockN = 32;
 constexpr int kEpilogueStageCount = 2;
 constexpr bool kPrefetchTmaDesc = true;
 constexpr int kSmCount = 20;
@@ -35,10 +37,12 @@ constexpr int kMacroSwizzleM = 8;
 constexpr int kMacroSwizzleN = 8;
 constexpr bool kMacroSwizzleMFast = true;
 
-template <int kTileM, int kTileN, int kTileK, int kClusterM>
+template <int kTileM, int kTileN, int kTileK, int kClusterM, int kEpilogueBlockN>
 struct KernelConfig {
     static_assert(kClusterM == 1 || kClusterM == 2);
     static_assert(kTileM == 4 * kWarpSize);
+    static_assert(
+        kEpilogueBlockN == 32 || kEpilogueBlockN == 64 || kEpilogueBlockN == 128);
     static_assert(kTileN % kEpilogueBlockN == 0);
     static_assert(kTileN % kClusterM == 0);
     static_assert(kTileK % 64 == 0);
@@ -78,6 +82,24 @@ __device__ inline void tma_3d_gmem2smem(
         "r"(_base_tma_mbar_addr),
         "n"(CTA_GROUP)
         : "memory");
+}
+
+__device__ inline void tma_3d_smem2gmem(
+    int src,
+    const void *tmap_ptr,
+    int x,
+    int y,
+    int z) {
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    asm volatile(
+        "cp.async.bulk.tensor.3d.global.shared::cta.bulk_group "
+        "[%0, {%1, %2, %3}], [%4];" ::"l"(tmap_ptr),
+        "r"(x),
+        "r"(y),
+        "r"(z),
+        "r"(src)
+        : "memory");
+    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
 }
 
 __device__ inline void tma_2d_smem2gmem(
@@ -193,7 +215,41 @@ inline void init_3D_tmap(
         CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 }
 
-inline void init_2D_tmap(
+inline void init_3D_output_tmap(
+    CUtensorMap *tmap,
+    nv_bfloat16 *ptr,
+    uint64_t global_height,
+    uint64_t global_width,
+    uint32_t shared_height,
+    uint32_t shared_width) {
+
+    constexpr uint32_t rank = 3;
+    constexpr uint32_t kSwizzleElements = 32;
+    assert(global_width % kSwizzleElements == 0);
+    assert(shared_width % kSwizzleElements == 0);
+    uint64_t global_dim[rank] = {
+        kSwizzleElements, global_width / kSwizzleElements, global_height};
+    uint64_t global_strides[rank - 1] = {
+        kSwizzleElements * sizeof(nv_bfloat16), global_width * sizeof(nv_bfloat16)};
+    uint32_t box_dim[rank] = {
+        kSwizzleElements, shared_width / kSwizzleElements, shared_height};
+    uint32_t element_strides[rank] = {1, 1, 1};
+
+    cuTensorMapEncodeTiled(tmap,
+        CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        rank,
+        ptr,
+        global_dim,
+        global_strides,
+        box_dim,
+        element_strides,
+        CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B,
+        CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+        CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+}
+
+inline void init_2D_output_tmap(
     CUtensorMap *tmap,
     nv_bfloat16 *ptr,
     uint64_t global_height,
@@ -217,11 +273,18 @@ inline void init_2D_tmap(
         element_strides,
         CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
         CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B,
-        CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+        CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
         CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 }
 
-template <int kTileM, int kTileN, int kTileK, int kClusterM, bool DO_PROFILE>
+template <
+    int kTileM,
+    int kTileN,
+    int kTileK,
+    int kClusterM,
+    int kEpilogueBlockN,
+    bool DO_PROFILE,
+    bool SWAP_AB>
 __global__
 __cluster_dims__(kClusterM, 1, 1)
 __launch_bounds__(kBlockThreads)
@@ -235,7 +298,7 @@ void bf16_gemm_kernel(
     int64_t *profiler_ptr,
     int num_entries) {
 
-    using Config = KernelConfig<kTileM, kTileN, kTileK, kClusterM>;
+    using Config = KernelConfig<kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN>;
     constexpr int kStageCount = Config::kStageCount;
     constexpr int kASmemBytes = Config::kASmemBytes;
     constexpr int kBSmemBytes = Config::kBSmemBytes;
@@ -456,15 +519,30 @@ void bf16_gemm_kernel(
             // wait
             asm volatile("tcgen05.wait::ld.sync.aligned;");
 
-            nv_bfloat162 out[4];
-            for (int i = 0; i < 4; i++) {
-                out[i] = __float22bfloat162_rn({tmp[i * 2], tmp[i * 2 + 1]});
+            if constexpr (!SWAP_AB) {
+                nv_bfloat162 out[4];
+                for (int i = 0; i < 4; i++) {
+                    out[i] = __float22bfloat162_rn({tmp[i * 2], tmp[i * 2 + 1]});
+                }
+                const int chunk = tid * (kEpilogueBlockN / 8) + n;
+                const int swizzled_chunk =
+                    (chunk & ~7) + ((chunk & 7) ^ ((chunk >> 3) & 3));
+                reinterpret_cast<int4 *>(smem_out + swizzled_chunk * 8)[0] =
+                    reinterpret_cast<int4 *>(out)[0];
+            } else {
+                // Form one kEpilogueBlockN x 128 tile from the four
+                // transposed TMEM panels.
+                const int dst_row = n * 8;
+                const int dst_col = warp_id * kWarpSize + tid % kWarpSize;
+                for (int i = 0; i < 8; ++i) {
+                    const int elem = (dst_row + i) * kTileM + dst_col;
+                    const int chunk = elem / 8;
+                    const int swizzled_chunk =
+                        (chunk & ~7) + ((chunk & 7) ^ ((chunk >> 3) & 3));
+                    smem_out[swizzled_chunk * 8 + elem % 8] =
+                        __float2bfloat16_rn(tmp[i]);
+                }
             }
-            const int chunk = tid * (kEpilogueBlockN / 8) + n;
-            const int swizzled_chunk =
-                (chunk & ~7) + ((chunk & 7) ^ ((chunk >> 3) & 3));
-            reinterpret_cast<int4 *>(smem_out + swizzled_chunk * 8)[0] =
-                reinterpret_cast<int4 *>(out)[0];
         }
     };
 
@@ -499,8 +577,24 @@ void bf16_gemm_kernel(
             // TMA consumes the current stage while the epilogue warps fill the
             // other stage from tensor memory.
             if (tid == 0) {
-                tma_2d_smem2gmem(
-                    stage_smem, &C_tmap, off_n + n_block * kEpilogueBlockN, off_m);
+                if constexpr (!SWAP_AB && kEpilogueBlockN == 32) {
+                    tma_2d_smem2gmem(stage_smem,
+                        &C_tmap,
+                        off_n + n_block * kEpilogueBlockN,
+                        off_m);
+                } else if constexpr (!SWAP_AB) {
+                    tma_3d_smem2gmem(stage_smem,
+                        &C_tmap,
+                        0,
+                        (off_n + n_block * kEpilogueBlockN) / 32,
+                        off_m);
+                } else {
+                    tma_3d_smem2gmem(stage_smem,
+                        &C_tmap,
+                        0,
+                        off_m / 32,
+                        off_n + n_block * kEpilogueBlockN);
+                }
             }
 
             if (n_block + 1 < n_block_num) {
@@ -690,7 +784,14 @@ void bf16_gemm_kernel(
 
 } // namespace
 
-template <int kTileM, int kTileN, int kTileK, int kClusterM, bool DO_PROFILE>
+template <
+    int kTileM,
+    int kTileN,
+    int kTileK,
+    int kClusterM,
+    int kEpilogueBlockN,
+    bool DO_PROFILE,
+    bool SWAP_AB>
 void launch_bf16_gemm_impl(
     const __nv_bfloat16 *A_ptr,
     const __nv_bfloat16 *B_ptr,
@@ -702,9 +803,20 @@ void launch_bf16_gemm_impl(
     int num_entries,
     cudaStream_t stream) {
 
-    using Config = KernelConfig<kTileM, kTileN, kTileK, kClusterM>;
+    using Config = KernelConfig<kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN>;
     constexpr int kStageCount = Config::kStageCount;
     constexpr int kDynamicSmemBytes = Config::kDynamicSmemBytes;
+
+    const int logic_M = M;
+    const int logic_N = N;
+    if constexpr (SWAP_AB) {
+        const __nv_bfloat16 *tmp_ptr = A_ptr;
+        A_ptr = B_ptr;
+        B_ptr = tmp_ptr;
+        const int tmp_dim = M;
+        M = N;
+        N = tmp_dim;
+    }
 
     CUtensorMap A_tmap, B_tmap, C_tmap;
 
@@ -725,14 +837,31 @@ void launch_bf16_gemm_impl(
         kTileN / kClusterM,
         kTileK,
         CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B);
-    init_2D_tmap(&C_tmap, C_ptr, M, N, kTileM, kEpilogueBlockN);
+    if constexpr (SWAP_AB) {
+        init_3D_output_tmap(
+            &C_tmap, C_ptr, logic_M, logic_N, kEpilogueBlockN, kTileM);
+    } else if constexpr (kEpilogueBlockN == 32) {
+        init_2D_output_tmap(
+            &C_tmap, C_ptr, logic_M, logic_N, kTileM, kEpilogueBlockN);
+    } else {
+        init_3D_output_tmap(
+            &C_tmap, C_ptr, logic_M, logic_N, kTileM, kEpilogueBlockN);
+    }
 
     constexpr int mbarrier_smem = 256;
     const int smem_size = kDynamicSmemBytes + mbarrier_smem;
 
     int grid = kSmCount;
 
-    auto kernel = bf16_gemm_kernel<kTileM, kTileN, kTileK, kClusterM, DO_PROFILE>;
+    auto kernel =
+        bf16_gemm_kernel<
+            kTileM,
+            kTileN,
+            kTileK,
+            kClusterM,
+            kEpilogueBlockN,
+            DO_PROFILE,
+            SWAP_AB>;
 
     if (smem_size > 48 * 1024) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
@@ -756,13 +885,27 @@ void launch_bf16_gemm(
     int M,
     int N,
     int K,
+    bool swap_ab,
     cudaStream_t stream) {
-    launch_bf16_gemm_impl<
-        SM110A_BF16_TILE_M,
-        SM110A_BF16_TILE_N,
-        SM110A_BF16_TILE_K,
-        SM110A_BF16_CLUSTER_M,
-        false>(A_ptr, B_ptr, C_ptr, M, N, K, nullptr, 0, stream);
+    if (swap_ab) {
+        launch_bf16_gemm_impl<
+            SM110A_BF16_TILE_M,
+            SM110A_BF16_TILE_N,
+            SM110A_BF16_TILE_K,
+            SM110A_BF16_CLUSTER_M,
+            SM110A_BF16_EPILOGUE_BLOCK_N,
+            false,
+            true>(A_ptr, B_ptr, C_ptr, M, N, K, nullptr, 0, stream);
+    } else {
+        launch_bf16_gemm_impl<
+            SM110A_BF16_TILE_M,
+            SM110A_BF16_TILE_N,
+            SM110A_BF16_TILE_K,
+            SM110A_BF16_CLUSTER_M,
+            SM110A_BF16_EPILOGUE_BLOCK_N,
+            false,
+            false>(A_ptr, B_ptr, C_ptr, M, N, K, nullptr, 0, stream);
+    }
 }
 
 void launch_bf16_gemm_profile(
@@ -774,11 +917,25 @@ void launch_bf16_gemm_profile(
     int K,
     int64_t *profiler_ptr,
     int num_entries,
+    bool swap_ab,
     cudaStream_t stream) {
-    launch_bf16_gemm_impl<
-        SM110A_BF16_TILE_M,
-        SM110A_BF16_TILE_N,
-        SM110A_BF16_TILE_K,
-        SM110A_BF16_CLUSTER_M,
-        true>(A_ptr, B_ptr, C_ptr, M, N, K, profiler_ptr, num_entries, stream);
+    if (swap_ab) {
+        launch_bf16_gemm_impl<
+            SM110A_BF16_TILE_M,
+            SM110A_BF16_TILE_N,
+            SM110A_BF16_TILE_K,
+            SM110A_BF16_CLUSTER_M,
+            SM110A_BF16_EPILOGUE_BLOCK_N,
+            true,
+            true>(A_ptr, B_ptr, C_ptr, M, N, K, profiler_ptr, num_entries, stream);
+    } else {
+        launch_bf16_gemm_impl<
+            SM110A_BF16_TILE_M,
+            SM110A_BF16_TILE_N,
+            SM110A_BF16_TILE_K,
+            SM110A_BF16_CLUSTER_M,
+            SM110A_BF16_EPILOGUE_BLOCK_N,
+            true,
+            false>(A_ptr, B_ptr, C_ptr, M, N, K, profiler_ptr, num_entries, stream);
+    }
 }

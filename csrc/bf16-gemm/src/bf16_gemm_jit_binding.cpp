@@ -21,6 +21,10 @@
 #error "SM110A_BF16_CLUSTER_M must be defined by the JIT compiler"
 #endif
 
+#ifndef SM110A_BF16_EPILOGUE_BLOCK_N
+#error "SM110A_BF16_EPILOGUE_BLOCK_N must be defined by the JIT compiler"
+#endif
+
 namespace {
 
 void check_tensor(const torch::Tensor& tensor, const char* name) {
@@ -30,7 +34,7 @@ void check_tensor(const torch::Tensor& tensor, const char* name) {
   TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
 }
 
-void check_inputs(const torch::Tensor& a, const torch::Tensor& b) {
+void check_inputs(const torch::Tensor& a, const torch::Tensor& b, bool swap_ab) {
   check_tensor(a, "A");
   check_tensor(b, "B");
   TORCH_CHECK(a.dim() == 2, "A must be 2D");
@@ -45,16 +49,18 @@ void check_inputs(const torch::Tensor& a, const torch::Tensor& b) {
               b.size(0),
               "x",
               b.size(1));
-  TORCH_CHECK(a.size(0) % (SM110A_BF16_TILE_M * SM110A_BF16_CLUSTER_M) == 0,
-              "M must be a multiple of ",
+  const int64_t physical_m = swap_ab ? b.size(1) : a.size(0);
+  const int64_t physical_n = swap_ab ? a.size(0) : b.size(1);
+  TORCH_CHECK(physical_m % (SM110A_BF16_TILE_M * SM110A_BF16_CLUSTER_M) == 0,
+              swap_ab ? "N" : "M", " must be a multiple of ",
               SM110A_BF16_TILE_M * SM110A_BF16_CLUSTER_M,
               ", got ",
-              a.size(0));
-  TORCH_CHECK(b.size(1) % SM110A_BF16_TILE_N == 0,
-              "N must be a multiple of ",
+              physical_m);
+  TORCH_CHECK(physical_n % SM110A_BF16_TILE_N == 0,
+              swap_ab ? "M" : "N", " must be a multiple of ",
               SM110A_BF16_TILE_N,
               ", got ",
-              b.size(1));
+              physical_n);
   TORCH_CHECK(a.size(1) % SM110A_BF16_TILE_K == 0,
               "K must be a multiple of ",
               SM110A_BF16_TILE_K,
@@ -83,8 +89,8 @@ void check_output(const torch::Tensor& out, int64_t m, int64_t n,
 }
 
 torch::Tensor bf16_gemm_out_jit(torch::Tensor a, torch::Tensor b,
-                                torch::Tensor out) {
-  check_inputs(a, b);
+                                torch::Tensor out, bool swap_ab) {
+  check_inputs(a, b, swap_ab);
   check_output(out, a.size(0), b.size(1), a.device());
   c10::cuda::CUDAGuard device_guard(a.device());
 
@@ -96,24 +102,27 @@ torch::Tensor bf16_gemm_out_jit(torch::Tensor a, torch::Tensor b,
       static_cast<int>(a.size(0)),
       static_cast<int>(b.size(1)),
       static_cast<int>(a.size(1)),
+      swap_ab,
       stream);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
 
-torch::Tensor bf16_gemm_jit(torch::Tensor a, torch::Tensor b) {
-  check_inputs(a, b);
+torch::Tensor bf16_gemm_jit(torch::Tensor a, torch::Tensor b, bool swap_ab) {
+  check_inputs(a, b, swap_ab);
   c10::cuda::CUDAGuard device_guard(a.device());
 
   auto out = torch::empty({a.size(0), b.size(1)}, a.options());
-  return bf16_gemm_out_jit(a, b, out);
+  return bf16_gemm_out_jit(a, b, out, swap_ab);
 }
 
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("bf16_gemm", &bf16_gemm_jit,
+  m.def("bf16_gemm", &bf16_gemm_jit, py::arg("a"), py::arg("b"),
+        py::arg("swap_ab") = false,
         "JIT-compiled BF16 GEMM");
-  m.def("bf16_gemm_out", &bf16_gemm_out_jit,
+  m.def("bf16_gemm_out", &bf16_gemm_out_jit, py::arg("a"), py::arg("b"),
+        py::arg("out"), py::arg("swap_ab") = false,
         "JIT-compiled BF16 GEMM with explicit output");
 }
