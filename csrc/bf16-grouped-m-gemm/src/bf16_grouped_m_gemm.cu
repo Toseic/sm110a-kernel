@@ -35,8 +35,8 @@ constexpr int kTmemStageCount = 2;
 // Two tiles amortize setup without letting persistent workers drift across
 // unrelated experts and destroy the cross-cluster A reuse.
 constexpr int kPersistentTileCount = 2;
-constexpr int kMacroSwizzleM = 8;
-constexpr int kMacroSwizzleN = 8;
+constexpr int kMacroSwizzleM = 4;
+constexpr int kMacroSwizzleN = 16;
 
 template <
     int kTileM,
