@@ -67,18 +67,26 @@ def cublaslt_gemm_out_batched(a, b, out, workspace, iters):
     return _EXT.cublaslt_gemm_out_batched(a, b, out, workspace, iters)
 
 
-def bf16_grouped_m_gemm(a, b, grouped_layout, config=None):
+def bf16_grouped_m_gemm(
+    a, b, grouped_layout, config=None, swap_ab=False
+):
     from .jit import get_bf16_grouped_m_gemm_module
 
     module = get_bf16_grouped_m_gemm_module(a, b, config)
-    return module.bf16_grouped_m_gemm(a, b, grouped_layout)
+    return module.bf16_grouped_m_gemm(
+        a, b, grouped_layout, swap_ab=swap_ab
+    )
 
 
-def bf16_grouped_m_gemm_out(a, b, grouped_layout, out, config=None):
+def bf16_grouped_m_gemm_out(
+    a, b, grouped_layout, out, config=None, swap_ab=False
+):
     from .jit import get_bf16_grouped_m_gemm_module
 
     module = get_bf16_grouped_m_gemm_module(a, b, config)
-    return module.bf16_grouped_m_gemm_out(a, b, grouped_layout, out)
+    return module.bf16_grouped_m_gemm_out(
+        a, b, grouped_layout, out, swap_ab=swap_ab
+    )
 
 
 from .jit import get_bf16_gemm_module as _get_bf16_gemm_module

@@ -31,10 +31,11 @@ GROUPED_M_CONFIGS = tuple(
         epilogue_tile_n=epilogue_tile_n,
         cluster_m=cluster_m,
     )
-    for tile_n in (128, 256)
+    for tile_n in (64, 128, 192, 256)
     for tile_k in (64, 128)
     for epilogue_tile_n in (32, 64, 128)
     for cluster_m in (1, 2)
+    if tile_n % epilogue_tile_n == 0
 )
 
 
@@ -118,14 +119,18 @@ def benchmark_grouped_baseline(a, b, tokens_per_expert, out, args):
     )
 
 
-def benchmark_grouped_kernel(a, b, layout, out, config, args):
+def benchmark_grouped_kernel(
+    a, b, layout, out, config, swap_ab, args
+):
     # Compile and launch once before recording CUDA events. This also rejects a
     # configuration that cannot launch on the current device.
-    bf16_grouped_m_gemm_out(a, b, layout, out, config=config)
+    bf16_grouped_m_gemm_out(
+        a, b, layout, out, config=config, swap_ab=swap_ab
+    )
     torch.cuda.synchronize()
     return benchmark_with_stats(
         lambda: bf16_grouped_m_gemm_out(
-            a, b, layout, out, config=config
+            a, b, layout, out, config=config, swap_ab=swap_ab
         ),
         args.warmup,
         args.iters,
@@ -133,31 +138,41 @@ def benchmark_grouped_kernel(a, b, layout, out, config, args):
     )
 
 
-def compatible_configs(n, k):
+def compatible_candidates(n, k):
     return tuple(
-        config
+        (config, swap_ab)
         for config in GROUPED_M_CONFIGS
-        if n % config.tile_n == 0 and k % config.tile_k == 0
+        for swap_ab in (False, True)
+        if (
+            n
+            % (
+                config.cluster_m * config.tile_m
+                if swap_ab
+                else config.tile_n
+            )
+            == 0
+            and k % config.tile_k == 0
+        )
     )
 
 
 def benchmark_best_grouped_kernel(a, b, layout, out, args):
-    configs = compatible_configs(b.size(1), a.size(1))
-    if not configs:
+    candidates = compatible_candidates(b.size(1), a.size(1))
+    if not candidates:
         raise RuntimeError(
             f"no grouped M config supports N={b.size(1)}, K={a.size(1)}"
         )
 
     results = []
-    for config in configs:
+    for config, swap_ab in candidates:
         stats = benchmark_grouped_kernel(
-            a, b, layout, out, config, args
+            a, b, layout, out, config, swap_ab, args
         )
-        results.append((stats, config))
-    best_stats, best_config = min(
+        results.append((stats, config, swap_ab))
+    best_stats, best_config, best_swap_ab = min(
         results, key=lambda result: result[0]["median_ms"]
     )
-    return best_stats, best_config, results
+    return best_stats, best_config, best_swap_ab, results
 
 
 def format_config(config):
@@ -165,6 +180,10 @@ def format_config(config):
         f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
         f"/e{config.epilogue_tile_n}/c{config.cluster_m}"
     )
+
+
+def format_candidate(config, swap_ab):
+    return f"{format_config(config)}/{'swap' if swap_ab else 'noswap'}"
 
 
 def max_valid_abs_diff(ref, test):
@@ -190,6 +209,7 @@ def print_result(
     baseline_stats,
     diff,
     best_config,
+    best_swap_ab,
 ):
     valid_m = experts * tokens_per_expert
     kernel_tflops = tflops_from_ms(valid_m, n, k, kernel_stats["median_ms"])
@@ -202,7 +222,8 @@ def print_result(
         f"{experts:<8}{n:<8}{k:<8}"
         f"{kernel_stats['median_ms']:<16.4f}{kernel_tflops:<16.3f}"
         f"{baseline_stats['median_ms']:<16.4f}{baseline_tflops:<16.3f}"
-        f"{speedup:<12.2f}{diff:<12.6f}{format_config(best_config):<28}"
+        f"{speedup:<12.2f}{diff:<12.6f}"
+        f"{format_candidate(best_config, best_swap_ab):<28}"
     )
 
 
@@ -213,13 +234,14 @@ def print_debug_results(results, experts, n, k):
         f"{'Tok/E':<8}{'Config':<28}{'Median(ms)':<14}"
         f"{'TFLOPS':<14}{'Best':<6}"
     )
-    for tokens_per_expert, stats, config, is_best in results:
+    for tokens_per_expert, stats, config, swap_ab, is_best in results:
         valid_m = experts * tokens_per_expert
         tflops = tflops_from_ms(
             valid_m, n, k, stats["median_ms"]
         )
         print(
-            f"{tokens_per_expert:<8}{format_config(config):<28}"
+            f"{tokens_per_expert:<8}"
+            f"{format_candidate(config, swap_ab):<28}"
             f"{stats['median_ms']:<14.4f}{tflops:<14.3f}"
             f"{'*' if is_best else '':<6}"
         )
@@ -240,10 +262,16 @@ def main():
     )
     print(
         "[autotune] configs="
-        + ", ".join(format_config(config) for config in GROUPED_M_CONFIGS)
+        + ", ".join(
+            format_candidate(config, swap_ab)
+            for config, swap_ab in compatible_candidates(N, K)
+        )
     )
     compile_bf16_grouped_m_gemm_configs(
-        compatible_configs(N, K)
+        dict.fromkeys(
+            config
+            for config, _ in compatible_candidates(N, K)
+        )
     )
 
     b = torch.empty((EXPERTS, N, K), device="cuda", dtype=torch.bfloat16)
@@ -265,6 +293,7 @@ def main():
         (
             kernel_stats,
             best_config,
+            best_swap_ab,
             config_results,
         ) = benchmark_best_grouped_kernel(a, b, layout, out_kernel, args)
         if args.debug:
@@ -273,11 +302,16 @@ def main():
                     tokens_per_expert,
                     stats,
                     config,
-                    config == best_config,
+                    swap_ab,
+                    config == best_config and swap_ab == best_swap_ab,
                 )
-                for stats, config in config_results
+                for stats, config, swap_ab in config_results
             )
-        grouped_m_tile = best_config.cluster_m * best_config.tile_m
+        grouped_m_tile = (
+            best_config.tile_n
+            if best_swap_ab
+            else best_config.cluster_m * best_config.tile_m
+        )
         padded_tokens = (
             math.ceil(tokens_per_expert / grouped_m_tile) * grouped_m_tile
         )
@@ -289,6 +323,7 @@ def main():
                 layout,
                 out_kernel,
                 config=best_config,
+                swap_ab=best_swap_ab,
             )
             run_grouped_baseline(a, b, tokens_per_expert, out_baseline)
             diff = max_valid_abs_diff(out_baseline, out_kernel)
@@ -302,6 +337,7 @@ def main():
             baseline_stats,
             diff,
             best_config,
+            best_swap_ab,
         )
 
     if args.debug:

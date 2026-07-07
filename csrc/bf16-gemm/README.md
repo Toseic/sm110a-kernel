@@ -82,10 +82,18 @@ config = GroupedMConfig(
     cluster_m=2,
 )
 compile_bf16_grouped_m_gemm(config)  # optional warm-up
-bf16_grouped_m_gemm_out(a, b, grouped_layout, out, config=config)
+bf16_grouped_m_gemm_out(
+    a, b, grouped_layout, out, config=config, swap_ab=True
+)
 ```
 
 `epilogue_tile_n` supports `32`, `64`, and `128`.
+The grouped kernel supports native MMA N shapes from 8 through 256 for
+`cluster_m=1` and from 16 through 256 for `cluster_m=2`; the benchmark tunes
+`tile_n` over `64`, `128`, `192`, and `256`.
+With `swap_ab=True`, each expert computes the equivalent transposed
+`B_e @ A_e.T` problem and transposes the epilogue back to the original
+`(M, N)` output layout.
 
 Compiled modules are reused in-process and through PyTorch's extension cache
 across processes. Set `SM110A_JIT_CACHE_DIR` to choose the disk cache directory,

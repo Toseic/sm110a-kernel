@@ -34,10 +34,18 @@ class GroupedMConfig:
             raise ValueError("cluster_m must be 1 or 2")
         if self.epilogue_tile_n not in (32, 64, 128):
             raise ValueError("epilogue_tile_n must be 32, 64, or 128")
-        if self.tile_n <= 0 or self.tile_n % self.epilogue_tile_n:
-            raise ValueError("tile_n must be positive and divisible by epilogue_tile_n")
-        if self.tile_n % self.cluster_m:
-            raise ValueError("tile_n must be divisible by cluster_m")
+        mma_n_granularity = 8 * self.cluster_m
+        if (
+            self.tile_n < mma_n_granularity
+            or self.tile_n > 256
+            or self.tile_n % mma_n_granularity
+        ):
+            raise ValueError(
+                "tile_n must be at most 256 and a positive multiple of "
+                f"{mma_n_granularity} for cluster_m={self.cluster_m}"
+            )
+        if self.tile_n % self.epilogue_tile_n:
+            raise ValueError("tile_n must be divisible by epilogue_tile_n")
         if self.tile_k <= 0 or self.tile_k % 64:
             raise ValueError("tile_k must be a positive multiple of 64")
 
@@ -61,25 +69,35 @@ class _GroupedMModule:
         self._launcher_address = library.entry_address
         self._config = config
 
-    def bf16_grouped_m_gemm(self, a, b, grouped_layout):
+    def bf16_grouped_m_gemm(
+        self, a, b, grouped_layout, swap_ab: bool = False
+    ):
         return self._binding.bf16_grouped_m_gemm(
             a,
             b,
             grouped_layout,
             self._launcher_address,
+            self._config.tile_m,
             self._config.tile_n,
             self._config.tile_k,
+            self._config.cluster_m,
+            swap_ab,
         )
 
-    def bf16_grouped_m_gemm_out(self, a, b, grouped_layout, out):
+    def bf16_grouped_m_gemm_out(
+        self, a, b, grouped_layout, out, swap_ab: bool = False
+    ):
         return self._binding.bf16_grouped_m_gemm_out(
             a,
             b,
             grouped_layout,
             out,
             self._launcher_address,
+            self._config.tile_m,
             self._config.tile_n,
             self._config.tile_k,
+            self._config.cluster_m,
+            swap_ab,
         )
 
 
