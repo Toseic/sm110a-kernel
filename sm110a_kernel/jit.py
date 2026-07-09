@@ -26,6 +26,7 @@ class GroupedMConfig:
     tile_k: int = 128
     epilogue_tile_n: int = 32
     cluster_m: int = 2
+    mode: int = 0  # 0=non-persistent, 1=persistent, 2=CLC
 
     def validate(self) -> None:
         if self.tile_m != 128:
@@ -48,6 +49,10 @@ class GroupedMConfig:
             raise ValueError("tile_n must be divisible by epilogue_tile_n")
         if self.tile_k <= 0 or self.tile_k % 64:
             raise ValueError("tile_k must be a positive multiple of 64")
+        if self.mode not in (0, 1, 2):
+            raise ValueError(
+                "mode must be 0 (non-persistent), 1 (persistent), or 2 (CLC)"
+            )
 
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -110,7 +115,7 @@ def _default_config(a, b) -> GroupedMConfig:
 
 def _grouped_m_kernel_cflags(
     config: GroupedMConfig,
-    enable_clc,
+    variant,
 ) -> tuple[str, ...]:
     return (
         f"-DSM110A_GROUPED_TILE_M={config.tile_m}",
@@ -118,7 +123,7 @@ def _grouped_m_kernel_cflags(
         f"-DSM110A_GROUPED_TILE_K={config.tile_k}",
         f"-DSM110A_GROUPED_EPILOGUE_TILE_N={config.epilogue_tile_n}",
         f"-DSM110A_GROUPED_CLUSTER_M={config.cluster_m}",
-        f"-DSM110A_GROUPED_ENABLE_CLC={int(enable_clc)}",
+        f"-DSM110A_GROUPED_MODE={config.mode}",
     )
 
 
@@ -141,9 +146,7 @@ _GROUPED_M_JIT = SplitCudaJit[GroupedMConfig, _GroupedMModule](
     ),
     kernel_symbol="sm110a_bf16_grouped_m_gemm_launch",
     config_key=lambda config: config,
-    variant_key=lambda: (
-        os.environ.get("SM110A_GROUPED_M_CLC", "0") == "1"
-    ),
+    variant_key=lambda: None,
     kernel_cflags=_grouped_m_kernel_cflags,
     make_facade=_make_grouped_m_module,
     include_paths=(_INCLUDE_DIR,),
