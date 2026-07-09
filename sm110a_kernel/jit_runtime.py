@@ -49,10 +49,15 @@ def jit_build_directory(
     name: str,
     cache_root_env: str = "SM110A_JIT_CACHE_DIR",
 ) -> Optional[str]:
-    """Return a persistent per-module build directory when configured."""
+    """Return a persistent per-module build directory.
+
+    Uses ``SM110A_JIT_CACHE_DIR`` if set, otherwise defaults to
+    ``~/.cache/sm110a_jit/`` so that compiled kernels survive across
+    interpreter restarts.
+    """
     cache_root = os.environ.get(cache_root_env)
     if not cache_root:
-        return None
+        cache_root = str(Path.home() / ".cache" / "sm110a_jit")
     build_path = Path(cache_root).expanduser().resolve() / name
     build_path.mkdir(parents=True, exist_ok=True)
     return str(build_path)
@@ -320,7 +325,7 @@ class SplitCudaJit(Generic[ConfigT, FacadeT]):
             return ()
         if max_workers is None:
             configured_workers = int(
-                os.environ.get(self._workers_env, "4")
+                os.environ.get(self._workers_env, "10")
             )
             max_workers = min(len(configs), configured_workers)
         if max_workers <= 0:
