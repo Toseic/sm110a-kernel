@@ -43,8 +43,8 @@ peak_m = 915 * e
 
 
 EXPERTS = 256
-N = 6144
-K = 4096
+N = 4096
+K = 6144
 DEFAULT_TOKENS_PER_EXPERT_VALUES = (64, 128, 256, 512, 1024)
 GROUPED_M_CONFIGS = tuple(
     GroupedMConfig(

@@ -1,3 +1,143 @@
+/*
+Design overview: this file implements a BF16 grouped-M GEMM specialized for the
+Blackwell/SM110A execution model. Here, grouped-M means that rows of the input
+matrix A are dispatched to different expert-specific B weight slices according
+to `grouped_layout[row] -> expert`; in other words, different rows select
+different `B[expert, :, :]` tiles.
+
+This is not designed as "one CTA computes one regular GEMM tile". Instead, the
+implementation is split into three layers:
+
+1. Host-side preprocessing
+   `collect_expert_metadata` scans `grouped_layout` and computes
+   `expert_offsets[expert]` and `expert_counts[expert]` for each expert.
+   The implementation assumes that rows belonging to the same expert are
+   already arranged as one contiguous segment in grouped layout order, so the
+   minimum row index plus the row count is enough to recover that expert's
+   contiguous M range in A.
+
+2. Task construction
+   `build_expert_tile_tasks` then slices each expert's contiguous row range
+   into multiple `ExpertTileTask` entries. Each task describes one tile-row
+   chunk within a single expert:
+   `{row_start, row_count, tile_row, expert}`.
+   - `row_start` is the first grouped row for that expert.
+   - `row_count` is the total number of rows assigned to that expert.
+   - `tile_row` is the task-local row offset relative to `row_start`.
+   - `expert` selects which B weight tensor slice to use.
+   This lets the kernel consume a compact task queue instead of re-parsing the
+   original row-to-expert layout.
+
+3. Device execution
+   The actual GEMM kernel uses a cluster as the basic cooperation unit. One
+   cluster contains `kClusterM` CTAs, and each CTA owns one `kTileM=128`
+   sub-tile along M, so one cluster covers one output tile of height
+   `kClusterTileM = kClusterM * kTileM`. Along N, the kernel processes
+   `kTileN` columns at a time.
+
+Why the work is partitioned this way:
+
+- The main grouped-M challenge is not raw compute throughput but fragmented B
+  accesses caused by switching experts. By first coalescing rows into
+  expert-local tasks and then letting a cluster work on one task at a time,
+  the kernel improves reuse of the same expert B tile.
+- Multiple CTAs inside one cluster process adjacent M tiles together, which
+  allows the A/B TMA transfers and the tcgen05 MMA pipeline to share one
+  launch order and one synchronization protocol.
+- `compute_macro_swizzled_tile` applies a macro-level swizzle in persistent
+  mode so launch order stays within a compact working set. The N dimension
+  advances faster, which makes it more likely that concurrently scheduled
+  clusters reuse the same A tile.
+
+The main datapath is organized as a three-stage pipeline:
+
+1. Producer: GMEM -> SMEM
+   Warp 4 acts as the producer and uses TMA (`cp.async.bulk.tensor`) to move
+   A/B tiles from global memory into shared memory. Each mainloop stage owns
+   one SMEM region containing both A and B. The number of stages is derived
+   from available shared memory so the kernel can hide TMA latency with as
+   deep a pipeline as possible. `tma_mbars` tell the consumer that a stage is
+   ready to read, and `mma_mbars` tell the producer that a stage has been
+   consumed and may be overwritten.
+
+2. Consumer: SMEM -> TMEM accumulators
+   Warp 5 in cluster rank 0 issues `tcgen05.mma`. After waiting for a TMA
+   stage, it encodes the shared-memory A/B tiles into tcgen05-compatible
+   matrix descriptors and advances through the K dimension in `kMmaK=16`
+   steps. Accumulation does not stay in registers; results are accumulated
+   directly into TMEM. The kernel then calls `tcgen05.commit` explicitly and
+   uses `mainloop_mbars` to signal to the epilogue that a full TMEM output
+   stage is ready to read.
+
+3. Epilogue: TMEM -> SMEM/GMEM
+   Warps 0-3 convert completed TMEM output back to BF16 and write it out.
+   The default path is:
+   TMEM -> registers (float) -> BF16 pack -> SMEM (swizzled) -> TMA store -> GMEM
+   This enables high-throughput TMA stores for full tiles. Boundary tiles,
+   where the valid row count is smaller than `kTileM` or `kEpilogueTileN`,
+   fall back to per-thread stores to avoid out-of-bounds writes.
+   If `SM110A_GROUPED_DIRECT_GMEM` is enabled and the path is not `swap_ab`,
+   the epilogue may use TMEM -> registers -> direct GMEM stores and skip the
+   intermediate SMEM/TMA path.
+
+Why the epilogue uses both TMEM and SMEM:
+
+- tcgen05 accumulators naturally live in TMEM, which is not a convenient
+  layout for arbitrary global stores.
+- TMA stores impose alignment and swizzle requirements, so the kernel first
+  reshapes the results into a shared-memory layout that matches the tensor map,
+  then issues large stores from there. This gives better throughput for full
+  tiles.
+- `kEpilogueStageCount` allows the kernel to prefetch the next N block from
+  TMEM into another SMEM stage while the current N block is being written,
+  creating a second small pipeline inside the epilogue itself.
+
+Persistent scheduling:
+
+- When `SM110A_GROUPED_MODE == 1`, the kernel runs in persistent mode.
+  Clusters are no longer mapped one-to-one to output tiles; instead they pull
+  work dynamically through the global cursor `next_cluster_tile`.
+- Each fetch claims `kPersistentTileCount=2` tiles. That amortizes the cost of
+  one atomic work claim without letting a worker drift too far and destroy
+  expert-local A/B reuse.
+- In persistent mode, `epilogue_mbars` are used additionally to ensure that a
+  TMEM stage is not overwritten by the next mainloop iteration before the
+  epilogue has finished consuming it.
+
+Meaning of the `swap_ab` path:
+
+- In the default mode, the grouped GEMM is logically an
+  `A[m, k] x B[expert, n, k]^T -> C[m, n]` style computation, and tasks are
+  sliced along M.
+- When `swap_ab` is true, the roles of the A/B tensor maps are exchanged and
+  the output store layout switches to the swizzled format described by
+  `init_swapped_c_tensor_map`. That changes the task granularity, the meaning
+  of the tile M/N axes, and the shared-memory epilogue layout.
+- The purpose is not to implement a different algorithm, but to reuse the same
+  tcgen05/TMA execution skeleton while making the originally less contiguous
+  side become the more tensor-map-friendly read direction.
+
+Thread-role summary:
+
+- Warp 4: mainloop TMA producer.
+- Warp 5: mainloop MMA consumer / TMEM producer.
+- Warps 0-3: epilogue, moving TMEM results into shared memory and then into GMEM.
+
+Synchronization summary:
+
+- `tma_mbars[stage]`: TMA has completed, MMA may read this stage.
+- `mma_mbars[stage]`: MMA has completed, TMA may overwrite this stage.
+- `mainloop_mbars[stage]`: one TMEM output stage is ready for the epilogue.
+- `epilogue_mbars[stage]`: in persistent mode, the epilogue has finished and
+  the TMEM stage may be reused.
+
+At a high level, the kernel can be summarized as:
+"compress grouped rows into expert-local tile tasks, then use a
+cluster-persistent Blackwell TMA + tcgen05 three-stage pipeline to stream
+expert-specific BF16 GEMM tiles across SMEM, TMEM, and GMEM while preserving
+as much expert locality and store throughput as possible."
+*/
+
 #include <cstdint>
 #include <cstdlib>
 #include <cudaTypedefs.h>
@@ -39,7 +179,11 @@ constexpr int kTmemStageCount = 2;
 // unrelated experts and destroy the cross-cluster A reuse.
 constexpr int kPersistentTileCount = 2;
 constexpr int kMacroSwizzleM = 4;
-constexpr int kMacroSwizzleN = 16;
+// Keep the persistent working set below Thor's 32 MiB L2.  A 16-wide N band
+// needs 25 MiB of B plus up to 12 MiB of A for four 256-row tasks, which
+// evicts the B tiles before the next M task can reuse them.  An 8-wide band
+// keeps the combined A/B footprint at or below 25 MiB for the large-M cases.
+constexpr int kMacroSwizzleN = 8;
 
 template <int kTileM, int kTileN, int kTileK, int kEpilogueTileN, int kClusterM>
 struct KernelConfig {
@@ -92,6 +236,7 @@ struct ExpertTileTask {
     int row_count;
     int tile_row;
     int expert;
+    int tile_n;
 };
 
 __global__ void collect_expert_metadata(
@@ -117,6 +262,7 @@ __global__ void build_expert_tile_tasks(
     const int *expert_offsets,
     const int *expert_counts,
     int experts,
+    int grid_n,
     ExpertTileTask *tasks,
     int *task_count) {
     if (blockIdx.x != 0 || threadIdx.x != 0) {
@@ -129,8 +275,22 @@ __global__ void build_expert_tile_tasks(
             continue;
         }
         const int row_start = expert_offsets[expert];
-        for (int tile_row = 0; tile_row < row_count; tile_row += kTaskTileRows) {
-            tasks[next_task++] = {row_start, row_count, tile_row, expert};
+        for (int group_row = 0; group_row < row_count;
+            group_row += kMacroSwizzleM * kTaskTileRows) {
+            const int group_row_end =
+                group_row + kMacroSwizzleM * kTaskTileRows < row_count
+                    ? group_row + kMacroSwizzleM * kTaskTileRows
+                    : row_count;
+            for (int macro_n = 0; macro_n < grid_n; macro_n += kMacroSwizzleN) {
+                const int band_end =
+                    macro_n + kMacroSwizzleN < grid_n ? macro_n + kMacroSwizzleN : grid_n;
+                for (int tile_row = group_row; tile_row < group_row_end;
+                    tile_row += kTaskTileRows) {
+                    for (int tile_n = macro_n; tile_n < band_end; ++tile_n) {
+                        tasks[next_task++] = {row_start, row_count, tile_row, expert, tile_n};
+                    }
+                }
+            }
         }
     }
     *task_count = next_task;
@@ -293,34 +453,6 @@ __device__ inline void tcgen05_commit(
     }
 }
 
-template <bool kUseMacroSwizzle>
-__device__ inline void compute_macro_swizzled_tile(
-    int cluster_bid,
-    int grid_m,
-    int grid_n,
-    int &tile_m,
-    int &tile_n) {
-    if constexpr (!kUseMacroSwizzle) {
-        tile_m = cluster_bid / grid_n;
-        tile_n = cluster_bid % grid_n;
-        return;
-    }
-
-    // Keep an 8x8 tile working set together in launch order. The N dimension
-    // changes fastest so concurrently scheduled clusters share the same A tile.
-    const int full_n_band_size = grid_m * kMacroSwizzleN;
-    const int macro_n = cluster_bid / full_n_band_size;
-    const int bid_in_n_band = cluster_bid - macro_n * full_n_band_size;
-    const int remaining_n = grid_n - macro_n * kMacroSwizzleN;
-    const int real_macro_n = remaining_n < kMacroSwizzleN ? remaining_n : kMacroSwizzleN;
-    const int macro_size = kMacroSwizzleM * real_macro_n;
-    const int macro_m = bid_in_n_band / macro_size;
-    const int macro_lane = bid_in_n_band - macro_m * macro_size;
-
-    tile_m = macro_m * kMacroSwizzleM + macro_lane / real_macro_n;
-    tile_n = macro_n * kMacroSwizzleN + macro_lane % real_macro_n;
-}
-
 template <int kTileM, int kTileK>
 inline bool init_a_tensor_map(
     CUtensorMap *tensor_map,
@@ -474,9 +606,7 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
     const int worker_id = blockIdx.x / kClusterM;
-    const int grid_m = *task_count;
-    const int grid_n = n / (kSwapAB ? kClusterTileM : kTileN);
-    const int cluster_tiles = grid_m * grid_n;
+    const int cluster_tiles = *task_count;
     constexpr int kWorkerTileCount = kPersistent ? kPersistentTileCount : 1;
     const int static_first_cluster_bid = worker_id * kWorkerTileCount;
     if constexpr (!kPersistent) {
@@ -685,14 +815,8 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
         if (warp_id == 4 && elect_sync()) {
             for (int cluster_bid = first_cluster_bid; cluster_bid < last_cluster_bid;
                 ++cluster_bid) {
-                int tile_m;
-                int tile_n;
-                compute_macro_swizzled_tile<kPersistent>(cluster_bid,
-                    grid_m,
-                    grid_n,
-                    tile_m,
-                    tile_n);
-                const ExpertTileTask task = tasks[tile_m];
+                const ExpertTileTask task = tasks[cluster_bid];
+                const int tile_n = task.tile_n;
                 const int cta_row = task.row_start + task.tile_row + cta_rank * kTileM;
                 const int tile_col = tile_n * kTileN;
 
@@ -821,14 +945,8 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
                     epilogue_mainloop_phase);
                 asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-                int tile_m;
-                int tile_n;
-                compute_macro_swizzled_tile<kPersistent>(cluster_bid,
-                    grid_m,
-                    grid_n,
-                    tile_m,
-                    tile_n);
-                const ExpertTileTask task = tasks[tile_m];
+                const ExpertTileTask task = tasks[cluster_bid];
+                const int tile_n = task.tile_n;
                 const int cta_tile_row = task.tile_row + cta_rank * kTileM;
                 const int cta_row = task.row_start + cta_tile_row;
                 const int remaining_rows = task.row_count - cta_tile_row;
@@ -1092,10 +1210,11 @@ void launch_bf16_grouped_m_gemm_impl(
     //  │     tile_row, expert}                    │
     //  └──────────────────────────────────────────┘
     //
-    // max_tasks upper-bounds:
-    //   ceil(m / kTaskTileRows)  ← every row bundle produces 1 task
-    // + experts                  ← worst case: each expert gets its own slot
-    const int max_tasks = (m + kTaskTileRows - 1) / kTaskTileRows + experts;
+    // Each row bundle produces one task per logical N tile.  The extra expert
+    // slots account for the per-expert ceil when row counts are uneven.
+    const int grid_n = n / kLogicalNTile;
+    const int max_m_tasks = (m + kTaskTileRows - 1) / kTaskTileRows + experts;
+    const int max_tasks = max_m_tasks * grid_n;
     const size_t metadata_bytes = (2 * experts + 2) * sizeof(int);
     const size_t task_offset =
         (metadata_bytes + alignof(ExpertTileTask) - 1) & ~(alignof(ExpertTileTask) - 1);
@@ -1119,9 +1238,9 @@ void launch_bf16_grouped_m_gemm_impl(
         0,
         stream>>>(d_grouped_layout, m, experts, expert_offsets, expert_counts);
     build_expert_tile_tasks<kTaskTileRows>
-        <<<1, 1, 0, stream>>>(expert_offsets, expert_counts, experts, tasks, task_count);
+        <<<1, 1, 0, stream>>>(expert_offsets, expert_counts, experts, grid_n, tasks, task_count);
 
-    const int max_cluster_tiles = max_tasks * (n / kLogicalNTile);
+    const int max_cluster_tiles = max_tasks;
 
     if constexpr (SM110A_GROUPED_MODE == 1) {
         const int persistent_clusters =
