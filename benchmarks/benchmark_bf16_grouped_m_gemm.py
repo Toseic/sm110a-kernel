@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import argparse
 import math
 import sys
 from pathlib import Path
@@ -12,8 +11,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from common import (
+    BenchmarkBase,
     benchmark_with_stats,
-    summarize_samples,
+    quick_probe,
     tflops_from_ms,
 )
 from sm110a_kernel import GroupedMConfig, bf16_grouped_m_gemm_out
@@ -64,63 +64,6 @@ GROUPED_M_CONFIGS = tuple(
     for direct_gmem in (False,)
     if tile_n % epilogue_tile_n == 0
 )
-
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--warmup", type=int, default=2)
-    parser.add_argument("--iters", type=int, default=3)
-    parser.add_argument("--samples", type=int, default=3)
-    parser.add_argument("--check", action="store_true")
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="print per-config performance after the benchmark",
-    )
-    parser.add_argument(
-        "--torch-blas",
-        choices=("default", "cublas", "cublaslt"),
-        default="default",
-    )
-    parser.add_argument(
-        "--token",
-        type=int,
-        default=0,
-        help="run a single sweep token instead of the default token sweep",
-    )
-    args = parser.parse_args()
-
-    if args.warmup < 0:
-        raise SystemExit("--warmup must be non-negative")
-    if args.iters <= 0:
-        raise SystemExit("--iters must be positive")
-    if args.samples <= 0:
-        raise SystemExit("--samples must be positive")
-    if args.token < 0:
-        raise SystemExit("--token must be non-negative")
-    return args
-
-
-def configure_torch_blas(preferred_blas):
-    if not hasattr(torch.backends.cuda, "preferred_blas_library"):
-        if preferred_blas != "default":
-            raise SystemExit(
-                "This PyTorch build does not support selecting the CUDA BLAS backend"
-            )
-        return "unavailable"
-
-    if preferred_blas == "default":
-        torch.backends.cuda.preferred_blas_library("default")
-    elif preferred_blas == "cublas":
-        torch.backends.cuda.preferred_blas_library("cublas")
-    elif preferred_blas == "cublaslt":
-        torch.backends.cuda.preferred_blas_library("cublaslt")
-    else:
-        raise SystemExit(f"unsupported --torch-blas value: {preferred_blas}")
-
-    return str(torch.backends.cuda.preferred_blas_library()).split(".")[-1]
-
-
 def build_layout(tokens_per_expert, experts):
     layout = torch.arange(experts, device="cuda", dtype=torch.int32)
     return layout.repeat_interleave(tokens_per_expert)
@@ -173,6 +116,18 @@ def benchmark_grouped_kernel(
     )
 
 
+def probe_grouped_kernel(a, b, layout, out, config, swap_ab):
+    bf16_grouped_m_gemm_out(
+        a, b, layout, out, config=config, swap_ab=swap_ab
+    )
+    torch.cuda.synchronize()
+    return quick_probe(
+        lambda: bf16_grouped_m_gemm_out(
+            a, b, layout, out, config=config, swap_ab=swap_ab
+        )
+    )
+
+
 def compatible_candidates(n, k):
     candidates = []
     for config in GROUPED_M_CONFIGS:
@@ -200,50 +155,6 @@ def compile_grouped_m_configs(configs, debug):
         compile_bf16_grouped_m_gemm_configs(configs)
 
 
-def benchmark_best_grouped_kernel(a, b, layout, out, args):
-    candidates = compatible_candidates(b.size(1), a.size(1))
-    if not candidates:
-        raise RuntimeError(
-            f"no grouped M config supports N={b.size(1)}, K={a.size(1)}"
-        )
-
-    if args.debug:
-        print("  [debug] per-config performance", flush=True)
-
-    results = []
-    best_stats = None
-    best_config = None
-    best_swap_ab = False
-    for config, swap_ab in candidates:
-        stats = benchmark_grouped_kernel(
-            a, b, layout, out, config, swap_ab, args
-        )
-        results.append((stats, config, swap_ab))
-        tflops = tflops_from_ms(
-            a.size(0), b.size(1), a.size(1), stats["median_ms"]
-        )
-        marker = ""
-        if best_stats is None or stats["median_ms"] < best_stats["median_ms"]:
-            best_stats = stats
-            best_config = config
-            best_swap_ab = swap_ab
-            marker = " *"
-        if args.debug:
-            print(
-                f"  {format_candidate(config, swap_ab):<40}"
-                f" min={stats['min_ms']:.4f}ms"
-                f" median={stats['median_ms']:.4f}ms"
-                f" {tflops:.1f} TF/s{marker}",
-                flush=True,
-            )
-    if args.debug:
-        print(
-            f"  -> best: {format_candidate(best_config, best_swap_ab)}",
-            flush=True,
-        )
-    return best_stats, best_config, best_swap_ab, results
-
-
 _MODE_LABELS = {0: "np", 1: "pe", 2: "cl"}
 
 
@@ -264,15 +175,6 @@ def max_valid_abs_diff(ref, test):
     return (ref.float() - test.float()).abs().max().item()
 
 
-def print_header():
-    print(
-        f"{'Tok/E':<8}{'Pad/E':<8}{'M':<10}{'E':<8}{'N':<8}{'K':<8}"
-        f"{'KernelMed(ms)':<16}{'Kernel TF/s':<16}"
-        f"{'BaselineMed(ms)':<16}{'Baseline TF/s':<16}"
-        f"{'Speedup':<12}{'MaxDiff':<12}{'BestConfig':<40}"
-    )
-
-
 def print_result(
     tokens_per_expert,
     padded_tokens,
@@ -286,18 +188,20 @@ def print_result(
     best_swap_ab,
 ):
     valid_m = experts * tokens_per_expert
-    kernel_tflops = tflops_from_ms(valid_m, n, k, kernel_stats["median_ms"])
-    baseline_tflops = tflops_from_ms(
-        valid_m, n, k, baseline_stats["median_ms"]
-    )
-    speedup = baseline_stats["median_ms"] / kernel_stats["median_ms"]
-    print(
-        f"{tokens_per_expert:<8}{padded_tokens:<8}{valid_m:<10}"
-        f"{experts:<8}{n:<8}{k:<8}"
-        f"{kernel_stats['median_ms']:<16.4f}{kernel_tflops:<16.3f}"
-        f"{baseline_stats['median_ms']:<16.4f}{baseline_tflops:<16.3f}"
-        f"{speedup:<12.2f}{diff:<12.6f}"
-        f"{format_candidate(best_config, best_swap_ab):<40}"
+    return (
+        tokens_per_expert,
+        padded_tokens,
+        valid_m,
+        experts,
+        n,
+        k,
+        f"{kernel_stats['median_ms']:.4f}",
+        f"{tflops_from_ms(valid_m, n, k, kernel_stats['median_ms']):.3f}",
+        f"{baseline_stats['median_ms']:.4f}",
+        f"{tflops_from_ms(valid_m, n, k, baseline_stats['median_ms']):.3f}",
+        f"{baseline_stats['median_ms'] / kernel_stats['median_ms']:.2f}",
+        f"{diff:.6f}",
+        format_candidate(best_config, best_swap_ab),
     )
 
 
@@ -321,88 +225,168 @@ def print_debug_results(results, experts, n, k):
         )
 
 
-def main():
-    if not torch.cuda.is_available():
-        raise SystemExit("CUDA is required")
+class Bf16GroupedMGemmBenchmark(BenchmarkBase):
+    def make_result_table(self):
+        return self.make_table_printer(
+            (
+                ("Tok/E", 8),
+                ("Pad/E", 8),
+                ("M", 10),
+                ("E", 8),
+                ("N", 8),
+                ("K", 8),
+                ("KernelMed(ms)", 16),
+                ("Kernel TF/s", 16),
+                ("BaselineMed(ms)", 16),
+                ("Baseline TF/s", 16),
+                ("Speedup", 12),
+                ("MaxDiff", 12),
+                ("BestConfig", 40),
+            )
+        )
 
-    args = parse_args()
-    tokens_per_expert_values = (
-        (args.token,) if args.token > 0 else DEFAULT_TOKENS_PER_EXPERT_VALUES
-    )
-    torch.manual_seed(1234)
+    def build_parser(self):
+        parser = super().build_parser()
+        self.add_timing_args(parser, warmup=2, iters=3, samples=3)
+        parser.add_argument("--check", action="store_true")
+        parser.add_argument(
+            "--debug",
+            action="store_true",
+            help="print per-config performance after the benchmark",
+        )
+        self.add_torch_blas_arg(parser)
+        parser.add_argument(
+            "--token",
+            type=int,
+            default=0,
+            help="run a single sweep token instead of the default token sweep",
+        )
+        return parser
 
-    actual_blas = configure_torch_blas(args.torch_blas)
-    print(f"[torch] preferred BLAS backend: {actual_blas}")
-    print(
-        f"[workload] experts={EXPERTS} n={N} k={K} "
-        f"tokens_per_expert={tokens_per_expert_values}"
-    )
-    print(
-        "[autotune] configs="
-        + ", ".join(
-            format_candidate(config, swap_ab)
-            for config, swap_ab in compatible_candidates(N, K)
-        )
-    )
-    compile_grouped_m_configs(
-        dict.fromkeys(
-            config for config, _ in compatible_candidates(N, K)
-        ),
-        args.debug,
-    )
+    def validate_args(self, args):
+        self.validate_timing_args(args, allow_zero_warmup=True)
+        if args.token < 0:
+            raise SystemExit("--token must be non-negative")
+        return args
 
-    b = torch.empty((EXPERTS, N, K), device="cuda", dtype=torch.bfloat16)
-    b.uniform_(-1.0, 1.0)
-    print_header()
-    for tokens_per_expert in tokens_per_expert_values:
-        a, layout, out_kernel, out_baseline = make_workload(
-            tokens_per_expert, b
+    def run_with_args(self, args):
+        tokens_per_expert_values = (
+            (args.token,) if args.token > 0 else DEFAULT_TOKENS_PER_EXPERT_VALUES
         )
-        baseline_stats = benchmark_grouped_baseline(
-            a,
-            b,
-            tokens_per_expert,
-            out_baseline,
-            args,
+
+        actual_blas = self.configure_torch_blas(args.torch_blas)
+        print(f"[torch] preferred BLAS backend: {actual_blas}")
+        print(
+            f"[workload] experts={EXPERTS} n={N} k={K} "
+            f"tokens_per_expert={tokens_per_expert_values}"
         )
-        (
-            kernel_stats,
-            best_config,
-            best_swap_ab,
-            config_results,
-        ) = benchmark_best_grouped_kernel(a, b, layout, out_kernel, args)
-        grouped_m_tile = (
-            best_config.tile_n
-            if best_swap_ab
-            else best_config.cluster_m * best_config.tile_m
+        print(
+            "[autotune] configs="
+            + ", ".join(
+                format_candidate(config, swap_ab)
+                for config, swap_ab in compatible_candidates(N, K)
+            )
         )
-        padded_tokens = (
-            math.ceil(tokens_per_expert / grouped_m_tile) * grouped_m_tile
+        compile_grouped_m_configs(
+            dict.fromkeys(
+                config for config, _ in compatible_candidates(N, K)
+            ),
+            args.debug,
         )
-        diff = 0.0
-        if args.check:
-            bf16_grouped_m_gemm_out(
+
+        b = torch.empty((EXPERTS, N, K), device="cuda", dtype=torch.bfloat16)
+        b.uniform_(-1.0, 1.0)
+        self.make_result_table().print_header()
+        for tokens_per_expert in tokens_per_expert_values:
+            a, layout, out_kernel, out_baseline = make_workload(
+                tokens_per_expert, b
+            )
+            baseline_stats = benchmark_grouped_baseline(
                 a,
                 b,
-                layout,
-                out_kernel,
-                config=best_config,
-                swap_ab=best_swap_ab,
+                tokens_per_expert,
+                out_baseline,
+                args,
             )
-            run_grouped_baseline(a, b, tokens_per_expert, out_baseline)
-            diff = max_valid_abs_diff(out_baseline, out_kernel)
-        print_result(
-            tokens_per_expert,
-            padded_tokens,
-            EXPERTS,
-            N,
-            K,
-            kernel_stats,
-            baseline_stats,
-            diff,
-            best_config,
-            best_swap_ab,
+            (
+                kernel_stats,
+                best_config,
+                best_swap_ab,
+                _,
+            ) = self.benchmark_best_grouped_kernel(a, b, layout, out_kernel, args)
+            grouped_m_tile = (
+                best_config.tile_n
+                if best_swap_ab
+                else best_config.cluster_m * best_config.tile_m
+            )
+            padded_tokens = (
+                math.ceil(tokens_per_expert / grouped_m_tile) * grouped_m_tile
+            )
+            diff = 0.0
+            if args.check:
+                bf16_grouped_m_gemm_out(
+                    a,
+                    b,
+                    layout,
+                    out_kernel,
+                    config=best_config,
+                    swap_ab=best_swap_ab,
+                )
+                run_grouped_baseline(a, b, tokens_per_expert, out_baseline)
+                diff = max_valid_abs_diff(out_baseline, out_kernel)
+            self.make_result_table().print_row(
+                *print_result(
+                    tokens_per_expert,
+                    padded_tokens,
+                    EXPERTS,
+                    N,
+                    K,
+                    kernel_stats,
+                    baseline_stats,
+                    diff,
+                    best_config,
+                    best_swap_ab,
+                )
+            )
+
+    def benchmark_best_grouped_kernel(self, a, b, layout, out, args):
+        candidates = compatible_candidates(b.size(1), a.size(1))
+        if not candidates:
+            raise RuntimeError(
+                f"no grouped M config supports N={b.size(1)}, K={a.size(1)}"
+            )
+
+        if args.debug:
+            print("  [debug] per-config performance", flush=True)
+
+        best_candidate, best_stats, raw_results = self.autotune_candidates(
+            candidates,
+            args=args,
+            benchmark_candidate=lambda candidate: benchmark_grouped_kernel(
+                a, b, layout, out, candidate[0], candidate[1], args
+            ),
+            format_candidate=lambda candidate: format_candidate(
+                candidate[0], candidate[1]
+            ),
+            probe_candidate=lambda candidate: probe_grouped_kernel(
+                a, b, layout, out, candidate[0], candidate[1]
+            ),
+            metric_formatter=lambda _candidate, stats: (
+                f"{tflops_from_ms(a.size(0), b.size(1), a.size(1), stats['median_ms']):.1f} TF/s"
+            ),
+            candidate_width=40,
+            flush=True,
         )
+        best_config, best_swap_ab = best_candidate
+        results = [
+            (stats, candidate[0], candidate[1])
+            for candidate, stats, _probe_ms in raw_results
+        ]
+        return best_stats, best_config, best_swap_ab, results
+
+
+def main():
+    Bf16GroupedMGemmBenchmark().run()
 
 
 if __name__ == "__main__":
