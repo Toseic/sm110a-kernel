@@ -45,7 +45,7 @@ peak_m = 915 * e
 EXPERTS = 256
 N = 6144
 K = 4096
-TOKENS_PER_EXPERT_VALUES = (32, 64, 128, 256, 512, 1024)
+DEFAULT_TOKENS_PER_EXPERT_VALUES = (64, 128, 256, 512, 1024)
 GROUPED_M_CONFIGS = tuple(
     GroupedMConfig(
         tile_m=128,
@@ -54,12 +54,14 @@ GROUPED_M_CONFIGS = tuple(
         epilogue_tile_n=epilogue_tile_n,
         cluster_m=cluster_m,
         mode=mode,
+        direct_gmem=direct_gmem,
     )
-    for tile_n in (64, 128, 256)
+    for tile_n in (128, 256)
     for tile_k in (64, 128)
     for epilogue_tile_n in (32, 64)
     for cluster_m in (1, 2)
     for mode in (0, 1)
+    for direct_gmem in (False,)
     if tile_n % epilogue_tile_n == 0
 )
 
@@ -80,6 +82,12 @@ def parse_args():
         choices=("default", "cublas", "cublaslt"),
         default="default",
     )
+    parser.add_argument(
+        "--token",
+        type=int,
+        default=0,
+        help="run a single sweep token instead of the default token sweep",
+    )
     args = parser.parse_args()
 
     if args.warmup < 0:
@@ -88,6 +96,8 @@ def parse_args():
         raise SystemExit("--iters must be positive")
     if args.samples <= 0:
         raise SystemExit("--samples must be positive")
+    if args.token < 0:
+        raise SystemExit("--token must be non-negative")
     return args
 
 
@@ -177,11 +187,17 @@ def compatible_candidates(n, k):
 
 def compile_grouped_m_configs(configs, debug):
     if debug:
-        for config in configs:
-            print(f"[compile] {format_config(config)}", flush=True)
-            compile_bf16_grouped_m_gemm(config)
-        return
-    compile_bf16_grouped_m_gemm_configs(configs)
+        configs = list(configs)
+        try:
+            from tqdm import tqdm
+        except ImportError:
+            for config in configs:
+                print(f"[compile] {format_config(config)}", flush=True)
+        else:
+            print(f"[compile] compiling {len(configs)} configs...", flush=True)
+        compile_bf16_grouped_m_gemm_configs(configs)
+    else:
+        compile_bf16_grouped_m_gemm_configs(configs)
 
 
 def benchmark_best_grouped_kernel(a, b, layout, out, args):
@@ -232,11 +248,12 @@ _MODE_LABELS = {0: "np", 1: "pe", 2: "cl"}
 
 
 def format_config(config):
-    return (
+    base = (
         f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
         f"/e{config.epilogue_tile_n}/c{config.cluster_m}"
         f"/{_MODE_LABELS.get(config.mode, config.mode)}"
     )
+    return base + "+dg" if getattr(config, "direct_gmem", False) else base
 
 
 def format_candidate(config, swap_ab):
@@ -309,13 +326,16 @@ def main():
         raise SystemExit("CUDA is required")
 
     args = parse_args()
+    tokens_per_expert_values = (
+        (args.token,) if args.token > 0 else DEFAULT_TOKENS_PER_EXPERT_VALUES
+    )
     torch.manual_seed(1234)
 
     actual_blas = configure_torch_blas(args.torch_blas)
     print(f"[torch] preferred BLAS backend: {actual_blas}")
     print(
         f"[workload] experts={EXPERTS} n={N} k={K} "
-        f"tokens_per_expert={TOKENS_PER_EXPERT_VALUES}"
+        f"tokens_per_expert={tokens_per_expert_values}"
     )
     print(
         "[autotune] configs="
@@ -334,7 +354,7 @@ def main():
     b = torch.empty((EXPERTS, N, K), device="cuda", dtype=torch.bfloat16)
     b.uniform_(-1.0, 1.0)
     print_header()
-    for tokens_per_expert in TOKENS_PER_EXPERT_VALUES:
+    for tokens_per_expert in tokens_per_expert_values:
         a, layout, out_kernel, out_baseline = make_workload(
             tokens_per_expert, b
         )

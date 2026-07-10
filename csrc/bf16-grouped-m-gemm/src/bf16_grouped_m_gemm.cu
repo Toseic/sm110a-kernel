@@ -24,6 +24,9 @@
 #ifndef SM110A_GROUPED_MODE
 #define SM110A_GROUPED_MODE 0
 #endif
+#ifndef SM110A_GROUPED_DIRECT_GMEM
+#define SM110A_GROUPED_DIRECT_GMEM 0
+#endif
 
 namespace {
 
@@ -456,7 +459,8 @@ template <
     int kClusterM,
     bool kPersistent,
     bool kDynamicClc = false,
-    bool kSwapAB = false>
+    bool kSwapAB = false,
+    bool kDirectGmem = false>
 __global__ __cluster_dims__(kClusterM, 1, 1)
 __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
     const __grid_constant__ CUtensorMap a_tensor_map,
@@ -563,7 +567,9 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
 
     const int k_tiles = k / kTileK;
 
-    auto tmem_to_smem = [&](int mainloop_stage, int n_block, int smem_stage) {
+    auto tmem_to_smem = [&](int mainloop_stage, int n_block, int smem_stage,
+                             int cta_row = 0, int tile_col = 0,
+                             int valid_rows = kTileM) {
         char *stage_smem = dynamic_smem + kMainloopSmemBytes + smem_stage * kEpilogueStageBytes;
 
         for (int n_group = 0; n_group < kEpilogueTileN / 8; ++n_group) {
@@ -591,15 +597,29 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
                     packed[i] = __float22bfloat162_rn({values[2 * i], values[2 * i + 1]});
                 }
 
-                const int store_tile = n_group / kChunksPerStoreTile;
-                const int chunk_in_store =
-                    tid * kChunksPerStoreTile + n_group % kChunksPerStoreTile;
-                const int swizzled_chunk =
-                    (chunk_in_store & ~7) +
-                    ((chunk_in_store & 7) ^ ((chunk_in_store >> 3) & kSwizzlePhaseMask));
-                reinterpret_cast<int4 *>(
-                    stage_smem + store_tile * kStoreTileBytes)[swizzled_chunk] =
-                    reinterpret_cast<int4 *>(packed)[0];
+                if constexpr (kDirectGmem) {
+                    // Direct TMEM → RMEM → GMEM: write packed values straight
+                    // to global memory, bypassing shared memory.
+                    if (tid < valid_rows) {
+                        const int gmem_row = cta_row + tid;
+                        const int gmem_col =
+                            tile_col + n_block * kEpilogueTileN + n_group * 8;
+                        reinterpret_cast<int4 *>(
+                            c + gmem_row * n + gmem_col)[0] =
+                            reinterpret_cast<int4 *>(packed)[0];
+                    }
+                } else {
+                    const int store_tile = n_group / kChunksPerStoreTile;
+                    const int chunk_in_store =
+                        tid * kChunksPerStoreTile + n_group % kChunksPerStoreTile;
+                    const int swizzled_chunk =
+                        (chunk_in_store & ~7) +
+                        ((chunk_in_store & 7) ^
+                            ((chunk_in_store >> 3) & kSwizzlePhaseMask));
+                    reinterpret_cast<int4 *>(
+                        stage_smem + store_tile * kStoreTileBytes)[swizzled_chunk] =
+                        reinterpret_cast<int4 *>(packed)[0];
+                }
             } else {
                 // Match STSM's register fragment directly: each warp reads
                 // lanes 0-15 and 16-31 as two .16x256b TMEM fragments.
@@ -877,7 +897,7 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
                     }
                 };
 
-                tmem_to_smem(epilogue_mainloop_stage, 0, 0);
+                tmem_to_smem(epilogue_mainloop_stage, 0, 0, cta_row, tile_col, valid_rows);
                 asm volatile("bar.sync 1, 128;" ::: "memory");
                 if constexpr (kEpilogueBlockCount == 1) {
                     release_tmem();
@@ -887,36 +907,55 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
                     const int smem_stage = n_block % kEpilogueStageCount;
                     const int stage_smem = epilogue_smem + smem_stage * kEpilogueStageBytes;
                         if constexpr (!kSwapAB) {
-                            const int block_col = tile_col + n_block * kEpilogueTileN;
-                            if (valid_rows == kTileM) {
-                                if (tid == 0) {
-                                    for (int store_tile = 0; store_tile < kEpilogueStoreTiles;
-                                        ++store_tile) {
-                                        tma_store_3d(stage_smem + store_tile * kStoreTileBytes,
-                                            &c_tensor_map,
-                                            block_col + store_tile * kEpilogueStoreTileN,
-                                            cta_row,
-                                            0);
+                            // Direct gmem: data already written by tmem_to_smem.
+                            // Only the SMEM→TMA path needs TMA store / fallback.
+                            if constexpr (!kDirectGmem) {
+                                const int block_col = tile_col + n_block * kEpilogueTileN;
+                                if (valid_rows == kTileM) {
+                                    if (tid == 0) {
+                                        for (int store_tile = 0;
+                                            store_tile < kEpilogueStoreTiles;
+                                            ++store_tile) {
+                                            tma_store_3d(
+                                                stage_smem +
+                                                    store_tile * kStoreTileBytes,
+                                                &c_tensor_map,
+                                                block_col +
+                                                    store_tile * kEpilogueStoreTileN,
+                                                cta_row,
+                                                0);
+                                        }
+                                        tma_store_commit_group();
                                     }
-                                    tma_store_commit_group();
-                                }
-                            } else if (tid < valid_rows) {
-                                char *stage_smem_ptr = dynamic_smem + kMainloopSmemBytes +
-                                                       smem_stage * kEpilogueStageBytes;
-                                for (int n_group = 0; n_group < kEpilogueTileN / 8; ++n_group) {
-                                    const int store_tile = n_group / kChunksPerStoreTile;
-                                    const int chunk_in_store =
-                                        tid * kChunksPerStoreTile + n_group % kChunksPerStoreTile;
-                                    const int swizzled_chunk =
-                                        (chunk_in_store & ~7) +
-                                        ((chunk_in_store & 7) ^
-                                            ((chunk_in_store >> 3) & kSwizzlePhaseMask));
-                                    const int4 value = reinterpret_cast<int4 *>(
-                                        stage_smem_ptr +
-                                        store_tile * kStoreTileBytes)[swizzled_chunk];
-                                    const int output_offset =
-                                        (cta_row + tid) * n + block_col + n_group * 8;
-                                    reinterpret_cast<int4 *>(c + output_offset)[0] = value;
+                                } else if (tid < valid_rows) {
+                                    char *stage_smem_ptr =
+                                        dynamic_smem + kMainloopSmemBytes +
+                                        smem_stage * kEpilogueStageBytes;
+                                    for (int n_group = 0;
+                                        n_group < kEpilogueTileN / 8;
+                                        ++n_group) {
+                                        const int store_tile =
+                                            n_group / kChunksPerStoreTile;
+                                        const int chunk_in_store =
+                                            tid * kChunksPerStoreTile +
+                                            n_group % kChunksPerStoreTile;
+                                        const int swizzled_chunk =
+                                            (chunk_in_store & ~7) +
+                                            ((chunk_in_store & 7) ^
+                                                ((chunk_in_store >> 3) &
+                                                    kSwizzlePhaseMask));
+                                        const int4 value =
+                                            reinterpret_cast<int4 *>(
+                                                stage_smem_ptr +
+                                                store_tile *
+                                                    kStoreTileBytes)
+                                                [swizzled_chunk];
+                                        const int output_offset =
+                                            (cta_row + tid) * n + block_col +
+                                            n_group * 8;
+                                        reinterpret_cast<int4 *>(
+                                            c + output_offset)[0] = value;
+                                    }
                                 }
                             }
                         } else {
@@ -974,17 +1013,21 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
 
                         if (n_block + 1 < kEpilogueBlockCount) {
                             if (kEpilogueStageCount == 1 || n_block > 0) {
-                                if (tid == 0) {
-                                    asm volatile("cp.async.bulk.wait_group.read %0;"
-                                        :
-                                        : "n"(kEpilogueStageCount - 1)
-                                        : "memory");
+                                if constexpr (!kDirectGmem || kSwapAB) {
+                                    if (tid == 0) {
+                                        asm volatile(
+                                            "cp.async.bulk.wait_group.read %0;"
+                                            :
+                                            : "n"(kEpilogueStageCount - 1)
+                                            : "memory");
+                                    }
                                 }
                                 asm volatile("bar.sync 1, 128;" ::: "memory");
                             }
 
                             const int next_stage = (n_block + 1) % kEpilogueStageCount;
-                            tmem_to_smem(epilogue_mainloop_stage, n_block + 1, next_stage);
+                            tmem_to_smem(epilogue_mainloop_stage, n_block + 1, next_stage,
+                                         cta_row, tile_col, valid_rows);
                             asm volatile("bar.sync 1, 128;" ::: "memory");
                             if (n_block + 2 == kEpilogueBlockCount) {
                                 release_tmem();
@@ -1176,7 +1219,8 @@ void launch_bf16_grouped_m_gemm_impl(
             kClusterM,
             true,
             true,
-            kSwapAB>;
+            kSwapAB,
+            (SM110A_GROUPED_DIRECT_GMEM != 0)>;
         if constexpr (kDynamicSmemBytes > 48 * 1024) {
             cudaFuncSetAttribute(kernel,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -1207,7 +1251,8 @@ void launch_bf16_grouped_m_gemm_impl(
             kClusterM,
             true,
             false,
-            kSwapAB>;
+            kSwapAB,
+            (SM110A_GROUPED_DIRECT_GMEM != 0)>;
         if constexpr (kDynamicSmemBytes > 48 * 1024) {
             cudaFuncSetAttribute(kernel,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -1250,7 +1295,8 @@ void launch_bf16_grouped_m_gemm_impl(
         kClusterM,
         false,
         false,
-        kSwapAB>;
+        kSwapAB,
+        (SM110A_GROUPED_DIRECT_GMEM != 0)>;
     if constexpr (kDynamicSmemBytes > 48 * 1024) {
         cudaFuncSetAttribute(kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize,

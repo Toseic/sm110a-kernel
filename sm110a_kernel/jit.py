@@ -27,6 +27,7 @@ class GroupedMConfig:
     epilogue_tile_n: int = 32
     cluster_m: int = 2
     mode: int = 0  # 0=non-persistent, 1=persistent, 2=CLC
+    direct_gmem: bool = False  # bypass SMEM epilogue — write TMEM→RMEM→GMEM directly
 
     def validate(self) -> None:
         if self.tile_m != 128:
@@ -51,7 +52,7 @@ class GroupedMConfig:
             raise ValueError("tile_k must be a positive multiple of 64")
         if self.mode not in (0, 1, 2):
             raise ValueError(
-                "mode must be 0 (non-persistent), 1 (persistent), or 2 (CLC)"
+                "mode must be 0 (np), 1 (persistent), or 2 (CLC)"
             )
 
 
@@ -124,6 +125,7 @@ def _grouped_m_kernel_cflags(
         f"-DSM110A_GROUPED_EPILOGUE_TILE_N={config.epilogue_tile_n}",
         f"-DSM110A_GROUPED_CLUSTER_M={config.cluster_m}",
         f"-DSM110A_GROUPED_MODE={config.mode}",
+        f"-DSM110A_GROUPED_DIRECT_GMEM={int(config.direct_gmem)}",
     )
 
 
