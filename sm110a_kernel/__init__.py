@@ -89,6 +89,22 @@ def bf16_grouped_m_gemm_out(
     )
 
 
+def fc1_block_interleaved_swiglu(a, b_interleaved, grouped_layout, config=None):
+    from .jit import get_fc1_block_interleaved_swiglu_module
+
+    module = get_fc1_block_interleaved_swiglu_module(a, b_interleaved, config)
+    return module.fc1_block_interleaved_swiglu(a, b_interleaved, grouped_layout)
+
+
+def fc1_block_interleaved_swiglu_out(
+    a, b_interleaved, grouped_layout, out, config=None
+):
+    from .jit import get_fc1_block_interleaved_swiglu_module
+
+    module = get_fc1_block_interleaved_swiglu_module(a, b_interleaved, config)
+    return module.fc1_block_interleaved_swiglu_out(a, b_interleaved, grouped_layout, out)
+
+
 from .jit import get_bf16_gemm_module as _get_bf16_gemm_module
 
 _bf16_module_cache = {}
@@ -115,7 +131,10 @@ def bf16_gemm_out(a, b, out, config=None, swap_ab=False):
 
 from .jit import (
     Bf16GemmConfig,
+    Fc1BlockInterleavedSwiGLUConfig,
     GroupedMConfig,
     compile_bf16_gemm,
+    compile_fc1_block_interleaved_swiglu,
+    compile_fc1_block_interleaved_swiglu_configs,
     compile_bf16_grouped_m_gemm,
 )

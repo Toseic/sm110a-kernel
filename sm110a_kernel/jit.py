@@ -158,6 +158,153 @@ _GROUPED_M_JIT = SplitCudaJit[GroupedMConfig, _GroupedMModule](
 )
 
 
+@dataclass(frozen=True)
+class Fc1BlockInterleavedSwiGLUConfig:
+    tile_m: int = 128
+    tile_n: int = 128
+    tile_k: int = 128
+    cluster_m: int = 1
+    direct_gmem: bool = False  # bypass the pipelined TMEM -> SMEM -> GMEM epilogue
+
+    def validate(self) -> None:
+        if self.tile_m != 128:
+            raise ValueError("tile_m must be 128 for the current four-warp mainloop")
+        if self.cluster_m not in (1, 2):
+            raise ValueError("cluster_m must be 1 or 2")
+        mma_n_granularity = 8 * self.cluster_m
+        if (
+            self.tile_n < mma_n_granularity
+            or self.tile_n > 256
+            or self.tile_n % mma_n_granularity
+        ):
+            raise ValueError(
+                "tile_n must be at most 256 and a positive multiple of "
+                f"{mma_n_granularity} for cluster_m={self.cluster_m}"
+            )
+        if self.tile_n % 2:
+            raise ValueError("tile_n must be even")
+        if self.tile_n % 64:
+            raise ValueError("tile_n must be divisible by 64 for 32-column interleave blocks")
+        if self.tile_n < 64:
+            raise ValueError("tile_n must be at least 64 for the 32-column epilogue pipeline")
+        if self.tile_k <= 0 or self.tile_k % 64:
+            raise ValueError("tile_k must be a positive multiple of 64")
+
+
+_FC1_MOE_SOURCE_DIR = _ROOT / "csrc/bf16-moe/src"
+
+
+class _Fc1BlockInterleavedSwiGLUModule:
+    def __init__(
+        self,
+        binding: ModuleType,
+        library: LoadedCudaLibrary,
+        config: Fc1BlockInterleavedSwiGLUConfig,
+    ) -> None:
+        self._binding = binding
+        self._library = library
+        self._launcher_address = library.entry_address
+        self._config = config
+
+    def fc1_block_interleaved_swiglu(self, a, b_interleaved, grouped_layout):
+        return self._binding.fc1_block_interleaved_swiglu(
+            a,
+            b_interleaved,
+            grouped_layout,
+            self._launcher_address,
+            self._config.tile_n,
+            self._config.tile_k,
+        )
+
+    def fc1_block_interleaved_swiglu_out(
+        self, a, b_interleaved, grouped_layout, out
+    ):
+        return self._binding.fc1_block_interleaved_swiglu_out(
+            a,
+            b_interleaved,
+            grouped_layout,
+            out,
+            self._launcher_address,
+            self._config.tile_n,
+            self._config.tile_k,
+        )
+
+
+def _fc1_moe_kernel_cflags(
+    config: Fc1BlockInterleavedSwiGLUConfig,
+    variant,
+) -> tuple[str, ...]:
+    return (
+        f"-DSM110A_FC1_TILE_M={config.tile_m}",
+        f"-DSM110A_FC1_TILE_N={config.tile_n}",
+        f"-DSM110A_FC1_TILE_K={config.tile_k}",
+        f"-DSM110A_FC1_CLUSTER_M={config.cluster_m}",
+        f"-DSM110A_FC1_DIRECT_GMEM={int(config.direct_gmem)}",
+    )
+
+
+def _make_fc1_moe_module(
+    binding: ModuleType,
+    library: LoadedCudaLibrary,
+    config: Fc1BlockInterleavedSwiGLUConfig,
+) -> _Fc1BlockInterleavedSwiGLUModule:
+    return _Fc1BlockInterleavedSwiGLUModule(binding, library, config)
+
+
+_FC1_MOE_JIT = SplitCudaJit[
+    Fc1BlockInterleavedSwiGLUConfig, _Fc1BlockInterleavedSwiGLUModule
+](
+    name="sm110a_fc1_moe",
+    root=_ROOT,
+    binding_sources=(_FC1_MOE_SOURCE_DIR / "torch_binding.cpp",),
+    kernel_sources=(_FC1_MOE_SOURCE_DIR / "fc1_block_interleaved_swiglu.cu",),
+    kernel_dependencies=(
+        _INCLUDE_DIR / "bf16_moe_fc1.h",
+        _INCLUDE_DIR / "common.h",
+    ),
+    kernel_symbol="sm110a_fc1_block_interleaved_swiglu_launch",
+    config_key=lambda config: config,
+    variant_key=lambda: None,
+    kernel_cflags=_fc1_moe_kernel_cflags,
+    make_facade=_make_fc1_moe_module,
+    include_paths=(_INCLUDE_DIR,),
+)
+
+
+def compile_fc1_block_interleaved_swiglu(
+    config: Optional[Fc1BlockInterleavedSwiGLUConfig] = None,
+) -> _Fc1BlockInterleavedSwiGLUModule:
+    config = config or Fc1BlockInterleavedSwiGLUConfig()
+    if not isinstance(config, Fc1BlockInterleavedSwiGLUConfig):
+        raise TypeError("config must be a Fc1BlockInterleavedSwiGLUConfig")
+    config.validate()
+    return _FC1_MOE_JIT.compile(config)
+
+
+def compile_fc1_block_interleaved_swiglu_configs(
+    configs: Iterable[Fc1BlockInterleavedSwiGLUConfig],
+    max_workers: Optional[int] = None,
+) -> tuple[_Fc1BlockInterleavedSwiGLUModule, ...]:
+    configs = tuple(configs)
+    if not configs:
+        return ()
+    for config in configs:
+        if not isinstance(config, Fc1BlockInterleavedSwiGLUConfig):
+            raise TypeError(
+                "configs must contain Fc1BlockInterleavedSwiGLUConfig values"
+            )
+        config.validate()
+    return _FC1_MOE_JIT.compile_many(configs, max_workers)
+
+
+def get_fc1_block_interleaved_swiglu_module(
+    a, b_interleaved, config: Optional[Fc1BlockInterleavedSwiGLUConfig] = None
+) -> _Fc1BlockInterleavedSwiGLUModule:
+    return compile_fc1_block_interleaved_swiglu(
+        config or Fc1BlockInterleavedSwiGLUConfig()
+    )
+
+
 def compile_bf16_grouped_m_gemm(
     config: Optional[GroupedMConfig] = None,
 ) -> _GroupedMModule:
