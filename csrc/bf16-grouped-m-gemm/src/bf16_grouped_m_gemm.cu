@@ -184,24 +184,6 @@ __device__ inline void mbarrier_wait(
         : "memory");
 }
 
-__device__ inline void clc_mbarrier_wait(
-    int mbar_addr,
-    int phase) {
-    constexpr uint32_t kSuspendTicks = 0x989680;
-    asm volatile("{\n\t"
-                 ".reg .pred done;\n\t"
-                 "WAIT_CLC:\n\t"
-                 "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 "
-                 "done, [%0], %1, %2;\n\t"
-                 "@done bra.uni COMPLETE_CLC;\n\t"
-                 "bra.uni WAIT_CLC;\n\t"
-                 "COMPLETE_CLC:\n\t"
-                 "}" ::"r"(mbar_addr),
-        "r"(phase),
-        "r"(kSuspendTicks)
-        : "memory");
-}
-
 template <int kClusterM>
 __device__ inline void tma_load_4d(
     int dst_smem,
@@ -458,7 +440,6 @@ template <
     int kEpilogueTileN,
     int kClusterM,
     bool kPersistent,
-    bool kDynamicClc = false,
     bool kSwapAB = false,
     bool kDirectGmem = false>
 __global__ __cluster_dims__(kClusterM, 1, 1)
@@ -473,7 +454,6 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
     int n,
     int k) {
     using Config = KernelConfig<kTileM, kTileN, kTileK, kEpilogueTileN, kClusterM>;
-    static_assert(!kDynamicClc || kPersistent);
     constexpr int kClusterTileM = Config::kClusterTileM;
     constexpr int kStageCount = Config::kStageCount;
     constexpr int kASmemBytes = Config::kASmemBytes;
@@ -507,8 +487,6 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
 
     __shared__ int tmem_base[1];
     __shared__ int next_work_smem[2];
-    __shared__ __align__(16) uint4 clc_response[1];
-    __shared__ uint64_t clc_mbar[1];
     __shared__ uint64_t tma_mbars[kStageCount];
     __shared__ uint64_t mma_mbars[kStageCount];
     __shared__ uint64_t mainloop_mbars[kTmemStageCount];
@@ -532,9 +510,6 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
             if constexpr (kPersistent) {
                 mbarrier_init(base_epilogue_mbar_addr + stage * sizeof(uint64_t), 4 * kClusterM);
             }
-        }
-        if constexpr (kDynamicClc) {
-            mbarrier_init(static_cast<int>(__cvta_generic_to_shared(clc_mbar)), 1);
         }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
@@ -674,31 +649,10 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
     int consumer_epilogue_phase = 1;
     int epilogue_mainloop_stage = 0;
     int epilogue_mainloop_phase = 0;
-    int clc_phase = 0;
-    int dynamic_first_cluster_bid = static_first_cluster_bid;
 
     while (true) {
         int first_cluster_bid;
-        if constexpr (kDynamicClc) {
-            first_cluster_bid = dynamic_first_cluster_bid;
-
-            const int clc_response_addr = static_cast<int>(__cvta_generic_to_shared(clc_response));
-            const int clc_mbar_addr = static_cast<int>(__cvta_generic_to_shared(clc_mbar));
-            if (tid == 0) {
-                asm volatile("mbarrier.arrive.expect_tx.relaxed.cluster."
-                             "shared::cta.b64 _, [%0], 16;" ::"r"(clc_mbar_addr)
-                    : "memory");
-            }
-            asm volatile("barrier.cluster.arrive.relaxed.aligned;");
-            asm volatile("barrier.cluster.wait.aligned;");
-            if (cta_rank == 0 && tid == 0) {
-                asm volatile("clusterlaunchcontrol.try_cancel.async.shared::cta."
-                             "mbarrier::complete_tx::bytes.multicast::cluster::all."
-                             "b128 [%0], [%1];" ::"r"(clc_response_addr),
-                    "r"(clc_mbar_addr)
-                    : "memory");
-            }
-        } else if constexpr (kPersistent) {
+        if constexpr (kPersistent) {
             if (cta_rank == 0 && tid == 0) {
                 next_work_smem[0] = atomicAdd(next_cluster_tile, kPersistentTileCount);
             }
@@ -717,10 +671,8 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
         } else {
             first_cluster_bid = static_first_cluster_bid;
         }
-        if constexpr (!kDynamicClc) {
-            if (first_cluster_bid >= cluster_tiles) {
-                break;
-            }
+        if (first_cluster_bid >= cluster_tiles) {
+            break;
         }
         const bool has_work = first_cluster_bid < cluster_tiles;
         const int last_cluster_bid = has_work
@@ -906,133 +858,133 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
                 for (int n_block = 0; n_block < kEpilogueBlockCount; ++n_block) {
                     const int smem_stage = n_block % kEpilogueStageCount;
                     const int stage_smem = epilogue_smem + smem_stage * kEpilogueStageBytes;
-                        if constexpr (!kSwapAB) {
-                            // Direct gmem: data already written by tmem_to_smem.
-                            // Only the SMEM→TMA path needs TMA store / fallback.
-                            if constexpr (!kDirectGmem) {
-                                const int block_col = tile_col + n_block * kEpilogueTileN;
-                                if (valid_rows == kTileM) {
-                                    if (tid == 0) {
-                                        for (int store_tile = 0;
-                                            store_tile < kEpilogueStoreTiles;
-                                            ++store_tile) {
-                                            tma_store_3d(
-                                                stage_smem +
-                                                    store_tile * kStoreTileBytes,
-                                                &c_tensor_map,
-                                                block_col +
-                                                    store_tile * kEpilogueStoreTileN,
-                                                cta_row,
-                                                0);
-                                        }
-                                        tma_store_commit_group();
-                                    }
-                                } else if (tid < valid_rows) {
-                                    char *stage_smem_ptr =
-                                        dynamic_smem + kMainloopSmemBytes +
-                                        smem_stage * kEpilogueStageBytes;
-                                    for (int n_group = 0;
-                                        n_group < kEpilogueTileN / 8;
-                                        ++n_group) {
-                                        const int store_tile =
-                                            n_group / kChunksPerStoreTile;
-                                        const int chunk_in_store =
-                                            tid * kChunksPerStoreTile +
-                                            n_group % kChunksPerStoreTile;
-                                        const int swizzled_chunk =
-                                            (chunk_in_store & ~7) +
-                                            ((chunk_in_store & 7) ^
-                                                ((chunk_in_store >> 3) &
-                                                    kSwizzlePhaseMask));
-                                        const int4 value =
-                                            reinterpret_cast<int4 *>(
-                                                stage_smem_ptr +
-                                                store_tile *
-                                                    kStoreTileBytes)
-                                                [swizzled_chunk];
-                                        const int output_offset =
-                                            (cta_row + tid) * n + block_col +
-                                            n_group * 8;
-                                        reinterpret_cast<int4 *>(
-                                            c + output_offset)[0] = value;
-                                    }
-                                }
-                            }
-                        } else {
-                            const int block_row =
-                                task.row_start + task.tile_row + n_block * kEpilogueTileN;
-                            const int remaining_block_rows =
-                                task.row_count - task.tile_row - n_block * kEpilogueTileN;
-                            const int valid_block_rows =
-                                remaining_block_rows < 0
-                                    ? 0
-                                    : (remaining_block_rows < kEpilogueTileN
-                                              ? remaining_block_rows
-                                              : kEpilogueTileN);
-                            const int block_col = tile_col + cta_rank * kTileM;
-                            if (valid_block_rows == kEpilogueTileN) {
+                    if constexpr (!kSwapAB) {
+                        // Direct gmem: data already written by tmem_to_smem.
+                        // Only the SMEM→TMA path needs TMA store / fallback.
+                        if constexpr (!kDirectGmem) {
+                            const int block_col = tile_col + n_block * kEpilogueTileN;
+                            if (valid_rows == kTileM) {
                                 if (tid == 0) {
-                                    constexpr int kSwappedStoreColumns = 64;
-                                    constexpr int kSwappedStoreBytes =
-                                        kEpilogueTileN * kSwappedStoreColumns *
-                                        sizeof(nv_bfloat16);
-                                    for (int atom = 0; atom < 2; ++atom) {
-                                        tma_store_3d(stage_smem + atom * kSwappedStoreBytes,
+                                    for (int store_tile = 0;
+                                        store_tile < kEpilogueStoreTiles;
+                                        ++store_tile) {
+                                        tma_store_3d(
+                                            stage_smem +
+                                                store_tile * kStoreTileBytes,
                                             &c_tensor_map,
-                                            0,
-                                            block_col / kSwappedStoreColumns + atom,
-                                            block_row);
+                                            block_col +
+                                                store_tile * kEpilogueStoreTileN,
+                                            cta_row,
+                                            0);
                                     }
                                     tma_store_commit_group();
                                 }
-                            } else if (tid < kTileM) {
+                            } else if (tid < valid_rows) {
+                                char *stage_smem_ptr =
+                                    dynamic_smem + kMainloopSmemBytes +
+                                    smem_stage * kEpilogueStageBytes;
+                                for (int n_group = 0;
+                                    n_group < kEpilogueTileN / 8;
+                                    ++n_group) {
+                                    const int store_tile =
+                                        n_group / kChunksPerStoreTile;
+                                    const int chunk_in_store =
+                                        tid * kChunksPerStoreTile +
+                                        n_group % kChunksPerStoreTile;
+                                    const int swizzled_chunk =
+                                        (chunk_in_store & ~7) +
+                                        ((chunk_in_store & 7) ^
+                                            ((chunk_in_store >> 3) &
+                                                kSwizzlePhaseMask));
+                                    const int4 value =
+                                        reinterpret_cast<int4 *>(
+                                            stage_smem_ptr +
+                                            store_tile *
+                                                kStoreTileBytes)
+                                            [swizzled_chunk];
+                                    const int output_offset =
+                                        (cta_row + tid) * n + block_col +
+                                        n_group * 8;
+                                    reinterpret_cast<int4 *>(
+                                        c + output_offset)[0] = value;
+                                }
+                            }
+                        }
+                    } else {
+                        const int block_row =
+                            task.row_start + task.tile_row + n_block * kEpilogueTileN;
+                        const int remaining_block_rows =
+                            task.row_count - task.tile_row - n_block * kEpilogueTileN;
+                        const int valid_block_rows =
+                            remaining_block_rows < 0
+                                ? 0
+                                : (remaining_block_rows < kEpilogueTileN
+                                          ? remaining_block_rows
+                                          : kEpilogueTileN);
+                        const int block_col = tile_col + cta_rank * kTileM;
+                        if (valid_block_rows == kEpilogueTileN) {
+                            if (tid == 0) {
                                 constexpr int kSwappedStoreColumns = 64;
-                                constexpr int kSwizzleAtomBytes = 128;
-                                constexpr int kBankGroupElements = 16 / sizeof(nv_bfloat16);
-                                auto *stage_values =
-                                    reinterpret_cast<nv_bfloat16 *>(
-                                        dynamic_smem + kMainloopSmemBytes +
-                                        smem_stage * kEpilogueStageBytes);
-                                const int atom = tid / kSwappedStoreColumns;
-                                const int col_in_atom = tid % kSwappedStoreColumns;
-                                for (int row = 0; row < valid_block_rows; ++row) {
-                                    const int bank_group = col_in_atom / kBankGroupElements;
-                                    const int value_in_group = col_in_atom % kBankGroupElements;
-                                    const int atom_elements =
-                                        kEpilogueTileN * kSwappedStoreColumns;
-                                    const int swizzled_index =
-                                        atom * atom_elements +
-                                        row * (kSwizzleAtomBytes / sizeof(nv_bfloat16)) +
-                                        (bank_group ^ (row & 7)) * kBankGroupElements +
-                                        value_in_group;
-                                    c[(block_row + row) * n + block_col + tid] =
-                                        stage_values[swizzled_index];
+                                constexpr int kSwappedStoreBytes =
+                                    kEpilogueTileN * kSwappedStoreColumns *
+                                    sizeof(nv_bfloat16);
+                                for (int atom = 0; atom < 2; ++atom) {
+                                    tma_store_3d(stage_smem + atom * kSwappedStoreBytes,
+                                        &c_tensor_map,
+                                        0,
+                                        block_col / kSwappedStoreColumns + atom,
+                                        block_row);
                                 }
+                                tma_store_commit_group();
+                            }
+                        } else if (tid < kTileM) {
+                            constexpr int kSwappedStoreColumns = 64;
+                            constexpr int kSwizzleAtomBytes = 128;
+                            constexpr int kBankGroupElements = 16 / sizeof(nv_bfloat16);
+                            auto *stage_values =
+                                reinterpret_cast<nv_bfloat16 *>(
+                                    dynamic_smem + kMainloopSmemBytes +
+                                    smem_stage * kEpilogueStageBytes);
+                            const int atom = tid / kSwappedStoreColumns;
+                            const int col_in_atom = tid % kSwappedStoreColumns;
+                            for (int row = 0; row < valid_block_rows; ++row) {
+                                const int bank_group = col_in_atom / kBankGroupElements;
+                                const int value_in_group = col_in_atom % kBankGroupElements;
+                                const int atom_elements =
+                                    kEpilogueTileN * kSwappedStoreColumns;
+                                const int swizzled_index =
+                                    atom * atom_elements +
+                                    row * (kSwizzleAtomBytes / sizeof(nv_bfloat16)) +
+                                    (bank_group ^ (row & 7)) * kBankGroupElements +
+                                    value_in_group;
+                                c[(block_row + row) * n + block_col + tid] =
+                                    stage_values[swizzled_index];
                             }
                         }
+                    }
 
-                        if (n_block + 1 < kEpilogueBlockCount) {
-                            if (kEpilogueStageCount == 1 || n_block > 0) {
-                                if constexpr (!kDirectGmem || kSwapAB) {
-                                    if (tid == 0) {
-                                        asm volatile(
-                                            "cp.async.bulk.wait_group.read %0;"
-                                            :
-                                            : "n"(kEpilogueStageCount - 1)
-                                            : "memory");
-                                    }
+                    if (n_block + 1 < kEpilogueBlockCount) {
+                        if (kEpilogueStageCount == 1 || n_block > 0) {
+                            if constexpr (!kDirectGmem || kSwapAB) {
+                                if (tid == 0) {
+                                    asm volatile(
+                                        "cp.async.bulk.wait_group.read %0;"
+                                        :
+                                        : "n"(kEpilogueStageCount - 1)
+                                        : "memory");
                                 }
-                                asm volatile("bar.sync 1, 128;" ::: "memory");
                             }
-
-                            const int next_stage = (n_block + 1) % kEpilogueStageCount;
-                            tmem_to_smem(epilogue_mainloop_stage, n_block + 1, next_stage,
-                                         cta_row, tile_col, valid_rows);
                             asm volatile("bar.sync 1, 128;" ::: "memory");
-                            if (n_block + 2 == kEpilogueBlockCount) {
-                                release_tmem();
-                            }
                         }
+
+                        const int next_stage = (n_block + 1) % kEpilogueStageCount;
+                        tmem_to_smem(epilogue_mainloop_stage, n_block + 1, next_stage,
+                                     cta_row, tile_col, valid_rows);
+                        asm volatile("bar.sync 1, 128;" ::: "memory");
+                        if (n_block + 2 == kEpilogueBlockCount) {
+                            release_tmem();
+                        }
+                    }
                 }
 
                 if (tid == 0) {
@@ -1047,47 +999,7 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
             }
         }
 
-        if constexpr (kDynamicClc) {
-            const int clc_mbar_addr = static_cast<int>(__cvta_generic_to_shared(clc_mbar));
-            if (tid == 0) {
-                clc_mbarrier_wait(clc_mbar_addr, clc_phase);
-
-                const uint4 response = clc_response[0];
-                int canceled;
-                int canceled_cta_x = 0;
-                asm volatile("{\n\t"
-                             ".reg .pred was_canceled;\n\t"
-                             ".reg .b128 response;\n\t"
-                             "mov.b128 response, {%2, %3, %4, %5};\n\t"
-                             "clusterlaunchcontrol.query_cancel.is_canceled.pred."
-                             "b128 was_canceled, response;\n\t"
-                             "selp.u32 %0, 1, 0, was_canceled;\n\t"
-                             "@was_canceled "
-                             "clusterlaunchcontrol.query_cancel.get_first_ctaid::x."
-                             "b32.b128 %1, response;\n\t"
-                             "}"
-                    : "=r"(canceled), "=r"(canceled_cta_x)
-                    : "r"(response.x), "r"(response.y), "r"(response.z), "r"(response.w)
-                    : "memory");
-                next_work_smem[0] = canceled;
-                next_work_smem[1] = canceled_cta_x / kClusterM * kPersistentTileCount;
-            }
-            __syncthreads();
-            if (next_work_smem[0] == 0) {
-                break;
-            }
-            dynamic_first_cluster_bid = next_work_smem[1];
-            clc_phase ^= 1;
-
-            asm volatile("fence.proxy.async::generic.release."
-                         "sync_restrict::shared::cta.cluster;" ::
-                             : "memory");
-            asm volatile("barrier.cluster.arrive.relaxed.aligned;");
-            asm volatile("barrier.cluster.wait.aligned;");
-            asm volatile("fence.proxy.async::generic.acquire."
-                         "sync_restrict::shared::cluster.cluster;" ::
-                             : "memory");
-        } else if constexpr (!kPersistent) {
+        if constexpr (!kPersistent) {
             break;
         }
     }
@@ -1107,7 +1019,13 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
     }
 }
 
-template <int kTileM, int kTileN, int kTileK, int kEpilogueTileN, int kClusterM, bool kSwapAB>
+template <
+    int kTileM,
+    int kTileN,
+    int kTileK,
+    int kEpilogueTileN,
+    int kClusterM,
+    bool kSwapAB>
 void launch_bf16_grouped_m_gemm_impl(
     const __nv_bfloat16 *d_a,
     const __nv_bfloat16 *d_b,
@@ -1158,10 +1076,10 @@ void launch_bf16_grouped_m_gemm_impl(
     //             ▼
     //  ┌──────────────────────────────────────────┐
     //  │  expert_offsets[experts]     int32 []    │  experts × 4 B
-    //  │    per‑expert min row index              │
+    //  │    per-expert min row index              │
     //  ├──────────────────────────────────────────┤
     //  │  expert_counts[experts]     int32 []     │  experts × 4 B
-    //  │    per‑expert row count                  │
+    //  │    per-expert row count                  │
     //  ├──────────────────────────────────────────┤
     //  │  task_count                 int32        │  4 B
     //  │    actual #tasks written by builder      │
@@ -1174,11 +1092,9 @@ void launch_bf16_grouped_m_gemm_impl(
     //  │     tile_row, expert}                    │
     //  └──────────────────────────────────────────┘
     //
-    // max_tasks upper‑bounds:
+    // max_tasks upper-bounds:
     //   ceil(m / kTaskTileRows)  ← every row bundle produces 1 task
-    // + experts                   ← worst case: each expert gets its own
-    //                               "empty/sentinel" slot
-    // ──────────────────────────────────────────────────────────────
+    // + experts                  ← worst case: each expert gets its own slot
     const int max_tasks = (m + kTaskTileRows - 1) / kTaskTileRows + experts;
     const size_t metadata_bytes = (2 * experts + 2) * sizeof(int);
     const size_t task_offset =
@@ -1207,9 +1123,7 @@ void launch_bf16_grouped_m_gemm_impl(
 
     const int max_cluster_tiles = max_tasks * (n / kLogicalNTile);
 
-#if SM110A_GROUPED_MODE == 2
-    // ── CLC (persistent + dynamic cluster launch control) ─────
-    {
+    if constexpr (SM110A_GROUPED_MODE == 1) {
         const int persistent_clusters =
             (max_cluster_tiles + kPersistentTileCount - 1) / kPersistentTileCount;
         auto kernel = bf16_grouped_m_gemm_kernel<kTileM,
@@ -1218,39 +1132,6 @@ void launch_bf16_grouped_m_gemm_impl(
             kEpilogueTileN,
             kClusterM,
             true,
-            true,
-            kSwapAB,
-            (SM110A_GROUPED_DIRECT_GMEM != 0)>;
-        if constexpr (kDynamicSmemBytes > 48 * 1024) {
-            cudaFuncSetAttribute(kernel,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                kDynamicSmemBytes);
-        }
-        // CLC needs a full logical grid: resident clusters steal work by
-        // canceling clusters that have not started yet.
-        kernel<<<kClusterM * persistent_clusters, kBlockThreads, kDynamicSmemBytes, stream>>>(
-            a_tensor_map,
-            b_tensor_map,
-            c_tensor_map,
-            tasks,
-            task_count,
-            next_cluster_tile,
-            d_c,
-            n,
-            k);
-    }
-#elif SM110A_GROUPED_MODE == 1
-    // ── Persistent (resident clusters with occupancy limiting) ─
-    {
-        const int persistent_clusters =
-            (max_cluster_tiles + kPersistentTileCount - 1) / kPersistentTileCount;
-        auto kernel = bf16_grouped_m_gemm_kernel<kTileM,
-            kTileN,
-            kTileK,
-            kEpilogueTileN,
-            kClusterM,
-            true,
-            false,
             kSwapAB,
             (SM110A_GROUPED_DIRECT_GMEM != 0)>;
         if constexpr (kDynamicSmemBytes > 48 * 1024) {
@@ -1285,40 +1166,35 @@ void launch_bf16_grouped_m_gemm_impl(
             d_c,
             n,
             k);
+    } else {
+        auto kernel = bf16_grouped_m_gemm_kernel<kTileM,
+            kTileN,
+            kTileK,
+            kEpilogueTileN,
+            kClusterM,
+            false,
+            kSwapAB,
+            (SM110A_GROUPED_DIRECT_GMEM != 0)>;
+        if constexpr (kDynamicSmemBytes > 48 * 1024) {
+            cudaFuncSetAttribute(kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                kDynamicSmemBytes);
+        }
+        kernel<<<kClusterM * max_cluster_tiles, kBlockThreads, kDynamicSmemBytes, stream>>>(
+            a_tensor_map,
+            b_tensor_map,
+            c_tensor_map,
+            tasks,
+            task_count,
+            next_cluster_tile,
+            d_c,
+            n,
+            k);
     }
-#else
-    // ── Non-persistent ───────────────────────────────────────────
-    auto kernel = bf16_grouped_m_gemm_kernel<kTileM,
-        kTileN,
-        kTileK,
-        kEpilogueTileN,
-        kClusterM,
-        false,
-        false,
-        kSwapAB,
-        (SM110A_GROUPED_DIRECT_GMEM != 0)>;
-    if constexpr (kDynamicSmemBytes > 48 * 1024) {
-        cudaFuncSetAttribute(kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            kDynamicSmemBytes);
-    }
-    kernel<<<kClusterM * max_cluster_tiles, kBlockThreads, kDynamicSmemBytes, stream>>>(
-        a_tensor_map,
-        b_tensor_map,
-        c_tensor_map,
-        tasks,
-        task_count,
-        next_cluster_tile,
-        d_c,
-        n,
-        k);
-#endif
     cudaFreeAsync(workspace, stream);
 }
 
-} // namespace
-
-void launch_bf16_grouped_m_gemm(
+void launch_bf16_grouped_m_gemm_entry(
     const __nv_bfloat16 *d_a,
     const __nv_bfloat16 *d_b,
     const int32_t *d_grouped_layout,
@@ -1336,7 +1212,6 @@ void launch_bf16_grouped_m_gemm(
         return;
     }
 
-    // The JIT compiler emits exactly one template instance per configuration.
     if (swap_ab) {
         launch_bf16_grouped_m_gemm_impl<SM110A_GROUPED_TILE_M,
             SM110A_GROUPED_TILE_N,
@@ -1354,6 +1229,24 @@ void launch_bf16_grouped_m_gemm(
     }
 }
 
+} // namespace
+
+#if SM110A_GROUPED_MODE != 2
+void launch_bf16_grouped_m_gemm(
+    const __nv_bfloat16 *d_a,
+    const __nv_bfloat16 *d_b,
+    const int32_t *d_grouped_layout,
+    __nv_bfloat16 *d_c,
+    int m,
+    int experts,
+    int n,
+    int k,
+    bool swap_ab,
+    cudaStream_t stream) {
+    launch_bf16_grouped_m_gemm_entry(
+        d_a, d_b, d_grouped_layout, d_c, m, experts, n, k, swap_ab, stream);
+}
+
 extern "C" void sm110a_bf16_grouped_m_gemm_launch(
     const __nv_bfloat16 *d_a,
     const __nv_bfloat16 *d_b,
@@ -1367,3 +1260,4 @@ extern "C" void sm110a_bf16_grouped_m_gemm_launch(
     cudaStream_t stream) {
     launch_bf16_grouped_m_gemm(d_a, d_b, d_grouped_layout, d_c, m, experts, n, k, swap_ab, stream);
 }
+#endif

@@ -141,7 +141,10 @@ _GROUPED_M_JIT = SplitCudaJit[GroupedMConfig, _GroupedMModule](
     name="sm110a_grouped_m",
     root=_ROOT,
     binding_sources=(_SOURCE_DIR / "torch_binding.cpp",),
-    kernel_sources=(_SOURCE_DIR / "bf16_grouped_m_gemm.cu",),
+    kernel_sources=(
+        _SOURCE_DIR / "bf16_grouped_m_gemm.cu",
+        _SOURCE_DIR / "bf16_grouped_m_gemm_dynamic_scheduled.cu",
+    ),
     kernel_dependencies=(
         _INCLUDE_DIR / "bf16_grouped_m_gemm.h",
         _INCLUDE_DIR / "common.h",
