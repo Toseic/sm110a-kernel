@@ -5,10 +5,11 @@
 void launch_fc1_block_interleaved_swiglu(
     const __nv_bfloat16* d_a,
     const __nv_bfloat16* d_b_interleaved,
-    const int32_t* d_grouped_layout,
+    const __nv_bfloat16* d_router_scores,
     __nv_bfloat16* d_out,
-    int m,
+    int tokens,
     int experts,
+    int topk,
     int n,
     int k,
     cudaStream_t stream);

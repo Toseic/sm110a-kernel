@@ -22,7 +22,8 @@ from sm110a_kernel import (
 DEFAULT_EXPERTS = 256
 DEFAULT_N = 2048
 DEFAULT_K = 6144
-DEFAULT_TOKENS_PER_EXPERT_VALUES = (64, 128, 256, 512, 1024)
+DEFAULT_TOKEN_VALUES = (64*32, 128*32, 256*32, 512*32, 1024*32)
+DEFAULT_TOPK = 8
 INTERLEAVE_BLOCK = 32
 FC1_CONFIGS = tuple(
     Fc1BlockInterleavedSwiGLUConfig(
@@ -30,26 +31,25 @@ FC1_CONFIGS = tuple(
         tile_n=tile_n,
         tile_k=tile_k,
         cluster_m=cluster_m,
+        cluster_n=cluster_n,
         direct_gmem=direct_gmem,
     )
     for tile_n in (64, 128, 256)
     for tile_k in (64, 128)
     for cluster_m in (1, 2)
+    for cluster_n in (1, 2)
     for direct_gmem in (False, True)
     if tile_n % (8 * cluster_m) == 0
     and tile_n % (2 * INTERLEAVE_BLOCK) == 0
+    and (cluster_n == 1 or cluster_m == 2)
 )
 
 
-def fc1_swiglu_tflops_from_ms(m, n, k, elapsed_ms):
-    """Return GEMM-equivalent TFLOP/s for both FC1 SwiGLU projections."""
+def routed_fc1_swiglu_tflops_from_ms(tokens, topk, n, k, elapsed_ms):
+    """Return end-to-end GEMM-equivalent TFLOP/s for routed FC1 SwiGLU."""
+    m = tokens * topk
     flops = 4.0 * m * n * k  # gate and up projections, each 2 * M * N * K
     return flops / (elapsed_ms * 1.0e-3) / 1.0e12
-
-
-def build_grouped_layout(tokens_per_expert, experts):
-    layout = torch.arange(experts, device="cuda", dtype=torch.int32)
-    return layout.repeat_interleave(tokens_per_expert)
 
 
 def interleave_gate_up_weights(gate_w, up_w, block_size=INTERLEAVE_BLOCK):
@@ -67,22 +67,6 @@ def interleave_gate_up_weights(gate_w, up_w, block_size=INTERLEAVE_BLOCK):
     return interleaved.reshape(experts, 2 * n, k).contiguous()
 
 
-def deinterleave_gate_up_output(interleaved_out, block_size=INTERLEAVE_BLOCK):
-    if interleaved_out.ndim != 2:
-        raise ValueError("interleaved output must have shape [m, 2n]")
-    m, two_n = interleaved_out.shape
-    if two_n % (2 * block_size) != 0:
-        raise ValueError(
-            f"interleaved width must be divisible by {2 * block_size}"
-        )
-
-    logical_n = two_n // 2
-    view = interleaved_out.view(m, logical_n // block_size, 2, block_size)
-    gate = view[:, :, 0, :].reshape(m, logical_n)
-    up = view[:, :, 1, :].reshape(m, logical_n)
-    return gate, up
-
-
 def swiglu(gate, up):
     return torch.nn.functional.silu(gate.float()) * up.float()
 
@@ -95,15 +79,25 @@ def run_baseline(a, gate_w, up_w, layout, out, config):
     out.copy_(swiglu(gate_acc, up_acc).to(torch.bfloat16))
 
 
-def run_interleaved_reference(a, interleaved_w, layout, out, config):
-    interleaved_out = torch.empty(
-        (a.size(0), interleaved_w.size(1)), device="cuda", dtype=torch.bfloat16
+def build_routed_reference(a, router_scores, topk):
+    selected = torch.topk(
+        router_scores.float(), topk, dim=1, largest=True, sorted=True
+    ).indices
+    selected_flat = selected.reshape(-1)
+    source_tokens = (
+        torch.arange(a.size(0), device=a.device, dtype=torch.int64)
+        .view(-1, 1)
+        .expand(-1, topk)
+        .reshape(-1)
     )
-    bf16_grouped_m_gemm_out(
-        a, interleaved_w, layout, interleaved_out, config=config, swap_ab=False
+    grouped_order = torch.argsort(selected_flat, stable=True)
+    grouped_a = a.index_select(
+        0, source_tokens.index_select(0, grouped_order)
+    ).contiguous()
+    grouped_layout = (
+        selected_flat.index_select(0, grouped_order).to(torch.int32).contiguous()
     )
-    gate_acc, up_acc = deinterleave_gate_up_output(interleaved_out)
-    out.copy_(swiglu(gate_acc, up_acc).to(torch.bfloat16))
+    return grouped_a, grouped_layout
 
 
 def resolve_fused_impl():
@@ -113,18 +107,18 @@ def resolve_fused_impl():
     return None, None
 
 
-def run_fused(a, interleaved_w, layout, out, config):
+def run_fused(a, interleaved_w, router_scores, topk, out, config):
     impl_name, impl = resolve_fused_impl()
     if impl is None:
         raise RuntimeError("fused fc1_block_interleaved_swiglu_out binding is unavailable")
-    impl(a, interleaved_w, layout, out, config=config)
+    impl(a, interleaved_w, router_scores, topk, out, config=config)
     return impl_name
 
 
 def format_candidate(config):
     epilogue = "direct-gmem" if config.direct_gmem else "tmem-smem-tma"
     return (
-        f"{config.tile_m}x{config.tile_n}x{config.tile_k}/c{config.cluster_m}/"
+        f"{config.tile_m}x{config.tile_n}x{config.tile_k}/c{config.cluster_m}n{config.cluster_n}/"
         f"{epilogue}"
     )
 
@@ -137,6 +131,21 @@ def compatible_candidates(n, k):
     )
 
 
+def selected_candidates(n, k, args):
+    candidates = compatible_candidates(n, k)
+    if args.tile_n is not None:
+        candidates = tuple(c for c in candidates if c.tile_n == args.tile_n)
+    if args.tile_k is not None:
+        candidates = tuple(c for c in candidates if c.tile_k == args.tile_k)
+    if args.cluster_m is not None:
+        candidates = tuple(c for c in candidates if c.cluster_m == args.cluster_m)
+    if args.cluster_n is not None:
+        candidates = tuple(c for c in candidates if c.cluster_n == args.cluster_n)
+    if args.direct_gmem:
+        candidates = tuple(c for c in candidates if c.direct_gmem)
+    return candidates
+
+
 def compile_fc1_configs(configs, debug):
     if debug:
         configs = list(configs)
@@ -146,21 +155,23 @@ def compile_fc1_configs(configs, debug):
         compile_fc1_block_interleaved_swiglu_configs(configs)
 
 
-def benchmark_fused_kernel(a, interleaved_w, layout, out, config, args):
-    run_fused(a, interleaved_w, layout, out, config)
+def benchmark_fused_kernel(a, interleaved_w, router_scores, topk, out, config, args):
+    run_fused(a, interleaved_w, router_scores, topk, out, config)
     torch.cuda.synchronize()
     return benchmark_with_stats(
-        lambda: run_fused(a, interleaved_w, layout, out, config),
+        lambda: run_fused(a, interleaved_w, router_scores, topk, out, config),
         args.warmup,
         args.iters,
         args.samples,
     )
 
 
-def probe_fused_kernel(a, interleaved_w, layout, out, config):
-    run_fused(a, interleaved_w, layout, out, config)
+def probe_fused_kernel(a, interleaved_w, router_scores, topk, out, config):
+    run_fused(a, interleaved_w, router_scores, topk, out, config)
     torch.cuda.synchronize()
-    return quick_probe(lambda: run_fused(a, interleaved_w, layout, out, config))
+    return quick_probe(
+        lambda: run_fused(a, interleaved_w, router_scores, topk, out, config)
+    )
 
 
 class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
@@ -168,7 +179,7 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
         parser = super().build_parser()
         self.add_timing_args(parser, warmup=2, iters=3, samples=3)
         parser.add_argument("--experts", type=int, default=DEFAULT_EXPERTS)
-        parser.add_argument("--tokens-per-expert", type=int, default=0)
+        parser.add_argument("--topk", type=int, default=DEFAULT_TOPK)
         parser.add_argument("--n", type=int, default=DEFAULT_N)
         parser.add_argument("--k", type=int, default=DEFAULT_K)
         parser.add_argument("--seed", type=int, default=self.seed)
@@ -212,16 +223,25 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
             default=0,
             help="run a single sweep token instead of the default token sweep",
         )
+        parser.add_argument("--tile-n", type=int, choices=(64, 128, 256))
+        parser.add_argument("--tile-k", type=int, choices=(64, 128))
+        parser.add_argument("--cluster-m", type=int, choices=(1, 2))
+        parser.add_argument("--cluster-n", type=int, choices=(1, 2))
+        parser.add_argument(
+            "--direct-gmem",
+            action="store_true",
+            help="profile only the direct-GMEM epilogue (when selecting a config)",
+        )
         return parser
 
     def validate_args(self, args):
         self.validate_timing_args(args, allow_zero_warmup=True)
         if args.experts <= 0:
             raise SystemExit("--experts must be positive")
-        if args.tokens_per_expert < 0:
-            raise SystemExit("--tokens-per-expert must be non-negative")
         if args.token < 0:
             raise SystemExit("--token must be non-negative")
+        if args.topk <= 0 or args.topk > args.experts:
+            raise SystemExit("--topk must be positive and no larger than --experts")
         if args.n <= 0 or args.k <= 0:
             raise SystemExit("--n and --k must be positive")
         if args.n % INTERLEAVE_BLOCK != 0:
@@ -239,21 +259,26 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
     def make_result_table(self):
         return self.make_table_printer(
             (
-                ("Tok/E", 8),
+                ("Tokens", 8),
                 ("M", 10),
+                ("TopK", 8),
                 ("E", 8),
                 ("N", 8),
                 ("K", 8),
                 ("KernelMed(ms)", 16),
-                ("Kernel TF/s", 16),
+                ("E2E TF/s", 16),
                 ("MaxDiff", 12),
                 ("BestConfig", 36),
                 ("Path", 30),
             )
         )
 
-    def benchmark_best_fused_kernel(self, a, interleaved_w, layout, out, args):
-        candidates = compatible_candidates(interleaved_w.size(1) // 2, a.size(1))
+    def benchmark_best_fused_kernel(
+        self, a, interleaved_w, router_scores, topk, out, args
+    ):
+        candidates = selected_candidates(
+            interleaved_w.size(1) // 2, a.size(1), args
+        )
         if not candidates:
             raise RuntimeError(
                 f"no fc1 config supports N={interleaved_w.size(1) // 2}, K={a.size(1)}"
@@ -266,14 +291,14 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
             candidates,
             args=args,
             benchmark_candidate=lambda config: benchmark_fused_kernel(
-                a, interleaved_w, layout, out, config, args
+                a, interleaved_w, router_scores, topk, out, config, args
             ),
             format_candidate=format_candidate,
             probe_candidate=lambda config: probe_fused_kernel(
-                a, interleaved_w, layout, out, config
+                a, interleaved_w, router_scores, topk, out, config
             ),
             metric_formatter=lambda _config, stats: (
-                f"{fc1_swiglu_tflops_from_ms(a.size(0), interleaved_w.size(1) // 2, a.size(1), stats['median_ms']):.1f} TF/s"
+                f"{routed_fc1_swiglu_tflops_from_ms(a.size(0), topk, interleaved_w.size(1) // 2, a.size(1), stats['median_ms']):.1f} TF/s"
             ),
             candidate_width=36,
             flush=True,
@@ -282,11 +307,7 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
 
     def run_with_args(self, args):
         torch.manual_seed(args.seed)
-        tokens_per_expert_values = (
-            (args.token,)
-            if args.token > 0
-            else ((args.tokens_per_expert,) if args.tokens_per_expert > 0 else DEFAULT_TOKENS_PER_EXPERT_VALUES)
-        )
+        token_values = (args.token,) if args.token > 0 else DEFAULT_TOKEN_VALUES
 
         gate_w = torch.empty(
             (args.experts, args.n, args.k), device="cuda", dtype=torch.bfloat16
@@ -305,10 +326,12 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
             mode=args.baseline_mode,
             direct_gmem=False,
         )
-        candidates = compatible_candidates(args.n, args.k)
+        candidates = selected_candidates(args.n, args.k, args)
+        if not candidates:
+            raise SystemExit("no compatible FC1 configs match the requested filters")
         print(
             f"[config] experts={args.experts} n={args.n} k={args.k} "
-            f"tokens_per_expert={tokens_per_expert_values}"
+            f"topk={args.topk} tokens={token_values}"
         )
         print(f"[config] interleave_block={INTERLEAVE_BLOCK}")
         print(
@@ -321,21 +344,44 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
         )
         compile_fc1_configs(dict.fromkeys(candidates), args.debug)
         self.make_result_table().print_header()
-        for tokens_per_expert in tokens_per_expert_values:
-            m = args.experts * tokens_per_expert
-            layout = build_grouped_layout(tokens_per_expert, args.experts)
-            a = torch.empty((m, args.k), device="cuda", dtype=torch.bfloat16).uniform_(-1.0, 1.0)
-            baseline_out = torch.empty((m, args.n), device="cuda", dtype=torch.bfloat16)
+        for tokens in token_values:
+            m = tokens * args.topk
+            a = torch.empty(
+                (tokens, args.k), device="cuda", dtype=torch.bfloat16
+            ).uniform_(-1.0, 1.0)
+            router_scores = torch.empty(
+                (tokens, args.experts), device="cuda", dtype=torch.bfloat16
+            ).uniform_(-1.0, 1.0)
+            baseline_out = torch.empty(
+                (m, args.n), device="cuda", dtype=torch.bfloat16
+            )
             test_out = torch.empty_like(baseline_out)
             kernel_stats, best_config = self.benchmark_best_fused_kernel(
-                a, interleaved_w, layout, test_out, args
+                a, interleaved_w, router_scores, args.topk, test_out, args
             )
 
             max_abs_diff = 0.0
             path_name = "fused"
             if args.check:
-                run_baseline(a, gate_w, up_w, layout, baseline_out, baseline_config)
-                path_name = run_fused(a, interleaved_w, layout, test_out, best_config)
+                grouped_a, grouped_layout = build_routed_reference(
+                    a, router_scores, args.topk
+                )
+                run_baseline(
+                    grouped_a,
+                    gate_w,
+                    up_w,
+                    grouped_layout,
+                    baseline_out,
+                    baseline_config,
+                )
+                path_name = run_fused(
+                    a,
+                    interleaved_w,
+                    router_scores,
+                    args.topk,
+                    test_out,
+                    best_config,
+                )
                 torch.cuda.synchronize()
                 max_abs_diff = (baseline_out.float() - test_out.float()).abs().max().item()
                 passed = torch.allclose(
@@ -345,7 +391,7 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
                     rtol=args.rtol,
                 )
                 print(
-                    f"[check tok/e={tokens_per_expert}] max_abs_diff={max_abs_diff:.6f} "
+                    f"[check tokens={tokens}] max_abs_diff={max_abs_diff:.6f} "
                     f"atol={args.atol} rtol={args.rtol}"
                 )
                 print("[check] PASS" if passed else "[check] FAIL")
@@ -353,13 +399,14 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
                     raise SystemExit(1)
 
             self.make_result_table().print_row(
-                tokens_per_expert,
+                tokens,
                 m,
+                args.topk,
                 args.experts,
                 args.n,
                 args.k,
                 f"{kernel_stats['median_ms']:.4f}",
-                f"{fc1_swiglu_tflops_from_ms(m, args.n, args.k, kernel_stats['median_ms']):.3f}",
+                f"{routed_fc1_swiglu_tflops_from_ms(tokens, args.topk, args.n, args.k, kernel_stats['median_ms']):.3f}",
                 f"{max_abs_diff:.6f}",
                 format_candidate(best_config),
                 path_name,
