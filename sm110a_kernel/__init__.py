@@ -1,39 +1,4 @@
-import os
-from pathlib import Path
-
-
-def _load_extension():
-    try:
-        import torch
-        from torch.utils.cpp_extension import load
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "sm110a_kernel requires PyTorch with CUDA support installed."
-        ) from exc
-
-    root = Path(__file__).resolve().parent.parent
-    cuda_arch = os.environ.get("CUDA_ARCH", "sm_110a")
-    compute_arch = os.environ.get("COMPUTE_CUDA_ARCH", "compute_110a")
-
-    return load(
-        name=f"sm110a_kernel_ext_{cuda_arch}",
-        sources=[
-            str(root / "csrc/bf16-gemm/src/torch_binding.cpp"),
-            str(root / "csrc/bf16-gemm/src/bf16_gemm_dynamic_schedule.cu"),
-        ],
-        extra_include_paths=[str(root / "include")],
-        extra_cuda_cflags=[
-            "-O3",
-            "-lineinfo",
-            f"-gencode=arch={compute_arch},code={cuda_arch}",
-        ],
-        extra_cflags=["-O3", "-std=c++17"],
-        extra_ldflags=["-lcuda", "-lcublas", "-lcublasLt"],
-        verbose=False,
-    )
-
-
-_EXT = _load_extension()
+"""Public API for the SM110A kernel collection."""
 
 from .profiler import (
     PROFILER_WARPS_PER_BLOCK,
@@ -41,102 +6,36 @@ from .profiler import (
     profiler_events,
     write_trace,
 )
-
-
-def bf16_gemm_dynamic_schedule(a, b):
-    return _EXT.bf16_gemm_dynamic_schedule(a, b)
-
-
-def bf16_gemm_dynamic_schedule_out(a, b, out):
-    return _EXT.bf16_gemm_dynamic_schedule_out(a, b, out)
-
-
-def bf16_gemm_dynamic_schedule_profile(a, b, profiler, num_entries):
-    return _EXT.bf16_gemm_dynamic_schedule_profile(a, b, profiler, num_entries)
-
-
-def cublaslt_gemm(a, b):
-    return _EXT.cublaslt_gemm(a, b)
-
-
-def cublaslt_gemm_out(a, b, out, workspace):
-    return _EXT.cublaslt_gemm_out(a, b, out, workspace)
-
-
-def cublaslt_gemm_out_batched(a, b, out, workspace, iters):
-    return _EXT.cublaslt_gemm_out_batched(a, b, out, workspace, iters)
-
-
-def bf16_grouped_m_gemm(
-    a, b, grouped_layout, config=None, swap_ab=False
-):
-    from .jit import get_bf16_grouped_m_gemm_module
-
-    module = get_bf16_grouped_m_gemm_module(a, b, config)
-    return module.bf16_grouped_m_gemm(
-        a, b, grouped_layout, swap_ab=swap_ab
-    )
-
-
-def bf16_grouped_m_gemm_out(
-    a, b, grouped_layout, out, config=None, swap_ab=False
-):
-    from .jit import get_bf16_grouped_m_gemm_module
-
-    module = get_bf16_grouped_m_gemm_module(a, b, config)
-    return module.bf16_grouped_m_gemm_out(
-        a, b, grouped_layout, out, swap_ab=swap_ab
-    )
-
-
-def fc1_block_interleaved_swiglu(a, b_interleaved, router_scores, topk, config=None):
-    from .jit import get_fc1_block_interleaved_swiglu_module
-
-    module = get_fc1_block_interleaved_swiglu_module(a, b_interleaved, config)
-    return module.fc1_block_interleaved_swiglu(a, b_interleaved, router_scores, topk)
-
-
-def fc1_block_interleaved_swiglu_out(
-    a, b_interleaved, router_scores, topk, out, config=None
-):
-    from .jit import get_fc1_block_interleaved_swiglu_module
-
-    module = get_fc1_block_interleaved_swiglu_module(a, b_interleaved, config)
-    return module.fc1_block_interleaved_swiglu_out(
-        a, b_interleaved, router_scores, topk, out
-    )
-
-
-from .jit import get_bf16_gemm_module as _get_bf16_gemm_module
-
-_bf16_module_cache = {}
-
-
-def _cached_bf16_module(a, b, config):
-    # Use object identity of config (or its hash) as cache key.
-    # Since Bf16GemmConfig is frozen, hash is stable.
-    key = hash(config) if config is not None else 0
-    mod = _bf16_module_cache.get(key)
-    if mod is None:
-        mod = _get_bf16_gemm_module(a, b, config)
-        _bf16_module_cache[key] = mod
-    return mod
-
-
-def bf16_gemm(a, b, config=None, swap_ab=False):
-    return _cached_bf16_module(a, b, config).bf16_gemm(a, b, swap_ab)
-
-
-def bf16_gemm_out(a, b, out, config=None, swap_ab=False):
-    return _cached_bf16_module(a, b, config).bf16_gemm_out(a, b, out, swap_ab)
-
-
-from .jit import (
+from .kernels.bf16_gemm import (
     Bf16GemmConfig,
-    Fc1BlockInterleavedSwiGLUConfig,
-    GroupedMConfig,
+    bf16_gemm,
+    bf16_gemm_out,
     compile_bf16_gemm,
+    get_bf16_gemm_module,
+)
+from .kernels.bf16_gemm_dynamic_schedule import (
+    bf16_gemm_dynamic_schedule,
+    bf16_gemm_dynamic_schedule_out,
+    bf16_gemm_dynamic_schedule_profile,
+    cublaslt_gemm,
+    cublaslt_gemm_out,
+    cublaslt_gemm_out_batched,
+)
+from .kernels.fc1_block_interleaved_swiglu import (
+    Fc1BlockInterleavedSwiGLUConfig,
     compile_fc1_block_interleaved_swiglu,
     compile_fc1_block_interleaved_swiglu_configs,
-    compile_bf16_grouped_m_gemm,
+    fc1_block_interleaved_swiglu,
+    fc1_block_interleaved_swiglu_out,
+    get_fc1_block_interleaved_swiglu_module,
 )
+from .kernels.grouped_m_gemm import (
+    GroupedMConfig,
+    bf16_grouped_m_gemm,
+    bf16_grouped_m_gemm_out,
+    compile_bf16_grouped_m_gemm,
+    compile_bf16_grouped_m_gemm_configs,
+    get_bf16_grouped_m_gemm_module,
+)
+
+__all__ = [name for name in globals() if not name.startswith("_")]
