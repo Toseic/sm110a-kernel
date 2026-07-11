@@ -1,8 +1,11 @@
 """Shared benchmarking utilities for sm110a-kernel benchmarks."""
 
 import argparse
+import dataclasses
+import json
 import math
 import statistics
+from pathlib import Path
 
 import torch
 
@@ -10,6 +13,9 @@ import torch
 TARGET_SAMPLE_MS = 50.0
 PROBE_TARGET_MS = 10.0       # quick probe target — small enough to be fast
 EARLY_STOP_RATIO = 1.3       # skip config if probe > best_probe * this
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CACHE_FILENAME = "autotune_cache.json"
 
 
 class TablePrinter:
@@ -38,6 +44,7 @@ class BenchmarkBase:
     """Common CLI and runtime helpers for benchmark entry points."""
 
     seed = 1234
+    cache_filename = DEFAULT_CACHE_FILENAME
 
     def build_parser(self):
         return argparse.ArgumentParser()
@@ -49,6 +56,80 @@ class BenchmarkBase:
 
     def validate_args(self, args):
         return args
+
+    def add_cache_args(self, parser):
+        """Register the --force-sweep and --cache-path flags."""
+        parser.add_argument(
+            "--force-sweep",
+            action="store_true",
+            help="ignore the cached best config and re-run the full autotune sweep",
+        )
+        parser.add_argument(
+            "--cache-path",
+            default=None,
+            help=(
+                "path to the autotune cache JSON "
+                f"(default: <repo>/profiles/{self.cache_filename})"
+            ),
+        )
+
+    def cache_path(self, args):
+        override = getattr(args, "cache_path", None)
+        if override:
+            return Path(override)
+        return _REPO_ROOT / "profiles" / self.cache_filename
+
+    def load_cache(self, args):
+        path = self.cache_path(args)
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def save_cache(self, args, cache):
+        path = self.cache_path(args)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(cache, indent=2, sort_keys=True))
+        tmp.replace(path)
+
+    @staticmethod
+    def _cache_key_str(key):
+        return json.dumps(list(key) if isinstance(key, tuple) else key, sort_keys=True)
+
+    @staticmethod
+    def _candidate_config_cls(candidate):
+        if isinstance(candidate, tuple) and candidate:
+            return type(candidate[0])
+        return type(candidate)
+
+    @staticmethod
+    def _serialize_candidate(candidate, stats=None):
+        if isinstance(candidate, tuple) and len(candidate) == 2 and dataclasses.is_dataclass(candidate[0]):
+            config, swap_ab = candidate
+            entry = {
+                "config": dataclasses.asdict(config),
+                "swap_ab": bool(swap_ab),
+            }
+        elif dataclasses.is_dataclass(candidate):
+            entry = {"config": dataclasses.asdict(candidate)}
+        else:
+            raise TypeError(f"unsupported candidate type: {type(candidate)!r}")
+        if stats is not None:
+            entry["median_ms"] = float(stats["median_ms"])
+            entry["min_ms"] = float(stats["min_ms"])
+        return entry
+
+    @classmethod
+    def _deserialize_candidate(cls, entry, config_cls):
+        config = config_cls(**entry["config"])
+        swap_ab = entry.get("swap_ab")
+        if swap_ab is None:
+            return config
+        return (config, swap_ab)
 
     def add_timing_args(self, parser, *, warmup=20, iters=20, samples=7):
         parser.add_argument("--warmup", type=int, default=warmup)
@@ -115,6 +196,8 @@ class BenchmarkBase:
         args,
         benchmark_candidate,
         format_candidate,
+        cache_namespace=None,
+        cache_key=None,
         probe_candidate=None,
         metric_formatter=None,
         candidate_width=28,
@@ -124,11 +207,66 @@ class BenchmarkBase:
         if not candidates:
             raise RuntimeError("no compatible candidates")
 
+        debug = getattr(args, "debug", False)
+        cache_lookup_enabled = (
+            cache_namespace is not None
+            and cache_key is not None
+            and not getattr(args, "force_sweep", False)
+        )
+        cache_store_enabled = (
+            cache_namespace is not None and cache_key is not None
+        )
+        config_cls = self._candidate_config_cls(candidates[0])
+
+        # Cache lookup: short-circuit the sweep by re-benchmarking the cached best.
+        if cache_lookup_enabled:
+            cache = self.load_cache(args)
+            key_str = self._cache_key_str(cache_key)
+            cached_entry = cache.get(cache_namespace, {}).get(key_str)
+            if cached_entry is not None:
+                try:
+                    best_candidate = self._deserialize_candidate(
+                        cached_entry, config_cls
+                    )
+                except (TypeError, ValueError):
+                    best_candidate = None
+                if best_candidate is not None:
+                    if debug:
+                        cached_ms = cached_entry.get("median_ms")
+                        cached_note = (
+                            f" (cached median_ms={cached_ms:.4f})"
+                            if cached_ms is not None
+                            else ""
+                        )
+                        print(
+                            f"  [cache] hit {cache_namespace}{cache_key}"
+                            f" -> {format_candidate(best_candidate)}"
+                            f"{cached_note}",
+                            flush=flush,
+                        )
+                    best_stats = benchmark_candidate(best_candidate)
+                    if debug:
+                        metric_suffix = ""
+                        if metric_formatter is not None:
+                            metric_suffix = (
+                                f" {metric_formatter(best_candidate, best_stats)}"
+                            )
+                        print(
+                            f"  {format_candidate(best_candidate):<{candidate_width}}"
+                            f" (cached) min={best_stats['min_ms']:.4f}ms"
+                            f" median={best_stats['median_ms']:.4f}ms{metric_suffix}",
+                            flush=flush,
+                        )
+                    return (
+                        best_candidate,
+                        best_stats,
+                        [(best_candidate, best_stats, None)],
+                    )
+
         best_candidate = None
         best_stats = None
         best_probe_ms = None
         results = []
-        debug = getattr(args, "debug", False)
 
         for candidate in candidates:
             probe_ms = None
@@ -178,6 +316,21 @@ class BenchmarkBase:
                 f"  -> best: {format_candidate(best_candidate)}",
                 flush=flush,
             )
+
+        # Persist the winner so the next run can skip the sweep for this shape.
+        if cache_store_enabled and best_candidate is not None:
+            cache = self.load_cache(args)
+            ns_entry = cache.setdefault(cache_namespace, {})
+            ns_entry[self._cache_key_str(cache_key)] = self._serialize_candidate(
+                best_candidate, best_stats
+            )
+            self.save_cache(args, cache)
+            if debug:
+                print(
+                    f"  [cache] stored {cache_namespace}{cache_key}"
+                    f" -> {format_candidate(best_candidate)}",
+                    flush=flush,
+                )
         return best_candidate, best_stats, results
 
 
@@ -200,6 +353,7 @@ class GemmBenchmarkBase(BenchmarkBase):
             choices=("torch", "cublaslt"),
             default="cublaslt",
         )
+        self.add_cache_args(parser)
         self.add_arguments(parser)
         return parser
 

@@ -272,6 +272,8 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
             args=args,
             benchmark_candidate=run_kernel,
             format_candidate=format_candidate,
+            cache_namespace="bf16_gemm",
+            cache_key=(m, n, k),
             probe_candidate=probe_kernel,
             metric_formatter=lambda _candidate, stats: (
                 f"{tflops_from_ms(m, n, k, stats['median_ms']):.1f} TF/s"

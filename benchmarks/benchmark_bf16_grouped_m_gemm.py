@@ -255,6 +255,7 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
             help="print per-config performance after the benchmark",
         )
         self.add_torch_blas_arg(parser)
+        self.add_cache_args(parser)
         parser.add_argument(
             "--token",
             type=int,
@@ -359,6 +360,9 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
         if args.debug:
             print("  [debug] per-config performance", flush=True)
 
+        tokens_per_expert = layout.numel() // b.size(0)
+        n = b.size(1)
+        k = a.size(1)
         best_candidate, best_stats, raw_results = self.autotune_candidates(
             candidates,
             args=args,
@@ -368,11 +372,13 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
             format_candidate=lambda candidate: format_candidate(
                 candidate[0], candidate[1]
             ),
+            cache_namespace="bf16_grouped_m_gemm",
+            cache_key=(n, k, tokens_per_expert),
             probe_candidate=lambda candidate: probe_grouped_kernel(
                 a, b, layout, out, candidate[0], candidate[1]
             ),
             metric_formatter=lambda _candidate, stats: (
-                f"{tflops_from_ms(a.size(0), b.size(1), a.size(1), stats['median_ms']):.1f} TF/s"
+                f"{tflops_from_ms(a.size(0), n, k, stats['median_ms']):.1f} TF/s"
             ),
             candidate_width=40,
             flush=True,

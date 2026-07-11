@@ -178,6 +178,7 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
     def build_parser(self):
         parser = super().build_parser()
         self.add_timing_args(parser, warmup=2, iters=3, samples=3)
+        self.add_cache_args(parser)
         parser.add_argument("--experts", type=int, default=DEFAULT_EXPERTS)
         parser.add_argument("--topk", type=int, default=DEFAULT_TOPK)
         parser.add_argument("--n", type=int, default=DEFAULT_N)
@@ -294,6 +295,8 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
                 a, interleaved_w, router_scores, topk, out, config, args
             ),
             format_candidate=format_candidate,
+            cache_namespace="fc1_block_interleaved_swiglu",
+            cache_key=(a.size(0), interleaved_w.size(1) // 2, a.size(1), topk),
             probe_candidate=lambda config: probe_fused_kernel(
                 a, interleaved_w, router_scores, topk, out, config
             ),
