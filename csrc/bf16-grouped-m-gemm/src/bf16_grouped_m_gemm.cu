@@ -1,142 +1,198 @@
 /*
-Design overview: this file implements a BF16 grouped-M GEMM specialized for the
-Blackwell/SM110A execution model. Here, grouped-M means that rows of the input
-matrix A are dispatched to different expert-specific B weight slices according
-to `grouped_layout[row] -> expert`; in other words, different rows select
-different `B[expert, :, :]` tiles.
-
-This is not designed as "one CTA computes one regular GEMM tile". Instead, the
-implementation is split into three layers:
-
-1. Host-side preprocessing
-   `collect_expert_metadata` scans `grouped_layout` and computes
-   `expert_offsets[expert]` and `expert_counts[expert]` for each expert.
-   The implementation assumes that rows belonging to the same expert are
-   already arranged as one contiguous segment in grouped layout order, so the
-   minimum row index plus the row count is enough to recover that expert's
-   contiguous M range in A.
-
-2. Task construction
-   `build_expert_tile_tasks` then slices each expert's contiguous row range
-   into multiple `ExpertTileTask` entries. Each task describes one tile-row
-   chunk within a single expert:
-   `{row_start, row_count, tile_row, expert}`.
-   - `row_start` is the first grouped row for that expert.
-   - `row_count` is the total number of rows assigned to that expert.
-   - `tile_row` is the task-local row offset relative to `row_start`.
-   - `expert` selects which B weight tensor slice to use.
-   This lets the kernel consume a compact task queue instead of re-parsing the
-   original row-to-expert layout.
-
-3. Device execution
-   The actual GEMM kernel uses a cluster as the basic cooperation unit. One
-   cluster contains `kClusterM` CTAs, and each CTA owns one `kTileM=128`
-   sub-tile along M, so one cluster covers one output tile of height
-   `kClusterTileM = kClusterM * kTileM`. Along N, the kernel processes
-   `kTileN` columns at a time.
-
-Why the work is partitioned this way:
-
-- The main grouped-M challenge is not raw compute throughput but fragmented B
-  accesses caused by switching experts. By first coalescing rows into
-  expert-local tasks and then letting a cluster work on one task at a time,
-  the kernel improves reuse of the same expert B tile.
-- Multiple CTAs inside one cluster process adjacent M tiles together, which
-  allows the A/B TMA transfers and the tcgen05 MMA pipeline to share one
-  launch order and one synchronization protocol.
-- `compute_macro_swizzled_tile` applies a macro-level swizzle in persistent
-  mode so launch order stays within a compact working set. The N dimension
-  advances faster, which makes it more likely that concurrently scheduled
-  clusters reuse the same A tile.
-
-The main datapath is organized as a three-stage pipeline:
-
-1. Producer: GMEM -> SMEM
-   Warp 4 acts as the producer and uses TMA (`cp.async.bulk.tensor`) to move
-   A/B tiles from global memory into shared memory. Each mainloop stage owns
-   one SMEM region containing both A and B. The number of stages is derived
-   from available shared memory so the kernel can hide TMA latency with as
-   deep a pipeline as possible. `tma_mbars` tell the consumer that a stage is
-   ready to read, and `mma_mbars` tell the producer that a stage has been
-   consumed and may be overwritten.
-
-2. Consumer: SMEM -> TMEM accumulators
-   Warp 5 in cluster rank 0 issues `tcgen05.mma`. After waiting for a TMA
-   stage, it encodes the shared-memory A/B tiles into tcgen05-compatible
-   matrix descriptors and advances through the K dimension in `kMmaK=16`
-   steps. Accumulation does not stay in registers; results are accumulated
-   directly into TMEM. The kernel then calls `tcgen05.commit` explicitly and
-   uses `mainloop_mbars` to signal to the epilogue that a full TMEM output
-   stage is ready to read.
-
-3. Epilogue: TMEM -> SMEM/GMEM
-   Warps 0-3 convert completed TMEM output back to BF16 and write it out.
-   The default path is:
-   TMEM -> registers (float) -> BF16 pack -> SMEM (swizzled) -> TMA store -> GMEM
-   This enables high-throughput TMA stores for full tiles. Boundary tiles,
-   where the valid row count is smaller than `kTileM` or `kEpilogueTileN`,
-   fall back to per-thread stores to avoid out-of-bounds writes.
-   If `SM110A_GROUPED_DIRECT_GMEM` is enabled and the path is not `swap_ab`,
-   the epilogue may use TMEM -> registers -> direct GMEM stores and skip the
-   intermediate SMEM/TMA path.
-
-Why the epilogue uses both TMEM and SMEM:
-
-- tcgen05 accumulators naturally live in TMEM, which is not a convenient
-  layout for arbitrary global stores.
-- TMA stores impose alignment and swizzle requirements, so the kernel first
-  reshapes the results into a shared-memory layout that matches the tensor map,
-  then issues large stores from there. This gives better throughput for full
-  tiles.
-- `kEpilogueStageCount` allows the kernel to prefetch the next N block from
-  TMEM into another SMEM stage while the current N block is being written,
-  creating a second small pipeline inside the epilogue itself.
-
-Persistent scheduling:
-
-- When `SM110A_GROUPED_MODE == 1`, the kernel runs in persistent mode.
-  Clusters are no longer mapped one-to-one to output tiles; instead they pull
-  work dynamically through the global cursor `next_cluster_tile`.
-- Each fetch claims `kPersistentTileCount=2` tiles. That amortizes the cost of
-  one atomic work claim without letting a worker drift too far and destroy
-  expert-local A/B reuse.
-- In persistent mode, `epilogue_mbars` are used additionally to ensure that a
-  TMEM stage is not overwritten by the next mainloop iteration before the
-  epilogue has finished consuming it.
-
-Meaning of the `swap_ab` path:
-
-- In the default mode, the grouped GEMM is logically an
-  `A[m, k] x B[expert, n, k]^T -> C[m, n]` style computation, and tasks are
-  sliced along M.
-- When `swap_ab` is true, the roles of the A/B tensor maps are exchanged and
-  the output store layout switches to the swizzled format described by
-  `init_swapped_c_tensor_map`. That changes the task granularity, the meaning
-  of the tile M/N axes, and the shared-memory epilogue layout.
-- The purpose is not to implement a different algorithm, but to reuse the same
-  tcgen05/TMA execution skeleton while making the originally less contiguous
-  side become the more tensor-map-friendly read direction.
-
-Thread-role summary:
-
-- Warp 4: mainloop TMA producer.
-- Warp 5: mainloop MMA consumer / TMEM producer.
-- Warps 0-3: epilogue, moving TMEM results into shared memory and then into GMEM.
-
-Synchronization summary:
-
-- `tma_mbars[stage]`: TMA has completed, MMA may read this stage.
-- `mma_mbars[stage]`: MMA has completed, TMA may overwrite this stage.
-- `mainloop_mbars[stage]`: one TMEM output stage is ready for the epilogue.
-- `epilogue_mbars[stage]`: in persistent mode, the epilogue has finished and
-  the TMEM stage may be reused.
-
-At a high level, the kernel can be summarized as:
-"compress grouped rows into expert-local tile tasks, then use a
-cluster-persistent Blackwell TMA + tcgen05 three-stage pipeline to stream
-expert-specific BF16 GEMM tiles across SMEM, TMEM, and GMEM while preserving
-as much expert locality and store throughput as possible."
-*/
+ * bf16_grouped_m_gemm.cu — SM110A / Blackwell BF16 grouped-M GEMM kernel.
+ *
+ * What it does
+ * ------------
+ * Computes  C = A · B^T  in BF16, where rows of A are routed to per-expert
+ * weight slices B[expert, :, :] via `grouped_layout[row] -> expert`. Different
+ * rows may select different experts, so the kernel is responsible for fusing
+ * these otherwise fragmented accesses into a single high-throughput kernel
+ * that still reuses each expert's B tile as much as possible.
+ *
+ * The kernel runs entirely on Blackwell/SM110A, using the cluster/TMA/tcgen05
+ * execution model. It is exposed as `sm110a_bf16_grouped_m_gemm_launch`
+ * (extern "C") and as `launch_bf16_grouped_m_gemm` from the host wrapper.
+ *
+ * Key optimizations
+ * -----------------
+ * 1. Expert coalescing on the host. Rows belonging to the same expert are
+ *    assumed to live in one contiguous segment of `grouped_layout`. Two
+ *    device kernels, `collect_expert_metadata` and
+ *    `build_expert_tile_tasks`, compress that layout into a compact task
+ *    queue of `ExpertTileTask{ row_start, row_count, tile_row, expert,
+ *    tile_n }`. From that queue the GEMM kernel never has to re-parse the
+ *    original row-to-expert table.
+ *
+ * 2. Cluster cooperation along M. The kernel uses one cluster as the basic
+ *    scheduling unit. A cluster contains `kClusterM` CTAs, each owning one
+ *    `kTileM` sub-tile along M, so one cluster covers `kClusterTileM =
+ *    kClusterM * kTileM` rows. Along N the kernel processes `kTileN`
+ *    columns at a time. `cta_group::1` and `cta_group::2` variants of the
+ *    TMA / tcgen05 instructions are selected by the `kClusterM` template
+ *    parameter, so the same kernel body supports both cluster sizes.
+ *
+ * 3. Macro-level swizzle. In persistent mode (`SM110A_GROUPED_MODE == 1`),
+ *    tasks are issued in an order that walks M first inside a band of
+ *    `kMacroSwizzleM` tile-rows and N second inside a band of
+ *    `kMacroSwizzleN` N-tiles. The chosen N band (8) keeps the combined A+B
+ *    footprint below Thor's 32 MiB L2 so concurrent clusters can still hit
+ *    in-cache B tiles.
+ *
+ * 4. Deep, SMEM-bound mainloop pipeline. `KernelConfig` packs as many
+ *    mainloop stages as the per-CTA 228 KiB SMEM budget (minus the epilogue
+ *    regions) allows. Each stage holds the A and B tiles for one
+ *    `kTileK`-sized K slab and exchanges ownership through `tma_mbars` /
+ *    `mma_mbars` pairs so the producer and consumer overlap perfectly.
+ *
+ * 5. TMEM accumulators + tcgen05.mma. The consumer warp issues
+ *    `tcgen05.mma.kind::f16` directly from shared-memory descriptors into
+ *    TMEM accumulators. Two TMEM stages (`kTmemStageCount = 2`) let the
+ *    epilogue consume the previous N block while the consumer is still
+ *    producing the next one. `mainloop_mbars`/`epilogue_mbars` ensure the
+ *    epilogue never races the consumer on a TMEM stage.
+ *
+ * 6. TMA-store epilogue. By default the epilogue reshapes each `kTileM x
+ *    kEpilogueTileN` TMEM slice into a swizzled SMEM staging buffer and
+ *    issues a `cp.async.bulk.tensor` store. A second swizzle/prefetch
+ *    pipeline inside the epilogue (`kEpilogueStageCount`) hides TMEM→SMEM
+ *    latency behind the GMEM stores. Boundary tiles whose valid row count
+ *    is smaller than `kTileM` / `kEpilogueTileN` fall back to per-thread
+ *    stores to avoid out-of-bounds writes.
+ *
+ * 7. Optional direct-GMEM epilogue. Setting `SM110A_GROUPED_DIRECT_GMEM`
+ *    skips the SMEM/TMA path on the non-`swap_ab` branch and writes
+ *    BF16-packed TMEM values straight to global memory. Useful when the
+ *    SMEM/TMA path is bandwidth-bound on small shapes.
+ *
+ * 8. Persistent scheduling. With `SM110A_GROUPED_MODE == 1`, clusters pull
+ *    work dynamically through `next_cluster_tile`, claiming
+ *    `kPersistentTileCount = 2` tiles per fetch. This amortizes the cost of
+ *    the atomic work claim while preventing workers from drifting across
+ *    unrelated experts and destroying expert-local reuse.
+ *
+ * 9. `swap_ab` view. When `swap_ab == true` the A/B tensor maps and the
+ *    C tensor map are swapped (using `init_swapped_c_tensor_map`), the task
+ *    granularity changes to slice N rather than M, and the epilogue writes
+ *    via `stmatrix.trans` into a swizzled SMEM atom layout. The intent is
+ *    to reuse the same tcgen05/TMA skeleton while flipping the originally
+ *    less-contiguous dimension into the tensor-map-friendly read direction.
+ *
+ * Pipeline in detail
+ * ------------------
+ * The host path performs the following steps per launch:
+ *
+ *     launch_bf16_grouped_m_gemm_entry
+ *       └── launch_bf16_grouped_m_gemm_impl<...>
+ *             ├── Build CUtensorMaps for A, B, C (init_a/b/c/swapped_*).
+ *             ├── cudaMallocAsync a workspace laid out as
+ *             │     [expert_offsets | expert_counts | task_count
+ *             │      | next_cluster_tile | tasks[]].
+ *             ├── cudaMemsetAsync expert_offsets to INT32_MAX (so atomicMin
+ *             │     yields the first row of each expert) and the counts to 0.
+ *             ├── collect_expert_metadata<<<>>>:
+ *             │     one thread per grouped row, performs
+ *             │       atomicMin(expert_offsets + expert, row)
+ *             │       atomicAdd(expert_counts + expert, 1).
+ *             ├── build_expert_tile_tasks<<<1,1>>>:
+ *             │     single-threaded pass that emits one ExpertTileTask per
+ *             │     (M chunk within an expert, tile_n) pair, ordered to
+ *             │     match the persistent swizzle and writes task_count.
+ *             └── Launch bf16_grouped_m_gemm_kernel in either:
+ *                   * one cluster per output tile (non-persistent), or
+ *                   * `resident_clusters` persistent clusters that
+ *                     steal through next_cluster_tile.
+ *
+ * The device-side kernel (`bf16_grouped_m_gemm_kernel`) is organized as a
+ * three-stage pipeline plus a small persistent-stealing outer loop:
+ *
+ *   ┌────────────────────────────────────────────────────────────────────┐
+ *   │ outer loop (persistent mode only):                                 │
+ *   │   rank-0 CTA thread 0 does atomicAdd(next_cluster_tile, 2)         │
+ *   │   to claim the next two cluster tiles. The other ranks in the      │
+ *   │   cluster fetch the cursor via cluster.shared::cluster and exit    │
+ *   │   when the cursor has reached `task_count`.                        │
+ *   └────────────────────────────────────────────────────────────────────┘
+ *
+ *   ┌────────────────────────────────────────────────────────────────────┐
+ *   │ Producer (warp 4, one elected thread):                             │
+ *   │   for each tile_k in 0..k_tiles:                                   │
+ *   │     mbarrier_wait(mma_mbars[stage], producer_phase)                │
+ *   │       # MMA has released this SMEM stage for reuse.                │
+ *   │     arrive.expect_tx on tma_mbar for kASmemBytes + kBSmemBytes     │
+ *   │     tma_load_4d<kClusterM>(a_smem, A tensor map, ...)              │
+ *   │     tma_load_4d<kClusterM>(b_smem, B tensor map, ...)              │
+ *   │       # On cta_group::2 the B load is multicast so both cluster    │
+ *   │       # ranks share one TMA transaction.                           │
+ *   │     stage = (stage + 1) % kStageCount; phase ^= when wraps         │
+ *   └────────────────────────────────────────────────────────────────────┘
+ *
+ *   ┌────────────────────────────────────────────────────────────────────┐
+ *   │ Consumer (warp 5, cluster rank 0, one elected thread):             │
+ *   │   In persistent mode, mbarrier_wait(epilogue_mbars[stage], phase)  │
+ *   │     before touching TMEM so the epilogue has released the stage.   │
+ *   │   for each tile_k in 0..k_tiles:                                   │
+ *   │     mbarrier_wait(tma_mbars[stage], consumer_phase)                │
+ *   │       # TMA has filled this SMEM stage.                            │
+ *   │     tcgen05.fence::after_thread_sync                               │
+ *   │     for mma_k in 0..kTileK/kMmaK:                                  │
+ *   │       build k-major 128B shared-memory descriptors for the         │
+ *   │       current k_slab / k_in_slab and issue                         │
+ *   │       tcgen05.mma.kind::f16 with accumulate=(tile_k|mma_k != 0)    │
+ *   │     tcgen05.commit.cta_group::N → mma_mbars[stage]                 │
+ *   │     stage = (stage + 1) % kStageCount; phase ^= when wraps         │
+ *   │   tcgen05.commit.cta_group::N → mainloop_mbars[tmem_stage]         │
+ *   │     signals the epilogue that one full kTileN-wide TMEM stage is   │
+ *   │     ready to read.                                                 │
+ *   └────────────────────────────────────────────────────────────────────┘
+ *
+ *   ┌────────────────────────────────────────────────────────────────────┐
+ *   │ Epilogue (warps 0..3):                                             │
+ *   │   mbarrier_wait(mainloop_mbars[stage], epilogue_phase)             │
+ *   │   tcgen05.fence::after_thread_sync                                 │
+ *   │   for n_block in 0..kTileN/kEpilogueTileN:                         │
+ *   │     tmem_to_smem(stage, n_block, smem_stage%kEpilogueStageCount):  │
+ *   │       * non-swap: tcgen05.ld.32x32b.x8 → float[8] → __nv_bfloat162 │
+ *   │         → SMEM at the swizzled chunk index for this tid.           │
+ *   │       * swap_ab: tcgen05.ld.16x256b.x1 → STSM transposed atom      │
+ *   │         into the swizzled SMEM staging region.                     │
+ *   │       * SM110A_GROUPED_DIRECT_GMEM (non-swap only): write the      │
+ *   │         packed BF16 values straight to GMEM.                       │
+ *   │     bar.sync 1, 128 (keeps the four epilogue warps in lockstep).   │
+ *   │     if full tile: tid 0 issues tma_store_3d for each store tile    │
+ *   │                   + cp.async.bulk.commit_group;                    │
+ *   │     else:       per-thread fallback stores from the swizzled SMEM  │
+ *   │                   to GMEM to avoid OOB writes.                     │
+ *   │     rotate to the next smem_stage (epilogue prefetch pipeline).    │
+ *   │   release_tmem(): in persistent mode, arrive on epilogue_mbar so   │
+ *   │     the consumer may overwrite this TMEM stage next iteration.     │
+ *   │   cp.async.bulk.wait_group 0; bar.sync 1, 128.                     │
+ *   └────────────────────────────────────────────────────────────────────┘
+ *
+ *   ┌────────────────────────────────────────────────────────────────────┐
+ *   │ End-of-kernel: barrier.cluster + tcgen05.dealloc (warp 0).         │
+ *   └────────────────────────────────────────────────────────────────────┘
+ *
+ * Thread roles
+ * ------------
+ *   warp 0..3   epilogue warps (TMEM → SMEM/GMEM, TMA store, fallbacks).
+ *   warp 4      mainloop producer (TMA loads for A and B).
+ *   warp 5      mainloop consumer / TMEM producer (cluster rank 0 only).
+ *
+ * Synchronization objects (all in dynamic SMEM)
+ * ---------------------------------------------
+ *   tma_mbars[stage]      TMA → MMA      : stage is filled and may be read.
+ *   mma_mbars[stage]      MMA → TMA      : stage may be overwritten by TMA.
+ *   mainloop_mbars[stage] MMA → Epilogue : TMEM output stage is ready.
+ *   epilogue_mbars[stage] Epilogue → MMA : TMEM output stage is consumed
+ *                                          (persistent mode only).
+ *
+ * In one sentence
+ * ---------------
+ *   "Coalesce grouped rows into expert-local tile tasks, then drive a
+ *    cluster-persistent Blackwell pipeline of TMA + tcgen05 + TMEM →
+ *    swizzled SMEM → TMA-store epilogue, balancing expert-local reuse
+ *    against L2 working-set pressure."
+ */
 
 #include <cstdint>
 #include <cstdlib>
