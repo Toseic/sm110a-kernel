@@ -141,7 +141,37 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
             help="Print per-config sweep details",
         )
 
+    def validate_args(self, args):
+        # Allow --m alone to filter default shapes by M dimension, instead of
+        # requiring --m, --n, --k together for single-shape mode.
+        if args.m > 0 and args.n == 0 and args.k == 0:
+            args.single_shape = False
+            args.m_filter = args.m
+            self.validate_timing_args(args, allow_zero_warmup=True)
+            self.validate_extra_args(args)
+            return args
+        return super().validate_args(args)
+
+    def iter_shapes(self, args):
+        if args.single_shape:
+            yield (args.m, args.n, args.k)
+            return
+        m_filter = getattr(args, "m_filter", 0)
+        if m_filter:
+            for shape in self.default_shapes:
+                if shape[0] == m_filter:
+                    yield shape
+            return
+        yield from self.default_shapes
+
     def run_preflight(self, args):
+        if getattr(args, "m_filter", 0):
+            matched = sum(1 for s in self.default_shapes if s[0] == args.m_filter)
+            print(
+                f"[filter] M={args.m_filter}: {matched} matching shape(s) "
+                f"out of {len(self.default_shapes)}"
+            )
+            print()
         if not args.single_shape and not args.no_accuracy:
             run_accuracy_check(args)
 
