@@ -56,6 +56,116 @@ ncu --query-metrics --query-metrics-mode suffix \
 4. Import each report with `ncu --import` and summarize by actual problem shape, launch parameters, kernel, and configuration. One program argument may exercise multiple shapes or kernel variants.
 5. State whether cold-L2 eviction was enabled, list the exact metrics, distinguish throughput from hit rate, and include report paths.
 
+## Source-level hotspot analysis
+
+Use this workflow when a metric such as `long_scoreboard`, `barrier`, or
+`lg_throttle` needs to be attributed to a source operation rather than merely
+reported at kernel level.
+
+### Preserve and verify source correlation
+
+Compile CUDA code with `-lineinfo`. For this repository, first verify the
+actual JIT command or cache manifest:
+
+```bash
+rg -n -- '-lineinfo|cuda_cflags' \
+  ~/.cache/sm110a_jit ~/.cache/torch_extensions 2>/dev/null
+```
+
+Verify the resulting binary contains debug line sections:
+
+```bash
+cuobjdump --dump-elf /path/to/kernel.so | \
+  rg '\.debug_line|\.nv_debug_line_sass'
+```
+
+When collecting the report, import source files into the report. `-lineinfo`
+alone is not enough for a portable `.ncu-rep` source view:
+
+```bash
+ncu --set full \
+  --import-source on \
+  --source-folders "$PWD" \
+  --kernel-name 'regex:.*target_kernel.*' \
+  -o /tmp/ncu-reports/source-hotspots \
+  -- /path/to/program <args>
+```
+
+Inspect both CUDA and SASS views:
+
+```bash
+ncu --import /tmp/ncu-reports/source-hotspots.ncu-rep \
+  --page source --print-source cuda,sass
+```
+
+Use `--print-source cuda,sass`, not only the default SASS view. If the CUDA
+source column is empty, check that `--import-source on` was used during the
+profiling run and that `--source-folders` contains the exact source root.
+
+### Collect the stall metrics
+
+Use `SchedulerStats`, `WarpStateStats`, and source sampling in addition to the
+memory sections:
+
+```bash
+ncu --set full \
+  --section SchedulerStats --section WarpStateStats \
+  --section SourceCounters \
+  --import-source on --source-folders "$PWD" \
+  --kernel-name 'regex:.*target_kernel.*' \
+  -o /tmp/ncu-reports/target-stalls \
+  -- /path/to/program <args>
+```
+
+Useful aggregate metrics include:
+
+```text
+smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio
+smsp__average_warps_issue_stalled_barrier_per_issue_active.ratio
+smsp__average_warps_issue_stalled_lg_throttle_per_issue_active.ratio
+smsp__average_warps_issue_stalled_short_scoreboard_per_issue_active.ratio
+smsp__warps_eligible.avg.per_cycle_active
+smsp__warps_active.avg.per_cycle_active
+```
+
+Do not equate `long_scoreboard` with an L2 miss. NCU's generic scoreboard
+classification can include dependencies on asynchronous memory operations,
+barriers, and polling instructions. Confirm the actual instruction in the
+CUDA/SASS source table (`mbarrier.try_wait`, `cp.async.bulk.wait_group`, a
+global load, etc.) before naming L2 as the cause.
+
+### Inline helpers and source-line aggregation
+
+An inlined helper such as:
+
+```cpp
+__device__ inline void wait(...) { mbarrier.try_wait...; }
+```
+
+can cause all call sites to collapse into one source line. If the report shows
+one large hotspot but the helper has multiple producer/consumer roles, and the
+user has authorized an analysis-only source change, split the roles into
+separate inline helpers with identical PTX, for example:
+
+```cpp
+wait_mma_slot(...);
+wait_tma(...);
+wait_epilogue(...);
+wait_mainloop(...);
+```
+
+Keep the synchronization instructions, operands, phase handling, and call
+order unchanged. Rebuild with `-lineinfo`, profile again, and aggregate
+`stall_long_sb` (and the other stall columns) by the distinct helper lines.
+Report that this instrumentation can perturb code generation and should not be
+used for final performance numbers. Remove or clearly label the analysis-only
+diff after the investigation.
+
+For a source CSV, the relevant columns are `Line No`, `Source`,
+`stall_long_sb`, `stall_barrier`, `stall_sleep`, and `stall_wait`. Prefer
+source-level sample counts for locating a hotspot, then validate the diagnosis
+with the corresponding aggregate cycles-per-issue metric.
+
 ## BF16 GEMM on Thor (GB10B, CC 11.0)
 
 For `benchmarks/benchmark_bf16_gemm.py`, select only the JIT GEMM with `--kernel-name-base function --kernel-name 'regex:.*bf16_gemm_kernel.*'`. This is required because the benchmark initializes tensors and evicts L2 before timing.
@@ -88,6 +198,7 @@ l1tex__throughput.avg.pct_of_peak_sustained_active
 
 # L2: throughput, hit rate, pressure, and internal busy rates
 lts__throughput.avg.pct_of_peak_sustained_elapsed
+lts__throughput.avg.pct_of_peak_sustained_active
 lts__t_sector_hit_rate.pct
 lts__t_sectors_lookup_miss.sum
 lts__d_sectors.avg.pct_of_peak_sustained_elapsed
@@ -116,7 +227,10 @@ The queried `mcc__dram_throughput_op_read/write.*` metrics returned `nan` for th
 ## Guardrails
 
 - Do not run NCU jobs in parallel; they interfere through the shared GPU.
-- Do not modify benchmark or kernel source just to collect metrics.
+- Do not modify benchmark or kernel source just to collect metrics unless the
+  user explicitly authorizes source-level instrumentation; if authorized,
+  keep the change analysis-only and disclose its possible code-generation
+  perturbation.
 - L2 throughput is pipeline utilization, not cache residency. Use `lts__t_sector_hit_rate.pct` or `lts__t_request_hit_rate.pct` for cache hit rate.
 - A working set fitting in nominal L2 capacity does not imply a 100% hit rate because of cold-L2 eviction, compulsory misses, C traffic, sector granularity, and cache mapping.
 - DRAM throughput counters can return `nan` on some integrated or newer GPUs. Report them as unavailable and do not infer zero traffic.
