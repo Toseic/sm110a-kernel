@@ -38,6 +38,13 @@ DEFAULT_SHAPES = [
 ]
 ACCURACY_SHAPE = (512, 512, 512)
 CUBLASLT_WORKSPACE_BYTES = 32 * 1024 * 1024
+# Keep the per-config measurement work proportional to GEMM work.  The
+# bounds prevent tiny GEMMs from being dominated by launch/event overhead and
+# large GEMMs from making a sweep unnecessarily long.
+CALIBRATION_REFERENCE_WORK = 1024 * 1024 * 1024
+CALIBRATION_REFERENCE_MS = 50.0
+CALIBRATION_MIN_MS = 1.0
+CALIBRATION_MAX_MS = 50.0
 BF16_GEMM_CONFIGS = tuple(
     Bf16GemmConfig(
         tile_m=128,
@@ -85,6 +92,15 @@ def format_candidate(candidate):
         f"/c{config.cluster_m}"
         f"/e{config.epilogue_block_n}"
         f"/{'swap' if swap_ab else 'noswap'}"
+    )
+
+
+def calibration_target_ms(m, n, k):
+    """Return a size-aware target duration for one timing sample."""
+    work_scale = (m * n * k) / CALIBRATION_REFERENCE_WORK
+    return min(
+        CALIBRATION_MAX_MS,
+        max(CALIBRATION_MIN_MS, CALIBRATION_REFERENCE_MS * work_scale),
     )
 
 
@@ -210,6 +226,12 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
         self.make_result_table(baseline_name).print_header()
 
     def run_case(self, m, n, k, args):
+        target_ms = calibration_target_ms(m, n, k)
+        if args.debug:
+            print(
+                f"[calibration] work={m}x{n}x{k} target={target_ms:.2f}ms",
+                flush=True,
+            )
         a = torch.empty((m, k), device="cuda", dtype=torch.bfloat16)
         b = torch.empty((k, n), device="cuda", dtype=torch.bfloat16)
         a.uniform_(-1.0, 1.0)
@@ -243,6 +265,7 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
                 args.iters,
                 args.samples,
                 cold_l2_flush=getattr(args, "_cold_l2_flush", None),
+                target_ms=target_ms,
             )
         else:
             raise SystemExit(f"unsupported --baseline value: {args.baseline}")
@@ -274,6 +297,7 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
         )
 
     def benchmark_best_kernel(self, a, b, out, m, n, k, args):
+        target_ms = calibration_target_ms(m, n, k)
         candidates = compatible_candidates(m, n, k)
         if not candidates:
             raise RuntimeError(f"no JIT config supports M={m}, N={n}, K={k}")
@@ -290,6 +314,7 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
                 args.iters,
                 args.samples,
                 cold_l2_flush=getattr(args, "_cold_l2_flush", None),
+                target_ms=target_ms,
             )
 
         def probe_kernel(candidate):
@@ -301,6 +326,7 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
                     a, b, out, config=config, swap_ab=swap_ab
                 ),
                 cold_l2_flush=getattr(args, "_cold_l2_flush", None),
+                target_ms=target_ms,
             )
 
         best_candidate, best_stats, _ = self.autotune_candidates(

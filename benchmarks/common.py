@@ -531,9 +531,11 @@ def benchmark_once_batched(fn, warmup, iters, cold_l2_flush=None):
     return sum(start.elapsed_time(end) for start, end in events) / iters
 
 
-def benchmark_with_stats(fn, warmup, iters, samples, cold_l2_flush=None):
+def benchmark_with_stats(
+    fn, warmup, iters, samples, cold_l2_flush=None, target_ms=TARGET_SAMPLE_MS
+):
     probe_ms = benchmark_once(fn, warmup, iters, cold_l2_flush)
-    measured_iters = calibrate_iters(probe_ms, iters)
+    measured_iters = calibrate_iters(probe_ms, iters, target_ms=target_ms)
 
     timings = [benchmark_once(fn, warmup, measured_iters, cold_l2_flush)]
     for _ in range(1, samples):
@@ -541,9 +543,11 @@ def benchmark_with_stats(fn, warmup, iters, samples, cold_l2_flush=None):
     return summarize_samples(timings, measured_iters)
 
 
-def benchmark_with_stats_batched(fn, warmup, iters, samples, cold_l2_flush=None):
+def benchmark_with_stats_batched(
+    fn, warmup, iters, samples, cold_l2_flush=None, target_ms=TARGET_SAMPLE_MS
+):
     probe_ms = benchmark_once_batched(fn, warmup, iters, cold_l2_flush)
-    measured_iters = calibrate_iters(probe_ms, iters)
+    measured_iters = calibrate_iters(probe_ms, iters, target_ms=target_ms)
 
     timings = [benchmark_once_batched(fn, warmup, measured_iters, cold_l2_flush)]
     for _ in range(1, samples):
@@ -553,10 +557,12 @@ def benchmark_with_stats_batched(fn, warmup, iters, samples, cold_l2_flush=None)
     return summarize_samples(timings, measured_iters)
 
 
-def quick_probe(fn, cold_l2_flush=None):
-    """Lightweight probe (~10 ms GPU time) for early-stop decisions."""
+def quick_probe(
+    fn, cold_l2_flush=None, target_ms=PROBE_TARGET_MS
+):
+    """Lightweight size-aware probe for early-stop decisions."""
     ms = benchmark_once(fn, warmup=2, iters=5, cold_l2_flush=cold_l2_flush)
-    iters = calibrate_iters(ms, 5, target_ms=PROBE_TARGET_MS)
+    iters = calibrate_iters(ms, 5, target_ms=target_ms)
     return benchmark_once(
         fn, warmup=0, iters=iters, cold_l2_flush=cold_l2_flush
     )
