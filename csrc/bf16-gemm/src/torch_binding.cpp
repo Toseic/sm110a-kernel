@@ -4,7 +4,6 @@
 #include <cublasLt.h>
 #include <torch/extension.h>
 
-#include <limits>
 #include <vector>
 
 #include "bf16_gemm.h"
@@ -14,8 +13,6 @@ namespace {
 constexpr int kBlockM = 128;
 constexpr int kBlockN = 256;
 constexpr int kBlockK = 64;
-constexpr int kProfilerBlockCount = 20;
-constexpr int kProfilerWarpsPerBlock = 6;
 constexpr std::size_t kDefaultCublasLtWorkspaceBytes = 32ull * 1024ull * 1024ull;
 
 void check_cublas_status(cublasStatus_t status, const char* expr) {
@@ -91,26 +88,6 @@ void check_workspace(const torch::Tensor& workspace, const c10::Device& device) 
   TORCH_CHECK(workspace.device() == device,
               "Workspace must be on the same device");
   TORCH_CHECK(workspace.numel() > 0, "Workspace must be non-empty");
-}
-
-void check_profiler(const torch::Tensor& profiler, int num_entries,
-                    const c10::Device& device) {
-  TORCH_CHECK(num_entries > 0, "num_entries must be positive");
-  TORCH_CHECK(profiler.is_cuda(), "Profiler buffer must be a CUDA tensor");
-  TORCH_CHECK(profiler.scalar_type() == torch::kInt64,
-              "Profiler buffer must have dtype torch.int64");
-  TORCH_CHECK(profiler.dim() == 2, "Profiler buffer must be 2D");
-  TORCH_CHECK(profiler.is_contiguous(), "Profiler buffer must be contiguous");
-  TORCH_CHECK(profiler.device() == device,
-              "Profiler buffer must be on the same device");
-  TORCH_CHECK(profiler.size(0) >= kProfilerBlockCount * kProfilerWarpsPerBlock,
-              "Profiler buffer must provide at least ",
-              kProfilerBlockCount * kProfilerWarpsPerBlock,
-              " rows");
-  TORCH_CHECK(profiler.size(1) == 1 + static_cast<int64_t>(num_entries) * 4,
-              "Profiler buffer must have shape (*, ",
-              1 + static_cast<int64_t>(num_entries) * 4,
-              ")");
 }
 
 cublasLtHandle_t get_cublaslt_handle() {
@@ -214,68 +191,6 @@ void run_cublaslt(torch::Tensor a, torch::Tensor b, torch::Tensor out,
                       "cublasLtMatmulDescDestroy");
 }
 
-torch::Tensor bf16_gemm_dynamic_schedule(torch::Tensor a, torch::Tensor b) {
-  check_inputs(a, b);
-  c10::cuda::CUDAGuard device_guard(a.device());
-
-  auto out = torch::empty({a.size(0), b.size(1)}, a.options());
-  const auto stream = c10::cuda::getCurrentCUDAStream(a.device().index());
-  launch_bf16_gemm_dynamic_schedule(
-      reinterpret_cast<const __nv_bfloat16*>(a.data_ptr<at::BFloat16>()),
-      reinterpret_cast<const __nv_bfloat16*>(b.data_ptr<at::BFloat16>()),
-      reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
-      static_cast<int>(a.size(0)),
-      static_cast<int>(b.size(1)),
-      static_cast<int>(a.size(1)),
-      stream);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return out;
-}
-
-torch::Tensor bf16_gemm_dynamic_schedule_out(torch::Tensor a, torch::Tensor b,
-                                             torch::Tensor out) {
-  check_inputs(a, b);
-  check_output(out, a.size(0), b.size(1), a.device());
-  c10::cuda::CUDAGuard device_guard(a.device());
-
-  const auto stream = c10::cuda::getCurrentCUDAStream(a.device().index());
-  launch_bf16_gemm_dynamic_schedule(
-      reinterpret_cast<const __nv_bfloat16*>(a.data_ptr<at::BFloat16>()),
-      reinterpret_cast<const __nv_bfloat16*>(b.data_ptr<at::BFloat16>()),
-      reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
-      static_cast<int>(a.size(0)),
-      static_cast<int>(b.size(1)),
-      static_cast<int>(a.size(1)),
-      stream);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return out;
-}
-
-torch::Tensor bf16_gemm_dynamic_schedule_profile(
-    torch::Tensor a, torch::Tensor b, torch::Tensor profiler,
-    int64_t num_entries) {
-  check_inputs(a, b);
-  TORCH_CHECK(num_entries <= std::numeric_limits<int>::max(),
-              "num_entries is too large");
-  check_profiler(profiler, static_cast<int>(num_entries), a.device());
-  c10::cuda::CUDAGuard device_guard(a.device());
-
-  auto out = torch::empty({a.size(0), b.size(1)}, a.options());
-  const auto stream = c10::cuda::getCurrentCUDAStream(a.device().index());
-  launch_bf16_gemm_dynamic_schedule_profile(
-      reinterpret_cast<const __nv_bfloat16*>(a.data_ptr<at::BFloat16>()),
-      reinterpret_cast<const __nv_bfloat16*>(b.data_ptr<at::BFloat16>()),
-      reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
-      static_cast<int>(a.size(0)),
-      static_cast<int>(b.size(1)),
-      static_cast<int>(a.size(1)),
-      profiler.data_ptr<int64_t>(),
-      static_cast<int>(num_entries),
-      stream);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return out;
-}
-
 torch::Tensor cublaslt_gemm(torch::Tensor a, torch::Tensor b) {
   check_inputs(a, b);
   c10::cuda::CUDAGuard device_guard(a.device());
@@ -304,12 +219,6 @@ torch::Tensor cublaslt_gemm_out_batched(torch::Tensor a, torch::Tensor b,
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("bf16_gemm_dynamic_schedule", &bf16_gemm_dynamic_schedule,
-        "SM110A BF16 GEMM with dynamic schedule");
-  m.def("bf16_gemm_dynamic_schedule_out", &bf16_gemm_dynamic_schedule_out,
-        "SM110A BF16 GEMM with dynamic schedule and explicit output");
-  m.def("bf16_gemm_dynamic_schedule_profile", &bf16_gemm_dynamic_schedule_profile,
-        "SM110A BF16 GEMM with dynamic schedule and profiler output");
   m.def("cublaslt_gemm", &cublaslt_gemm, "cuBLASLt BF16 GEMM");
   m.def("cublaslt_gemm_out", &cublaslt_gemm_out,
         "cuBLASLt BF16 GEMM with explicit output and workspace");

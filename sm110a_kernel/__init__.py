@@ -13,10 +13,7 @@ from .kernels.bf16_gemm import (
     compile_bf16_gemm,
     get_bf16_gemm_module,
 )
-from .kernels.bf16_gemm_dynamic_schedule import (
-    bf16_gemm_dynamic_schedule,
-    bf16_gemm_dynamic_schedule_out,
-    bf16_gemm_dynamic_schedule_profile,
+from .kernels.cublaslt import (
     cublaslt_gemm,
     cublaslt_gemm_out,
     cublaslt_gemm_out_batched,

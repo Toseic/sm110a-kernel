@@ -50,12 +50,6 @@ Use the old-style cuBLASLt baseline from Python:
 /home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_bf16_gemm.py --baseline cublaslt
 ```
 
-Dynamic-schedule benchmark:
-
-```bash
-/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_bf16_gemm_dynamic_schedule.py
-```
-
 Grouped M benchmark:
 
 ```bash
@@ -115,10 +109,8 @@ baseline.
 ## Contents
 
 - `src/bf16_gemm.cu`: BF16 GEMM implementation
-- `src/bf16_gemm_dynamic_schedule.cu`: BF16 GEMM implementation with dynamic schedule entry point
 - `src/torch_binding.cpp`: PyTorch binding entry points
 - `../../benchmarks/benchmark_bf16_gemm.py`: Python benchmark driver
-- `../../benchmarks/benchmark_bf16_gemm_dynamic_schedule.py`: Python benchmark driver for the dynamic schedule entry point
 - `../../benchmarks/benchmark_bf16_grouped_m_gemm.py`: Python benchmark driver for grouped M GEMM
 - `../../sm110a_kernel/__init__.py`: Python API and core extension loader
 - `../../sm110a_kernel/jit.py`: configuration-specialized grouped M JIT loader
