@@ -135,6 +135,13 @@ class BenchmarkBase:
         parser.add_argument("--warmup", type=int, default=warmup)
         parser.add_argument("--iters", type=int, default=iters)
         parser.add_argument("--samples", type=int, default=samples)
+        parser.add_argument(
+            "--no-cold-l2",
+            dest="cold_l2",
+            action="store_false",
+            default=True,
+            help="do not evict L2 before each timed kernel invocation",
+        )
 
     def validate_timing_args(self, args, *, allow_zero_warmup=False):
         if allow_zero_warmup:
@@ -178,9 +185,39 @@ class BenchmarkBase:
             raise SystemExit("CUDA is required")
         torch.manual_seed(self.seed)
 
+    def configure_cold_l2(self, args):
+        """Prepare an L2-sized eviction buffer for the timing helpers."""
+        args._cold_l2_flush = None
+        if not getattr(args, "cold_l2", True):
+            print("[cache] cold L2: disabled")
+            return
+
+        l2_bytes = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).L2_cache_size
+        if l2_bytes <= 0:
+            print("[cache] cold L2: unavailable (device did not report L2 size)")
+            return
+
+        # Writing more than the cache capacity evicts data touched by the
+        # preceding warmup. Keep the tensor alive for the benchmark lifetime.
+        self._cold_l2_buffer = torch.empty(
+            (2 * l2_bytes,), device="cuda", dtype=torch.uint8
+        )
+
+        def flush_l2():
+            self._cold_l2_buffer.zero_()
+
+        args._cold_l2_flush = flush_l2
+        print(
+            "[cache] cold L2: enabled "
+            f"({2 * l2_bytes / 2**20:.0f} MiB eviction buffer)"
+        )
+
     def run(self):
         args = self.parse_args()
         self.initialize()
+        self.configure_cold_l2(args)
         self.run_with_args(args)
 
     def run_with_args(self, args):
@@ -435,57 +472,91 @@ def summarize_samples(samples, measured_iters):
     }
 
 
-def benchmark_once(fn, warmup, iters):
+def benchmark_once(fn, warmup, iters, cold_l2_flush=None):
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
+    if cold_l2_flush is None:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(iters):
+            fn()
+        end.record()
+        end.synchronize()
+        return start.elapsed_time(end) / iters
+
+    # The eviction is deliberately outside each event pair, so every measured
+    # kernel invocation sees a cold L2 without charging eviction time to it.
+    events = []
     for _ in range(iters):
+        cold_l2_flush()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
         fn()
-    end.record()
-    end.synchronize()
-    return start.elapsed_time(end) / iters
+        end.record()
+        events.append((start, end))
+    events[-1][1].synchronize()
+    return sum(start.elapsed_time(end) for start, end in events) / iters
 
 
-def benchmark_once_batched(fn, warmup, iters):
+def benchmark_once_batched(fn, warmup, iters, cold_l2_flush=None):
     for _ in range(warmup):
         fn(1)
     torch.cuda.synchronize()
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    fn(iters)
-    end.record()
-    end.synchronize()
-    return start.elapsed_time(end) / iters
+    if cold_l2_flush is None:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        fn(iters)
+        end.record()
+        end.synchronize()
+        return start.elapsed_time(end) / iters
+
+    # A batched native call cannot flush L2 between its internal launches, so
+    # issue one launch at a time when cold-L2 measurement is enabled.
+    events = []
+    for _ in range(iters):
+        cold_l2_flush()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        fn(1)
+        end.record()
+        events.append((start, end))
+    events[-1][1].synchronize()
+    return sum(start.elapsed_time(end) for start, end in events) / iters
 
 
-def benchmark_with_stats(fn, warmup, iters, samples):
-    probe_ms = benchmark_once(fn, warmup, iters)
+def benchmark_with_stats(fn, warmup, iters, samples, cold_l2_flush=None):
+    probe_ms = benchmark_once(fn, warmup, iters, cold_l2_flush)
     measured_iters = calibrate_iters(probe_ms, iters)
 
-    timings = [benchmark_once(fn, warmup, measured_iters)]
+    timings = [benchmark_once(fn, warmup, measured_iters, cold_l2_flush)]
     for _ in range(1, samples):
-        timings.append(benchmark_once(fn, 0, measured_iters))
+        timings.append(benchmark_once(fn, 0, measured_iters, cold_l2_flush))
     return summarize_samples(timings, measured_iters)
 
 
-def benchmark_with_stats_batched(fn, warmup, iters, samples):
-    probe_ms = benchmark_once_batched(fn, warmup, iters)
+def benchmark_with_stats_batched(fn, warmup, iters, samples, cold_l2_flush=None):
+    probe_ms = benchmark_once_batched(fn, warmup, iters, cold_l2_flush)
     measured_iters = calibrate_iters(probe_ms, iters)
 
-    timings = [benchmark_once_batched(fn, warmup, measured_iters)]
+    timings = [benchmark_once_batched(fn, warmup, measured_iters, cold_l2_flush)]
     for _ in range(1, samples):
-        timings.append(benchmark_once_batched(fn, 0, measured_iters))
+        timings.append(
+            benchmark_once_batched(fn, 0, measured_iters, cold_l2_flush)
+        )
     return summarize_samples(timings, measured_iters)
 
 
-def quick_probe(fn):
+def quick_probe(fn, cold_l2_flush=None):
     """Lightweight probe (~10 ms GPU time) for early-stop decisions."""
-    ms = benchmark_once(fn, warmup=2, iters=5)
+    ms = benchmark_once(fn, warmup=2, iters=5, cold_l2_flush=cold_l2_flush)
     iters = calibrate_iters(ms, 5, target_ms=PROBE_TARGET_MS)
-    return benchmark_once(fn, warmup=0, iters=iters)
+    return benchmark_once(
+        fn, warmup=0, iters=iters, cold_l2_flush=cold_l2_flush
+    )

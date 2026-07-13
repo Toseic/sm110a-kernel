@@ -94,6 +94,7 @@ def benchmark_grouped_baseline(a, b, tokens_per_expert, out, args):
         args.warmup,
         args.iters,
         args.samples,
+        cold_l2_flush=getattr(args, "_cold_l2_flush", None),
     )
 
 
@@ -113,10 +114,11 @@ def benchmark_grouped_kernel(
         args.warmup,
         args.iters,
         args.samples,
+        cold_l2_flush=getattr(args, "_cold_l2_flush", None),
     )
 
 
-def probe_grouped_kernel(a, b, layout, out, config, swap_ab):
+def probe_grouped_kernel(a, b, layout, out, config, swap_ab, args):
     bf16_grouped_m_gemm_out(
         a, b, layout, out, config=config, swap_ab=swap_ab
     )
@@ -124,7 +126,8 @@ def probe_grouped_kernel(a, b, layout, out, config, swap_ab):
     return quick_probe(
         lambda: bf16_grouped_m_gemm_out(
             a, b, layout, out, config=config, swap_ab=swap_ab
-        )
+        ),
+        cold_l2_flush=getattr(args, "_cold_l2_flush", None),
     )
 
 
@@ -375,7 +378,7 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
             cache_namespace="bf16_grouped_m_gemm",
             cache_key=(n, k, tokens_per_expert),
             probe_candidate=lambda candidate: probe_grouped_kernel(
-                a, b, layout, out, candidate[0], candidate[1]
+                a, b, layout, out, candidate[0], candidate[1], args
             ),
             metric_formatter=lambda _candidate, stats: (
                 f"{tflops_from_ms(a.size(0), n, k, stats['median_ms']):.1f} TF/s"

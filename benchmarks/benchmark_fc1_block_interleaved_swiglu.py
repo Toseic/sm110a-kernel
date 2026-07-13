@@ -163,14 +163,16 @@ def benchmark_fused_kernel(a, interleaved_w, router_scores, topk, out, config, a
         args.warmup,
         args.iters,
         args.samples,
+        cold_l2_flush=getattr(args, "_cold_l2_flush", None),
     )
 
 
-def probe_fused_kernel(a, interleaved_w, router_scores, topk, out, config):
+def probe_fused_kernel(a, interleaved_w, router_scores, topk, out, config, args):
     run_fused(a, interleaved_w, router_scores, topk, out, config)
     torch.cuda.synchronize()
     return quick_probe(
-        lambda: run_fused(a, interleaved_w, router_scores, topk, out, config)
+        lambda: run_fused(a, interleaved_w, router_scores, topk, out, config),
+        cold_l2_flush=getattr(args, "_cold_l2_flush", None),
     )
 
 
@@ -298,7 +300,7 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
             cache_namespace="fc1_block_interleaved_swiglu",
             cache_key=(a.size(0), interleaved_w.size(1) // 2, a.size(1), topk),
             probe_candidate=lambda config: probe_fused_kernel(
-                a, interleaved_w, router_scores, topk, out, config
+                a, interleaved_w, router_scores, topk, out, config, args
             ),
             metric_formatter=lambda _config, stats: (
                 f"{routed_fc1_swiglu_tflops_from_ms(a.size(0), topk, interleaved_w.size(1) // 2, a.size(1), stats['median_ms']):.1f} TF/s"

@@ -113,6 +113,8 @@ def run_accuracy_check(args):
         skip_check=False,
         baseline=args.baseline,
         debug=args.debug,
+        cold_l2=getattr(args, "cold_l2", True),
+        _cold_l2_flush=getattr(args, "_cold_l2_flush", None),
     )
     bench = Bf16GemmBenchmark()
     kernel_stats, baseline_stats, max_abs_diff, baseline_name, best_candidate = bench.run_case(
@@ -225,6 +227,7 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
                 args.warmup,
                 args.iters,
                 args.samples,
+                cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             )
         elif args.baseline == "cublaslt":
             baseline_name = "Lt"
@@ -239,6 +242,7 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
                 args.warmup,
                 args.iters,
                 args.samples,
+                cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             )
         else:
             raise SystemExit(f"unsupported --baseline value: {args.baseline}")
@@ -285,6 +289,7 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
                 args.warmup,
                 args.iters,
                 args.samples,
+                cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             )
 
         def probe_kernel(candidate):
@@ -294,7 +299,8 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
             return quick_probe(
                 lambda: bf16_gemm_out(
                     a, b, out, config=config, swap_ab=swap_ab
-                )
+                ),
+                cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             )
 
         best_candidate, best_stats, _ = self.autotune_candidates(

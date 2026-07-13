@@ -73,6 +73,7 @@ def run_case(m, n, k, args):
             args.warmup,
             args.iters,
             args.samples,
+            cold_l2_flush=getattr(args, "_cold_l2_flush", None),
         )
     elif args.baseline == "cublaslt":
         baseline_name = "Lt"
@@ -87,6 +88,7 @@ def run_case(m, n, k, args):
             args.warmup,
             args.iters,
             args.samples,
+            cold_l2_flush=getattr(args, "_cold_l2_flush", None),
         )
     else:
         raise SystemExit(f"unsupported --baseline value: {args.baseline}")
@@ -96,6 +98,7 @@ def run_case(m, n, k, args):
         args.warmup,
         args.iters,
         args.samples,
+        cold_l2_flush=getattr(args, "_cold_l2_flush", None),
     )
     max_abs_diff = 0.0
     if not args.skip_check:
