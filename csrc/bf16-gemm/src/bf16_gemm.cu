@@ -54,7 +54,6 @@
 //       stall on the descriptor fetch.
 //
 
-
 // Functional summary
 // ------------------
 //   * Persistent tiled kernel: launches one CTA per SM (grid == kSmCount == 20)
@@ -221,6 +220,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cudaTypedefs.h> // required for CUtensorMap
+
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -261,8 +261,7 @@ template <int kTileM, int kTileN, int kTileK, int kClusterM, int kEpilogueBlockN
 struct KernelConfig {
     static_assert(kClusterM == 1 || kClusterM == 2);
     static_assert(kTileM == 4 * kWarpSize);
-    static_assert(
-        kEpilogueBlockN == 32 || kEpilogueBlockN == 64 || kEpilogueBlockN == 128);
+    static_assert(kEpilogueBlockN == 32 || kEpilogueBlockN == 64 || kEpilogueBlockN == 128);
     static_assert(kTileN % kEpilogueBlockN == 0);
     static_assert(kTileN % kClusterM == 0);
     static_assert(kTileK % 64 == 0);
@@ -277,8 +276,7 @@ struct KernelConfig {
         kTileM * kEpilogueBlockN * static_cast<int>(sizeof(nv_bfloat16));
     static constexpr int kEpilogueSmemBytes = kEpilogueStageCount * kEpilogueStageBytes;
     static constexpr int kMaxSmemBytes = 227 * 1024;
-    static constexpr int kStageCount =
-        (kMaxSmemBytes - kEpilogueSmemBytes) / kPerStageSmemBytes;
+    static constexpr int kStageCount = (kMaxSmemBytes - kEpilogueSmemBytes) / kPerStageSmemBytes;
     static_assert(kStageCount >= 2);
     static constexpr int kMainloopSmemBytes = kStageCount * kPerStageSmemBytes;
     static constexpr int kDynamicSmemBytes = kMainloopSmemBytes + kEpilogueSmemBytes;
@@ -304,41 +302,104 @@ __device__ inline void tma_3d_gmem2smem(
         : "memory");
 }
 
+__device__ inline uint64_t make_epilogue_cache_policy() {
+    uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(policy));
+    return policy;
+}
+
 __device__ inline void tma_3d_smem2gmem(
+    uint64_t policy,
     int src,
     const void *tmap_ptr,
     int x,
     int y,
     int z) {
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-    asm volatile(
-        "cp.async.bulk.tensor.3d.global.shared::cta.bulk_group "
-        "[%0, {%1, %2, %3}], [%4];" ::"l"(tmap_ptr),
+    asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.bulk_group.L2::cache_hint "
+                 "[%0, {%1, %2, %3}], [%4], %5;" ::"l"(tmap_ptr),
         "r"(x),
         "r"(y),
         "r"(z),
-        "r"(src)
+        "r"(src),
+        "l"(policy)
         : "memory");
     asm volatile("cp.async.bulk.commit_group;" ::: "memory");
 }
 
 __device__ inline void tma_2d_smem2gmem(
+    uint64_t policy,
     int src,
     const void *tmap_ptr,
     int x,
     int y) {
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-    asm volatile(
-        "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group "
-        "[%0, {%1, %2}], [%3];" ::"l"(tmap_ptr),
+    asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group.L2::cache_hint "
+                 "[%0, {%1, %2}], [%3], %4;" ::"l"(tmap_ptr),
         "r"(x),
         "r"(y),
-        "r"(src)
+        "r"(src),
+        "l"(policy)
         : "memory");
     asm volatile("cp.async.bulk.commit_group;" ::: "memory");
 }
 
-__device__ inline void mbarrier_wait(
+// Keep these waits as separate functions for Nsight Compute source
+// correlation.  They intentionally contain identical PTX: only the
+// producer/consumer role differs, and the separate bodies let lineinfo
+// distinguish the four pipeline dependencies.
+__device__ inline void wait_mma_slot(
+    int mbar_addr,
+    int phase) {
+    uint32_t ticks = 0x989680;
+    asm volatile("{\n\t"
+                 ".reg .pred P1;\n\t"
+                 "LAB_WAIT:\n\t"
+                 "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [%0], %1, %2;\n\t"
+                 "@P1 bra.uni DONE;\n\t"
+                 "bra.uni LAB_WAIT;\n\t"
+                 "DONE:\n\t"
+                 "}" ::"r"(mbar_addr),
+        "r"(phase),
+        "r"(ticks)
+        : "memory");
+}
+
+__device__ inline void wait_tma(
+    int mbar_addr,
+    int phase) {
+    uint32_t ticks = 0x989680;
+    asm volatile("{\n\t"
+                 ".reg .pred P1;\n\t"
+                 "LAB_WAIT:\n\t"
+                 "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [%0], %1, %2;\n\t"
+                 "@P1 bra.uni DONE;\n\t"
+                 "bra.uni LAB_WAIT;\n\t"
+                 "DONE:\n\t"
+                 "}" ::"r"(mbar_addr),
+        "r"(phase),
+        "r"(ticks)
+        : "memory");
+}
+
+__device__ inline void wait_epilogue(
+    int mbar_addr,
+    int phase) {
+    uint32_t ticks = 0x989680;
+    asm volatile("{\n\t"
+                 ".reg .pred P1;\n\t"
+                 "LAB_WAIT:\n\t"
+                 "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [%0], %1, %2;\n\t"
+                 "@P1 bra.uni DONE;\n\t"
+                 "bra.uni LAB_WAIT;\n\t"
+                 "DONE:\n\t"
+                 "}" ::"r"(mbar_addr),
+        "r"(phase),
+        "r"(ticks)
+        : "memory");
+}
+
+__device__ inline void wait_mainloop(
     int mbar_addr,
     int phase) {
     uint32_t ticks = 0x989680;
@@ -447,12 +508,10 @@ inline void init_3D_output_tmap(
     constexpr uint32_t kSwizzleElements = 32;
     assert(global_width % kSwizzleElements == 0);
     assert(shared_width % kSwizzleElements == 0);
-    uint64_t global_dim[rank] = {
-        kSwizzleElements, global_width / kSwizzleElements, global_height};
-    uint64_t global_strides[rank - 1] = {
-        kSwizzleElements * sizeof(nv_bfloat16), global_width * sizeof(nv_bfloat16)};
-    uint32_t box_dim[rank] = {
-        kSwizzleElements, shared_width / kSwizzleElements, shared_height};
+    uint64_t global_dim[rank] = {kSwizzleElements, global_width / kSwizzleElements, global_height};
+    uint64_t global_strides[rank - 1] = {kSwizzleElements * sizeof(nv_bfloat16),
+        global_width * sizeof(nv_bfloat16)};
+    uint32_t box_dim[rank] = {kSwizzleElements, shared_width / kSwizzleElements, shared_height};
     uint32_t element_strides[rank] = {1, 1, 1};
 
     cuTensorMapEncodeTiled(tmap,
@@ -550,15 +609,14 @@ void bf16_gemm_kernel(
     // set up smem
     extern __shared__ __align__(1024) char _smem_ptr[];
     const int smem = static_cast<int>(__cvta_generic_to_shared(_smem_ptr));
-    nv_bfloat16 *epilogue_smem =
-        reinterpret_cast<nv_bfloat16 *>(_smem_ptr + kMainloopSmemBytes);
+    nv_bfloat16 *epilogue_smem = reinterpret_cast<nv_bfloat16 *>(_smem_ptr + kMainloopSmemBytes);
 
     constexpr int kClusterTileM = kClusterM * kTileM;
-    constexpr uint32_t i_desc = (1U << 4U)                           // dtype=FP32
-                                | (1U << 7U)                         // atype=BF16
-                                | (1U << 10U)                        // btype=BF16
-                                | ((uint32_t)kTileN >> 3U << 17U)   // MMA_N
-                                | ((uint32_t)kClusterTileM >> 4U << 24U)  // MMA_M
+    constexpr uint32_t i_desc = (1U << 4U)                               // dtype=FP32
+                                | (1U << 7U)                             // atype=BF16
+                                | (1U << 10U)                            // btype=BF16
+                                | ((uint32_t)kTileN >> 3U << 17U)        // MMA_N
+                                | ((uint32_t)kClusterTileM >> 4U << 24U) // MMA_M
         ;
 
     // setup Mbarrier
@@ -624,7 +682,7 @@ void bf16_gemm_kernel(
         if constexpr (DO_PROFILE) {
             profiler.start(ProfilerTag::WaitMMA);
         }
-        mbarrier_wait(mma_mbar_addr, mma_phase);
+        wait_mma_slot(mma_mbar_addr, mma_phase);
         if constexpr (DO_PROFILE) {
             profiler.stop();
         }
@@ -644,8 +702,7 @@ void bf16_gemm_kernel(
             "r"(cp_size)
             : "memory");
         const int off_k_64 = iter_k * (kTileK / 64);
-        tma_3d_gmem2smem<kClusterM>(
-            A_smem, &A_tmap, 0, off_m, off_k_64, tma_mbar_addr);
+        tma_3d_gmem2smem<kClusterM>(A_smem, &A_tmap, 0, off_m, off_k_64, tma_mbar_addr);
         tma_3d_gmem2smem<kClusterM>(B_smem,
             &B_tmap,
             0,
@@ -663,7 +720,7 @@ void bf16_gemm_kernel(
         if constexpr (DO_PROFILE) {
             profiler.start(ProfilerTag::WaitTMA);
         }
-        mbarrier_wait(tma_mbar_addr, tma_phase);
+        wait_tma(tma_mbar_addr, tma_phase);
         if constexpr (DO_PROFILE) {
             profiler.stop();
         }
@@ -715,14 +772,12 @@ void bf16_gemm_kernel(
     };
 
     auto tmem_to_smem = [&](int mainloop_stage, int n_block, int smem_stage) {
-        nv_bfloat16 *smem_out =
-            epilogue_smem + smem_stage * kTileM * kEpilogueBlockN;
+        nv_bfloat16 *smem_out = epilogue_smem + smem_stage * kTileM * kEpilogueBlockN;
 
         for (int n = 0; n < kEpilogueBlockN / 8; n++) {
             float tmp[8];
             const int row = cta_rank * 128 + warp_id * 32;
-            const int col =
-                n_block * kEpilogueBlockN + n * 8 + mainloop_stage * kTileN;
+            const int col = n_block * kEpilogueBlockN + n * 8 + mainloop_stage * kTileN;
             const int addr = taddr + (row << 16) + col;
             asm volatile(
                 "tcgen05.ld.sync.aligned.32x32b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
@@ -745,8 +800,7 @@ void bf16_gemm_kernel(
                     out[i] = __float22bfloat162_rn({tmp[i * 2], tmp[i * 2 + 1]});
                 }
                 const int chunk = tid * (kEpilogueBlockN / 8) + n;
-                const int swizzled_chunk =
-                    (chunk & ~7) + ((chunk & 7) ^ ((chunk >> 3) & 3));
+                const int swizzled_chunk = (chunk & ~7) + ((chunk & 7) ^ ((chunk >> 3) & 3));
                 reinterpret_cast<int4 *>(smem_out + swizzled_chunk * 8)[0] =
                     reinterpret_cast<int4 *>(out)[0];
             } else {
@@ -757,10 +811,8 @@ void bf16_gemm_kernel(
                 for (int i = 0; i < 8; ++i) {
                     const int elem = (dst_row + i) * kTileM + dst_col;
                     const int chunk = elem / 8;
-                    const int swizzled_chunk =
-                        (chunk & ~7) + ((chunk & 7) ^ ((chunk >> 3) & 3));
-                    smem_out[swizzled_chunk * 8 + elem % 8] =
-                        __float2bfloat16_rn(tmp[i]);
+                    const int swizzled_chunk = (chunk & ~7) + ((chunk & 7) ^ ((chunk >> 3) & 3));
+                    smem_out[swizzled_chunk * 8 + elem % 8] = __float2bfloat16_rn(tmp[i]);
                 }
             }
         }
@@ -773,8 +825,7 @@ void bf16_gemm_kernel(
 
         auto release_tmem = [&]() {
             if (elect_sync()) {
-                const int mbar_addr =
-                    (_base_epilogue_mbar_addr + mainloop_stage * 8) & 0xFEFFFFFF;
+                const int mbar_addr = (_base_epilogue_mbar_addr + mainloop_stage * 8) & 0xFEFFFFFF;
                 asm volatile(
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];" ::"r"(mbar_addr)
                     : "memory");
@@ -788,6 +839,10 @@ void bf16_gemm_kernel(
             release_tmem();
         }
 
+        uint64_t cache_policy = 0;
+        if (tid == 0) {
+            cache_policy = make_epilogue_cache_policy();
+        }
         for (int n_block = 0; n_block < n_block_num; n_block++) {
             const int smem_stage = n_block % kEpilogueStageCount;
             const int stage_smem =
@@ -798,18 +853,21 @@ void bf16_gemm_kernel(
             // other stage from tensor memory.
             if (tid == 0) {
                 if constexpr (!SWAP_AB && kEpilogueBlockN == 32) {
-                    tma_2d_smem2gmem(stage_smem,
+                    tma_2d_smem2gmem(cache_policy,
+                        stage_smem,
                         &C_tmap,
                         off_n + n_block * kEpilogueBlockN,
                         off_m);
                 } else if constexpr (!SWAP_AB) {
-                    tma_3d_smem2gmem(stage_smem,
+                    tma_3d_smem2gmem(cache_policy,
+                        stage_smem,
                         &C_tmap,
                         0,
                         (off_n + n_block * kEpilogueBlockN) / 32,
                         off_m);
                 } else {
-                    tma_3d_smem2gmem(stage_smem,
+                    tma_3d_smem2gmem(cache_policy,
+                        stage_smem,
                         &C_tmap,
                         0,
                         off_m / 32,
@@ -927,7 +985,7 @@ void bf16_gemm_kernel(
             if constexpr (DO_PROFILE) {
                 profiler.start(ProfilerTag::WaitEpilogue);
             }
-            mbarrier_wait(_base_epilogue_mbar_addr + mainloop_stage * 8, epilogue_phase);
+            wait_epilogue(_base_epilogue_mbar_addr + mainloop_stage * 8, epilogue_phase);
             if constexpr (DO_PROFILE) {
                 profiler.stop();
             }
@@ -964,7 +1022,7 @@ void bf16_gemm_kernel(
             if constexpr (DO_PROFILE)
                 if (elect_sync())
                     profiler.start(ProfilerTag::WaitMainloop);
-            mbarrier_wait(_base_mainloop_mbar_addr + 8 * mainloop_stage, mainloop_phase);
+            wait_mainloop(_base_mainloop_mbar_addr + 8 * mainloop_stage, mainloop_phase);
             asm volatile("tcgen05.fence::after_thread_sync;");
             if constexpr (DO_PROFILE)
                 if (elect_sync())
@@ -1004,8 +1062,7 @@ void bf16_gemm_kernel(
 
 } // namespace
 
-template <
-    int kTileM,
+template <int kTileM,
     int kTileN,
     int kTileK,
     int kClusterM,
@@ -1040,16 +1097,21 @@ void launch_bf16_gemm_impl(
 
     CUtensorMap A_tmap, B_tmap, C_tmap;
 
-    static_assert(kMacroSwizzleM * kMacroSwizzleN <=
-                  (32 * 1024 * 1024) /
-                      (static_cast<int>(sizeof(nv_bfloat16)) * kTileM * kTileK +
-                       static_cast<int>(sizeof(nv_bfloat16)) * kTileN * kTileK));
+    static_assert(
+        kMacroSwizzleM * kMacroSwizzleN <=
+        (32 * 1024 * 1024) / (static_cast<int>(sizeof(nv_bfloat16)) * kTileM * kTileK +
+                                 static_cast<int>(sizeof(nv_bfloat16)) * kTileN * kTileK));
     assert(M % (kClusterM * kTileM) == 0);
     assert(N % kTileN == 0);
     assert(K % kTileK == 0);
 
-    init_3D_tmap(
-        &A_tmap, A_ptr, M, K, kTileM, kTileK, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B);
+    init_3D_tmap(&A_tmap,
+        A_ptr,
+        M,
+        K,
+        kTileM,
+        kTileK,
+        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B);
     init_3D_tmap(&B_tmap,
         B_ptr,
         N,
@@ -1058,14 +1120,11 @@ void launch_bf16_gemm_impl(
         kTileK,
         CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B);
     if constexpr (SWAP_AB) {
-        init_3D_output_tmap(
-            &C_tmap, C_ptr, logic_M, logic_N, kEpilogueBlockN, kTileM);
+        init_3D_output_tmap(&C_tmap, C_ptr, logic_M, logic_N, kEpilogueBlockN, kTileM);
     } else if constexpr (kEpilogueBlockN == 32) {
-        init_2D_output_tmap(
-            &C_tmap, C_ptr, logic_M, logic_N, kTileM, kEpilogueBlockN);
+        init_2D_output_tmap(&C_tmap, C_ptr, logic_M, logic_N, kTileM, kEpilogueBlockN);
     } else {
-        init_3D_output_tmap(
-            &C_tmap, C_ptr, logic_M, logic_N, kTileM, kEpilogueBlockN);
+        init_3D_output_tmap(&C_tmap, C_ptr, logic_M, logic_N, kTileM, kEpilogueBlockN);
     }
 
     constexpr int mbarrier_smem = 256;
@@ -1074,14 +1133,7 @@ void launch_bf16_gemm_impl(
     int grid = kSmCount;
 
     auto kernel =
-        bf16_gemm_kernel<
-            kTileM,
-            kTileN,
-            kTileK,
-            kClusterM,
-            kEpilogueBlockN,
-            DO_PROFILE,
-            SWAP_AB>;
+        bf16_gemm_kernel<kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN, DO_PROFILE, SWAP_AB>;
 
     if (smem_size > 48 * 1024) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
@@ -1108,8 +1160,7 @@ void launch_bf16_gemm(
     bool swap_ab,
     cudaStream_t stream) {
     if (swap_ab) {
-        launch_bf16_gemm_impl<
-            SM110A_BF16_TILE_M,
+        launch_bf16_gemm_impl<SM110A_BF16_TILE_M,
             SM110A_BF16_TILE_N,
             SM110A_BF16_TILE_K,
             SM110A_BF16_CLUSTER_M,
@@ -1117,8 +1168,7 @@ void launch_bf16_gemm(
             false,
             true>(A_ptr, B_ptr, C_ptr, M, N, K, nullptr, 0, stream);
     } else {
-        launch_bf16_gemm_impl<
-            SM110A_BF16_TILE_M,
+        launch_bf16_gemm_impl<SM110A_BF16_TILE_M,
             SM110A_BF16_TILE_N,
             SM110A_BF16_TILE_K,
             SM110A_BF16_CLUSTER_M,
@@ -1140,8 +1190,7 @@ void launch_bf16_gemm_profile(
     bool swap_ab,
     cudaStream_t stream) {
     if (swap_ab) {
-        launch_bf16_gemm_impl<
-            SM110A_BF16_TILE_M,
+        launch_bf16_gemm_impl<SM110A_BF16_TILE_M,
             SM110A_BF16_TILE_N,
             SM110A_BF16_TILE_K,
             SM110A_BF16_CLUSTER_M,
@@ -1149,8 +1198,7 @@ void launch_bf16_gemm_profile(
             true,
             true>(A_ptr, B_ptr, C_ptr, M, N, K, profiler_ptr, num_entries, stream);
     } else {
-        launch_bf16_gemm_impl<
-            SM110A_BF16_TILE_M,
+        launch_bf16_gemm_impl<SM110A_BF16_TILE_M,
             SM110A_BF16_TILE_N,
             SM110A_BF16_TILE_K,
             SM110A_BF16_CLUSTER_M,
