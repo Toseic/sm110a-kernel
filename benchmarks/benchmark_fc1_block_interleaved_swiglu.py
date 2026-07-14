@@ -9,7 +9,13 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from common import BenchmarkBase, benchmark_with_stats, quick_probe
+from common import (
+    BenchmarkBase,
+    benchmark_with_stats,
+    print_sol_report,
+    quick_probe,
+    sol_bounds,
+)
 import sm110a_kernel as ext
 from sm110a_kernel import (
     Fc1BlockInterleavedSwiGLUConfig,
@@ -50,6 +56,38 @@ def routed_fc1_swiglu_tflops_from_ms(tokens, topk, n, k, elapsed_ms):
     m = tokens * topk
     flops = 4.0 * m * n * k  # gate and up projections, each 2 * M * N * K
     return flops / (elapsed_ms * 1.0e-3) / 1.0e12
+
+
+def fc1_main_kernel_sol_bounds(router_scores, topk, n, k, config):
+    """SOL model for FC1's main kernel; routing/scheduling are excluded."""
+    experts = router_scores.size(1)
+    selected = torch.topk(
+        router_scores.float(), topk, dim=1, largest=True, sorted=True
+    ).indices
+    expert_rows = torch.bincount(selected.reshape(-1), minlength=experts)
+    m = selected.numel()
+    m_task_count = torch.div(
+        expert_rows + config.cluster_m * config.tile_m - 1,
+        config.cluster_m * config.tile_m,
+        rounding_mode="floor",
+    ).sum().item()
+    task_count = m_task_count * (
+        n // ((config.tile_n // 2) * config.cluster_n)
+    )
+    flops = 4 * m * n * k
+    a_bytes = 2 * m * k
+    active_experts = int((expert_rows > 0).sum().item())
+    b_bytes = 4 * active_experts * n * k
+    c_bytes = 2 * m * n
+    tile_read_bytes = (
+        2
+        * task_count
+        * (config.cluster_m * config.tile_m + config.cluster_n * config.tile_n)
+        * k
+    )
+    return sol_bounds(
+        flops, a_bytes + b_bytes + c_bytes, a_bytes + b_bytes, tile_read_bytes
+    )
 
 
 def interleave_gate_up_weights(gate_w, up_w, block_size=INTERLEAVE_BLOCK):
@@ -181,6 +219,7 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
         parser = super().build_parser()
         self.add_timing_args(parser, warmup=2, iters=3, samples=3)
         self.add_cache_args(parser)
+        self.add_sol_arg(parser)
         parser.add_argument("--experts", type=int, default=DEFAULT_EXPERTS)
         parser.add_argument("--topk", type=int, default=DEFAULT_TOPK)
         parser.add_argument("--n", type=int, default=DEFAULT_N)
@@ -416,6 +455,14 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
                 format_candidate(best_config),
                 path_name,
             )
+            if args.sol:
+                print_sol_report(
+                    fc1_main_kernel_sol_bounds(
+                        router_scores, args.topk, args.n, args.k, best_config
+                    ),
+                    kernel_stats["median_ms"],
+                    label="FC1 main kernel (routing excluded)",
+                )
 
 
 if __name__ == "__main__":

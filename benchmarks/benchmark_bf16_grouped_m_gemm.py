@@ -15,6 +15,8 @@ from common import (
     benchmark_with_stats,
     quick_probe,
     tflops_from_ms,
+    print_sol_report,
+    sol_bounds,
 )
 from sm110a_kernel import GroupedMConfig, bf16_grouped_m_gemm_out
 from sm110a_kernel.jit import (
@@ -208,6 +210,29 @@ def print_result(
     )
 
 
+def grouped_m_gemm_sol_bounds(tokens_per_expert, experts, n, k, config):
+    """SOL model for this benchmark's uniform expert-contiguous workload."""
+    m = tokens_per_expert * experts
+    task_count = (
+        experts
+        * math.ceil(tokens_per_expert / (config.cluster_m * config.tile_m))
+        * math.ceil(n / config.tile_n)
+    )
+    flops = 2 * m * n * k
+    a_bytes = 2 * m * k
+    b_bytes = 2 * experts * n * k
+    c_bytes = 2 * m * n
+    tile_read_bytes = (
+        2
+        * task_count
+        * (config.cluster_m * config.tile_m + config.tile_n)
+        * k
+    )
+    return sol_bounds(
+        flops, a_bytes + b_bytes + c_bytes, a_bytes + b_bytes, tile_read_bytes
+    )
+
+
 def print_debug_results(results, experts, n, k):
     print()
     print("[debug] per-config performance")
@@ -259,6 +284,7 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
         )
         self.add_torch_blas_arg(parser)
         self.add_cache_args(parser)
+        self.add_sol_arg(parser)
         parser.add_argument(
             "--token",
             type=int,
@@ -352,6 +378,14 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
                     best_swap_ab,
                 )
             )
+            if args.sol:
+                print_sol_report(
+                    grouped_m_gemm_sol_bounds(
+                        tokens_per_expert, EXPERTS, N, K, best_config
+                    ),
+                    kernel_stats["median_ms"],
+                    label="grouped-M GEMM",
+                )
 
     def benchmark_best_grouped_kernel(self, a, b, layout, out, args):
         candidates = compatible_candidates(b.size(1), a.size(1))

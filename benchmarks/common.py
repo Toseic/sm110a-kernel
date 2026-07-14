@@ -13,6 +13,12 @@ import torch
 TARGET_SAMPLE_MS = 50.0
 PROBE_TARGET_MS = 10.0       # quick probe target — small enough to be fast
 EARLY_STOP_RATIO = 1.3       # skip config if probe > best_probe * this
+MMA_PEAK_TFLOPS = 250.0
+GMEM_BW_GBPS = 273.0
+L2_BW_GBPS = 1.281 * 1000.0
+BF16_BYTES = 2
+_DECIMAL_MB = 1000 ** 2
+_DECIMAL_GFLOP = 1000 ** 3
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CACHE_FILENAME = "autotune_cache.json"
@@ -63,6 +69,13 @@ class BenchmarkBase:
             "--force-sweep",
             action="store_true",
             help="ignore the cached best config and re-run the full autotune sweep",
+        )
+
+    def add_sol_arg(self, parser):
+        parser.add_argument(
+            "--sol",
+            action="store_true",
+            help="print analytical SOL bounds and measured SOL attainment",
         )
         parser.add_argument(
             "--cache-path",
@@ -391,6 +404,7 @@ class GemmBenchmarkBase(BenchmarkBase):
             default="cublaslt",
         )
         self.add_cache_args(parser)
+        self.add_sol_arg(parser)
         self.add_arguments(parser)
         return parser
 
@@ -416,6 +430,7 @@ class GemmBenchmarkBase(BenchmarkBase):
         yield from self.default_shapes
 
     def run_with_args(self, args):
+        self._sol_enabled = getattr(args, "sol", False)
         actual_blas = None
         if args.baseline == "torch":
             actual_blas = self.configure_torch_blas(args.torch_blas)
@@ -450,6 +465,49 @@ class GemmBenchmarkBase(BenchmarkBase):
 def tflops_from_ms(m, n, k, elapsed_ms):
     flops = 2.0 * m * n * k
     return flops / (elapsed_ms * 1.0e-3) / 1.0e12
+
+
+def _ms_for_bytes(byte_count, bandwidth_gbps):
+    return byte_count / (bandwidth_gbps * _DECIMAL_MB)
+
+
+def sol_bounds(flops, compulsory_bytes, a_and_b_bytes, tile_read_bytes):
+    """Return the SOL models shared by the three BF16 benchmark families."""
+    mma_ms = flops / (MMA_PEAK_TFLOPS * _DECIMAL_GFLOP)
+    hbm_ms = _ms_for_bytes(compulsory_bytes, GMEM_BW_GBPS)
+    gmem_ms = _ms_for_bytes(tile_read_bytes, GMEM_BW_GBPS)
+    pure_l2_ms = _ms_for_bytes(tile_read_bytes, L2_BW_GBPS)
+    best_l2_ms = (
+        _ms_for_bytes(a_and_b_bytes, GMEM_BW_GBPS)
+        + _ms_for_bytes(tile_read_bytes - a_and_b_bytes, L2_BW_GBPS)
+    )
+    return {
+        "mma_ms": mma_ms,
+        "hbm_ms": hbm_ms,
+        "gmem_ms": gmem_ms,
+        "pure_l2_ms": pure_l2_ms,
+        "best_l2_ms": best_l2_ms,
+        "compulsory_bytes": compulsory_bytes,
+        "tile_read_bytes": tile_read_bytes,
+        # HBM misses and L2 hits can be serviced concurrently. Their sum is a
+        # useful serialized-traffic estimate, but not a hard lower bound.
+        # The roofline is the maximum demand on the independent resources.
+        "sol_ms": max(mma_ms, hbm_ms, pure_l2_ms),
+    }
+
+
+def print_sol_report(bounds, measured_ms, *, label="SOL"):
+    """Print a readable, multi-line bound breakdown below a benchmark result."""
+    attainment = 100.0 * bounds["sol_ms"] / measured_ms
+    print(f"[sol] {label}")
+    print(f"      mma:          {bounds['mma_ms']:.4f} ms")
+    print(f"      hbm:          {bounds['hbm_ms']:.4f} ms")
+    print(f"      gmem:         {bounds['gmem_ms']:.4f} ms")
+    print(f"      pure-l2:      {bounds['pure_l2_ms']:.4f} ms")
+    print(f"      mixed-serial:  {bounds['best_l2_ms']:.4f} ms")
+    print(f"      selected:     {bounds['sol_ms']:.4f} ms")
+    print(f"      attainment:   {attainment:.1f}%")
+    print(f"      tile-read:    {bounds['tile_read_bytes'] / _DECIMAL_MB:.1f} MB")
 
 
 def calibrate_iters(initial_ms, requested_iters, target_ms=TARGET_SAMPLE_MS):

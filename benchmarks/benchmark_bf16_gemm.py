@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -16,6 +17,8 @@ from common import (
     benchmark_with_stats_batched,
     quick_probe,
     tflops_from_ms,
+    print_sol_report,
+    sol_bounds,
 )
 from sm110a_kernel import (
     Bf16GemmConfig,
@@ -104,6 +107,19 @@ def calibration_target_ms(m, n, k):
     )
 
 
+def gemm_sol_bounds(m, n, k, config, swap_ab=False):
+    """SOL model for the selected standard-GEMM mainloop configuration."""
+    if swap_ab:
+        m, n = n, m
+    cluster_tile_m = config.cluster_m * config.tile_m
+    tile_count = math.ceil(m / cluster_tile_m) * math.ceil(n / config.tile_n)
+    flops = 2 * m * n * k
+    a_and_b_bytes = 2 * (m * k + n * k)
+    compulsory_bytes = a_and_b_bytes + 2 * m * n
+    tile_read_bytes = 2 * tile_count * (cluster_tile_m + config.tile_n) * k
+    return sol_bounds(flops, compulsory_bytes, a_and_b_bytes, tile_read_bytes)
+
+
 def print_result(m, n, k, kernel_stats, baseline_stats, max_abs_diff, best_candidate):
     return (
         m,
@@ -146,6 +162,13 @@ def run_accuracy_check(args):
             best_candidate,
         )
     )
+    if args.sol:
+        config, swap_ab = best_candidate
+        print_sol_report(
+            gemm_sol_bounds(*ACCURACY_SHAPE, config, swap_ab),
+            kernel_stats["median_ms"],
+            label="GEMM",
+        )
     print()
 
 
@@ -352,6 +375,13 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
                 m, n, k, kernel_stats, baseline_stats, max_abs_diff, best_candidate
             )
         )
+        if self._sol_enabled:
+            config, swap_ab = best_candidate
+            print_sol_report(
+                gemm_sol_bounds(m, n, k, config, swap_ab),
+                kernel_stats["median_ms"],
+                label="GEMM",
+            )
 
 
 def main():
