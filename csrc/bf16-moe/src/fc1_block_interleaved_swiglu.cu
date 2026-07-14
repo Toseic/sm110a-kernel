@@ -53,11 +53,12 @@ constexpr int kWarpCount = kMmaWarp + 1;
 constexpr int kBlockThreads = kWarpSize * kWarpCount;
 constexpr int kAProducerThreadCount = kProducerWarpCount * kWarpSize;
 constexpr int kTmemStageCount = 2;
-constexpr int kPersistentTileCount = 4;
+constexpr int kPersistentTileCount = 2;
 constexpr int kMacroSwizzleM = 8;
-// Keep each expert-local A/B working set below Thor's 32 MiB L2 while the
-// persistent workers traverse neighboring M tasks.
-constexpr int kMacroSwizzleN = 8;
+// A four-wide physical-B band (12 MiB at N=256, K=6144) leaves room in L2
+// for the concurrently reused routed-A tiles.  Larger bands made B-TMA
+// completion visible to the consumer at the 32k-token persistent workload.
+constexpr int kMacroSwizzleN = 4;
 constexpr int kInterleaveBlock = 32;
 constexpr int kRoutingThreads = 256;
 
