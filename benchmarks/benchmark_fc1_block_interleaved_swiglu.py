@@ -21,6 +21,7 @@ from sm110a_kernel import (
     Fc1BlockInterleavedSwiGLUConfig,
     GroupedMConfig,
     bf16_grouped_m_gemm_out,
+    prepare_grouped_m_metadata,
     compile_fc1_block_interleaved_swiglu_configs,
 )
 
@@ -112,8 +113,9 @@ def swiglu(gate, up):
 def run_baseline(a, gate_w, up_w, layout, out, config):
     gate_acc = torch.empty_like(out)
     up_acc = torch.empty_like(out)
-    bf16_grouped_m_gemm_out(a, gate_w, layout, gate_acc, config=config, swap_ab=False)
-    bf16_grouped_m_gemm_out(a, up_w, layout, up_acc, config=config, swap_ab=False)
+    metadata = prepare_grouped_m_metadata(layout, gate_w.size(0), gate_w.size(1), config=config)
+    bf16_grouped_m_gemm_out(a, gate_w, metadata, gate_acc, config=config, swap_ab=False)
+    bf16_grouped_m_gemm_out(a, up_w, metadata, up_acc, config=config, swap_ab=False)
     out.copy_(swiglu(gate_acc, up_acc).to(torch.bfloat16))
 
 
@@ -145,11 +147,11 @@ def resolve_fused_impl():
     return None, None
 
 
-def run_fused(a, interleaved_w, router_scores, topk, out, config):
+def run_fused(a, interleaved_w, metadata, out, config):
     impl_name, impl = resolve_fused_impl()
     if impl is None:
         raise RuntimeError("fused fc1_block_interleaved_swiglu_out binding is unavailable")
-    impl(a, interleaved_w, router_scores, topk, out, config=config)
+    impl(a, interleaved_w, metadata, out, config=config)
     return impl_name
 
 
@@ -194,10 +196,11 @@ def compile_fc1_configs(configs, debug):
 
 
 def benchmark_fused_kernel(a, interleaved_w, router_scores, topk, out, config, args):
-    run_fused(a, interleaved_w, router_scores, topk, out, config)
+    metadata = ext.prepare_fc1_metadata(router_scores, topk, out.size(1), config=config)
+    run_fused(a, interleaved_w, metadata, out, config)
     torch.cuda.synchronize()
     return benchmark_with_stats(
-        lambda: run_fused(a, interleaved_w, router_scores, topk, out, config),
+        lambda: run_fused(a, interleaved_w, metadata, out, config),
         args.warmup,
         args.iters,
         args.samples,
@@ -206,10 +209,11 @@ def benchmark_fused_kernel(a, interleaved_w, router_scores, topk, out, config, a
 
 
 def probe_fused_kernel(a, interleaved_w, router_scores, topk, out, config, args):
-    run_fused(a, interleaved_w, router_scores, topk, out, config)
+    metadata = ext.prepare_fc1_metadata(router_scores, topk, out.size(1), config=config)
+    run_fused(a, interleaved_w, metadata, out, config)
     torch.cuda.synchronize()
     return quick_probe(
-        lambda: run_fused(a, interleaved_w, router_scores, topk, out, config),
+        lambda: run_fused(a, interleaved_w, metadata, out, config),
         cold_l2_flush=getattr(args, "_cold_l2_flush", None),
     )
 
@@ -416,14 +420,8 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
                     baseline_out,
                     baseline_config,
                 )
-                run_fused(
-                    a,
-                    interleaved_w,
-                    router_scores,
-                    args.topk,
-                    test_out,
-                    best_config,
-                )
+                metadata = ext.prepare_fc1_metadata(router_scores, args.topk, test_out.size(1), config=best_config)
+                run_fused(a, interleaved_w, metadata, test_out, best_config)
                 torch.cuda.synchronize()
                 max_abs_diff = (baseline_out.float() - test_out.float()).abs().max().item()
                 passed = torch.allclose(

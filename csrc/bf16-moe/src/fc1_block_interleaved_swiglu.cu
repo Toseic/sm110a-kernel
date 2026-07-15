@@ -115,7 +115,6 @@ __device__ inline float silu(
     float x) {
     return x / (1.0f + expf(-x));
 }
-
 __device__ inline float router_score_to_float(__nv_bfloat16 value) {
     return __bfloat162float(value);
 }
@@ -202,6 +201,7 @@ __global__ void build_grouped_row_map_kernel(
     const int *__restrict__ selected_experts,
     const int *__restrict__ expert_offsets,
     int *__restrict__ source_rows,
+    int *__restrict__ grouped_assignments,
     int m,
     int topk) {
     constexpr int kWarpsPerBlock = kRoutingThreads / kWarpSize;
@@ -244,6 +244,8 @@ __global__ void build_grouped_row_map_kernel(
         if (matches) {
             const int grouped_row = rows_written + warp_offsets[warp] + warp_prefix;
             source_rows[grouped_row] = assignment / topk;
+            if (grouped_assignments != nullptr)
+                grouped_assignments[grouped_row] = assignment;
         }
         __syncthreads();
         if (threadIdx.x == 0) {
@@ -251,6 +253,23 @@ __global__ void build_grouped_row_map_kernel(
         }
         __syncthreads();
     }
+}
+
+__global__ void materialize_grouped_layout_kernel(
+    const int *expert_offsets, const int *expert_counts, int experts, int *grouped_layout) {
+    const int expert = blockIdx.x;
+    if (expert >= experts)
+        return;
+    for (int row = expert_offsets[expert] + threadIdx.x;
+         row < expert_offsets[expert] + expert_counts[expert]; row += blockDim.x)
+        grouped_layout[row] = expert;
+}
+
+__global__ void invert_grouped_assignments_kernel(
+    const int *grouped_assignments, int m, int *assignment_to_grouped) {
+    const int grouped_row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (grouped_row < m)
+        assignment_to_grouped[grouped_assignments[grouped_row]] = grouped_row;
 }
 
 template <int kTaskTileRows>
@@ -1535,173 +1554,88 @@ cudaError_t launch_topk_router(
         stream);
 }
 
+// Breaking API: preparation owns every routing/task kernel; this function
+// launches only the FC1 compute kernel from device-resident metadata.
 template <int kTileM, int kTileN, int kTileK, int kClusterM, int kClusterN, bool kDirectGmem>
-void launch_fc1_block_interleaved_swiglu_impl(
-    const __nv_bfloat16 *d_a,
-    const __nv_bfloat16 *d_b_interleaved,
-    const __nv_bfloat16 *d_router_scores,
-    __nv_bfloat16 *d_out,
-    int tokens,
-    int experts,
-    int topk,
-    int n,
-    int k,
-    cudaStream_t stream) {
+void launch_fc1_main_impl(const __nv_bfloat16* d_a, const __nv_bfloat16* d_b,
+                          const int32_t* source_rows, const int32_t* task_words,
+                          int32_t* task_state, __nv_bfloat16* d_out, int m, int experts,
+                          int n, int k, int max_tasks, cudaStream_t stream) {
     using Config = KernelConfig<kTileM, kTileN, kTileK, kClusterM, kDirectGmem>;
-    constexpr int kClusterTileM = Config::kClusterTileM;
+    if (!d_a || !d_b || !source_rows || !task_words || !task_state || !d_out ||
+        m <= 0 || experts <= 0 || n <= 0 || k <= 0 || max_tasks <= 0 ||
+        n % ((kTileN / 2) * kClusterN) || k % kTileK) return;
+    CUtensorMap b_tensor_map, c_tensor_map;
+    if (!init_b_tensor_map<kTileN, kTileK, kClusterM>(&b_tensor_map, d_b, experts, 2 * n, k) ||
+        !init_c_tensor_map<kTileM, Config::kEpilogueTileN>(&c_tensor_map, d_out, m, n)) return;
     constexpr int kDynamicSmemBytes = Config::kDynamicSmemBytes;
-    constexpr int kTaskTileRows = kClusterTileM;
+    const int persistent_clusters = (max_tasks + kPersistentTileCount - 1) / kPersistentTileCount;
+    auto kernel = fc1_block_interleaved_swiglu_kernel<kTileM, kTileN, kTileK,
+        kClusterM, kClusterN, kDirectGmem>;
+    if constexpr (kDynamicSmemBytes > 48 * 1024)
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kDynamicSmemBytes);
+    kernel<<<dim3(kClusterM * persistent_clusters, kClusterN, 1), kBlockThreads,
+        kDynamicSmemBytes, stream>>>(d_a, source_rows, b_tensor_map, c_tensor_map,
+        reinterpret_cast<const ExpertTileTask*>(task_words), task_state, d_out, n, k);
+}
 
-    if (d_a == nullptr || d_b_interleaved == nullptr || d_router_scores == nullptr ||
-        d_out == nullptr) {
-        return;
-    }
-    if (tokens <= 0 || experts <= 0 || topk <= 0 || topk > experts || n <= 0 || k <= 0) {
-        return;
-    }
-    if (n % (kTileN / 2) != 0 || k % kTileK != 0) {
-        return;
-    }
-
+template <int kTileM, int kTileN, int kTileK, int kClusterM, int kClusterN, bool kDirectGmem>
+void launch_fc1_metadata_impl(const __nv_bfloat16* router, int tokens, int experts, int topk,
+                              int32_t* routing, int32_t* source_rows, int32_t* task_words,
+                              int32_t* task_state, int max_tasks, int n, cudaStream_t stream) {
+    if (!router || !routing || !source_rows || !task_words || !task_state || tokens <= 0 ||
+        experts <= 0 || topk <= 0 || topk > experts || max_tasks <= 0 ||
+        n % ((kTileN / 2) * kClusterN)) return;
     const int m = tokens * topk;
-    if (n % ((kTileN / 2) * kClusterN) != 0) {
-        return;
+    int32_t* selected = nullptr;
+    if (cudaMallocAsync(&selected, m * sizeof(int32_t), stream) != cudaSuccess) return;
+    auto* counts = routing;
+    auto* offsets = counts + experts;
+    auto* grouped_layout = offsets + experts;
+    auto* grouped_assignments = grouped_layout + m;
+    auto* assignment_to_grouped = grouped_assignments + m;
+    cudaMemsetAsync(counts, 0, experts * sizeof(int32_t), stream);
+    cudaMemsetAsync(task_state, 0, 2 * sizeof(int32_t), stream);
+    if (launch_topk_router(router, tokens, experts, topk, selected, counts, offsets, stream) != cudaSuccess) {
+        cudaFreeAsync(selected, stream); return;
     }
+    build_grouped_row_map_kernel<<<experts, kRoutingThreads, 0, stream>>>(selected, offsets,
+        source_rows, grouped_assignments, m, topk);
+    materialize_grouped_layout_kernel<<<experts, kRoutingThreads, 0, stream>>>(
+        offsets, counts, experts, grouped_layout);
+    invert_grouped_assignments_kernel<<<(m + kRoutingThreads - 1) / kRoutingThreads,
+        kRoutingThreads, 0, stream>>>(grouped_assignments, m, assignment_to_grouped);
+    constexpr int kTaskRows = kClusterM * kTileM;
     const int grid_n = n / ((kTileN / 2) * kClusterN);
-    const int max_m_tasks = (m + kTaskTileRows - 1) / kTaskTileRows + experts;
-    const int max_tasks = max_m_tasks * grid_n;
-    const size_t metadata_bytes =
-        (2 * static_cast<size_t>(experts) + 2 * static_cast<size_t>(m) + 1) * sizeof(int);
-    const size_t task_offset =
-        (metadata_bytes + alignof(ExpertTileTask) - 1) & ~(alignof(ExpertTileTask) - 1);
-    const size_t workspace_bytes = task_offset + max_tasks * sizeof(ExpertTileTask);
-    void *workspace = nullptr;
-    if (cudaMallocAsync(&workspace, workspace_bytes, stream) != cudaSuccess) {
-        return;
-    }
-
-    auto *expert_counts = static_cast<int *>(workspace);
-    int *expert_offsets = expert_counts + experts;
-    int *selected_experts = expert_offsets + experts;
-    int *source_rows = selected_experts + m;
-    int *task_count = source_rows + m;
-    auto *tasks = reinterpret_cast<ExpertTileTask *>(static_cast<char *>(workspace) + task_offset);
-    cudaMemsetAsync(expert_counts, 0, experts * sizeof(int), stream);
-    cudaMemsetAsync(task_count, 0, sizeof(int), stream);
-
-    const cudaError_t routing_status = launch_topk_router(d_router_scores,
-        tokens,
-        experts,
-        topk,
-        selected_experts,
-        expert_counts,
-        expert_offsets,
-        stream);
-    if (routing_status != cudaSuccess) {
-        cudaFreeAsync(workspace, stream);
-        return;
-    }
-    build_grouped_row_map_kernel<<<experts, kRoutingThreads, 0, stream>>>(selected_experts,
-        expert_offsets,
-        source_rows,
-        m,
-        topk);
-
-    CUtensorMap b_tensor_map;
-    CUtensorMap c_tensor_map;
-    const int physical_n = 2 * n;
-    const bool tensor_maps_ok =
-        init_b_tensor_map<kTileN, kTileK, kClusterM>(&b_tensor_map,
-            d_b_interleaved,
-            experts,
-            physical_n,
-            k) &&
-        init_c_tensor_map<kTileM, Config::kEpilogueTileN>(&c_tensor_map, d_out, m, n);
-    if (!tensor_maps_ok) {
-        cudaFreeAsync(workspace, stream);
-        return;
-    }
-
-    constexpr int kMetadataThreads = 256;
-    build_expert_tile_tasks<kTaskTileRows>
-        <<<(experts + kMetadataThreads - 1) / kMetadataThreads, kMetadataThreads, 0, stream>>>(
-            expert_offsets,
-            expert_counts,
-            experts,
-            grid_n,
-            tasks,
-            task_count);
-
-    const int max_cluster_tiles = max_tasks;
-    const int persistent_clusters =
-        (max_cluster_tiles + kPersistentTileCount - 1) / kPersistentTileCount;
-    auto kernel =
-        fc1_block_interleaved_swiglu_kernel<
-            kTileM, kTileN, kTileK, kClusterM, kClusterN, kDirectGmem>;
-    if constexpr (kDynamicSmemBytes > 48 * 1024) {
-        cudaFuncSetAttribute(kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            kDynamicSmemBytes);
-    }
-    // CLC needs one logical launch ID per worker batch. Hardware starts as many
-    // clusters as resources allow; completed clusters steal not-yet-started IDs.
-    kernel<<<dim3(kClusterM * persistent_clusters, kClusterN, 1),
-        kBlockThreads,
-        kDynamicSmemBytes,
-        stream>>>(
-        d_a,
-        source_rows,
-        b_tensor_map,
-        c_tensor_map,
-        tasks,
-        task_count,
-        d_out,
-        n,
-        k);
-    cudaFreeAsync(workspace, stream);
+    build_expert_tile_tasks<kTaskRows><<<(experts + kRoutingThreads - 1) / kRoutingThreads,
+        kRoutingThreads, 0, stream>>>(offsets, counts, experts, grid_n,
+        reinterpret_cast<ExpertTileTask*>(task_words), task_state);
+    cudaFreeAsync(selected, stream);
 }
 
 } // namespace
 
-void launch_fc1_block_interleaved_swiglu(
-    const __nv_bfloat16 *d_a,
-    const __nv_bfloat16 *d_b_interleaved,
-    const __nv_bfloat16 *d_router_scores,
-    __nv_bfloat16 *d_out,
-    int tokens,
-    int experts,
-    int topk,
-    int n,
-    int k,
-    cudaStream_t stream) {
-    launch_fc1_block_interleaved_swiglu_impl<SM110A_FC1_TILE_M,
-        SM110A_FC1_TILE_N,
-        SM110A_FC1_TILE_K,
-        SM110A_FC1_CLUSTER_M,
-        SM110A_FC1_CLUSTER_N,
-        (SM110A_FC1_DIRECT_GMEM !=
-            0)>(d_a, d_b_interleaved, d_router_scores, d_out, tokens, experts, topk, n, k, stream);
+extern "C" void sm110a_fc1_metadata_prepare(const __nv_bfloat16* router, int tokens,
+    int experts, int topk, int32_t* routing, int32_t* source_rows, int32_t* task_words,
+    int32_t* task_state, int max_tasks, int n, cudaStream_t stream) {
+    launch_fc1_metadata_impl<SM110A_FC1_TILE_M, SM110A_FC1_TILE_N, SM110A_FC1_TILE_K,
+        SM110A_FC1_CLUSTER_M, SM110A_FC1_CLUSTER_N, (SM110A_FC1_DIRECT_GMEM != 0)>(
+            router, tokens, experts, topk, routing, source_rows, task_words, task_state,
+            max_tasks, n, stream);
 }
 
-extern "C" void sm110a_fc1_block_interleaved_swiglu_launch(
-    const __nv_bfloat16 *d_a,
-    const __nv_bfloat16 *d_b_interleaved,
-    const __nv_bfloat16 *d_router_scores,
-    __nv_bfloat16 *d_out,
-    int tokens,
-    int experts,
-    int topk,
-    int n,
-    int k,
+extern "C" void sm110a_fc1_main_launch(const __nv_bfloat16* a, const __nv_bfloat16* b,
+    const int32_t* source_rows, const int32_t* task_words, int32_t* task_state,
+    __nv_bfloat16* out, int m, int experts, int n, int k, int max_tasks, cudaStream_t stream) {
+    launch_fc1_main_impl<SM110A_FC1_TILE_M, SM110A_FC1_TILE_N, SM110A_FC1_TILE_K,
+        SM110A_FC1_CLUSTER_M, SM110A_FC1_CLUSTER_N, (SM110A_FC1_DIRECT_GMEM != 0)>(
+            a, b, source_rows, task_words, task_state, out, m, experts, n, k, max_tasks, stream);
+}
+
+void launch_fc1_main(const __nv_bfloat16* a, const __nv_bfloat16* b,
+    const int32_t* source_rows, const int32_t* tasks, int32_t* state,
+    __nv_bfloat16* out, int m, int experts, int n, int k, int max_tasks,
     cudaStream_t stream) {
-    launch_fc1_block_interleaved_swiglu(d_a,
-        d_b_interleaved,
-        d_router_scores,
-        d_out,
-        tokens,
-        experts,
-        topk,
-        n,
-        k,
-        stream);
+    sm110a_fc1_main_launch(a, b, source_rows, tasks, state, out, m, experts, n, k,
+                           max_tasks, stream);
 }
