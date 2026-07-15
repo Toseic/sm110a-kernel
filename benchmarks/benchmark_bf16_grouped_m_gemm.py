@@ -63,7 +63,7 @@ GROUPED_M_CONFIGS = tuple(
     for tile_k in (64, 128)
     for epilogue_tile_n in (32, 64)
     for cluster_m in (1, 2)
-    for mode in (0, 1)
+    for mode in (0, 1, 2)
     for direct_gmem in (False,)
     if tile_n % epilogue_tile_n == 0
 )
@@ -150,14 +150,14 @@ def compatible_candidates(n, k):
     return tuple(candidates)
 
 
-_MODE_LABELS = {0: "np", 1: "pe", 2: "cl"}
+_MODE_LABELS = {0: "np", 1: "pe", 2: "clc"}
 
 
 def format_config(config):
     base = (
         f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
         f"/e{config.epilogue_tile_n}/c{config.cluster_m}"
-        f"/{_MODE_LABELS.get(config.mode, config.mode)}"
+        f"/{_MODE_LABELS[config.mode]}"
     )
     return base + "+dg" if getattr(config, "direct_gmem", False) else base
 

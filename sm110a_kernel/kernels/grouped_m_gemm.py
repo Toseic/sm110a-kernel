@@ -38,8 +38,8 @@ class GroupedMConfig:
             raise ValueError("tile_n must be divisible by epilogue_tile_n")
         if self.tile_k <= 0 or self.tile_k % 64:
             raise ValueError("tile_k must be a positive multiple of 64")
-        if self.mode not in (0, 1):
-            raise ValueError("breaking metadata API supports mode 0 (np) or 1 (persistent)")
+        if self.mode not in (0, 1, 2):
+            raise ValueError("mode must be 0 (non-persistent), 1 (persistent), or 2 (CLC)")
 
 
 @dataclass(frozen=True)
@@ -49,7 +49,7 @@ class GroupedMMetadata:
     offsets: object
     counts: object
     tasks: object
-    state: object  # int32 {task_count, next_cluster_tile}
+    state: object  # int32 {task_count, next_cluster_tile/reserved}
 
 
 def _default_config(a, b):

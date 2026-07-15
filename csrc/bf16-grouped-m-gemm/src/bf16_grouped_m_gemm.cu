@@ -31,8 +31,7 @@
  *    TMA / tcgen05 instructions are selected by the `kClusterM` template
  *    parameter, so the same kernel body supports both cluster sizes.
  *
- * 3. Macro-level swizzle. In persistent mode (`SM110A_GROUPED_MODE == 1`),
- *    tasks are issued in an order that walks M first inside a band of
+ * 3. Macro-level swizzle. Metadata preparation orders tasks by M first inside a band of
  *    `kMacroSwizzleM` tile-rows and N second inside a band of
  *    `kMacroSwizzleN` N-tiles. The chosen N band (8) keeps the combined A+B
  *    footprint below Thor's 32 MiB L2 so concurrent clusters can still hit
@@ -64,11 +63,10 @@
  *    BF16-packed TMEM values straight to global memory. Useful when the
  *    SMEM/TMA path is bandwidth-bound on small shapes.
  *
- * 8. Persistent scheduling. With `SM110A_GROUPED_MODE == 1`, clusters pull
- *    work dynamically through `next_cluster_tile`, claiming
- *    `kPersistentTileCount = 2` tiles per fetch. This amortizes the cost of
- *    the atomic work claim while preventing workers from drifting across
- *    unrelated experts and destroying expert-local reuse.
+ * 8. Scheduling modes. Mode 0 launches one cluster per task; mode 1 uses an
+ *    atomic persistent cursor; mode 2 starts with two tasks per cluster, then
+ *    uses Cluster Launch Control to cancel an unstarted cluster and take its
+ *    work without a global atomic cursor.
  *
  * 9. `swap_ab` view. When `swap_ab == true` the A/B tensor maps and the
  *    C tensor map are swapped (using `init_swapped_c_tensor_map`), the task
@@ -86,31 +84,21 @@
  *             ├── Build CUtensorMaps for A, B, C (init_a/b/c/swapped_*).
  *             ├── cudaMallocAsync a workspace laid out as
  *             │     [expert_offsets | expert_counts | task_count
- *             │      | next_cluster_tile | tasks[]].
+ *             │      | reserved | tasks[]].
  *             ├── cudaMemsetAsync expert_offsets to INT32_MAX (so atomicMin
  *             │     yields the first row of each expert) and the counts to 0.
- *             ├── collect_expert_metadata<<<>>>:
- *             │     one thread per grouped row, performs
- *             │       atomicMin(expert_offsets + expert, row)
- *             │       atomicAdd(expert_counts + expert, 1).
- *             ├── build_expert_tile_tasks<<<1,1>>>:
- *             │     single-threaded pass that emits one ExpertTileTask per
- *             │     (M chunk within an expert, tile_n) pair, ordered to
- *             │     match the persistent swizzle and writes task_count.
- *             └── Launch bf16_grouped_m_gemm_kernel in either:
- *                   * one cluster per output tile (non-persistent), or
- *                   * `resident_clusters` persistent clusters that
- *                     steal through next_cluster_tile.
+ *             └── Metadata preparation builds expert-local tasks, then launch
+ *                 the kernel according to `SM110A_GROUPED_MODE`.
  *
  * The device-side kernel (`bf16_grouped_m_gemm_kernel`) is organized as a
- * three-stage pipeline plus a small persistent-stealing outer loop:
+ * three-stage pipeline plus a mode-specific scheduling outer loop. In mode 2:
  *
  *   ┌────────────────────────────────────────────────────────────────────┐
- *   │ outer loop (persistent mode only):                                 │
- *   │   rank-0 CTA thread 0 does atomicAdd(next_cluster_tile, 2)         │
- *   │   to claim the next two cluster tiles. The other ranks in the      │
- *   │   cluster fetch the cursor via cluster.shared::cluster and exit    │
- *   │   when the cursor has reached `task_count`.                        │
+ *   │ outer loop:                                                        │
+ *   │   rank-0 CTA asynchronously asks CLC to cancel an unstarted        │
+ *   │   cluster. After its current two tasks complete, every CTA reads   │
+ *   │   the response and either adopts the canceled cluster's tasks or   │
+ *   │   exits when none remain.                                          │
  *   └────────────────────────────────────────────────────────────────────┘
  *
  *   ┌────────────────────────────────────────────────────────────────────┐
@@ -128,8 +116,8 @@
  *
  *   ┌────────────────────────────────────────────────────────────────────┐
  *   │ Consumer (warp 5, cluster rank 0, one elected thread):             │
- *   │   In persistent mode, mbarrier_wait(epilogue_mbars[stage], phase)  │
- *   │     before touching TMEM so the epilogue has released the stage.   │
+ *   │   mbarrier_wait(epilogue_mbars[stage], phase) before touching TMEM │
+ *   │     so the epilogue has released the stage.                        │
  *   │   for each tile_k in 0..k_tiles:                                   │
  *   │     mbarrier_wait(tma_mbars[stage], consumer_phase)                │
  *   │       # TMA has filled this SMEM stage.                            │
@@ -163,7 +151,7 @@
  *   │     else:       per-thread fallback stores from the swizzled SMEM  │
  *   │                   to GMEM to avoid OOB writes.                     │
  *   │     rotate to the next smem_stage (epilogue prefetch pipeline).    │
- *   │   release_tmem(): in persistent mode, arrive on epilogue_mbar so   │
+ *   │   release_tmem(): arrive on epilogue_mbar so                       │
  *   │     the consumer may overwrite this TMEM stage next iteration.     │
  *   │   cp.async.bulk.wait_group 0; bar.sync 1, 128.                     │
  *   └────────────────────────────────────────────────────────────────────┘
@@ -184,12 +172,12 @@
  *   mma_mbars[stage]      MMA → TMA      : stage may be overwritten by TMA.
  *   mainloop_mbars[stage] MMA → Epilogue : TMEM output stage is ready.
  *   epilogue_mbars[stage] Epilogue → MMA : TMEM output stage is consumed
- *                                          (persistent mode only).
+ *                                          before a CLC worker reuses it.
  *
  * In one sentence
  * ---------------
  *   "Coalesce grouped rows into expert-local tile tasks, then drive a
- *    cluster-persistent Blackwell pipeline of TMA + tcgen05 + TMEM →
+ *    Blackwell pipeline of TMA + tcgen05 + TMEM →
  *    swizzled SMEM → TMA-store epilogue, balancing expert-local reuse
  *    against L2 working-set pressure."
  */
@@ -231,15 +219,10 @@ constexpr int kWarpSize = 32;
 constexpr int kWarpCount = 6;
 constexpr int kBlockThreads = kWarpSize * kWarpCount;
 constexpr int kTmemStageCount = 2;
-// Two tiles amortize setup without letting persistent workers drift across
-// unrelated experts and destroy the cross-cluster A reuse.
 constexpr int kPersistentTileCount = 2;
-constexpr int kMacroSwizzleM = 4;
-// Keep the persistent working set below Thor's 32 MiB L2.  A 16-wide N band
-// needs 25 MiB of B plus up to 12 MiB of A for four 256-row tasks, which
-// evicts the B tiles before the next M task can reuse them.  An 8-wide band
-// keeps the combined A/B footprint at or below 25 MiB for the large-M cases.
-constexpr int kMacroSwizzleN = 8;
+// Each mode-2 CLC worker cluster starts with two tasks.  Once it completes
+// them it steals the work of an unstarted cluster through Cluster Launch Control.
+constexpr int kClcWorkerTileCount = 2;
 
 template <int kTileM, int kTileN, int kTileK, int kEpilogueTileN, int kClusterM>
 struct KernelConfig {
@@ -295,62 +278,6 @@ struct ExpertTileTask {
     int tile_n;
 };
 
-__global__ void collect_expert_metadata(
-    const int32_t *grouped_layout,
-    int m,
-    int experts,
-    int *expert_offsets,
-    int *expert_counts) {
-    const int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= m) {
-        return;
-    }
-    const int expert = grouped_layout[row];
-    if (expert < 0 || expert >= experts) {
-        return;
-    }
-    atomicMin(expert_offsets + expert, row);
-    atomicAdd(expert_counts + expert, 1);
-}
-
-template <int kTaskTileRows>
-__global__ void build_expert_tile_tasks(
-    const int *expert_offsets,
-    const int *expert_counts,
-    int experts,
-    int grid_n,
-    ExpertTileTask *tasks,
-    int *task_count) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) {
-        return;
-    }
-    int next_task = 0;
-    for (int expert = 0; expert < experts; ++expert) {
-        const int row_count = expert_counts[expert];
-        if (row_count == 0) {
-            continue;
-        }
-        const int row_start = expert_offsets[expert];
-        for (int group_row = 0; group_row < row_count;
-            group_row += kMacroSwizzleM * kTaskTileRows) {
-            const int group_row_end = group_row + kMacroSwizzleM * kTaskTileRows < row_count
-                                          ? group_row + kMacroSwizzleM * kTaskTileRows
-                                          : row_count;
-            for (int macro_n = 0; macro_n < grid_n; macro_n += kMacroSwizzleN) {
-                const int band_end =
-                    macro_n + kMacroSwizzleN < grid_n ? macro_n + kMacroSwizzleN : grid_n;
-                for (int tile_row = group_row; tile_row < group_row_end;
-                    tile_row += kTaskTileRows) {
-                    for (int tile_n = macro_n; tile_n < band_end; ++tile_n) {
-                        tasks[next_task++] = {row_start, row_count, tile_row, expert, tile_n};
-                    }
-                }
-            }
-        }
-    }
-    *task_count = next_task;
-}
-
 __device__ inline uint32_t elect_sync() {
     uint32_t elected = 0;
     asm volatile("{\n\t"
@@ -394,6 +321,24 @@ __device__ inline void mbarrier_wait(
                  "bra.uni WAIT;\n\t"
                  "COMPLETE:\n\t"
                  "}" ::"r"(mbar_addr),
+        "r"(phase),
+        "r"(kSuspendTicks)
+        : "memory");
+}
+
+__device__ inline void clc_mbarrier_wait(
+    int mbar_addr,
+    int phase) {
+    constexpr uint32_t kSuspendTicks = 0x989680;
+    asm volatile("{\n\t"
+                 ".reg .pred done;\n\t"
+                 "WAIT_CLC:\n\t"
+                 "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 "
+                 "done, [%0], %1, %2;\n\t"
+                 "@done bra.uni COMPLETE_CLC;\n\t"
+                 "bra.uni WAIT_CLC;\n\t"
+                 "COMPLETE_CLC:\n\t"
+                 "}" :: "r"(mbar_addr),
         "r"(phase),
         "r"(kSuspendTicks)
         : "memory");
@@ -627,6 +572,7 @@ template <
     int kEpilogueTileN,
     int kClusterM,
     bool kPersistent,
+    bool kDynamicClc = false,
     bool kSwapAB = false,
     bool kDirectGmem = false>
 __global__ __cluster_dims__(kClusterM, 1, 1)
@@ -662,9 +608,10 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
     const int worker_id = blockIdx.x / kClusterM;
     const int cluster_tiles = *task_count;
-    constexpr int kWorkerTileCount = kPersistent ? kPersistentTileCount : 1;
+    constexpr int kWorkerTileCount = kDynamicClc ? kClcWorkerTileCount :
+        (kPersistent ? kPersistentTileCount : 1);
     const int static_first_cluster_bid = worker_id * kWorkerTileCount;
-    if constexpr (!kPersistent) {
+    if constexpr (!kPersistent && !kDynamicClc) {
         if (static_first_cluster_bid >= cluster_tiles) {
             return;
         }
@@ -672,6 +619,8 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
 
     __shared__ int tmem_base[1];
     __shared__ int next_work_smem[2];
+    __shared__ __align__(16) uint4 clc_response[1];
+    __shared__ __align__(8) uint64_t clc_mbar[1];
     __shared__ uint64_t tma_mbars[kStageCount];
     __shared__ uint64_t mma_mbars[kStageCount];
     __shared__ uint64_t mainloop_mbars[kTmemStageCount];
@@ -692,9 +641,12 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
         }
         for (int stage = 0; stage < kTmemStageCount; ++stage) {
             mbarrier_init(base_mainloop_mbar_addr + stage * sizeof(uint64_t), 1);
-            if constexpr (kPersistent) {
+            if constexpr (kPersistent || kDynamicClc) {
                 mbarrier_init(base_epilogue_mbar_addr + stage * sizeof(uint64_t), 4 * kClusterM);
             }
+        }
+        if constexpr (kDynamicClc) {
+            mbarrier_init(static_cast<int>(__cvta_generic_to_shared(clc_mbar)), 1);
         }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
@@ -834,10 +786,34 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
     int consumer_epilogue_phase = 1;
     int epilogue_mainloop_stage = 0;
     int epilogue_mainloop_phase = 0;
+    int clc_phase = 0;
+    int dynamic_first_cluster_bid = static_first_cluster_bid;
 
     while (true) {
         int first_cluster_bid;
-        if constexpr (kPersistent) {
+        int clc_mbar_addr = 0;
+        if constexpr (kDynamicClc) {
+            first_cluster_bid = dynamic_first_cluster_bid;
+
+            // One request per cluster.  CLC multicasts the cancellation response
+            // to every CTA so all ranks advance together after finishing work.
+            const int clc_response_addr = static_cast<int>(__cvta_generic_to_shared(clc_response));
+            clc_mbar_addr = static_cast<int>(__cvta_generic_to_shared(clc_mbar));
+            if (tid == 0) {
+                asm volatile("mbarrier.arrive.expect_tx.relaxed.cluster."
+                             "shared::cta.b64 _, [%0], 16;" :: "r"(clc_mbar_addr)
+                    : "memory");
+            }
+            asm volatile("barrier.cluster.arrive.relaxed.aligned;");
+            asm volatile("barrier.cluster.wait.aligned;");
+            if (cta_rank == 0 && tid == 0) {
+                asm volatile("clusterlaunchcontrol.try_cancel.async.shared::cta."
+                             "mbarrier::complete_tx::bytes.multicast::cluster::all."
+                             "b128 [%0], [%1];" :: "r"(clc_response_addr),
+                    "r"(clc_mbar_addr)
+                    : "memory");
+            }
+        } else if constexpr (kPersistent) {
             if (cta_rank == 0 && tid == 0) {
                 next_work_smem[0] = atomicAdd(next_cluster_tile, kPersistentTileCount);
             }
@@ -856,8 +832,10 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
         } else {
             first_cluster_bid = static_first_cluster_bid;
         }
-        if (first_cluster_bid >= cluster_tiles) {
-            break;
+        if constexpr (!kDynamicClc) {
+            if (first_cluster_bid >= cluster_tiles) {
+                break;
+            }
         }
         const bool has_work = first_cluster_bid < cluster_tiles;
         const int last_cluster_bid = has_work
@@ -936,7 +914,7 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
         if (cta_rank == 0 && warp_id == 5 && elect_sync()) {
             for (int cluster_bid = first_cluster_bid; cluster_bid < last_cluster_bid;
                 ++cluster_bid) {
-                if constexpr (kPersistent) {
+                if constexpr (kPersistent || kDynamicClc) {
                     mbarrier_wait(
                         base_epilogue_mbar_addr + consumer_mainloop_stage * sizeof(uint64_t),
                         consumer_epilogue_phase);
@@ -984,7 +962,7 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
 
                 consumer_mainloop_stage = (consumer_mainloop_stage + 1) % kTmemStageCount;
                 if (consumer_mainloop_stage == 0) {
-                    if constexpr (kPersistent) {
+                    if constexpr (kPersistent || kDynamicClc) {
                         consumer_epilogue_phase ^= 1;
                     }
                 }
@@ -1010,7 +988,7 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
                 const int tile_col = tile_n * (kSwapAB ? kClusterTileM : kTileN);
 
                 auto release_tmem = [&]() {
-                    if constexpr (kPersistent) {
+                    if constexpr (kPersistent || kDynamicClc) {
                         if (elect_sync()) {
                             const int mbar_addr = (base_epilogue_mbar_addr +
                                                       epilogue_mainloop_stage * sizeof(uint64_t)) &
@@ -1155,7 +1133,44 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
             }
         }
 
-        if constexpr (!kPersistent) {
+        if constexpr (kDynamicClc) {
+            if (tid == 0) {
+                clc_mbarrier_wait(clc_mbar_addr, clc_phase);
+
+                const uint4 response = clc_response[0];
+                int canceled;
+                int canceled_cta_x = 0;
+                asm volatile("{\n\t"
+                         ".reg .pred was_canceled;\n\t"
+                         ".reg .b128 response;\n\t"
+                         "mov.b128 response, {%2, %3, %4, %5};\n\t"
+                         "clusterlaunchcontrol.query_cancel.is_canceled.pred."
+                         "b128 was_canceled, response;\n\t"
+                         "selp.u32 %0, 1, 0, was_canceled;\n\t"
+                         "@was_canceled "
+                         "clusterlaunchcontrol.query_cancel.get_first_ctaid::x."
+                         "b32.b128 %1, response;\n\t"
+                         "}"
+                : "=r"(canceled), "=r"(canceled_cta_x)
+                : "r"(response.x), "r"(response.y), "r"(response.z), "r"(response.w)
+                : "memory");
+                next_work_smem[0] = canceled;
+                next_work_smem[1] = canceled_cta_x / kClusterM * kWorkerTileCount;
+            }
+            __syncthreads();
+            if (next_work_smem[0] == 0) {
+                break;
+            }
+            dynamic_first_cluster_bid = next_work_smem[1];
+            clc_phase ^= 1;
+
+            asm volatile("fence.proxy.async::generic.release."
+                         "sync_restrict::shared::cta.cluster;" ::: "memory");
+            asm volatile("barrier.cluster.arrive.relaxed.aligned;");
+            asm volatile("barrier.cluster.wait.aligned;");
+            asm volatile("fence.proxy.async::generic.acquire."
+                         "sync_restrict::shared::cluster.cluster;" ::: "memory");
+        } else if constexpr (!kPersistent) {
             break;
         }
     }
@@ -1236,8 +1251,6 @@ void launch_bf16_grouped_m_gemm_impl(
     //  │  task_count                 int32        │  4 B
     //  │    actual #tasks written by builder      │
     //  ├──────────────────────────────────────────┤
-    //  │  next_cluster_tile          int32        │  4 B
-    //  │    global work-stealing cursor           │
     //  ├─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ -  ─┤  ← task_offset
     //  │  tasks[max_tasks]        ExpertTileTask  │  max_tasks × 16 B
     //  │    {row_start, row_count,                │
@@ -1251,17 +1264,36 @@ void launch_bf16_grouped_m_gemm_impl(
     auto *next_cluster_tile = d_state + 1;
     cudaMemsetAsync(next_cluster_tile, 0, sizeof(int32_t), stream);
 
-    const int max_cluster_tiles = max_tasks;
-
-    if constexpr (SM110A_GROUPED_MODE == 1) {
+    if constexpr (SM110A_GROUPED_MODE == 2) {
+        const int worker_clusters =
+            (max_tasks + kClcWorkerTileCount - 1) / kClcWorkerTileCount;
+        auto kernel = bf16_grouped_m_gemm_kernel<kTileM,
+            kTileN,
+            kTileK,
+            kEpilogueTileN,
+            kClusterM,
+            false,
+            true,
+            kSwapAB,
+            (SM110A_GROUPED_DIRECT_GMEM != 0)>;
+        if constexpr (kDynamicSmemBytes > 48 * 1024) {
+            cudaFuncSetAttribute(kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                kDynamicSmemBytes);
+        }
+        kernel<<<kClusterM * worker_clusters, kBlockThreads, kDynamicSmemBytes, stream>>>(
+            a_tensor_map, b_tensor_map, c_tensor_map, tasks, task_count,
+            next_cluster_tile, d_c, n, k);
+    } else if constexpr (SM110A_GROUPED_MODE == 1) {
         const int persistent_clusters =
-            (max_cluster_tiles + kPersistentTileCount - 1) / kPersistentTileCount;
+            (max_tasks + kPersistentTileCount - 1) / kPersistentTileCount;
         auto kernel = bf16_grouped_m_gemm_kernel<kTileM,
             kTileN,
             kTileK,
             kEpilogueTileN,
             kClusterM,
             true,
+            false,
             kSwapAB,
             (SM110A_GROUPED_DIRECT_GMEM != 0)>;
         if constexpr (kDynamicSmemBytes > 48 * 1024) {
@@ -1287,21 +1319,15 @@ void launch_bf16_grouped_m_gemm_impl(
         const int launched_clusters =
             resident_clusters < persistent_clusters ? resident_clusters : persistent_clusters;
         kernel<<<kClusterM * launched_clusters, kBlockThreads, kDynamicSmemBytes, stream>>>(
-            a_tensor_map,
-            b_tensor_map,
-            c_tensor_map,
-            tasks,
-            task_count,
-            next_cluster_tile,
-            d_c,
-            n,
-            k);
+            a_tensor_map, b_tensor_map, c_tensor_map, tasks, task_count,
+            next_cluster_tile, d_c, n, k);
     } else {
         auto kernel = bf16_grouped_m_gemm_kernel<kTileM,
             kTileN,
             kTileK,
             kEpilogueTileN,
             kClusterM,
+            false,
             false,
             kSwapAB,
             (SM110A_GROUPED_DIRECT_GMEM != 0)>;
@@ -1310,16 +1336,9 @@ void launch_bf16_grouped_m_gemm_impl(
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 kDynamicSmemBytes);
         }
-        kernel<<<kClusterM * max_cluster_tiles, kBlockThreads, kDynamicSmemBytes, stream>>>(
-            a_tensor_map,
-            b_tensor_map,
-            c_tensor_map,
-            tasks,
-            task_count,
-            next_cluster_tile,
-            d_c,
-            n,
-            k);
+        kernel<<<kClusterM * max_tasks, kBlockThreads, kDynamicSmemBytes, stream>>>(
+            a_tensor_map, b_tensor_map, c_tensor_map, tasks, task_count,
+            next_cluster_tile, d_c, n, k);
     }
 }
 
@@ -1363,7 +1382,6 @@ void launch_bf16_grouped_m_gemm_entry(
 
 } // namespace
 
-#if SM110A_GROUPED_MODE != 2
 void launch_bf16_grouped_m_gemm_main(
     const __nv_bfloat16 *d_a,
     const __nv_bfloat16 *d_b,
@@ -1417,4 +1435,3 @@ extern "C" void sm110a_bf16_grouped_m_gemm_launch(
         swap_ab,
         stream);
 }
-#endif

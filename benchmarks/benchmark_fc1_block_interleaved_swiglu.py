@@ -251,7 +251,7 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
             "--baseline-mode",
             type=int,
             choices=(0, 1, 2),
-            default=1,
+            default=2,
             help="grouped GEMM baseline mode",
         )
         parser.add_argument(

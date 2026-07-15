@@ -35,7 +35,7 @@ void check_inputs(const torch::Tensor& a, const torch::Tensor& b,
   TORCH_CHECK(a.dim() == 2, "A must be 2D");
   TORCH_CHECK(b.dim() == 3, "B must be 3D");
   TORCH_CHECK(tasks.dim() == 2 && tasks.size(1) == 5, "metadata.tasks must have shape [N, 5]");
-  TORCH_CHECK(state.numel() == 2, "metadata.state must contain {task_count, next_cluster_tile}");
+  TORCH_CHECK(state.numel() == 2, "metadata.state must contain {task_count, next_cluster_tile/reserved}");
   TORCH_CHECK(a.device() == b.device(), "A and B must be on the same device");
   TORCH_CHECK(a.device() == tasks.device() && a.device() == state.device(),
               "A and metadata must be on the same device");
