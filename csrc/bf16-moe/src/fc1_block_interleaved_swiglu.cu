@@ -402,7 +402,10 @@ __device__ inline void mbarrier_init(
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(mbar_addr), "r"(count));
 }
 
-__device__ inline void mbarrier_wait(
+// Analysis-only split: these helpers deliberately keep identical PTX while
+// giving SourceCounters a distinct line-info location for each pipeline edge.
+// Keep their operands, ordering, and suspend interval in sync.
+__device__ inline void mbarrier_wait_mma_reuse(
     int mbar_addr,
     int phase) {
     constexpr uint32_t kSuspendTicks = 0x989680;
@@ -415,6 +418,150 @@ __device__ inline void mbarrier_wait(
                  "bra.uni WAIT;\n\t"
                  "COMPLETE:\n\t"
                  "}" ::"r"(mbar_addr),
+        "r"(phase),
+        "r"(kSuspendTicks)
+        : "memory");
+}
+
+__device__ inline void mbarrier_wait_producer_a_ready(
+    int mbar_addr,
+    int phase) {
+    constexpr uint32_t kSuspendTicks = 0x989680;
+    asm volatile("{\n\t"
+                 ".reg .pred done;\n\t"
+                 "WAIT:\n\t"
+                 "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 "
+                 "done, [%0], %1, %2;\n\t"
+                 "@done bra.uni COMPLETE;\n\t"
+                 "bra.uni WAIT;\n\t"
+                 "COMPLETE:\n\t"
+                 "}" :: "r"(mbar_addr),
+        "r"(phase),
+        "r"(kSuspendTicks)
+        : "memory");
+}
+
+__device__ inline void mbarrier_wait_forward_a_ready(
+    int mbar_addr,
+    int phase) {
+    constexpr uint32_t kSuspendTicks = 0x989680;
+    asm volatile("{\n\t"
+                 ".reg .pred done;\n\t"
+                 "WAIT:\n\t"
+                 "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 "
+                 "done, [%0], %1, %2;\n\t"
+                 "@done bra.uni COMPLETE;\n\t"
+                 "bra.uni WAIT;\n\t"
+                 "COMPLETE:\n\t"
+                 "}" :: "r"(mbar_addr),
+        "r"(phase),
+        "r"(kSuspendTicks)
+        : "memory");
+}
+
+__device__ inline void mbarrier_wait_epilogue_slot(
+    int mbar_addr,
+    int phase) {
+    constexpr uint32_t kSuspendTicks = 0x989680;
+    asm volatile("{\n\t"
+                 ".reg .pred done;\n\t"
+                 "WAIT:\n\t"
+                 "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 "
+                 "done, [%0], %1, %2;\n\t"
+                 "@done bra.uni COMPLETE;\n\t"
+                 "bra.uni WAIT;\n\t"
+                 "COMPLETE:\n\t"
+                 "}" :: "r"(mbar_addr),
+        "r"(phase),
+        "r"(kSuspendTicks)
+        : "memory");
+}
+
+__device__ inline void mbarrier_wait_consumer_a_ready(
+    int mbar_addr,
+    int phase) {
+    constexpr uint32_t kSuspendTicks = 0x989680;
+    asm volatile("{\n\t"
+                 ".reg .pred done;\n\t"
+                 "WAIT:\n\t"
+                 "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 "
+                 "done, [%0], %1, %2;\n\t"
+                 "@done bra.uni COMPLETE;\n\t"
+                 "bra.uni WAIT;\n\t"
+                 "COMPLETE:\n\t"
+                 "}" :: "r"(mbar_addr),
+        "r"(phase),
+        "r"(kSuspendTicks)
+        : "memory");
+}
+
+__device__ inline void mbarrier_wait_consumer_cluster_a_ready(
+    int mbar_addr,
+    int phase) {
+    constexpr uint32_t kSuspendTicks = 0x989680;
+    asm volatile("{\n\t"
+                 ".reg .pred done;\n\t"
+                 "WAIT:\n\t"
+                 "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 "
+                 "done, [%0], %1, %2;\n\t"
+                 "@done bra.uni COMPLETE;\n\t"
+                 "bra.uni WAIT;\n\t"
+                 "COMPLETE:\n\t"
+                 "}" :: "r"(mbar_addr),
+        "r"(phase),
+        "r"(kSuspendTicks)
+        : "memory");
+}
+
+__device__ inline void mbarrier_wait_tma_b_ready(
+    int mbar_addr,
+    int phase) {
+    constexpr uint32_t kSuspendTicks = 0x989680;
+    asm volatile("{\n\t"
+                 ".reg .pred done;\n\t"
+                 "WAIT:\n\t"
+                 "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 "
+                 "done, [%0], %1, %2;\n\t"
+                 "@done bra.uni COMPLETE;\n\t"
+                 "bra.uni WAIT;\n\t"
+                 "COMPLETE:\n\t"
+                 "}" :: "r"(mbar_addr),
+        "r"(phase),
+        "r"(kSuspendTicks)
+        : "memory");
+}
+
+__device__ inline void mbarrier_wait_mainloop_output(
+    int mbar_addr,
+    int phase) {
+    constexpr uint32_t kSuspendTicks = 0x989680;
+    asm volatile("{\n\t"
+                 ".reg .pred done;\n\t"
+                 "WAIT:\n\t"
+                 "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 "
+                 "done, [%0], %1, %2;\n\t"
+                 "@done bra.uni COMPLETE;\n\t"
+                 "bra.uni WAIT;\n\t"
+                 "COMPLETE:\n\t"
+                 "}" :: "r"(mbar_addr),
+        "r"(phase),
+        "r"(kSuspendTicks)
+        : "memory");
+}
+
+__device__ inline void clc_mbarrier_wait(
+    int mbar_addr,
+    int phase) {
+    constexpr uint32_t kSuspendTicks = 0x989680;
+    asm volatile("{\n\t"
+                 ".reg .pred done;\n\t"
+                 "WAIT_CLC:\n\t"
+                 "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 "
+                 "done, [%0], %1, %2;\n\t"
+                 "@done bra.uni COMPLETE_CLC;\n\t"
+                 "bra.uni WAIT_CLC;\n\t"
+                 "COMPLETE_CLC:\n\t"
+                 "}" :: "r"(mbar_addr),
         "r"(phase),
         "r"(kSuspendTicks)
         : "memory");
@@ -668,7 +815,6 @@ __launch_bounds__(kBlockThreads) void fc1_block_interleaved_swiglu_kernel(
     const __grid_constant__ CUtensorMap c_tensor_map,
     const ExpertTileTask *tasks,
     const int *task_count,
-    int *next_cluster_tile,
     nv_bfloat16 *out,
     int n,
     int k) {
@@ -698,11 +844,15 @@ __launch_bounds__(kBlockThreads) void fc1_block_interleaved_swiglu_kernel(
     const int m_rank = cta_rank % kClusterM;
     const int n_rank = cta_rank / kClusterM;
 
+    const int worker_id = blockIdx.x / kClusterM;
     const int cluster_tiles = *task_count;
     constexpr int kWorkerTileCount = kPersistentTileCount;
+    const int static_first_cluster_bid = worker_id * kWorkerTileCount;
 
     __shared__ int tmem_base[1];
     __shared__ int next_work_smem[2];
+    __shared__ __align__(16) uint4 clc_response[1];
+    __shared__ __align__(8) uint64_t clc_mbar[1];
     __shared__ int task_source_rows[kTileM];
     __shared__ __align__(8) uint64_t a_mbars[kStageCount];
     // Hosted by CTA 0.  For ClusterM=2, each CTA arrives after its local
@@ -745,6 +895,7 @@ __launch_bounds__(kBlockThreads) void fc1_block_interleaved_swiglu_kernel(
             mbarrier_init(base_mainloop_mbar_addr + stage * sizeof(uint64_t), 1);
             mbarrier_init(base_epilogue_mbar_addr + stage * sizeof(uint64_t), 4 * kClusterM);
         }
+        mbarrier_init(static_cast<int>(__cvta_generic_to_shared(clc_mbar)), 1);
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     __syncthreads();
@@ -863,29 +1014,36 @@ __launch_bounds__(kBlockThreads) void fc1_block_interleaved_swiglu_kernel(
     int epilogue_mainloop_stage = 0;
     int epilogue_mainloop_phase = 0;
     int cached_source_row_start = -1;
+    int clc_phase = 0;
+    int dynamic_first_cluster_bid = static_first_cluster_bid;
     while (true) {
-        if (cta_rank == 0 && tid == 0) {
-            next_work_smem[0] = atomicAdd(next_cluster_tile, kWorkerTileCount);
-        }
-        asm volatile("barrier.cluster.arrive.release.aligned;");
-        asm volatile("barrier.cluster.wait.acquire.aligned;");
+        const int first_cluster_bid = dynamic_first_cluster_bid;
 
-        const int local_work_addr = static_cast<int>(__cvta_generic_to_shared(next_work_smem));
-        int rank_zero_work_addr;
-        asm volatile("mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(rank_zero_work_addr)
-            : "r"(local_work_addr), "r"(0));
-        int first_cluster_bid;
-        asm volatile("ld.shared::cluster.u32 %0, [%1];"
-            : "=r"(first_cluster_bid)
-            : "r"(rank_zero_work_addr)
-            : "memory");
-        if (first_cluster_bid >= cluster_tiles) {
-            break;
+        // Submit one cancellation request for the entire cluster. The response
+        // is multicast to every CTA, so all ranks transition to the same stolen
+        // cluster task after completing their current work.
+        const int clc_response_addr = static_cast<int>(__cvta_generic_to_shared(clc_response));
+        const int clc_mbar_addr = static_cast<int>(__cvta_generic_to_shared(clc_mbar));
+        if (tid == 0) {
+            asm volatile("mbarrier.arrive.expect_tx.relaxed.cluster."
+                         "shared::cta.b64 _, [%0], 16;" :: "r"(clc_mbar_addr)
+                : "memory");
         }
-        const int last_cluster_bid = first_cluster_bid + kWorkerTileCount < cluster_tiles
-                                         ? first_cluster_bid + kWorkerTileCount
-                                         : cluster_tiles;
+        asm volatile("barrier.cluster.arrive.relaxed.aligned;");
+        asm volatile("barrier.cluster.wait.aligned;");
+        if (cta_rank == 0 && tid == 0) {
+            asm volatile("clusterlaunchcontrol.try_cancel.async.shared::cta."
+                         "mbarrier::complete_tx::bytes.multicast::cluster::all."
+                         "b128 [%0], [%1];" :: "r"(clc_response_addr),
+                "r"(clc_mbar_addr)
+                : "memory");
+        }
+        const bool has_work = first_cluster_bid < cluster_tiles;
+        const int last_cluster_bid = has_work
+                                         ? (first_cluster_bid + kWorkerTileCount < cluster_tiles
+                                                   ? first_cluster_bid + kWorkerTileCount
+                                                   : cluster_tiles)
+                                         : first_cluster_bid;
 
         if (warp_id >= kProducerWarpBase && warp_id < kMmaWarp) {
             const int producer_rank = warp_id - kProducerWarpBase;
@@ -933,7 +1091,7 @@ __launch_bounds__(kBlockThreads) void fc1_block_interleaved_swiglu_kernel(
                     const int b_smem = a_smem + kASmemBytes;
 
                     // Acquire the stage only after tcgen05 has consumed A and B.
-                    mbarrier_wait(mma_mbar_addr, producer_mma_phase);
+                    mbarrier_wait_mma_reuse(mma_mbar_addr, producer_mma_phase);
 
                     // Start B TMA first so it overlaps the A LDGSTS traffic.
                     if (producer_rank == 0 && elect_sync()) {
@@ -972,7 +1130,7 @@ __launch_bounds__(kBlockThreads) void fc1_block_interleaved_swiglu_kernel(
                             dynamic_smem + stage * kStageSmemBytes);
                         cp_async_a_mbarrier_arrive_noinc(a_mbar_addr);
                     } else {
-                        mbarrier_wait(a_mbar_addr, producer_a_phase);
+                        mbarrier_wait_producer_a_ready(a_mbar_addr, producer_a_phase);
                         if (producer_rank == 0 && elect_sync()) {
                             const int source_cta_rank = cta_rank - kClusterM;
                             mbarrier_arrive_on_cluster_cta(
@@ -1000,7 +1158,7 @@ __launch_bounds__(kBlockThreads) void fc1_block_interleaved_swiglu_kernel(
                 for (int cluster_bid = first_cluster_bid; cluster_bid < last_cluster_bid;
                      ++cluster_bid) {
                     for (int tile_k = 0; tile_k < k_tiles; ++tile_k) {
-                        mbarrier_wait(
+                        mbarrier_wait_forward_a_ready(
                             base_a_mbar_addr + consumer_stage * sizeof(uint64_t),
                             consumer_a_phase);
                         mbarrier_arrive_on_cluster_cta(
@@ -1028,7 +1186,7 @@ __launch_bounds__(kBlockThreads) void fc1_block_interleaved_swiglu_kernel(
         if (m_rank == 0 && warp_id == kMmaWarp && elect_sync()) {
             for (int cluster_bid = first_cluster_bid; cluster_bid < last_cluster_bid;
                  ++cluster_bid) {
-                mbarrier_wait(base_epilogue_mbar_addr + consumer_mainloop_stage * sizeof(uint64_t),
+                mbarrier_wait_epilogue_slot(base_epilogue_mbar_addr + consumer_mainloop_stage * sizeof(uint64_t),
                     consumer_epilogue_phase);
 
                 const int stage_tmem_addr = tmem_addr + consumer_mainloop_stage * kTileN;
@@ -1040,7 +1198,7 @@ __launch_bounds__(kBlockThreads) void fc1_block_interleaved_swiglu_kernel(
 
                     if constexpr (kClusterN == 2) {
                         if (n_rank == 0) {
-                            mbarrier_wait(
+                            mbarrier_wait_consumer_a_ready(
                                 base_a_mbar_addr + consumer_stage * sizeof(uint64_t),
                                 consumer_a_phase);
                             mbarrier_arrive_on_cluster_cta(
@@ -1052,31 +1210,31 @@ __launch_bounds__(kBlockThreads) void fc1_block_interleaved_swiglu_kernel(
                                 a_smem,
                                 base_a_mbar_addr + consumer_stage * sizeof(uint64_t),
                                 cta_rank + kClusterM);
-                            mbarrier_wait(
+                            mbarrier_wait_consumer_cluster_a_ready(
                                 base_a_cluster_mbar_addr + consumer_stage * sizeof(uint64_t),
                                 consumer_a_phase);
                         } else {
-                            mbarrier_wait(
+                            mbarrier_wait_consumer_cluster_a_ready(
                                 base_a_cluster_mbar_addr + consumer_stage * sizeof(uint64_t),
                                 consumer_a_phase);
                         }
                     } else if constexpr (kClusterM == 1) {
-                        mbarrier_wait(
+                        mbarrier_wait_consumer_a_ready(
                             base_a_mbar_addr + consumer_stage * sizeof(uint64_t),
                             consumer_a_phase);
                     } else {
                         // Contribute CTA 0's local A completion.  CTA 1's idle
                         // MMA warp contributes its completion independently.
-                        mbarrier_wait(
+                        mbarrier_wait_consumer_a_ready(
                             base_a_mbar_addr + consumer_stage * sizeof(uint64_t),
                             consumer_a_phase);
                         mbarrier_arrive_on_cluster_cta(
                             base_a_cluster_mbar_addr + consumer_stage * sizeof(uint64_t), 0);
-                        mbarrier_wait(
+                        mbarrier_wait_consumer_cluster_a_ready(
                             base_a_cluster_mbar_addr + consumer_stage * sizeof(uint64_t),
                             consumer_a_phase);
                     }
-                    mbarrier_wait(tma_mbar_addr, consumer_tma_phase);
+                    mbarrier_wait_tma_b_ready(tma_mbar_addr, consumer_tma_phase);
                     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
                     {
                         const int a_smem = mainloop_smem + consumer_stage * kStageSmemBytes;
@@ -1120,7 +1278,7 @@ __launch_bounds__(kBlockThreads) void fc1_block_interleaved_swiglu_kernel(
         if (warp_id < 4) {
             for (int cluster_bid = first_cluster_bid; cluster_bid < last_cluster_bid;
                 ++cluster_bid) {
-                mbarrier_wait(base_mainloop_mbar_addr + epilogue_mainloop_stage * sizeof(uint64_t),
+                mbarrier_wait_mainloop_output(base_mainloop_mbar_addr + epilogue_mainloop_stage * sizeof(uint64_t),
                     epilogue_mainloop_phase);
                 asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
@@ -1256,6 +1414,45 @@ __launch_bounds__(kBlockThreads) void fc1_block_interleaved_swiglu_kernel(
                 }
             }
         }
+
+        if (tid == 0) {
+            clc_mbarrier_wait(clc_mbar_addr, clc_phase);
+
+            const uint4 response = clc_response[0];
+            int canceled;
+            int canceled_cta_x = 0;
+            asm volatile("{\n\t"
+                         ".reg .pred was_canceled;\n\t"
+                         ".reg .b128 response;\n\t"
+                         "mov.b128 response, {%2, %3, %4, %5};\n\t"
+                         "clusterlaunchcontrol.query_cancel.is_canceled.pred."
+                         "b128 was_canceled, response;\n\t"
+                         "selp.u32 %0, 1, 0, was_canceled;\n\t"
+                         "@was_canceled "
+                         "clusterlaunchcontrol.query_cancel.get_first_ctaid::x."
+                         "b32.b128 %1, response;\n\t"
+                         "}"
+                : "=r"(canceled), "=r"(canceled_cta_x)
+                : "r"(response.x), "r"(response.y), "r"(response.z), "r"(response.w)
+                : "memory");
+            next_work_smem[0] = canceled;
+            next_work_smem[1] = canceled_cta_x / kClusterM * kWorkerTileCount;
+        }
+        __syncthreads();
+        if (next_work_smem[0] == 0) {
+            break;
+        }
+        dynamic_first_cluster_bid = next_work_smem[1];
+        clc_phase ^= 1;
+
+        // The next request reuses the response storage. Pair the generic read
+        // with the CLC async proxy and keep every CTA in the cluster in lockstep.
+        asm volatile("fence.proxy.async::generic.release."
+                     "sync_restrict::shared::cta.cluster;" ::: "memory");
+        asm volatile("barrier.cluster.arrive.relaxed.aligned;");
+        asm volatile("barrier.cluster.wait.aligned;");
+        asm volatile("fence.proxy.async::generic.acquire."
+                     "sync_restrict::shared::cluster.cluster;" ::: "memory");
     }
 
     asm volatile("barrier.cluster.arrive.release.aligned;");
@@ -1374,7 +1571,7 @@ void launch_fc1_block_interleaved_swiglu_impl(
     const int max_m_tasks = (m + kTaskTileRows - 1) / kTaskTileRows + experts;
     const int max_tasks = max_m_tasks * grid_n;
     const size_t metadata_bytes =
-        (2 * static_cast<size_t>(experts) + 2 * static_cast<size_t>(m) + 2) * sizeof(int);
+        (2 * static_cast<size_t>(experts) + 2 * static_cast<size_t>(m) + 1) * sizeof(int);
     const size_t task_offset =
         (metadata_bytes + alignof(ExpertTileTask) - 1) & ~(alignof(ExpertTileTask) - 1);
     const size_t workspace_bytes = task_offset + max_tasks * sizeof(ExpertTileTask);
@@ -1388,10 +1585,9 @@ void launch_fc1_block_interleaved_swiglu_impl(
     int *selected_experts = expert_offsets + experts;
     int *source_rows = selected_experts + m;
     int *task_count = source_rows + m;
-    int *next_cluster_tile = task_count + 1;
     auto *tasks = reinterpret_cast<ExpertTileTask *>(static_cast<char *>(workspace) + task_offset);
     cudaMemsetAsync(expert_counts, 0, experts * sizeof(int), stream);
-    cudaMemsetAsync(task_count, 0, 2 * sizeof(int), stream);
+    cudaMemsetAsync(task_count, 0, sizeof(int), stream);
 
     const cudaError_t routing_status = launch_topk_router(d_router_scores,
         tokens,
@@ -1447,28 +1643,9 @@ void launch_fc1_block_interleaved_swiglu_impl(
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             kDynamicSmemBytes);
     }
-    cudaLaunchConfig_t launch_config{};
-    launch_config.gridDim = dim3(kClusterM * persistent_clusters, kClusterN, 1);
-    launch_config.blockDim = dim3(kBlockThreads, 1, 1);
-    launch_config.dynamicSmemBytes = kDynamicSmemBytes;
-    launch_config.stream = stream;
-    int resident_clusters = 0;
-    const cudaError_t occupancy_status =
-        cudaOccupancyMaxActiveClusters(&resident_clusters, kernel, &launch_config);
-    if (occupancy_status != cudaSuccess || resident_clusters <= 0) {
-        int device = 0;
-        int sm_count = 0;
-        cudaGetDevice(&device);
-        cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
-        resident_clusters = sm_count / (kClusterM * kClusterN) > 0
-            ? sm_count / (kClusterM * kClusterN)
-            : 1;
-    }
-    constexpr int kLocalityClusterLimit = 16;
-    const int available_clusters =
-        resident_clusters < persistent_clusters ? resident_clusters : persistent_clusters;
-    const int launched_clusters = available_clusters;
-    kernel<<<dim3(kClusterM * launched_clusters, kClusterN, 1),
+    // CLC needs one logical launch ID per worker batch. Hardware starts as many
+    // clusters as resources allow; completed clusters steal not-yet-started IDs.
+    kernel<<<dim3(kClusterM * persistent_clusters, kClusterN, 1),
         kBlockThreads,
         kDynamicSmemBytes,
         stream>>>(
@@ -1478,7 +1655,6 @@ void launch_fc1_block_interleaved_swiglu_impl(
         c_tensor_map,
         tasks,
         task_count,
-        next_cluster_tile,
         d_out,
         n,
         k);

@@ -166,6 +166,81 @@ For a source CSV, the relevant columns are `Line No`, `Source`,
 source-level sample counts for locating a hotspot, then validate the diagnosis
 with the corresponding aggregate cycles-per-issue metric.
 
+## Persistent FC1 / CLC SourceCounters recipe
+
+For `benchmark_fc1_block_interleaved_swiglu.py`, profile **one deterministic
+candidate**. A multi-candidate autotune changes the launch sequence and can
+silently profile the wrong specialization. In particular, the FC1 autotune
+cache key does not distinguish the direct-GMEM filter, so use a temporary cache
+path together with `--force-sweep` for direct-only experiments.
+
+The following command was verified on Thor for the 32k-token direct-GMEM
+control path. `--launch-skip 3` selects the final timed FC1 launch after the
+initial invocation, one warmup, and two timing iterations:
+
+```bash
+ncu --force-overwrite \\
+  --section SourceCounters \\
+  --import-source on --source-folders "$PWD" \\
+  --kernel-name-base demangled \\
+  --kernel-name 'regex:fc1_block_interleaved_swiglu_kernel' \\
+  --launch-skip 3 --launch-count 1 \\
+  --export /tmp/fc1_32k_source \\
+  -- /home/bifrost/miniforge3/bin/python3 \\
+  benchmarks/benchmark_fc1_block_interleaved_swiglu.py \\
+  --token 32768 --tile-n 256 --tile-k 64 \\
+  --cluster-m 2 --cluster-n 1 --direct-gmem \\
+  --warmup 1 --iters 2 --samples 1 \\
+  --force-sweep --cache-path /tmp/fc1_source_cache.json \\
+  --no-cold-l2
+```
+
+For the cached winning TMEM/SMEM/TMA candidate, use a cache file whose entry is
+known to be `tmem-smem-tma`, omit `--direct-gmem` and `--force-sweep`, and keep
+the same warmup/iteration/skip sequence. Confirm the specialization in NCU's
+kernel name: its final boolean is `0` for TMEM/SMEM/TMA and `1` for direct
+GMEM.
+
+### Replay and report lifecycle
+
+For this persistent CLC kernel, NCU can print `0%` and the warning that launch
+replay is taking longer than expected while the target is still progressing.
+Do not treat that line as a failure and do not check the report path
+immediately: NCU writes the `.ncu-rep` only after all replay passes complete.
+Wait for the report file to appear, then import it:
+
+```bash
+while [ ! -f /tmp/fc1_32k_source.ncu-rep ]; do sleep 5; done
+ncu --import /tmp/fc1_32k_source.ncu-rep --page details
+ncu --import /tmp/fc1_32k_source.ncu-rep \\
+  --page source --print-source cuda,sass \\
+  --resolve-source-file "$PWD/csrc/bf16-moe/src/fc1_block_interleaved_swiglu.cu"
+```
+
+### Splitting a collapsed mbarrier hotspot
+
+`mbarrier.try_wait` helpers are frequently inlined, causing all producer,
+consumer, TMA, and epilogue waits to collapse onto one helper source line. If
+that line is the SourceCounters hotspot, make an **analysis-only** source diff:
+duplicate the identical inline-PTX helper into separately named helpers for
+each pipeline edge (for example `mma_reuse`, `consumer_a_ready`,
+`consumer_cluster_a_ready`, `tma_b_ready`, `epilogue_slot`, and
+`mainloop_output`) and replace each call site with its semantic helper.
+
+Keep the PTX, operands, phase argument, suspend interval, memory clobber, and
+call order identical. Rebuild and rerun SourceCounters; report the per-helper
+stall samples rather than the aggregate helper total. This instrumentation may
+change code generation slightly, so validate it compiles and runs but do not
+use its timing as a final performance number. Clearly retain or remove the
+analysis-only diff intentionally after the investigation.
+
+Interpretation guardrail: a high `mainloop_output` wait sample count belongs to
+epilogue warps waiting for MMA output and is not itself a wall-time percentage.
+Compare it with `tma_b_ready`, local-A, cluster-A, and epilogue-slot waits. Low
+A/B-ready waits plus low epilogue-slot waits indicate that A/B transfer and
+epilogue store are hidden; the next investigation belongs in MMA/mainloop
+issue, commit, and stage-reuse cadence.
+
 ## BF16 GEMM on Thor (GB10B, CC 11.0)
 
 For `benchmarks/benchmark_bf16_gemm.py`, select only the JIT GEMM with `--kernel-name-base function --kernel-name 'regex:.*bf16_gemm_kernel.*'`. This is required because the benchmark initializes tensors and evicts L2 before timing.

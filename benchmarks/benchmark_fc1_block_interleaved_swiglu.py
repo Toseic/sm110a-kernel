@@ -311,7 +311,6 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
                 ("E2E TF/s", 16),
                 ("MaxDiff", 12),
                 ("BestConfig", 36),
-                ("Path", 30),
             )
         )
 
@@ -405,7 +404,6 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
             )
 
             max_abs_diff = 0.0
-            path_name = "fused"
             if args.check:
                 grouped_a, grouped_layout = build_routed_reference(
                     a, router_scores, args.topk
@@ -418,7 +416,7 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
                     baseline_out,
                     baseline_config,
                 )
-                path_name = run_fused(
+                run_fused(
                     a,
                     interleaved_w,
                     router_scores,
@@ -453,7 +451,6 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
                 f"{routed_fc1_swiglu_tflops_from_ms(tokens, args.topk, args.n, args.k, kernel_stats['median_ms']):.3f}",
                 f"{max_abs_diff:.6f}",
                 format_candidate(best_config),
-                path_name,
             )
             if args.sol:
                 print_sol_report(
