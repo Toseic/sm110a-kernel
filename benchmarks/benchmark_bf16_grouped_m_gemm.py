@@ -18,7 +18,11 @@ from common import (
     print_sol_report,
     sol_bounds,
 )
-from sm110a_kernel import GroupedMConfig, bf16_grouped_m_gemm_out
+from sm110a_kernel import (
+    GroupedMConfig,
+    bf16_grouped_m_gemm_out,
+    prepare_grouped_m_metadata,
+)
 from sm110a_kernel.jit import (
     compile_bf16_grouped_m_gemm,
     compile_bf16_grouped_m_gemm_configs,
@@ -103,15 +107,17 @@ def benchmark_grouped_baseline(a, b, tokens_per_expert, out, args):
 def benchmark_grouped_kernel(
     a, b, layout, out, config, swap_ab, args
 ):
+    metadata = prepare_grouped_m_metadata(
+        layout, b.size(0), b.size(1), config=config, swap_ab=swap_ab)
     # Compile and launch once before recording CUDA events. This also rejects a
     # configuration that cannot launch on the current device.
     bf16_grouped_m_gemm_out(
-        a, b, layout, out, config=config, swap_ab=swap_ab
+        a, b, metadata, out, config=config, swap_ab=swap_ab
     )
     torch.cuda.synchronize()
     return benchmark_with_stats(
         lambda: bf16_grouped_m_gemm_out(
-            a, b, layout, out, config=config, swap_ab=swap_ab
+            a, b, metadata, out, config=config, swap_ab=swap_ab
         ),
         args.warmup,
         args.iters,
@@ -121,13 +127,15 @@ def benchmark_grouped_kernel(
 
 
 def probe_grouped_kernel(a, b, layout, out, config, swap_ab, args):
+    metadata = prepare_grouped_m_metadata(
+        layout, b.size(0), b.size(1), config=config, swap_ab=swap_ab)
     bf16_grouped_m_gemm_out(
-        a, b, layout, out, config=config, swap_ab=swap_ab
+        a, b, metadata, out, config=config, swap_ab=swap_ab
     )
     torch.cuda.synchronize()
     return quick_probe(
         lambda: bf16_grouped_m_gemm_out(
-            a, b, layout, out, config=config, swap_ab=swap_ab
+            a, b, metadata, out, config=config, swap_ab=swap_ab
         ),
         cold_l2_flush=getattr(args, "_cold_l2_flush", None),
     )
@@ -354,10 +362,13 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
             )
             diff = 0.0
             if args.check:
+                metadata = prepare_grouped_m_metadata(
+                    layout, b.size(0), b.size(1), config=best_config,
+                    swap_ab=best_swap_ab)
                 bf16_grouped_m_gemm_out(
                     a,
                     b,
-                    layout,
+                    metadata,
                     out_kernel,
                     config=best_config,
                     swap_ab=best_swap_ab,

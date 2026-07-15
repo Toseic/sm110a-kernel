@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -37,8 +38,18 @@ class GroupedMConfig:
             raise ValueError("tile_n must be divisible by epilogue_tile_n")
         if self.tile_k <= 0 or self.tile_k % 64:
             raise ValueError("tile_k must be a positive multiple of 64")
-        if self.mode not in (0, 1, 2):
-            raise ValueError("mode must be 0 (np), 1 (persistent), or 2 (CLC)")
+        if self.mode not in (0, 1):
+            raise ValueError("breaking metadata API supports mode 0 (np) or 1 (persistent)")
+
+
+@dataclass(frozen=True)
+class GroupedMMetadata:
+    """Device-resident routing schedule consumed by one grouped GEMM config."""
+
+    offsets: object
+    counts: object
+    tasks: object
+    state: object  # int32 {task_count, next_cluster_tile}
 
 
 def _default_config(a, b):
@@ -52,17 +63,25 @@ class GroupedMModule:
         self._binding = binding
         self._library = library
         self._launcher_address = library.entry_address
+        symbol = getattr(library.handle, "sm110a_bf16_grouped_m_metadata_prepare")
+        self._metadata_launcher_address = ctypes.cast(symbol, ctypes.c_void_p).value
         self._config = config
 
-    def bf16_grouped_m_gemm(self, a, b, grouped_layout, swap_ab=False):
+    def prepare_metadata(self, grouped_layout, experts, n, swap_ab=False):
+        offsets, counts, tasks, state = self._binding.prepare_grouped_m_metadata(
+            grouped_layout, experts, n, self._metadata_launcher_address,
+            self._config.tile_m, self._config.tile_n, self._config.cluster_m, swap_ab)
+        return GroupedMMetadata(offsets, counts, tasks, state)
+
+    def bf16_grouped_m_gemm(self, a, b, metadata: GroupedMMetadata, swap_ab=False):
         return self._binding.bf16_grouped_m_gemm(
-            a, b, grouped_layout, self._launcher_address,
+            a, b, metadata.tasks, metadata.state, self._launcher_address,
             self._config.tile_m, self._config.tile_n, self._config.tile_k,
             self._config.cluster_m, swap_ab)
 
-    def bf16_grouped_m_gemm_out(self, a, b, grouped_layout, out, swap_ab=False):
+    def bf16_grouped_m_gemm_out(self, a, b, metadata: GroupedMMetadata, out, swap_ab=False):
         return self._binding.bf16_grouped_m_gemm_out(
-            a, b, grouped_layout, out, self._launcher_address,
+            a, b, metadata.tasks, metadata.state, out, self._launcher_address,
             self._config.tile_m, self._config.tile_n, self._config.tile_k,
             self._config.cluster_m, swap_ab)
 
@@ -83,7 +102,7 @@ _JIT = SplitCudaJit(
     name="sm110a_grouped_m",
     root=_ROOT,
     binding_sources=(_SOURCE_DIR / "torch_binding.cpp",),
-    kernel_sources=(_SOURCE_DIR / "bf16_grouped_m_gemm.cu", _SOURCE_DIR / "bf16_grouped_m_gemm_dynamic_scheduled.cu"),
+    kernel_sources=(_SOURCE_DIR / "bf16_grouped_m_gemm.cu", _SOURCE_DIR / "metadata.cu"),
     kernel_dependencies=(_INCLUDE_DIR / "bf16_grouped_m_gemm.h", _INCLUDE_DIR / "common.h"),
     kernel_symbol="sm110a_bf16_grouped_m_gemm_launch",
     config_key=lambda config: config,
@@ -116,9 +135,14 @@ def get_bf16_grouped_m_gemm_module(a, b, config=None):
     return compile_bf16_grouped_m_gemm(config or _default_config(a, b))
 
 
-def bf16_grouped_m_gemm(a, b, grouped_layout, config=None, swap_ab=False):
-    return get_bf16_grouped_m_gemm_module(a, b, config).bf16_grouped_m_gemm(a, b, grouped_layout, swap_ab)
+def prepare_grouped_m_metadata(grouped_layout, experts, n, config=None, swap_ab=False):
+    module = compile_bf16_grouped_m_gemm(config or GroupedMConfig())
+    return module.prepare_metadata(grouped_layout, experts, n, swap_ab)
 
 
-def bf16_grouped_m_gemm_out(a, b, grouped_layout, out, config=None, swap_ab=False):
-    return get_bf16_grouped_m_gemm_module(a, b, config).bf16_grouped_m_gemm_out(a, b, grouped_layout, out, swap_ab)
+def bf16_grouped_m_gemm(a, b, metadata, config=None, swap_ab=False):
+    return get_bf16_grouped_m_gemm_module(a, b, config).bf16_grouped_m_gemm(a, b, metadata, swap_ab)
+
+
+def bf16_grouped_m_gemm_out(a, b, metadata, out, config=None, swap_ab=False):
+    return get_bf16_grouped_m_gemm_module(a, b, config).bf16_grouped_m_gemm_out(a, b, metadata, out, swap_ab)

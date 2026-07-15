@@ -333,10 +333,9 @@ __global__ void build_expert_tile_tasks(
         const int row_start = expert_offsets[expert];
         for (int group_row = 0; group_row < row_count;
             group_row += kMacroSwizzleM * kTaskTileRows) {
-            const int group_row_end =
-                group_row + kMacroSwizzleM * kTaskTileRows < row_count
-                    ? group_row + kMacroSwizzleM * kTaskTileRows
-                    : row_count;
+            const int group_row_end = group_row + kMacroSwizzleM * kTaskTileRows < row_count
+                                          ? group_row + kMacroSwizzleM * kTaskTileRows
+                                          : row_count;
             for (int macro_n = 0; macro_n < grid_n; macro_n += kMacroSwizzleN) {
                 const int band_end =
                     macro_n + kMacroSwizzleN < grid_n ? macro_n + kMacroSwizzleN : grid_n;
@@ -728,9 +727,12 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
 
     const int k_tiles = k / kTileK;
 
-    auto tmem_to_smem = [&](int mainloop_stage, int n_block, int smem_stage,
-                             int cta_row = 0, int tile_col = 0,
-                             int valid_rows = kTileM) {
+    auto tmem_to_smem = [&](int mainloop_stage,
+                            int n_block,
+                            int smem_stage,
+                            int cta_row = 0,
+                            int tile_col = 0,
+                            int valid_rows = kTileM) {
         char *stage_smem = dynamic_smem + kMainloopSmemBytes + smem_stage * kEpilogueStageBytes;
 
         for (int n_group = 0; n_group < kEpilogueTileN / 8; ++n_group) {
@@ -763,10 +765,8 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
                     // to global memory, bypassing shared memory.
                     if (tid < valid_rows) {
                         const int gmem_row = cta_row + tid;
-                        const int gmem_col =
-                            tile_col + n_block * kEpilogueTileN + n_group * 8;
-                        reinterpret_cast<int4 *>(
-                            c + gmem_row * n + gmem_col)[0] =
+                        const int gmem_col = tile_col + n_block * kEpilogueTileN + n_group * 8;
+                        reinterpret_cast<int4 *>(c + gmem_row * n + gmem_col)[0] =
                             reinterpret_cast<int4 *>(packed)[0];
                     }
                 } else {
@@ -775,8 +775,7 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
                         tid * kChunksPerStoreTile + n_group % kChunksPerStoreTile;
                     const int swizzled_chunk =
                         (chunk_in_store & ~7) +
-                        ((chunk_in_store & 7) ^
-                            ((chunk_in_store >> 3) & kSwizzlePhaseMask));
+                        ((chunk_in_store & 7) ^ ((chunk_in_store >> 3) & kSwizzlePhaseMask));
                     reinterpret_cast<int4 *>(
                         stage_smem + store_tile * kStoreTileBytes)[swizzled_chunk] =
                         reinterpret_cast<int4 *>(packed)[0];
@@ -1039,48 +1038,33 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
                             const int block_col = tile_col + n_block * kEpilogueTileN;
                             if (valid_rows == kTileM) {
                                 if (tid == 0) {
-                                    for (int store_tile = 0;
-                                        store_tile < kEpilogueStoreTiles;
+                                    for (int store_tile = 0; store_tile < kEpilogueStoreTiles;
                                         ++store_tile) {
-                                        tma_store_3d(
-                                            stage_smem +
-                                                store_tile * kStoreTileBytes,
+                                        tma_store_3d(stage_smem + store_tile * kStoreTileBytes,
                                             &c_tensor_map,
-                                            block_col +
-                                                store_tile * kEpilogueStoreTileN,
+                                            block_col + store_tile * kEpilogueStoreTileN,
                                             cta_row,
                                             0);
                                     }
                                     tma_store_commit_group();
                                 }
                             } else if (tid < valid_rows) {
-                                char *stage_smem_ptr =
-                                    dynamic_smem + kMainloopSmemBytes +
-                                    smem_stage * kEpilogueStageBytes;
-                                for (int n_group = 0;
-                                    n_group < kEpilogueTileN / 8;
-                                    ++n_group) {
-                                    const int store_tile =
-                                        n_group / kChunksPerStoreTile;
+                                char *stage_smem_ptr = dynamic_smem + kMainloopSmemBytes +
+                                                       smem_stage * kEpilogueStageBytes;
+                                for (int n_group = 0; n_group < kEpilogueTileN / 8; ++n_group) {
+                                    const int store_tile = n_group / kChunksPerStoreTile;
                                     const int chunk_in_store =
-                                        tid * kChunksPerStoreTile +
-                                        n_group % kChunksPerStoreTile;
+                                        tid * kChunksPerStoreTile + n_group % kChunksPerStoreTile;
                                     const int swizzled_chunk =
                                         (chunk_in_store & ~7) +
                                         ((chunk_in_store & 7) ^
-                                            ((chunk_in_store >> 3) &
-                                                kSwizzlePhaseMask));
-                                    const int4 value =
-                                        reinterpret_cast<int4 *>(
-                                            stage_smem_ptr +
-                                            store_tile *
-                                                kStoreTileBytes)
-                                            [swizzled_chunk];
+                                            ((chunk_in_store >> 3) & kSwizzlePhaseMask));
+                                    const int4 value = reinterpret_cast<int4 *>(
+                                        stage_smem_ptr +
+                                        store_tile * kStoreTileBytes)[swizzled_chunk];
                                     const int output_offset =
-                                        (cta_row + tid) * n + block_col +
-                                        n_group * 8;
-                                    reinterpret_cast<int4 *>(
-                                        c + output_offset)[0] = value;
+                                        (cta_row + tid) * n + block_col + n_group * 8;
+                                    reinterpret_cast<int4 *>(c + output_offset)[0] = value;
                                 }
                             }
                         }
@@ -1092,16 +1076,14 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
                         const int valid_block_rows =
                             remaining_block_rows < 0
                                 ? 0
-                                : (remaining_block_rows < kEpilogueTileN
-                                          ? remaining_block_rows
-                                          : kEpilogueTileN);
+                                : (remaining_block_rows < kEpilogueTileN ? remaining_block_rows
+                                                                         : kEpilogueTileN);
                         const int block_col = tile_col + cta_rank * kTileM;
                         if (valid_block_rows == kEpilogueTileN) {
                             if (tid == 0) {
                                 constexpr int kSwappedStoreColumns = 64;
                                 constexpr int kSwappedStoreBytes =
-                                    kEpilogueTileN * kSwappedStoreColumns *
-                                    sizeof(nv_bfloat16);
+                                    kEpilogueTileN * kSwappedStoreColumns * sizeof(nv_bfloat16);
                                 for (int atom = 0; atom < 2; ++atom) {
                                     tma_store_3d(stage_smem + atom * kSwappedStoreBytes,
                                         &c_tensor_map,
@@ -1116,21 +1098,18 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
                             constexpr int kSwizzleAtomBytes = 128;
                             constexpr int kBankGroupElements = 16 / sizeof(nv_bfloat16);
                             auto *stage_values =
-                                reinterpret_cast<nv_bfloat16 *>(
-                                    dynamic_smem + kMainloopSmemBytes +
-                                    smem_stage * kEpilogueStageBytes);
+                                reinterpret_cast<nv_bfloat16 *>(dynamic_smem + kMainloopSmemBytes +
+                                                                smem_stage * kEpilogueStageBytes);
                             const int atom = tid / kSwappedStoreColumns;
                             const int col_in_atom = tid % kSwappedStoreColumns;
                             for (int row = 0; row < valid_block_rows; ++row) {
                                 const int bank_group = col_in_atom / kBankGroupElements;
                                 const int value_in_group = col_in_atom % kBankGroupElements;
-                                const int atom_elements =
-                                    kEpilogueTileN * kSwappedStoreColumns;
+                                const int atom_elements = kEpilogueTileN * kSwappedStoreColumns;
                                 const int swizzled_index =
                                     atom * atom_elements +
                                     row * (kSwizzleAtomBytes / sizeof(nv_bfloat16)) +
-                                    (bank_group ^ (row & 7)) * kBankGroupElements +
-                                    value_in_group;
+                                    (bank_group ^ (row & 7)) * kBankGroupElements + value_in_group;
                                 c[(block_row + row) * n + block_col + tid] =
                                     stage_values[swizzled_index];
                             }
@@ -1141,8 +1120,7 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
                         if (kEpilogueStageCount == 1 || n_block > 0) {
                             if constexpr (!kDirectGmem || kSwapAB) {
                                 if (tid == 0) {
-                                    asm volatile(
-                                        "cp.async.bulk.wait_group.read %0;"
+                                    asm volatile("cp.async.bulk.wait_group.read %0;"
                                         :
                                         : "n"(kEpilogueStageCount - 1)
                                         : "memory");
@@ -1152,8 +1130,12 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
                         }
 
                         const int next_stage = (n_block + 1) % kEpilogueStageCount;
-                        tmem_to_smem(epilogue_mainloop_stage, n_block + 1, next_stage,
-                                     cta_row, tile_col, valid_rows);
+                        tmem_to_smem(epilogue_mainloop_stage,
+                            n_block + 1,
+                            next_stage,
+                            cta_row,
+                            tile_col,
+                            valid_rows);
                         asm volatile("bar.sync 1, 128;" ::: "memory");
                         if (n_block + 2 == kEpilogueBlockCount) {
                             release_tmem();
@@ -1193,22 +1175,18 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
     }
 }
 
-template <
-    int kTileM,
-    int kTileN,
-    int kTileK,
-    int kEpilogueTileN,
-    int kClusterM,
-    bool kSwapAB>
+template <int kTileM, int kTileN, int kTileK, int kEpilogueTileN, int kClusterM, bool kSwapAB>
 void launch_bf16_grouped_m_gemm_impl(
     const __nv_bfloat16 *d_a,
     const __nv_bfloat16 *d_b,
-    const int32_t *d_grouped_layout,
+    const int32_t *d_tasks,
+    int32_t *d_state,
     __nv_bfloat16 *d_c,
     int m,
     int experts,
     int n,
     int k,
+    int max_tasks,
     cudaStream_t stream) {
     using Config = KernelConfig<kTileM, kTileN, kTileK, kEpilogueTileN, kClusterM>;
     constexpr int kClusterTileM = Config::kClusterTileM;
@@ -1242,7 +1220,7 @@ void launch_bf16_grouped_m_gemm_impl(
         return;
     }
 
-    // ── Workspace layout ──────────────────────────────────────────
+    /* Metadata is prepared outside the timed main kernel. */
     // We pack metadata + tile-task queue into a single GPU allocation
     // so the kernel can consume everything from one base pointer.
     //
@@ -1268,33 +1246,10 @@ void launch_bf16_grouped_m_gemm_impl(
     //
     // Each row bundle produces one task per logical N tile.  The extra expert
     // slots account for the per-expert ceil when row counts are uneven.
-    const int grid_n = n / kLogicalNTile;
-    const int max_m_tasks = (m + kTaskTileRows - 1) / kTaskTileRows + experts;
-    const int max_tasks = max_m_tasks * grid_n;
-    const size_t metadata_bytes = (2 * experts + 2) * sizeof(int);
-    const size_t task_offset =
-        (metadata_bytes + alignof(ExpertTileTask) - 1) & ~(alignof(ExpertTileTask) - 1);
-    const size_t workspace_bytes = task_offset + max_tasks * sizeof(ExpertTileTask);
-    void *workspace = nullptr;
-    if (cudaMallocAsync(&workspace, workspace_bytes, stream) != cudaSuccess) {
-        return;
-    }
-
-    auto *expert_offsets = static_cast<int *>(workspace);
-    int *expert_counts = expert_offsets + experts;
-    int *task_count = expert_counts + experts;
-    int *next_cluster_tile = task_count + 1;
-    auto *tasks = reinterpret_cast<ExpertTileTask *>(static_cast<char *>(workspace) + task_offset);
-    cudaMemsetAsync(expert_offsets, 0x7f, experts * sizeof(int), stream);
-    cudaMemsetAsync(expert_counts, 0, experts * sizeof(int), stream);
-    cudaMemsetAsync(task_count, 0, 2 * sizeof(int), stream);
-    constexpr int kMetadataThreads = 256;
-    collect_expert_metadata<<<(m + kMetadataThreads - 1) / kMetadataThreads,
-        kMetadataThreads,
-        0,
-        stream>>>(d_grouped_layout, m, experts, expert_offsets, expert_counts);
-    build_expert_tile_tasks<kTaskTileRows>
-        <<<1, 1, 0, stream>>>(expert_offsets, expert_counts, experts, grid_n, tasks, task_count);
+    auto *tasks = reinterpret_cast<const ExpertTileTask *>(d_tasks);
+    auto *task_count = d_state;
+    auto *next_cluster_tile = d_state + 1;
+    cudaMemsetAsync(next_cluster_tile, 0, sizeof(int32_t), stream);
 
     const int max_cluster_tiles = max_tasks;
 
@@ -1366,24 +1321,26 @@ void launch_bf16_grouped_m_gemm_impl(
             n,
             k);
     }
-    cudaFreeAsync(workspace, stream);
 }
 
 void launch_bf16_grouped_m_gemm_entry(
     const __nv_bfloat16 *d_a,
     const __nv_bfloat16 *d_b,
-    const int32_t *d_grouped_layout,
+    const int32_t *d_tasks,
+    int32_t *d_state,
     __nv_bfloat16 *d_c,
     int m,
     int experts,
     int n,
     int k,
+    int max_tasks,
     bool swap_ab,
     cudaStream_t stream) {
-    if (d_a == nullptr || d_b == nullptr || d_grouped_layout == nullptr || d_c == nullptr) {
+    if (d_a == nullptr || d_b == nullptr || d_tasks == nullptr || d_state == nullptr ||
+        d_c == nullptr) {
         return;
     }
-    if (m <= 0 || experts <= 0 || n <= 0 || k <= 0) {
+    if (m <= 0 || experts <= 0 || n <= 0 || k <= 0 || max_tasks <= 0) {
         return;
     }
 
@@ -1393,46 +1350,71 @@ void launch_bf16_grouped_m_gemm_entry(
             SM110A_GROUPED_TILE_K,
             SM110A_GROUPED_EPILOGUE_TILE_N,
             SM110A_GROUPED_CLUSTER_M,
-            true>(d_a, d_b, d_grouped_layout, d_c, m, experts, n, k, stream);
+            true>(d_a, d_b, d_tasks, d_state, d_c, m, experts, n, k, max_tasks, stream);
     } else {
         launch_bf16_grouped_m_gemm_impl<SM110A_GROUPED_TILE_M,
             SM110A_GROUPED_TILE_N,
             SM110A_GROUPED_TILE_K,
             SM110A_GROUPED_EPILOGUE_TILE_N,
             SM110A_GROUPED_CLUSTER_M,
-            false>(d_a, d_b, d_grouped_layout, d_c, m, experts, n, k, stream);
+            false>(d_a, d_b, d_tasks, d_state, d_c, m, experts, n, k, max_tasks, stream);
     }
 }
 
 } // namespace
 
 #if SM110A_GROUPED_MODE != 2
-void launch_bf16_grouped_m_gemm(
+void launch_bf16_grouped_m_gemm_main(
     const __nv_bfloat16 *d_a,
     const __nv_bfloat16 *d_b,
-    const int32_t *d_grouped_layout,
+    const int32_t *tasks,
+    int32_t *state,
     __nv_bfloat16 *d_c,
     int m,
     int experts,
     int n,
     int k,
+    int max_tasks,
     bool swap_ab,
     cudaStream_t stream) {
-    launch_bf16_grouped_m_gemm_entry(
-        d_a, d_b, d_grouped_layout, d_c, m, experts, n, k, swap_ab, stream);
+    launch_bf16_grouped_m_gemm_entry(d_a,
+        d_b,
+        tasks,
+        state,
+        d_c,
+        m,
+        experts,
+        n,
+        k,
+        max_tasks,
+        swap_ab,
+        stream);
 }
 
 extern "C" void sm110a_bf16_grouped_m_gemm_launch(
     const __nv_bfloat16 *d_a,
     const __nv_bfloat16 *d_b,
-    const int32_t *d_grouped_layout,
+    const int32_t *tasks,
+    int32_t *state,
     __nv_bfloat16 *d_c,
     int m,
     int experts,
     int n,
     int k,
+    int max_tasks,
     bool swap_ab,
     cudaStream_t stream) {
-    launch_bf16_grouped_m_gemm(d_a, d_b, d_grouped_layout, d_c, m, experts, n, k, swap_ab, stream);
+    launch_bf16_grouped_m_gemm_main(d_a,
+        d_b,
+        tasks,
+        state,
+        d_c,
+        m,
+        experts,
+        n,
+        k,
+        max_tasks,
+        swap_ab,
+        stream);
 }
 #endif
