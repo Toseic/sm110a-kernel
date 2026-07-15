@@ -22,8 +22,8 @@ from sm110a_kernel import (
     GroupedMConfig,
     bf16_grouped_m_gemm_out,
     prepare_grouped_m_metadata,
-    compile_fc1_block_interleaved_swiglu_configs,
 )
+from sm110a_kernel.runner import AutotuneRunner, PreparedKernel, TuneOptions
 
 
 DEFAULT_EXPERTS = 256
@@ -186,15 +186,6 @@ def selected_candidates(n, k, args):
     return candidates
 
 
-def compile_fc1_configs(configs, debug):
-    if debug:
-        configs = list(configs)
-        print(f"[compile] compiling {len(configs)} configs...", flush=True)
-        compile_fc1_block_interleaved_swiglu_configs(configs)
-    else:
-        compile_fc1_block_interleaved_swiglu_configs(configs)
-
-
 def benchmark_fused_kernel(a, interleaved_w, router_scores, topk, out, config, args):
     metadata = ext.prepare_fc1_metadata(router_scores, topk, out.size(1), config=config)
     run_fused(a, interleaved_w, metadata, out, config)
@@ -318,7 +309,7 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
             )
         )
 
-    def benchmark_best_fused_kernel(
+    def resolve_fused_kernel(
         self, a, interleaved_w, router_scores, topk, out, args
     ):
         candidates = selected_candidates(
@@ -329,28 +320,37 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
                 f"no fc1 config supports N={interleaved_w.size(1) // 2}, K={a.size(1)}"
             )
 
-        if args.debug:
-            print("  [debug] per-config performance", flush=True)
+        def prepare(config):
+            metadata = ext.prepare_fc1_metadata(
+                router_scores, topk, out.size(1), config=config
+            )
+            run = lambda: run_fused(a, interleaved_w, metadata, out, config)
+            run()
+            torch.cuda.synchronize()
+            return PreparedKernel(config, run)
 
-        best_config, best_stats, _raw_results = self.autotune_candidates(
+        options = TuneOptions(
+            warmup=args.warmup, iters=args.iters, samples=args.samples,
+            cold_l2_flush=getattr(args, "_cold_l2_flush", None),
+            cache_path=args.cache_path, force_sweep=args.force_sweep, debug=args.debug,
+        )
+        return AutotuneRunner(options).resolve(
             candidates,
-            args=args,
-            benchmark_candidate=lambda config: benchmark_fused_kernel(
-                a, interleaved_w, router_scores, topk, out, config, args
+            prepare=prepare,
+            benchmark=lambda prepared: benchmark_with_stats(
+                prepared.run, args.warmup, args.iters, args.samples,
+                cold_l2_flush=getattr(args, "_cold_l2_flush", None),
+            ),
+            probe=lambda prepared: quick_probe(
+                prepared.run, cold_l2_flush=getattr(args, "_cold_l2_flush", None)
             ),
             format_candidate=format_candidate,
-            cache_namespace="fc1_block_interleaved_swiglu",
-            cache_key=(a.size(0), interleaved_w.size(1) // 2, a.size(1), topk),
-            probe_candidate=lambda config: probe_fused_kernel(
-                a, interleaved_w, router_scores, topk, out, config, args
-            ),
+            namespace="fc1_block_interleaved_swiglu",
+            key=(a.size(0), interleaved_w.size(1) // 2, a.size(1), topk),
             metric_formatter=lambda _config, stats: (
                 f"{routed_fc1_swiglu_tflops_from_ms(a.size(0), topk, interleaved_w.size(1) // 2, a.size(1), stats['median_ms']):.1f} TF/s"
             ),
-            candidate_width=36,
-            flush=True,
         )
-        return best_stats, best_config
 
     def run_with_args(self, args):
         torch.manual_seed(args.seed)
@@ -385,11 +385,6 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
             f"[baseline] grouped-gemm tile_m=128 tile_n={args.baseline_tile_n} "
             f"tile_k={args.baseline_tile_k} cluster_m={args.baseline_cluster_m} mode={args.baseline_mode}"
         )
-        print(
-            "[autotune] configs="
-            + ", ".join(format_candidate(config) for config in candidates)
-        )
-        compile_fc1_configs(dict.fromkeys(candidates), args.debug)
         self.make_result_table().print_header()
         for tokens in token_values:
             m = tokens * args.topk
@@ -403,9 +398,10 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
                 (m, args.n), device="cuda", dtype=torch.bfloat16
             )
             test_out = torch.empty_like(baseline_out)
-            kernel_stats, best_config = self.benchmark_best_fused_kernel(
+            selection = self.resolve_fused_kernel(
                 a, interleaved_w, router_scores, args.topk, test_out, args
             )
+            kernel_stats, best_config = selection.stats, selection.candidate
 
             max_abs_diff = 0.0
             if args.check:
@@ -420,8 +416,7 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
                     baseline_out,
                     baseline_config,
                 )
-                metadata = ext.prepare_fc1_metadata(router_scores, args.topk, test_out.size(1), config=best_config)
-                run_fused(a, interleaved_w, metadata, test_out, best_config)
+                selection.prepared.run()
                 torch.cuda.synchronize()
                 max_abs_diff = (baseline_out.float() - test_out.float()).abs().max().item()
                 passed = torch.allclose(

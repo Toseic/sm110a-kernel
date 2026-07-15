@@ -23,10 +23,7 @@ from sm110a_kernel import (
     bf16_grouped_m_gemm_out,
     prepare_grouped_m_metadata,
 )
-from sm110a_kernel.jit import (
-    compile_bf16_grouped_m_gemm,
-    compile_bf16_grouped_m_gemm_configs,
-)
+from sm110a_kernel.runner import AutotuneRunner, PreparedKernel, TuneOptions
 
 '''
 roofline analysis:
@@ -151,21 +148,6 @@ def compatible_candidates(n, k):
         # if config.cluster_m == 1 and n % (config.cluster_m * config.tile_m) == 0:
         #     candidates.append((config, True)) # disable swapab [tmp]
     return tuple(candidates)
-
-
-def compile_grouped_m_configs(configs, debug):
-    if debug:
-        configs = list(configs)
-        try:
-            from tqdm import tqdm
-        except ImportError:
-            for config in configs:
-                print(f"[compile] {format_config(config)}", flush=True)
-        else:
-            print(f"[compile] compiling {len(configs)} configs...", flush=True)
-        compile_bf16_grouped_m_gemm_configs(configs)
-    else:
-        compile_bf16_grouped_m_gemm_configs(configs)
 
 
 _MODE_LABELS = {0: "np", 1: "pe", 2: "cl"}
@@ -318,20 +300,6 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
             f"[workload] experts={EXPERTS} n={N} k={K} "
             f"tokens_per_expert={tokens_per_expert_values}"
         )
-        print(
-            "[autotune] configs="
-            + ", ".join(
-                format_candidate(config, swap_ab)
-                for config, swap_ab in compatible_candidates(N, K)
-            )
-        )
-        compile_grouped_m_configs(
-            dict.fromkeys(
-                config for config, _ in compatible_candidates(N, K)
-            ),
-            args.debug,
-        )
-
         b = torch.empty((EXPERTS, N, K), device="cuda", dtype=torch.bfloat16)
         b.uniform_(-1.0, 1.0)
         self.make_result_table().print_header()
@@ -346,12 +314,9 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
                 out_baseline,
                 args,
             )
-            (
-                kernel_stats,
-                best_config,
-                best_swap_ab,
-                _,
-            ) = self.benchmark_best_grouped_kernel(a, b, layout, out_kernel, args)
+            selection = self.resolve_grouped_kernel(a, b, layout, out_kernel, args)
+            kernel_stats = selection.stats
+            best_config, best_swap_ab = selection.candidate
             grouped_m_tile = (
                 best_config.tile_n
                 if best_swap_ab
@@ -362,17 +327,7 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
             )
             diff = 0.0
             if args.check:
-                metadata = prepare_grouped_m_metadata(
-                    layout, b.size(0), b.size(1), config=best_config,
-                    swap_ab=best_swap_ab)
-                bf16_grouped_m_gemm_out(
-                    a,
-                    b,
-                    metadata,
-                    out_kernel,
-                    config=best_config,
-                    swap_ab=best_swap_ab,
-                )
+                selection.prepared.run()
                 run_grouped_baseline(a, b, tokens_per_expert, out_baseline)
                 diff = max_valid_abs_diff(out_baseline, out_kernel)
             self.make_result_table().print_row(
@@ -398,45 +353,51 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
                     label="grouped-M GEMM",
                 )
 
-    def benchmark_best_grouped_kernel(self, a, b, layout, out, args):
+    def resolve_grouped_kernel(self, a, b, layout, out, args):
         candidates = compatible_candidates(b.size(1), a.size(1))
         if not candidates:
             raise RuntimeError(
                 f"no grouped M config supports N={b.size(1)}, K={a.size(1)}"
             )
 
-        if args.debug:
-            print("  [debug] per-config performance", flush=True)
-
         tokens_per_expert = layout.numel() // b.size(0)
         n = b.size(1)
         k = a.size(1)
-        best_candidate, best_stats, raw_results = self.autotune_candidates(
+        def prepare(candidate):
+            config, swap_ab = candidate
+            metadata = prepare_grouped_m_metadata(
+                layout, b.size(0), b.size(1), config=config, swap_ab=swap_ab
+            )
+            run = lambda: bf16_grouped_m_gemm_out(
+                a, b, metadata, out, config=config, swap_ab=swap_ab
+            )
+            run()
+            torch.cuda.synchronize()
+            return PreparedKernel(candidate, run)
+
+        options = TuneOptions(
+            warmup=args.warmup, iters=args.iters, samples=args.samples,
+            cold_l2_flush=getattr(args, "_cold_l2_flush", None),
+            cache_path=args.cache_path, force_sweep=args.force_sweep, debug=args.debug,
+        )
+        return AutotuneRunner(options).resolve(
             candidates,
-            args=args,
-            benchmark_candidate=lambda candidate: benchmark_grouped_kernel(
-                a, b, layout, out, candidate[0], candidate[1], args
+            prepare=prepare,
+            benchmark=lambda prepared: benchmark_with_stats(
+                prepared.run, args.warmup, args.iters, args.samples,
+                cold_l2_flush=getattr(args, "_cold_l2_flush", None),
+            ),
+            probe=lambda prepared: quick_probe(
+                prepared.run, cold_l2_flush=getattr(args, "_cold_l2_flush", None)
             ),
             format_candidate=lambda candidate: format_candidate(
                 candidate[0], candidate[1]
             ),
-            cache_namespace="bf16_grouped_m_gemm",
-            cache_key=(n, k, tokens_per_expert),
-            probe_candidate=lambda candidate: probe_grouped_kernel(
-                a, b, layout, out, candidate[0], candidate[1], args
-            ),
+            namespace="bf16_grouped_m_gemm", key=(n, k, tokens_per_expert),
             metric_formatter=lambda _candidate, stats: (
                 f"{tflops_from_ms(a.size(0), n, k, stats['median_ms']):.1f} TF/s"
             ),
-            candidate_width=40,
-            flush=True,
         )
-        best_config, best_swap_ab = best_candidate
-        results = [
-            (stats, candidate[0], candidate[1])
-            for candidate, stats, _probe_ms in raw_results
-        ]
-        return best_stats, best_config, best_swap_ab, results
 
 
 def main():

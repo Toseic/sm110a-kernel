@@ -26,6 +26,7 @@ from sm110a_kernel import (
     cublaslt_gemm_out,
     cublaslt_gemm_out_batched,
 )
+from sm110a_kernel.runner import AutotuneRunner, PreparedKernel, TuneOptions
 
 
 DEFAULT_SHAPES = [
@@ -137,7 +138,7 @@ def print_result(m, n, k, kernel_stats, baseline_stats, max_abs_diff, best_candi
 
 def run_accuracy_check(args):
     print("[accuracy] small shape with correctness check")
-    print("[autotune] sweeping over configs")
+    print("[runner] resolving kernel config")
     accuracy_args = argparse.Namespace(
         warmup=2,
         iters=20,
@@ -219,12 +220,7 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
     def emit_runtime_banner(self, args, actual_blas):
         baseline_name = super().emit_runtime_banner(args, actual_blas)
         print(
-            "[autotune] configs: "
-            + ", ".join(
-                format_candidate((config, swap_ab))
-                for config in BF16_GEMM_CONFIGS
-                for swap_ab in (False, True)
-            )
+            "[runner] config selection is cached per workload and CUDA environment"
         )
         print()
         return baseline_name
@@ -293,16 +289,15 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
         else:
             raise SystemExit(f"unsupported --baseline value: {args.baseline}")
 
-        best_candidate, kernel_stats = self.benchmark_best_kernel(
+        selection = self.resolve_kernel(
             a, b, out_kernel, m, n, k, args
         )
+        best_candidate, kernel_stats = selection.candidate, selection.stats
 
         max_abs_diff = 0.0
         if not args.skip_check:
             best_config, best_swap_ab = best_candidate
-            bf16_gemm_out(
-                a, b, out_kernel, config=best_config, swap_ab=best_swap_ab
-            )
+            selection.prepared.run()
             if args.baseline == "torch":
                 baseline_fn()
             else:
@@ -319,53 +314,43 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
             best_candidate,
         )
 
-    def benchmark_best_kernel(self, a, b, out, m, n, k, args):
+    def resolve_kernel(self, a, b, out, m, n, k, args):
         target_ms = calibration_target_ms(m, n, k)
         candidates = compatible_candidates(m, n, k)
         if not candidates:
             raise RuntimeError(f"no JIT config supports M={m}, N={n}, K={k}")
 
-        def run_kernel(candidate):
+        def prepare(candidate):
             config, swap_ab = candidate
-            bf16_gemm_out(a, b, out, config=config, swap_ab=swap_ab)
+            run = lambda: bf16_gemm_out(a, b, out, config=config, swap_ab=swap_ab)
+            run()
             torch.cuda.synchronize()
-            return benchmark_with_stats(
-                lambda: bf16_gemm_out(
-                    a, b, out, config=config, swap_ab=swap_ab
-                ),
-                args.warmup,
-                args.iters,
-                args.samples,
-                cold_l2_flush=getattr(args, "_cold_l2_flush", None),
-                target_ms=target_ms,
-            )
+            return PreparedKernel(candidate, run)
 
-        def probe_kernel(candidate):
-            config, swap_ab = candidate
-            bf16_gemm_out(a, b, out, config=config, swap_ab=swap_ab)
-            torch.cuda.synchronize()
-            return quick_probe(
-                lambda: bf16_gemm_out(
-                    a, b, out, config=config, swap_ab=swap_ab
-                ),
-                cold_l2_flush=getattr(args, "_cold_l2_flush", None),
-                target_ms=target_ms,
-            )
-
-        best_candidate, best_stats, _ = self.autotune_candidates(
+        options = TuneOptions(
+            warmup=args.warmup, iters=args.iters, samples=args.samples,
+            cold_l2_flush=getattr(args, "_cold_l2_flush", None),
+            cache_path=getattr(args, "cache_path", None),
+            force_sweep=getattr(args, "force_sweep", False), debug=args.debug,
+        )
+        return AutotuneRunner(options).resolve(
             candidates,
-            args=args,
-            benchmark_candidate=run_kernel,
+            namespace="bf16_gemm", key=(m, n, k), prepare=prepare,
+            benchmark=lambda prepared: benchmark_with_stats(
+                prepared.run, args.warmup, args.iters, args.samples,
+                cold_l2_flush=getattr(args, "_cold_l2_flush", None),
+                target_ms=target_ms,
+            ),
+            probe=lambda prepared: quick_probe(
+                prepared.run,
+                cold_l2_flush=getattr(args, "_cold_l2_flush", None),
+                target_ms=target_ms,
+            ),
             format_candidate=format_candidate,
-            cache_namespace="bf16_gemm",
-            cache_key=(m, n, k),
-            probe_candidate=probe_kernel,
             metric_formatter=lambda _candidate, stats: (
                 f"{tflops_from_ms(m, n, k, stats['median_ms']):.1f} TF/s"
             ),
-            candidate_width=28,
         )
-        return best_candidate, best_stats
 
     def print_result(self, shape, result):
         m, n, k = shape

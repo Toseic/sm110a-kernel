@@ -48,5 +48,14 @@ from .kernels.grouped_m_gemm import (
     get_bf16_grouped_m_gemm_module,
     prepare_grouped_m_metadata,
 )
+_RUNNER_EXPORTS = {"AutotuneRunner", "PreparedKernel", "Selection", "TuneOptions"}
 
-__all__ = [name for name in globals() if not name.startswith("_")]
+
+def __getattr__(name):
+    if name in _RUNNER_EXPORTS:
+        from . import runner
+        return getattr(runner, name)
+    raise AttributeError(name)
+
+
+__all__ = [name for name in globals() if not name.startswith("_")] + sorted(_RUNNER_EXPORTS)

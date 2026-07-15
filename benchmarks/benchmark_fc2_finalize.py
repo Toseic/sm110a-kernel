@@ -20,11 +20,11 @@ from common import (
 from sm110a_kernel import (
     Fc2FinalizeConfig,
     GroupedMConfig,
-    compile_fc2_finalize_configs,
     fc2_finalize_with_routing_out,
     pack_routing_metadata,
     prepare_grouped_m_metadata,
 )
+from sm110a_kernel.runner import AutotuneRunner, PreparedKernel, TuneOptions
 
 
 DEFAULT_EXPERTS = 256
@@ -196,8 +196,7 @@ class Fc2FinalizeBenchmark(BenchmarkBase):
         if not candidates:
             raise SystemExit("no compatible FC2 configs match the requested filters")
         print(f"[config] experts={args.experts} h={args.h} i={args.i} topk={args.topk} tokens={tokens_values}")
-        print("[autotune] configs=" + ", ".join(format_candidate(config) for config in candidates))
-        compile_fc2_finalize_configs(dict.fromkeys(candidates))
+        print("[runner] resolving and caching the best compatible config")
         table = self.make_result_table()
         table.print_header()
         weights = torch.empty((args.experts, args.h, args.i), device="cuda", dtype=torch.bfloat16).uniform_(-1.0, 1.0)
@@ -206,21 +205,37 @@ class Fc2FinalizeBenchmark(BenchmarkBase):
                 tokens, args.experts, args.topk, args.i
             )
             out = torch.empty((tokens, args.h), device="cuda", dtype=torch.bfloat16)
-            best_config, stats, _ = self.autotune_candidates(
-                candidates, args=args,
-                benchmark_candidate=lambda config: benchmark_fc2(fc1, weights, routing_weights, routing, args.topk, out, config, args),
-                probe_candidate=lambda config: probe_fc2(fc1, weights, routing_weights, routing, args.topk, out, config, args),
-                format_candidate=format_candidate,
-                cache_namespace="fc2_finalize",
-                cache_key=(tokens, args.experts, args.topk, args.h, args.i),
-                metric_formatter=lambda _config, result: f"{fc2_tflops(tokens, args.topk, args.h, args.i, result['median_ms']):.1f} TF/s",
-                candidate_width=42,
-                flush=True,
+            def prepare(config):
+                metadata = prepare_fc2_metadata(routing, weights, fc1, config)
+                run = lambda: run_fc2(fc1, weights, routing_weights, routing, metadata, args.topk, out, config)
+                run()
+                torch.cuda.synchronize()
+                return PreparedKernel(config, run)
+
+            options = TuneOptions(
+                warmup=args.warmup, iters=args.iters, samples=args.samples,
+                cold_l2_flush=args._cold_l2_flush, cache_path=args.cache_path,
+                force_sweep=args.force_sweep, debug=args.debug,
             )
+            selection = AutotuneRunner(options).resolve(
+                candidates,
+                prepare=prepare,
+                benchmark=lambda prepared: benchmark_with_stats(
+                    prepared.run, args.warmup, args.iters, args.samples,
+                    cold_l2_flush=args._cold_l2_flush,
+                ),
+                probe=lambda prepared: quick_probe(
+                    prepared.run, cold_l2_flush=args._cold_l2_flush,
+                ),
+                format_candidate=format_candidate,
+                namespace="fc2_finalize",
+                key=(tokens, args.experts, args.topk, args.h, args.i),
+                metric_formatter=lambda _config, result: f"{fc2_tflops(tokens, args.topk, args.h, args.i, result['median_ms']):.1f} TF/s",
+            )
+            best_config, stats = selection.candidate, selection.stats
             max_abs_diff = 0.0
             if args.check:
-                grouped_metadata = prepare_fc2_metadata(routing, weights, fc1, best_config)
-                run_fc2(fc1, weights, routing_weights, routing, grouped_metadata, args.topk, out, best_config)
+                selection.prepared.run()
                 reference = reference_fc2(fc1, weights, routing_weights, selected, grouped_order, tokens, args.topk, args.h)
                 torch.cuda.synchronize()
                 max_abs_diff = (out.float() - reference.float()).abs().max().item()

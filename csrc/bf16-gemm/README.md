@@ -23,6 +23,18 @@ Default benchmark sweep:
 /home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_bf16_gemm.py
 ```
 
+Autotune is resolved by the shared runner before the benchmark's timed loop.
+To prewarm the same cache explicitly, invoke the runner with the workload and
+the normal benchmark arguments:
+
+```bash
+python3 -m sm110a_kernel.runner bf16-gemm -- --m 4096 --n 4096 --k 4096
+```
+
+The runner records results in `profiles/autotune_cache.json`, partitioned by
+the CUDA device, software stack, architecture settings, and source revision.
+Use `--force-sweep` to re-run selection for an existing workload.
+
 This runs a small `512 x 512 x 512` accuracy check first, then the default
 performance sweep.
 
