@@ -20,8 +20,8 @@ def _load_extension():
     return load(
         name=f"sm110a_cublaslt_ext_{cuda_arch}",
         sources=[
-            str(_ROOT / "csrc/bf16-gemm/src/torch_binding.cpp"),
-            str(_ROOT / "csrc/bf16-gemm/src/bf16_gemm.cu"),
+            str(_ROOT / "csrc/bf16_gemm/src/bf16_gemm_torch_binding.cpp"),
+            str(_ROOT / "csrc/bf16_gemm/src/bf16_gemm_kernel.cu"),
         ],
         extra_include_paths=[str(_ROOT / "include")],
         extra_cuda_cflags=[

@@ -1,5 +1,5 @@
 /*
- * bf16_grouped_m_gemm.cu — SM110A / Blackwell BF16 grouped-M GEMM kernel.
+ * bf16_grouped_m_gemm_kernel.cu — SM110A / Blackwell BF16 grouped-M GEMM kernel.
  *
  * What it does
  * ------------

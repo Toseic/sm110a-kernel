@@ -10,7 +10,7 @@ from typing import Iterable, Optional
 from ..jit_runtime import SplitCudaJit
 
 _ROOT = Path(__file__).resolve().parents[2]
-_SOURCE_DIR = _ROOT / "csrc/bf16-grouped-m-gemm/src"
+_SOURCE_DIR = _ROOT / "csrc/bf16_grouped_m_gemm/src"
 _INCLUDE_DIR = _ROOT / "include"
 
 
@@ -101,8 +101,8 @@ def _kernel_cflags(config: GroupedMConfig, variant):
 _JIT = SplitCudaJit(
     name="sm110a_grouped_m",
     root=_ROOT,
-    binding_sources=(_SOURCE_DIR / "torch_binding.cpp",),
-    kernel_sources=(_SOURCE_DIR / "bf16_grouped_m_gemm.cu", _SOURCE_DIR / "metadata.cu"),
+    binding_sources=(_SOURCE_DIR / "bf16_grouped_m_gemm_torch_binding.cpp",),
+    kernel_sources=(_SOURCE_DIR / "bf16_grouped_m_gemm_kernel.cu", _SOURCE_DIR / "bf16_grouped_m_gemm_metadata.cu"),
     kernel_dependencies=(_INCLUDE_DIR / "bf16_grouped_m_gemm.h", _INCLUDE_DIR / "common.h"),
     kernel_symbol="sm110a_bf16_grouped_m_gemm_launch",
     config_key=lambda config: config,

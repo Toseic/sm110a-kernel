@@ -10,7 +10,7 @@ from typing import Iterable, Optional
 from ..jit_runtime import SplitCudaJit
 
 _ROOT = Path(__file__).resolve().parents[2]
-_SOURCE_DIR = _ROOT / "csrc/bf16-moe/src"
+_SOURCE_DIR = _ROOT / "csrc/bf16_moe/src"
 _INCLUDE_DIR = _ROOT / "include"
 
 
@@ -85,8 +85,8 @@ def _kernel_cflags(config: Fc1BlockInterleavedSwiGLUConfig, variant):
 
 _JIT = SplitCudaJit(
     name="sm110a_fc1_moe", root=_ROOT,
-    binding_sources=(_SOURCE_DIR / "torch_binding.cpp",),
-    kernel_sources=(_SOURCE_DIR / "fc1_block_interleaved_swiglu.cu",),
+    binding_sources=(_SOURCE_DIR / "bf16_moe_torch_binding.cpp",),
+    kernel_sources=(_SOURCE_DIR / "bf16_fc1_block_interleaved_swiglu_kernel.cu",),
     kernel_dependencies=(_INCLUDE_DIR / "bf16_moe_fc1.h", _INCLUDE_DIR / "common.h"),
     kernel_symbol="sm110a_fc1_main_launch",
     config_key=lambda config: config, kernel_cflags=_kernel_cflags,

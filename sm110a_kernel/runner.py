@@ -222,8 +222,8 @@ def main():
     scripts = {
         "bf16-gemm": "benchmark_bf16_gemm.py",
         "grouped-m-gemm": "benchmark_bf16_grouped_m_gemm.py",
-        "fc1-swiglu": "benchmark_fc1_block_interleaved_swiglu.py",
-        "fc2-finalize": "benchmark_fc2_finalize.py",
+        "fc1-swiglu": "benchmark_bf16_fc1_block_interleaved_swiglu.py",
+        "fc2-finalize": "benchmark_bf16_fc2_finalize.py",
     }
     forwarded = parsed.args[1:] if parsed.args[:1] == ["--"] else parsed.args
     raise SystemExit(subprocess.call([sys.executable, str(_ROOT / "benchmarks" / scripts[parsed.workload]), *forwarded]))

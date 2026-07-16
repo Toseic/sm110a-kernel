@@ -1,5 +1,5 @@
 /*
- * fc2_finalize.cu — routed MoE FC2/finalize entry points for SM110A.
+ * bf16_fc2_finalize_kernel.cu — routed MoE FC2/finalize entry points for SM110A.
  *
  * This translation unit owns FC2 routing metadata and a private physical copy
  * of the Blackwell BF16 FC2 grouped-GEMM implementation. Keeping it here lets

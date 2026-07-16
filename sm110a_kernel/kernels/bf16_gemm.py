@@ -13,7 +13,7 @@ from typing import Optional
 from ..jit_runtime import jit_build_directory, source_digest
 
 _ROOT = Path(__file__).resolve().parents[2]
-_SOURCE_DIR = _ROOT / "csrc/bf16-gemm/src"
+_SOURCE_DIR = _ROOT / "csrc/bf16_gemm/src"
 _INCLUDE_DIR = _ROOT / "include"
 
 
@@ -69,7 +69,7 @@ _CACHE_LOCK = threading.Lock()
 
 def _module_name(config, cuda_arch, torch):
     digest = source_digest(
-        (_SOURCE_DIR / "bf16_gemm_jit_binding.cpp", _SOURCE_DIR / "bf16_gemm.cu",
+        (_SOURCE_DIR / "bf16_gemm_jit_binding.cpp", _SOURCE_DIR / "bf16_gemm_kernel.cu",
          _INCLUDE_DIR / "bf16_gemm.h", _INCLUDE_DIR / "common.h", _INCLUDE_DIR / "profiler.h"),
         _ROOT,
     )
@@ -98,7 +98,7 @@ def compile_bf16_gemm(config: Optional[Bf16GemmConfig] = None) -> Bf16GemmModule
         definitions = list(_kernel_cflags(config, None))
         module = load(
             name=name,
-            sources=[str(_SOURCE_DIR / "bf16_gemm_jit_binding.cpp"), str(_SOURCE_DIR / "bf16_gemm.cu")],
+            sources=[str(_SOURCE_DIR / "bf16_gemm_jit_binding.cpp"), str(_SOURCE_DIR / "bf16_gemm_kernel.cu")],
             extra_include_paths=[str(_INCLUDE_DIR)],
             extra_cuda_cflags=["-O3", "-lineinfo", f"-gencode=arch={compute_arch},code={cuda_arch}", *definitions],
             extra_cflags=["-O3", "-std=c++17", *definitions],
