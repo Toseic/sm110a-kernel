@@ -214,13 +214,14 @@ def main():
     parser = argparse.ArgumentParser(description="SM110A autotune runner")
     parser.add_argument(
         "workload",
-        choices=("bf16-gemm", "grouped-m-gemm", "fc1-swiglu", "fc2-finalize"),
+        choices=("bf16-gemm", "nvfp4-gemm", "grouped-m-gemm", "fc1-swiglu", "fc2-finalize"),
         help="workload to resolve and cache",
     )
     parser.add_argument("args", nargs=argparse.REMAINDER, help="arguments forwarded to the benchmark")
     parsed = parser.parse_args()
     scripts = {
         "bf16-gemm": "benchmark_bf16_gemm.py",
+        "nvfp4-gemm": "benchmark_nvfp4_gemm.py",
         "grouped-m-gemm": "benchmark_bf16_grouped_m_gemm.py",
         "fc1-swiglu": "benchmark_bf16_fc1_block_interleaved_swiglu.py",
         "fc2-finalize": "benchmark_bf16_fc2_finalize.py",

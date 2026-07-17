@@ -259,9 +259,15 @@ def _ms_for_bytes(byte_count, bandwidth_gbps):
     return byte_count / (bandwidth_gbps * _DECIMAL_MB)
 
 
-def sol_bounds(flops, compulsory_bytes, a_and_b_bytes, tile_read_bytes):
-    """Return the SOL models shared by the three BF16 benchmark families."""
-    mma_ms = flops / (MMA_PEAK_TFLOPS * _DECIMAL_GFLOP)
+def sol_bounds(
+    flops,
+    compulsory_bytes,
+    a_and_b_bytes,
+    tile_read_bytes,
+    mma_peak_tflops=MMA_PEAK_TFLOPS,
+):
+    """Return the shared GEMM SOL models for the requested MMA peak."""
+    mma_ms = flops / (mma_peak_tflops * _DECIMAL_GFLOP)
     hbm_ms = _ms_for_bytes(compulsory_bytes, GMEM_BW_GBPS)
     gmem_ms = _ms_for_bytes(tile_read_bytes, GMEM_BW_GBPS)
     pure_l2_ms = _ms_for_bytes(tile_read_bytes, L2_BW_GBPS)

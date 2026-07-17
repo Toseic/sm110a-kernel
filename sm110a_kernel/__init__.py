@@ -14,6 +14,16 @@ from .kernels.bf16_gemm import (
     compile_bf16_gemm,
     get_bf16_gemm_module,
 )
+from .kernels.nvfp4_gemm import (
+    Nvfp4GemmConfig,
+    compile_nvfp4_gemm,
+    from_blocked_nvfp4_scales,
+    nvfp4_gemm,
+    nvfp4_gemm_out,
+    quantize_nvfp4_gemm,
+    quantize_nvfp4_rows,
+    to_blocked_nvfp4_scales,
+)
 from .kernels.cublaslt import (
     cublaslt_gemm,
     cublaslt_gemm_out,
