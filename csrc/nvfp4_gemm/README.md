@@ -21,8 +21,9 @@ The low-level API accepts:
 - Output: contiguous BF16 `[M,N]`.
 
 `M` must be a multiple of 256, `N` a multiple of 128, and `K` a multiple of
-64.  `tile_n` and `tile_k` support 64, 128, and 256; the `tile_n` 64/128
-variants use two TMEM accumulator stages while the 256 variant uses one.
+64.  `tile_n` and `tile_k` support 64, 128, and 256. All variants use two
+TMEM accumulator stages; `tile_n=256` overlaps the stages by 16 columns and
+drains that region first in the epilogue so the next mainloop can start early.
 `to_blocked_nvfp4_scales` converts logical `[rows,K/16]` scales to the
 required physical format. This is the same scale format consumed by
 `torch._scaled_mm`/cuBLASLt.

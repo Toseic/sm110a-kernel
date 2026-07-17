@@ -16,10 +16,11 @@
 // the same shared-memory offset in both CTAs.
 //
 // FP32 accumulation lives in TMEM and is converted to BF16 through the
-// inherited four-warp pipelined TMA epilogue.  TMEM is organized as compact,
-// non-overlapping accumulator tiles followed by the scale-factor ring.  Two
-// accumulator stages are enabled when two TileN tiles plus that ring fit in
-// the 512 TMEM columns; otherwise the kernel uses one stage.
+// inherited four-warp pipelined TMA epilogue.  TileN=256 uses two accumulator
+// stages with a 16-column overlap: [0,256) and [240,496).  The epilogue drains
+// the shared 16 columns first and releases the next MMA stage before draining
+// the rest of the tile.  Scale factors occupy one 8/12-column slot after the
+// accumulators and are refreshed immediately before every MMA.
 //
 // Scale tensors use the same Blackwell SWIZZLE_32_4_4 physical format accepted
 // by torch._scaled_mm/cuBLASLt.  A logical [128,4] tile is stored as 32 rows
@@ -102,13 +103,15 @@ struct KernelConfig {
     static constexpr int kStageCount = kSmemLimitedStageCount < 6 ? kSmemLimitedStageCount : 6;
     static_assert(kStageCount >= 2);
     static constexpr int kScaleColsPerMma = 4 + 4 * kSFBScaleTileCount;
-    static constexpr int kScaleColsPerStage = kMmaStepsPerStage * kScaleColsPerMma;
-    static constexpr int kScaleTmemCols = kStageCount * kScaleColsPerStage;
-    static constexpr int kAccumulatorStageCount =
-        2 * kTileN + kScaleTmemCols <= kTmemColumnCapacity ? 2 : 1;
-    static constexpr int kAccumulatorTmemCols = kAccumulatorStageCount * kTileN;
+    static constexpr int kScaleTmemCols = kScaleColsPerMma;
+    static constexpr int kAccumulatorStageCount = 2;
+    static constexpr int kAccumulatorOverlapCols = kTileN == 256 ? 16 : 0;
+    static constexpr int kAccumulatorStageStride = kTileN - kAccumulatorOverlapCols;
+    static constexpr int kAccumulatorTmemCols =
+        kTileN + kAccumulatorStageStride;
     static_assert(kAccumulatorTmemCols + kScaleTmemCols <= kTmemColumnCapacity);
-    static_assert(kAccumulatorStageCount == (kTileN <= 128 ? 2 : 1));
+    static_assert(kTileN != 256 ||
+        kAccumulatorTmemCols + kScaleTmemCols == 508);
     static constexpr int kMainloopSmemBytes = kStageCount * kPerStageSmemBytes;
     static constexpr int kDynamicSmemBytes = kMainloopSmemBytes + kEpilogueSmemBytes;
 };
@@ -482,6 +485,8 @@ void nvfp4_gemm_kernel(
     constexpr int kSFBScaleTileCount = Config::kSFBScaleTileCount;
     constexpr int kMmaStepsPerStage = Config::kMmaStepsPerStage;
     constexpr int kAccumulatorStageCount = Config::kAccumulatorStageCount;
+    constexpr int kAccumulatorOverlapCols = Config::kAccumulatorOverlapCols;
+    constexpr int kAccumulatorStageStride = Config::kAccumulatorStageStride;
     constexpr int kMainloopSmemBytes = Config::kMainloopSmemBytes;
     constexpr int kEpilogueStageBytes = Config::kEpilogueStageBytes;
     constexpr int kPerStageSmemBytes = Config::kPerStageSmemBytes;
@@ -693,12 +698,9 @@ void nvfp4_gemm_kernel(
         };
 
         asm volatile("tcgen05.fence::after_thread_sync;");
-        const int this_taddr = taddr + mainloop_stage * kTileN;
+        const int this_taddr = taddr + mainloop_stage * kAccumulatorStageStride;
         constexpr int kScaleTmemBase = Config::kAccumulatorTmemCols;
-        constexpr int kScaleColsPerMma = Config::kScaleColsPerMma;
-        constexpr int kScaleColsPerStage = Config::kScaleColsPerStage;
-        const int scale_stage_taddr =
-            taddr + kScaleTmemBase + stage_id * kScaleColsPerStage;
+        const int scale_taddr = taddr + kScaleTmemBase;
 
         if constexpr (DO_PROFILE) {
             profiler.start(ProfilerTag::IssueMMA);
@@ -709,9 +711,12 @@ void nvfp4_gemm_kernel(
             const int B_mma_smem =
                 B_smem + mma_k * (kTileN / kClusterM) * (kMmaK / 2);
             const int SFA_mma_smem = SFA_smem + mma_k * 512;
-            const int sfa_taddr = scale_stage_taddr + mma_k * kScaleColsPerMma;
+            const int sfa_taddr = scale_taddr;
             const int sfb_taddr = sfa_taddr + 4;
 
+            // tcgen05.cp -> tcgen05.mma with the same CTA group is a PTX
+            // pipeline pairing, so the MMA observes these scale updates
+            // without an explicit commit/wait between the instructions.
             tcgen05_cp_scale_2cta(sfa_taddr, make_scale_desc(SFA_mma_smem));
             #pragma unroll
             for (int scale_tile = 0; scale_tile < kSFBScaleTileCount; ++scale_tile) {
@@ -746,14 +751,19 @@ void nvfp4_gemm_kernel(
         }
     };
 
-    auto tmem_to_smem = [&](int mainloop_stage, int n_block, int smem_stage) {
+    auto tmem_to_smem = [&](int mainloop_stage,
+                            int n_block,
+                            int smem_stage,
+                            int n_group_begin,
+                            int n_group_end) {
         nv_bfloat16 *smem_out = epilogue_smem + smem_stage * kTileM * kEpilogueBlockN;
 
-        for (int n = 0; n < kEpilogueBlockN / 8; n++) {
+        for (int n = n_group_begin; n < n_group_end; n++) {
             float tmp[8];
             const int row = cta_rank * 128 + warp_id * 32;
             const int col =
-                mainloop_stage * kTileN + n_block * kEpilogueBlockN + n * 8;
+                mainloop_stage * kAccumulatorStageStride +
+                n_block * kEpilogueBlockN + n * 8;
             const int addr = taddr + (row << 16) + col;
             asm volatile(
                 "tcgen05.ld.sync.aligned.32x32b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
@@ -808,8 +818,98 @@ void nvfp4_gemm_kernel(
             }
         };
 
+        constexpr int n_group_num = kEpilogueBlockN / 8;
+
+        if constexpr (kAccumulatorOverlapCols != 0) {
+            static_assert(kAccumulatorOverlapCols == 16);
+            static_assert(kEpilogueBlockN >= kAccumulatorOverlapCols);
+
+            // Stage 0 shares its last 16 columns with stage 1's first 16.
+            // Drain that half-block first.  Once all eight epilogue warps
+            // have arrived, the next MMA may overwrite the shared columns
+            // while this epilogue continues reading the disjoint remainder.
+            const int overlap_block = mainloop_stage == 0 ? n_block_num - 1 : 0;
+            const int overlap_group_begin =
+                mainloop_stage == 0 ? n_group_num - kAccumulatorOverlapCols / 8 : 0;
+            const int overlap_group_end =
+                overlap_group_begin + kAccumulatorOverlapCols / 8;
+
+            tmem_to_smem(mainloop_stage,
+                overlap_block,
+                0,
+                overlap_group_begin,
+                overlap_group_end);
+            release_tmem();
+            tmem_to_smem(mainloop_stage, overlap_block, 0, 0, overlap_group_begin);
+            tmem_to_smem(mainloop_stage,
+                overlap_block,
+                0,
+                overlap_group_end,
+                n_group_num);
+            asm volatile("bar.sync 1, 128;" ::: "memory");
+
+            uint64_t cache_policy = 0;
+            if (tid == 0) {
+                cache_policy = make_epilogue_cache_policy();
+            }
+            for (int block_idx = 0; block_idx < n_block_num; ++block_idx) {
+                const int n_block = (overlap_block + block_idx) % n_block_num;
+                const int smem_stage = block_idx % kEpilogueStageCount;
+                const int stage_smem =
+                    smem + kMainloopSmemBytes +
+                    smem_stage * kTileM * kEpilogueBlockN *
+                        static_cast<int>(sizeof(nv_bfloat16));
+
+                if (tid == 0) {
+                    if constexpr (!SWAP_AB && kEpilogueBlockN == 32) {
+                        tma_2d_smem2gmem(cache_policy,
+                            stage_smem,
+                            &C_tmap,
+                            off_n + n_block * kEpilogueBlockN,
+                            off_m);
+                    } else if constexpr (!SWAP_AB) {
+                        tma_3d_smem2gmem(cache_policy,
+                            stage_smem,
+                            &C_tmap,
+                            0,
+                            (off_n + n_block * kEpilogueBlockN) / 32,
+                            off_m);
+                    } else {
+                        tma_3d_smem2gmem(cache_policy,
+                            stage_smem,
+                            &C_tmap,
+                            0,
+                            off_m / 32,
+                            off_n + n_block * kEpilogueBlockN);
+                    }
+                }
+
+                if (block_idx + 1 < n_block_num) {
+                    if (block_idx > 0) {
+                        if (tid == 0) {
+                            asm volatile("cp.async.bulk.wait_group.read 1;" ::: "memory");
+                        }
+                        asm volatile("bar.sync 1, 128;" ::: "memory");
+                    }
+
+                    const int next_block =
+                        (overlap_block + block_idx + 1) % n_block_num;
+                    const int next_stage = (block_idx + 1) % kEpilogueStageCount;
+                    tmem_to_smem(
+                        mainloop_stage, next_block, next_stage, 0, n_group_num);
+                    asm volatile("bar.sync 1, 128;" ::: "memory");
+                }
+            }
+
+            if (tid == 0) {
+                asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+            }
+            asm volatile("bar.sync 1, 128;" ::: "memory");
+            return;
+        }
+
         // Only the four epilogue warps participate in named barrier 1.
-        tmem_to_smem(mainloop_stage, 0, 0);
+        tmem_to_smem(mainloop_stage, 0, 0, 0, n_group_num);
         asm volatile("bar.sync 1, 128;" ::: "memory");
         if constexpr (n_block_num == 1) {
             release_tmem();
@@ -860,7 +960,7 @@ void nvfp4_gemm_kernel(
                 }
 
                 const int next_stage = (n_block + 1) % kEpilogueStageCount;
-                tmem_to_smem(mainloop_stage, n_block + 1, next_stage);
+                tmem_to_smem(mainloop_stage, n_block + 1, next_stage, 0, n_group_num);
                 asm volatile("bar.sync 1, 128;" ::: "memory");
                 if (n_block + 2 == n_block_num) {
                     release_tmem();
