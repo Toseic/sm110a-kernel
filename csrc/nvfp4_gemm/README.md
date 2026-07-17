@@ -21,8 +21,8 @@ The low-level API accepts:
 - Output: contiguous BF16 `[M,N]`.
 
 `M` must be a multiple of 256, `N` a multiple of 128, and `K` a multiple of
-64.  `tile_n` supports 64, 128, and 256; the 64/128 variants use two TMEM
-accumulator stages while the 256 variant uses one.
+64.  `tile_n` and `tile_k` support 64, 128, and 256; the `tile_n` 64/128
+variants use two TMEM accumulator stages while the 256 variant uses one.
 `to_blocked_nvfp4_scales` converts logical `[rows,K/16]` scales to the
 required physical format. This is the same scale format consumed by
 `torch._scaled_mm`/cuBLASLt.
@@ -35,7 +35,7 @@ Run the benchmark and bit-exact comparison against PyTorch NVFP4:
   --m 4096 --n 4096 --k 4096 --warmup 5 --iters 20 --sol
 ```
 
-The benchmark autotunes `tile_n` over 64, 128, and 256 and
+The benchmark autotunes `tile_n` and `tile_k` over 64, 128, and 256, and
 `epilogue_block_n` over the compatible values 32, 64, and 128 through the
 shared runner. Selections are cached by workload and CUDA environment. Force
 a new sweep or prewarm the cache with:

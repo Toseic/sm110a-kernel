@@ -46,8 +46,13 @@ CALIBRATION_MAX_MS = 50.0
 NVFP4_MMA_PEAK_TFLOPS = 4.0 * 250.0
 
 NVFP4_GEMM_CONFIGS = tuple(
-    Nvfp4GemmConfig(tile_n=tile_n, epilogue_block_n=epilogue_block_n)
+    Nvfp4GemmConfig(
+        tile_n=tile_n,
+        tile_k=tile_k,
+        epilogue_block_n=epilogue_block_n,
+    )
     for tile_n in (64, 128, 256)
+    for tile_k in (64, 128, 256)
     for epilogue_block_n in (32, 64, 128)
     if tile_n % epilogue_block_n == 0
 )
@@ -80,7 +85,7 @@ def calibration_target_ms(m, n, k):
 
 
 def nvfp4_gemm_sol_bounds(m, n, k, config):
-    """Model packed operands, block scales, and duplicated full-N SFB."""
+    """Model packed operands, block scales, and multicast full-N SFB."""
     cluster_tile_m = config.cluster_m * config.tile_m
     tile_count = math.ceil(m / cluster_tile_m) * math.ceil(n / config.tile_n)
     flops = 2 * m * n * k
@@ -92,9 +97,10 @@ def nvfp4_gemm_sol_bounds(m, n, k, config):
 
     packed_tile_bytes = (cluster_tile_m + config.tile_n) * k / 2
     sfa_tile_bytes = cluster_tile_m * k / 16
-    # The kernel stages the complete N-wide SFB tile in both peer CTAs.
+    # Rank 0 loads the complete N-wide SFB tile once per CTA cluster and
+    # multicasts it into both CTAs' shared memory.
     staged_sfb_n = max(config.tile_n, 128)
-    sfb_tile_bytes = config.cluster_m * staged_sfb_n * k / 16
+    sfb_tile_bytes = staged_sfb_n * k / 16
     tile_read_bytes = tile_count * (
         packed_tile_bytes + sfa_tile_bytes + sfb_tile_bytes
     )
