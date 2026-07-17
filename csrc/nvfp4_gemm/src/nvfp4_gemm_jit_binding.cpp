@@ -54,6 +54,8 @@ void check_inputs(const torch::Tensor& a, const torch::Tensor& b,
               SM110A_NVFP4_TILE_M * SM110A_NVFP4_CLUSTER_M);
   TORCH_CHECK(n % SM110A_NVFP4_TILE_N == 0,
               "N must be a multiple of ", SM110A_NVFP4_TILE_N);
+  TORCH_CHECK(n % 128 == 0,
+              "N must be a multiple of 128 for blocked NVFP4 scales");
   TORCH_CHECK(k % SM110A_NVFP4_TILE_K == 0,
               "K must be a multiple of ", SM110A_NVFP4_TILE_K);
   check_scale(sfa, "SFA", m * (k / 16), a.device());

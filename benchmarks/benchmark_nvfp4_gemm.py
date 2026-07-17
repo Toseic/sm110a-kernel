@@ -46,8 +46,10 @@ CALIBRATION_MAX_MS = 50.0
 NVFP4_MMA_PEAK_TFLOPS = 4.0 * 250.0
 
 NVFP4_GEMM_CONFIGS = tuple(
-    Nvfp4GemmConfig(epilogue_block_n=epilogue_block_n)
+    Nvfp4GemmConfig(tile_n=tile_n, epilogue_block_n=epilogue_block_n)
+    for tile_n in (64, 128, 256)
     for epilogue_block_n in (32, 64, 128)
+    if tile_n % epilogue_block_n == 0
 )
 
 
@@ -57,6 +59,7 @@ def compatible_candidates(m, n, k):
         for config in NVFP4_GEMM_CONFIGS
         if m % (config.tile_m * config.cluster_m) == 0
         and n % config.tile_n == 0
+        and n % 128 == 0
         and k % config.tile_k == 0
     )
 
@@ -90,7 +93,8 @@ def nvfp4_gemm_sol_bounds(m, n, k, config):
     packed_tile_bytes = (cluster_tile_m + config.tile_n) * k / 2
     sfa_tile_bytes = cluster_tile_m * k / 16
     # The kernel stages the complete N-wide SFB tile in both peer CTAs.
-    sfb_tile_bytes = config.cluster_m * config.tile_n * k / 16
+    staged_sfb_n = max(config.tile_n, 128)
+    sfb_tile_bytes = config.cluster_m * staged_sfb_n * k / 16
     tile_read_bytes = tile_count * (
         packed_tile_bytes + sfa_tile_bytes + sfb_tile_bytes
     )
@@ -134,8 +138,10 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
         self.validate_timing_args(args, allow_zero_warmup=True)
         shapes = ((args.m, args.n, args.k),) if chosen else DEFAULT_SHAPES
         for m, n, k in shapes:
-            if m % 256 or n % 256 or k % 64:
-                raise SystemExit("M/N must be multiples of 256 and K a multiple of 64")
+            if m % 256 or n % 128 or k % 64:
+                raise SystemExit(
+                    "M must be a multiple of 256, N of 128, and K of 64"
+                )
         args.shapes = shapes
         return args
 
