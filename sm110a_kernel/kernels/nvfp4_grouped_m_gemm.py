@@ -21,8 +21,8 @@ class Nvfp4GroupedMConfig:
     cluster_m: int = 2
     mode: int = 0
     def validate(self):
-        if self.tile_m != 128 or self.tile_n not in (64, 128):
-            raise ValueError("tile_m must be 128 and tile_n must be 64 or 128")
+        if self.tile_m != 128 or self.tile_n not in (64, 128, 256):
+            raise ValueError("tile_m must be 128 and tile_n must be 64, 128, or 256")
         if self.tile_k not in (64, 128, 256) or self.cluster_m not in (1, 2):
             raise ValueError("invalid tile_k or cluster_m")
         if self.epilogue_tile_n not in (32, 64, 128) or self.tile_n % self.epilogue_tile_n:

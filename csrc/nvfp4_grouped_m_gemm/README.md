@@ -18,7 +18,7 @@ print the per-config runner table:
   --experts 8 --n 4096 --k 4096 --tokens 256 --force-sweep --debug --sol
 ```
 
-The sweep covers compatible combinations of tile-N 64/128, tile-K
+The sweep covers compatible combinations of tile-N 64/128/256, tile-K
 64/128/256, epilogue tile-N 32/64/128, cluster-M 1/2, and non-persistent,
 persistent, or CLC scheduling. Results are cached by CUDA environment and
 `(experts, N, K, tokens_per_expert)`.
@@ -26,7 +26,7 @@ persistent, or CLC scheduling. Results are cached by CUDA environment and
 `--sol` reports NVFP4 MMA, compulsory HBM, repeated tile-read GMEM/L2, and
 mixed HBM/L2 bounds for the runner-selected configuration. The traffic model
 accounts for packed E2M1 operands, UE4M3 block scales, BF16 output, and the
-current grouped kernel's per-CTA SFB scale loads.
+rank-0 SFB scale TMA multicast within each cluster.
 
 The same cache can be populated through the shared runner:
 

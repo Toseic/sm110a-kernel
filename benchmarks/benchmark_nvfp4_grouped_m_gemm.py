@@ -39,11 +39,11 @@ NVFP4_GROUPED_M_CONFIGS = tuple(
         cluster_m=cluster_m,
         mode=mode,
     )
-    for tile_n in (64, 128)
+    for tile_n in (64, 128, 256)
     for tile_k in (64, 128, 256)
     for epilogue_tile_n in (32, 64, 128)
     for cluster_m in (1, 2)
-    for mode in (0, 1, 2)
+    for mode in ( 1, 2)
     if tile_n % epilogue_tile_n == 0
 )
 _MODE_LABELS = {0: "np", 1: "pe", 2: "clc"}
@@ -85,10 +85,10 @@ def nvfp4_grouped_m_gemm_sol_bounds(tokens_per_expert, experts, n, k, config):
     packed_tile_bytes = (cluster_tile_m + config.tile_n) * k / 2
     sfa_tile_bytes = cluster_tile_m * k / 16
     # SFB is stored in 128-row blocks. Tile-N=64 therefore stages a complete
-    # 128-row scale tile. The grouped kernel currently loads that scale tile
-    # into each CTA rather than using the standalone GEMM's rank-0 multicast.
+    # 128-row scale tile. With cluster-M=2 rank 0 TMA-multicasts it to its
+    # peer, so it is fetched once per cluster rather than once per CTA.
     staged_sfb_n = max(config.tile_n, 128)
-    sfb_tile_bytes = config.cluster_m * staged_sfb_n * k / 16
+    sfb_tile_bytes = staged_sfb_n * k / 16
     tile_read_bytes = task_count * (
         packed_tile_bytes + sfa_tile_bytes + sfb_tile_bytes
     )

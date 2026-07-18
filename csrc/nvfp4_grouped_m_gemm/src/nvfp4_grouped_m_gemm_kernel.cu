@@ -48,7 +48,6 @@ constexpr int kMmaK = 64;
 constexpr int kWarpSize = 32;
 constexpr int kWarpCount = 6;
 constexpr int kBlockThreads = kWarpSize * kWarpCount;
-constexpr int kTmemStageCount = 2;
 constexpr int kPersistentTileCount = 2;
 // Each mode-2 CLC worker cluster starts with two tasks.  Once it completes
 // them it steals the work of an unstarted cluster through Cluster Launch Control.
@@ -61,7 +60,7 @@ struct KernelConfig {
     // tcgen05.mma.kind::f16 supports N in steps of 8 for cta_group::1
     // and steps of 16 for cta_group::2, up to N=256. The instruction
     // descriptor encodes this dimension as N >> 3 in bits 17-22.
-    static_assert(kTileN == 64 || kTileN == 128);
+    static_assert(kTileN == 64 || kTileN == 128 || kTileN == 256);
     static_assert(kTileK == 64 || kTileK == 128 || kTileK == 256);
     static_assert(kEpilogueTileN == 32 || kEpilogueTileN == 64 || kEpilogueTileN == 128);
     static_assert(kTileN % kEpilogueTileN == 0);
@@ -95,9 +94,16 @@ struct KernelConfig {
     static constexpr int kMainloopSmemBytes = kStageCount * kPerStageSmemBytes;
     static constexpr int kDynamicSmemBytes = kMainloopSmemBytes + kEpilogueSmemBytes;
     static constexpr int kScaleColsPerMma = 4 + 4 * kSFBScaleTileCount;
-    static constexpr int kScaleTmemCols = kStageCount * kMmaStepsPerStage * kScaleColsPerMma;
+    // A pair of accumulator banks fits for narrow-N.  At N=256 reserve one
+    // accumulator bank and reuse one scale slot, matching the standalone
+    // GEMM's capacity-constrained TMEM layout.
+    static constexpr int kTmemStageCount = kTileN == 256 ? 1 : 2;
+    static constexpr int kScaleTmemSlotCount =
+        kTileN < 256 ? kStageCount * kMmaStepsPerStage : 1;
+    static constexpr int kScaleTmemCols = kScaleTmemSlotCount * kScaleColsPerMma;
+    static constexpr int kAccumulatorTmemCols = kTileN * kTmemStageCount;
     static constexpr int kTmemColumnsNeeded = 512;
-    static_assert(kTileN * kTmemStageCount + kScaleTmemCols <= kTmemColumnsNeeded);
+    static_assert(kAccumulatorTmemCols + kScaleTmemCols <= kTmemColumnsNeeded);
     // tcgen05.alloc requires a power-of-two column count. In particular,
     // two N=192 accumulator stages need 384 columns but must allocate 512.
     static constexpr int kTmemAllocationColumns = 512;
@@ -217,6 +223,31 @@ __device__ inline void tma_load_4d(
             "r"(mbar_addr)
             : "memory");
     }
+}
+
+template <int kClusterM>
+__device__ inline void tma_load_4d_multicast(
+    int dst_smem,
+    const void *tensor_map,
+    int x,
+    int y,
+    int z,
+    int w,
+    int mbar_addr,
+    int16_t cta_mask) {
+    asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global."
+                 "mbarrier::complete_tx::bytes.multicast::cluster.cta_group::%8 "
+                 "[%0], [%1, {%2, %3, %4, %5}], [%6], %7;" ::
+            "r"(dst_smem),
+            "l"(tensor_map),
+            "r"(x),
+            "r"(y),
+            "r"(z),
+            "r"(w),
+            "r"(mbar_addr),
+            "h"(cta_mask),
+            "n"(kClusterM)
+            : "memory");
 }
 
 __device__ inline void tma_store_3d(
@@ -430,6 +461,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_grouped_m_gemm_kernel(
     constexpr int kSwizzlePhaseMask = kEpilogueStoreTileN == 32 ? 3 : 7;
     constexpr int kStoreTileBytes = kTileM * kEpilogueStoreTileN * sizeof(nv_bfloat16);
     constexpr int kMmaStepsPerStage = kTileK / kMmaK;
+    constexpr int kTmemStageCount = Config::kTmemStageCount;
     constexpr int kTmemAllocationColumns = Config::kTmemAllocationColumns;
     const int tid = threadIdx.x;
     const int warp_id = tid / kWarpSize;
@@ -710,12 +742,21 @@ __launch_bounds__(kBlockThreads) void nvfp4_grouped_m_gemm_kernel(
                         tma_transaction_mbar_addr);
                     tma_load_4d<kClusterM>(sfa_smem, &sfa_tensor_map, 0, 0, off_k64,
                         cta_row / kTileM, tma_transaction_mbar_addr);
-                    for (int scale_tile = 0; scale_tile < kSFBScaleTileCount; ++scale_tile)
-                        tma_load_4d<kClusterM>(
-                            sfb_smem + scale_tile * Config::kMmaStepsPerStage * 512,
-                            &sfb_tensor_map, 0, 0, off_k64,
-                            task.expert * (n / 128) + tile_col / 128 + scale_tile,
-                            tma_transaction_mbar_addr);
+                    for (int scale_tile = 0; scale_tile < kSFBScaleTileCount; ++scale_tile) {
+                        const int sfb_tile_smem =
+                            sfb_smem + scale_tile * Config::kMmaStepsPerStage * 512;
+                        const int sfb_tile_index =
+                            task.expert * (n / 128) + tile_col / 128 + scale_tile;
+                        if constexpr (kClusterM == 1) {
+                            tma_load_4d<1>(sfb_tile_smem, &sfb_tensor_map, 0, 0, off_k64,
+                                sfb_tile_index, tma_transaction_mbar_addr);
+                        } else if (cta_rank == 0) {
+                            constexpr int16_t cta_mask = (1 << kClusterM) - 1;
+                            tma_load_4d_multicast<kClusterM>(sfb_tile_smem, &sfb_tensor_map,
+                                0, 0, off_k64, sfb_tile_index, tma_transaction_mbar_addr,
+                                cta_mask);
+                        }
+                    }
 
                     producer_stage = (producer_stage + 1) % kStageCount;
                     if (producer_stage == 0) {
@@ -736,6 +777,8 @@ __launch_bounds__(kBlockThreads) void nvfp4_grouped_m_gemm_kernel(
                         consumer_epilogue_phase);
                 }
 
+                const ExpertTileTask task = tasks[cluster_bid];
+                const int tile_col = task.tile_n * kTileN;
                 const int stage_tmem_addr = tmem_addr + consumer_mainloop_stage * kTileN;
                 for (int tile_k = 0; tile_k < k_tiles; ++tile_k) {
                     const int tma_mbar_addr =
@@ -751,20 +794,27 @@ __launch_bounds__(kBlockThreads) void nvfp4_grouped_m_gemm_kernel(
                         const int sfa_smem = b_smem + kBSmemBytes;
                         const int sfb_smem = sfa_smem + kSFASmemBytes;
                         for (int mma_k = 0; mma_k < kMmaStepsPerStage; ++mma_k) {
-                            const int scale_addr = tmem_addr + 2 * kTileN +
-                                (consumer_stage * kMmaStepsPerStage + mma_k) *
-                                    Config::kScaleColsPerMma;
+                            const int scale_slot = kTileN < 256
+                                ? consumer_stage * kMmaStepsPerStage + mma_k
+                                : 0;
+                            const int scale_addr = tmem_addr + Config::kAccumulatorTmemCols +
+                                scale_slot * Config::kScaleColsPerMma;
                             tcgen05_cp_scale<kClusterM>(scale_addr,
                                 make_scale_desc(sfa_smem + mma_k * 512));
                             for (int scale_tile = 0; scale_tile < kSFBScaleTileCount; ++scale_tile)
                                 tcgen05_cp_scale<kClusterM>(scale_addr + 4 + scale_tile * 4,
                                     make_scale_desc(sfb_smem +
                                         (scale_tile * kMmaStepsPerStage + mma_k) * 512));
+                            // SFB is staged in 128-column blocks.  A 64-column
+                            // output tile in the upper half starts two TMEM
+                            // scale columns into that block.
+                            const int sfb_tmem_addr =
+                                scale_addr + 4 + (tile_col % 128) / 32;
                             const int accumulate = tile_k != 0 || mma_k != 0;
                             tcgen05_mma_nvfp4<kClusterM>(stage_tmem_addr,
                                 make_k_major_128b_desc(a_smem + mma_k * 32),
                                 make_k_major_128b_desc(b_smem + mma_k * 32),
-                                instruction_desc, scale_addr, scale_addr + 4, accumulate);
+                                instruction_desc, scale_addr, sfb_tmem_addr, accumulate);
                         }
                     }
                     tcgen05_commit<kClusterM>(mma_mbar_addr);
