@@ -25,8 +25,10 @@ class Nvfp4GemmConfig:
     epilogue_block_n: int = 32
 
     def validate(self) -> None:
-        if (self.tile_m, self.cluster_m) != (128, 2):
-            raise ValueError("the NVFP4 kernel requires tile_m=128 and cluster_m=2")
+        if self.tile_m != 128:
+            raise ValueError("tile_m must be 128")
+        if self.cluster_m not in (1, 2):
+            raise ValueError("cluster_m must be 1 or 2")
         if self.tile_n not in (64, 128, 256):
             raise ValueError("tile_n must be 64, 128, or 256")
         if self.tile_k not in (64, 128, 256):

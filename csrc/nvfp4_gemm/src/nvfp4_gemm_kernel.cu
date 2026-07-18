@@ -3,24 +3,26 @@
 // =============================================================================
 //
 // Computes BF16 C[M,N] from packed E2M1 A[M,K] and B-transpose[N,K] with
-// UE4M3 block-16 scales.  The CTA-pair MMA shape is 256xTileNx64, where
-// TileN is 64, 128, or 256.  A TileK of 64, 128, or 256 is composed from
-// TileK/64 such MMA instructions:
+// UE4M3 block-16 scales.  The MMA shape is (128*ClusterM)xTileNx64, where
+// ClusterM is 1 or 2 and TileN is 64, 128, or 256.  A TileK of 64, 128, or
+// 256 is composed from TileK/64 such MMA instructions:
 //
-//   tcgen05.mma.cta_group::2.kind::mxf4nvf4.block_scale.block16
+//   tcgen05.mma.cta_group::ClusterM.kind::mxf4nvf4.block_scale.block16
 //
-// Per CTA, each mainloop slot contains compact 32B-swizzled FP4 tiles
-// A[128,TileK] and B[TileN/2,TileK], one 512B SFA tile per K=64 slab, and
-// one or two 512B SFB tiles per slab.  Since both peer CTAs consume identical
-// SFB data, cluster rank 0 loads each SFB tile once and TMA-multicasts it into
-// the same shared-memory offset in both CTAs.
+// Per CTA, each mainloop slot contains 128B-swizzled FP4 tiles
+// A[128,TileK] and B[TileN/ClusterM,TileK], plus contiguous scale-factor
+// tiles covering the entire TileK.  With ClusterM=2 both peer CTAs consume
+// identical SFB data, so cluster rank 0 loads each SFB tile once and
+// TMA-multicasts it into the same shared-memory offset in both CTAs.
 //
 // FP32 accumulation lives in TMEM and is converted to BF16 through the
-// inherited four-warp pipelined TMA epilogue.  TileN=256 uses two accumulator
-// stages with a 16-column overlap: [0,256) and [240,496).  The epilogue drains
-// the shared 16 columns first and releases the next MMA stage before draining
-// the rest of the tile.  Scale factors occupy one 8/12-column slot after the
-// accumulators and are refreshed immediately before every MMA.
+// inherited four-warp pipelined TMA epilogue.  TileN=256 uses one accumulator
+// stage because two 256-column stages cannot coexist with scale factors without
+// aliasing live accumulator columns.  TileN=64/128 use their idle TMEM columns to
+// keep one 8-column scale-factor slot per mainloop SMEM stage and K=64 MMA
+// slab, allowing all scale factors for a TileK stage to be prefetched before
+// issuing its MMAs without aliasing any in-flight stage. TileN=256 retains one
+// 12-column scale slot and refreshes it immediately before each MMA.
 //
 // Scale tensors use the same Blackwell SWIZZLE_32_4_4 physical format accepted
 // by torch._scaled_mm/cuBLASLt.  A logical [128,4] tile is stored as 32 rows
@@ -62,6 +64,12 @@ constexpr int kWarpCount = 6;
 constexpr int kBlockThreads = kWarpSize * kWarpCount;
 constexpr int kEpilogueStageCount = 2;
 constexpr int kTmemColumnCapacity = 512;
+// cudaDevAttrMaxSharedMemoryPerBlockOptin on SM110A/Thor.  Dynamic shared
+// memory, the launch reserve, and statically allocated barriers all consume
+// this same per-block budget.
+constexpr int kMaxOptInSmemBytes = 232448;
+constexpr int kMbarrierSmemBytes = 256;
+constexpr int kStaticBarrierSmemBytes = 1024;
 constexpr bool kPrefetchTmaDesc = true;
 constexpr int kSmCount = 20;
 
@@ -71,7 +79,7 @@ constexpr bool kMacroSwizzleMFast = true;
 
 template <int kTileM, int kTileN, int kTileK, int kClusterM, int kEpilogueBlockN>
 struct KernelConfig {
-    static_assert(kClusterM == 2, "NVFP4 cta_group::2 requires a two-CTA cluster");
+    static_assert(kClusterM == 1 || kClusterM == 2);
     static_assert(kTileM == 128);
     static_assert(kTileN == 64 || kTileN == 128 || kTileN == 256);
     static_assert(kTileK == 64 || kTileK == 128 || kTileK == 256);
@@ -82,38 +90,54 @@ struct KernelConfig {
     static_assert(kTileK % kMmaK == 0);
 
     static constexpr int kClusterTileM = kClusterM * kTileM;
-    static constexpr int kASmemBytes = kTileM * kTileK / 2;
-    static constexpr int kBSmemBytes = (kTileN / kClusterM) * kTileK / 2;
+    static constexpr int kATmaBytes = kTileM * kTileK / 2;
+    static constexpr int kBTmaBytes = (kTileN / kClusterM) * kTileK / 2;
+    // A 128B swizzle always reserves a full 128B span per row, even when a
+    // TileK=64/128 transfer only populates 32B/64B of that span.
+    static constexpr int kASmemBytes = kTileM * 128;
+    static constexpr int kBSmemBytes = (kTileN / kClusterM) * 128;
     static constexpr int kMmaStepsPerStage = kTileK / kMmaK;
     static constexpr int kSFASmemBytes = kTileM * (kTileK / 16);
     // Scale storage is blocked in 128-row, 512-byte units.  TileN=64 loads
     // its containing 128-row tile and selects the appropriate half in TMEM.
     static constexpr int kSFBScaleTileCount = (kTileN + 127) / 128;
     static constexpr int kSFBSmemBytes = kMmaStepsPerStage * kSFBScaleTileCount * 512;
-    static constexpr int kPerStageSmemBytes =
+    static constexpr int kPerStagePayloadBytes =
         kASmemBytes + kBSmemBytes + kSFASmemBytes + kSFBSmemBytes;
+    static constexpr int kPerStageSmemBytes =
+        (kPerStagePayloadBytes + 1023) & ~1023;
     static constexpr int kEpilogueStageBytes =
         kTileM * kEpilogueBlockN * static_cast<int>(sizeof(nv_bfloat16));
     static constexpr int kEpilogueSmemBytes = kEpilogueStageCount * kEpilogueStageBytes;
     // Cap the ring at six stages, while reducing it for wider K tiles so the
     // mainloop and epilogue remain within Blackwell's per-CTA SMEM budget.
-    static constexpr int kMaxSmemBytes = 227 * 1024;
     static constexpr int kSmemLimitedStageCount =
-        (kMaxSmemBytes - kEpilogueSmemBytes) / kPerStageSmemBytes;
+        (kMaxOptInSmemBytes - kStaticBarrierSmemBytes -
+         kMbarrierSmemBytes - kEpilogueSmemBytes) /
+        kPerStageSmemBytes;
     static constexpr int kStageCount = kSmemLimitedStageCount < 6 ? kSmemLimitedStageCount : 6;
     static_assert(kStageCount >= 2);
     static constexpr int kScaleColsPerMma = 4 + 4 * kSFBScaleTileCount;
-    static constexpr int kScaleTmemCols = kScaleColsPerMma;
-    static constexpr int kAccumulatorStageCount = 2;
-    static constexpr int kAccumulatorOverlapCols = kTileN == 256 ? 16 : 0;
-    static constexpr int kAccumulatorStageStride = kTileN - kAccumulatorOverlapCols;
-    static constexpr int kAccumulatorTmemCols =
-        kTileN + kAccumulatorStageStride;
+    // Narrow-N kernels have ample TMEM after their two accumulator stages.
+    // Keep every in-flight SMEM stage and K=64 slab's scales in a distinct
+    // slot. The mma_mbar handshake prevents a stage's SMEM and TMEM scale
+    // slots from being reused until its asynchronous MMA has completed.
+    // TileN=256 is capacity constrained and reuses a single scale slot.
+    static constexpr int kScaleTmemSlotCount =
+        kTileN < 256 ? kStageCount * kMmaStepsPerStage : 1;
+    static constexpr int kScaleTmemCols =
+        kScaleColsPerMma * kScaleTmemSlotCount;
+    static constexpr int kAccumulatorStageCount = kTileN <= 128 ? 2 : 1;
+    static constexpr int kAccumulatorOverlapCols = 0;
+    static constexpr int kAccumulatorStageStride = kTileN;
+    static constexpr int kAccumulatorTmemCols = kAccumulatorStageCount * kTileN;
     static_assert(kAccumulatorTmemCols + kScaleTmemCols <= kTmemColumnCapacity);
-    static_assert(kTileN != 256 ||
-        kAccumulatorTmemCols + kScaleTmemCols == 508);
+    static_assert(kAccumulatorStageCount == (kTileN <= 128 ? 2 : 1));
     static constexpr int kMainloopSmemBytes = kStageCount * kPerStageSmemBytes;
     static constexpr int kDynamicSmemBytes = kMainloopSmemBytes + kEpilogueSmemBytes;
+    static_assert(kStaticBarrierSmemBytes + kDynamicSmemBytes +
+                      kMbarrierSmemBytes <=
+                  kMaxOptInSmemBytes);
 };
 
 template <int CTA_GROUP = 1>
@@ -273,15 +297,23 @@ __device__ inline void wait_mainloop(
         : "memory");
 }
 
-__device__ inline void tcgen05_cp_scale_2cta(
+template <int kClusterM>
+__device__ inline void tcgen05_cp_scale(
     int taddr,
     uint64_t smem_desc) {
-    asm volatile(
-        "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
-        :: "r"(taddr), "l"(smem_desc) : "memory");
+    if constexpr (kClusterM == 1) {
+        asm volatile(
+            "tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;"
+            :: "r"(taddr), "l"(smem_desc) : "memory");
+    } else {
+        asm volatile(
+            "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
+            :: "r"(taddr), "l"(smem_desc) : "memory");
+    }
 }
 
-__device__ inline void tcgen05_mma_nvf4_2cta(
+template <int kClusterM>
+__device__ inline void tcgen05_mma_nvf4(
     int taddr,
     uint64_t a_desc,
     uint64_t b_desc,
@@ -289,19 +321,41 @@ __device__ inline void tcgen05_mma_nvf4_2cta(
     int sfa_taddr,
     int sfb_taddr,
     int enable_input_d) {
-    asm volatile("{\n\t"
-                 ".reg .pred p;\n\t"
-                 "setp.ne.b32 p, %6, 0;\n\t"
-                 "tcgen05.mma.cta_group::2.kind::mxf4nvf4.block_scale.block16 "
-                 "[%0], %1, %2, %3, [%4], [%5], p;\n\t"
-                 "}" ::"r"(taddr),
-        "l"(a_desc),
-        "l"(b_desc),
-        "r"(i_desc),
-        "r"(sfa_taddr),
-        "r"(sfb_taddr),
-        "r"(enable_input_d)
-        : "memory");
+    if constexpr (kClusterM == 1) {
+        asm volatile("{\n\t"
+                     ".reg .pred p;\n\t"
+                     "setp.ne.b32 p, %6, 0;\n\t"
+                     "tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.block16 "
+                     "[%0], %1, %2, %3, [%4], [%5], p;\n\t"
+                     "}" ::"r"(taddr),
+            "l"(a_desc), "l"(b_desc), "r"(i_desc), "r"(sfa_taddr),
+            "r"(sfb_taddr), "r"(enable_input_d) : "memory");
+    } else {
+        asm volatile("{\n\t"
+                     ".reg .pred p;\n\t"
+                     "setp.ne.b32 p, %6, 0;\n\t"
+                     "tcgen05.mma.cta_group::2.kind::mxf4nvf4.block_scale.block16 "
+                     "[%0], %1, %2, %3, [%4], [%5], p;\n\t"
+                     "}" ::"r"(taddr),
+            "l"(a_desc), "l"(b_desc), "r"(i_desc), "r"(sfa_taddr),
+            "r"(sfb_taddr), "r"(enable_input_d) : "memory");
+    }
+}
+
+template <int kClusterM>
+__device__ inline void tcgen05_commit(int mbar_addr) {
+    if constexpr (kClusterM == 1) {
+        asm volatile("tcgen05.commit.cta_group::1."
+                     "mbarrier::arrive::one.shared::cluster.b64 [%0];" ::
+                         "r"(mbar_addr)
+            : "memory");
+    } else {
+        constexpr int16_t cta_mask = (1 << kClusterM) - 1;
+        asm volatile("tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster."
+                     "multicast::cluster.b64 [%0], %1;" ::
+                         "r"(mbar_addr), "h"(cta_mask)
+            : "memory");
+    }
 }
 
 __device__ inline uint32_t elect_sync() {
@@ -344,11 +398,12 @@ inline void init_fp4_tmap(
 
     constexpr uint32_t rank = 3;
 
-    uint64_t global_dim[rank] = {64, global_height, global_width / 64};
+    uint64_t global_dim[rank] = {global_width, global_height, 1};
 
-    uint64_t global_strides[rank - 1] = {global_width / 2, 32};
+    uint64_t global_strides[rank - 1] = {
+        global_width / 2, global_width * global_height / 2};
 
-    uint32_t box_dim[rank] = {64, shared_height, shared_width / 64};
+    uint32_t box_dim[rank] = {shared_width, shared_height, 1};
     uint32_t element_strides[rank] = {1, 1, 1};
 
     auto err = cuTensorMapEncodeTiled(tmap,
@@ -372,11 +427,14 @@ inline void init_scale_tmap(
     CUtensorMap *tmap,
     const uint8_t *scale_ptr,
     uint64_t row_tiles,
-    uint64_t k_tiles) {
+    uint64_t k_tiles,
+    uint32_t k_box_tiles) {
     constexpr uint32_t rank = 4;
     uint64_t global_dim[rank] = {256, 2, k_tiles, row_tiles};
     uint64_t global_strides[rank - 1] = {256, 512, 512 * k_tiles};
-    uint32_t box_dim[rank] = {256, 2, 1, 1};
+    // K=64 scale tiles are contiguous in both global and shared memory.  Make
+    // the whole TileK span one TMA box instead of issuing one 512B TMA per MMA.
+    uint32_t box_dim[rank] = {256, 2, k_box_tiles, 1};
     uint32_t element_strides[rank] = {1, 1, 1, 1};
     auto err = cuTensorMapEncodeTiled(tmap,
         CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
@@ -478,6 +536,8 @@ void nvfp4_gemm_kernel(
 
     using Config = KernelConfig<kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN>;
     constexpr int kStageCount = Config::kStageCount;
+    constexpr int kATmaBytes = Config::kATmaBytes;
+    constexpr int kBTmaBytes = Config::kBTmaBytes;
     constexpr int kASmemBytes = Config::kASmemBytes;
     constexpr int kBSmemBytes = Config::kBSmemBytes;
     constexpr int kSFASmemBytes = Config::kSFASmemBytes;
@@ -524,8 +584,11 @@ void nvfp4_gemm_kernel(
         ((uint32_t(kTileN) >> 3U) << 17U) |
         ((uint32_t(kClusterTileM) >> 7U) << 27U);
     static_assert(i_desc ==
-        (kTileN == 64 ? 0x10100480U :
-         kTileN == 128 ? 0x10200480U : 0x10400480U));
+        (kClusterM == 1 ?
+                (kTileN == 64 ? 0x08100480U :
+                 kTileN == 128 ? 0x08200480U : 0x08400480U) :
+                (kTileN == 64 ? 0x10100480U :
+                 kTileN == 128 ? 0x10200480U : 0x10400480U)));
 
     // setup Mbarrier
     __shared__ int tmem_addr[1];
@@ -613,7 +676,7 @@ void nvfp4_gemm_kernel(
 
         // tma issue
         constexpr int cp_size =
-            kASmemBytes + kBSmemBytes + kSFASmemBytes + kSFBSmemBytes;
+            kATmaBytes + kBTmaBytes + kSFASmemBytes + kSFBSmemBytes;
 
         if constexpr (DO_PROFILE) {
             profiler.start(ProfilerTag::IssueTMA);
@@ -622,38 +685,47 @@ void nvfp4_gemm_kernel(
                          tma_mbar_addr),
             "r"(cp_size)
             : "memory");
+        const int off_k = iter_k * kTileK;
         const int off_k_64 = iter_k * kMmaStepsPerStage;
-        tma_3d_gmem2smem<kClusterM>(A_smem, &A_tmap, 0, off_m, off_k_64, tma_mbar_addr);
+        tma_3d_gmem2smem<kClusterM>(A_smem, &A_tmap, off_k, off_m, 0, tma_mbar_addr);
         tma_3d_gmem2smem<kClusterM>(B_smem,
             &B_tmap,
-            0,
+            off_k,
             off_n + cta_rank * (kTileN / kClusterM),
+            0,
+            tma_mbar_addr);
+        // The scale tensor map spans all K=64 slabs in this TileK.  SFA is
+        // therefore one contiguous transfer, and SFB needs only one transfer
+        // per distinct 128-row scale tile (one or two, depending on TileN).
+        tma_4d_gmem2smem<kClusterM>(SFA_smem,
+            &SFA_tmap,
+            0,
+            0,
             off_k_64,
+            off_m / kTileM,
             tma_mbar_addr);
         #pragma unroll
-        for (int mma_k = 0; mma_k < kMmaStepsPerStage; ++mma_k) {
-            tma_4d_gmem2smem<kClusterM>(SFA_smem + mma_k * 512,
-                &SFA_tmap,
-                0,
-                0,
-                off_k_64 + mma_k,
-                off_m / kTileM,
-                tma_mbar_addr);
-            #pragma unroll
-            for (int scale_tile = 0; scale_tile < kSFBScaleTileCount; ++scale_tile) {
-                const int SFB_mma_smem =
-                    SFB_smem + (scale_tile * kMmaStepsPerStage + mma_k) * 512;
-                if (cta_rank == 0) {
-                    constexpr int16_t cta_mask = (1 << kClusterM) - 1;
-                    tma_4d_gmem2smem_multicast<kClusterM>(SFB_mma_smem,
-                        &SFB_tmap,
-                        0,
-                        0,
-                        off_k_64 + mma_k,
-                        off_n / 128 + scale_tile,
-                        tma_mbar_addr,
-                        cta_mask);
-                }
+        for (int scale_tile = 0; scale_tile < kSFBScaleTileCount; ++scale_tile) {
+            const int SFB_tile_smem =
+                SFB_smem + scale_tile * kMmaStepsPerStage * 512;
+            if constexpr (kClusterM == 1) {
+                tma_4d_gmem2smem<1>(SFB_tile_smem,
+                    &SFB_tmap,
+                    0,
+                    0,
+                    off_k_64,
+                    off_n / 128 + scale_tile,
+                    tma_mbar_addr);
+            } else if (cta_rank == 0) {
+                constexpr int16_t cta_mask = (1 << kClusterM) - 1;
+                tma_4d_gmem2smem_multicast<kClusterM>(SFB_tile_smem,
+                    &SFB_tmap,
+                    0,
+                    0,
+                    off_k_64,
+                    off_n / 128 + scale_tile,
+                    tma_mbar_addr,
+                    cta_mask);
             }
         }
         if constexpr (DO_PROFILE) {
@@ -685,9 +757,10 @@ void nvfp4_gemm_kernel(
         auto make_fp4_desc = [](int addr) -> uint64_t {
             // The descriptor always describes one K=64 MMA slab.  Wider
             // TileK values advance the base address between MMA issues.
-            constexpr int SBO = 8 * (kMmaK / 2);
+            constexpr int SBO = 8 * 128;
+            const uint64_t base_offset = (addr >> 7) & 0x7;
             return desc_encode(addr) | (desc_encode(SBO) << 32ULL) | (1ULL << 46ULL) |
-                   (6ULL << 61ULL);
+                   (base_offset << 49ULL) | (2ULL << 61ULL);
         };
         auto make_scale_desc = [](int addr) -> uint64_t {
             // 32 rows x 16 bytes; the stride dimension advances from one
@@ -705,47 +778,51 @@ void nvfp4_gemm_kernel(
         if constexpr (DO_PROFILE) {
             profiler.start(ProfilerTag::IssueMMA);
         }
-        #pragma unroll
-        for (int mma_k = 0; mma_k < kMmaStepsPerStage; ++mma_k) {
-            const int A_mma_smem = A_smem + mma_k * kTileM * (kMmaK / 2);
-            const int B_mma_smem =
-                B_smem + mma_k * (kTileN / kClusterM) * (kMmaK / 2);
+        auto copy_mma_scales = [&](int mma_k, int mma_scale_taddr) {
             const int SFA_mma_smem = SFA_smem + mma_k * 512;
-            const int sfa_taddr = scale_taddr;
-            const int sfb_taddr = sfa_taddr + 4;
-
-            // tcgen05.cp -> tcgen05.mma with the same CTA group is a PTX
-            // pipeline pairing, so the MMA observes these scale updates
-            // without an explicit commit/wait between the instructions.
-            tcgen05_cp_scale_2cta(sfa_taddr, make_scale_desc(SFA_mma_smem));
+            tcgen05_cp_scale<kClusterM>(
+                mma_scale_taddr, make_scale_desc(SFA_mma_smem));
             #pragma unroll
             for (int scale_tile = 0; scale_tile < kSFBScaleTileCount; ++scale_tile) {
                 const int SFB_mma_smem =
                     SFB_smem + (scale_tile * kMmaStepsPerStage + mma_k) * 512;
-                tcgen05_cp_scale_2cta(
-                    sfb_taddr + scale_tile * 4,
+                tcgen05_cp_scale<kClusterM>(
+                    mma_scale_taddr + 4 + scale_tile * 4,
                     make_scale_desc(SFB_mma_smem));
             }
+        };
+
+        #pragma unroll
+        for (int mma_k = 0; mma_k < kMmaStepsPerStage; ++mma_k) {
+            const int A_mma_smem = A_smem + mma_k * (kMmaK / 2);
+            const int B_mma_smem = B_smem + mma_k * (kMmaK / 2);
+            const int mma_scale_taddr = scale_taddr +
+                (kTileN < 256 ?
+                        (stage_id * kMmaStepsPerStage + mma_k) *
+                            Config::kScaleColsPerMma :
+                        0);
+
+            // Pair each scale copy with the MMA that consumes it.  Narrow-N
+            // uses a distinct slot per (SMEM stage, K=64 slab); TileN=256
+            // reuses its sole capacity-constrained slot.  In both cases the
+            // cp -> mma ordering supplies the required pipeline dependency.
+            copy_mma_scales(mma_k, mma_scale_taddr);
+
             // In the block16 SFB layout, each TMEM column covers 32 N values.
             // A TileN=64 tile may therefore start at column 0 or 2 of its
             // containing 128-row blocked scale tile.
-            const int mma_sfb_taddr = sfb_taddr + (off_n % 128) / 32;
-            tcgen05_mma_nvf4_2cta(this_taddr,
+            const int mma_sfb_taddr =
+                mma_scale_taddr + 4 + (off_n % 128) / 32;
+            tcgen05_mma_nvf4<kClusterM>(this_taddr,
                 make_fp4_desc(A_mma_smem),
                 make_fp4_desc(B_mma_smem),
                 i_desc,
-                sfa_taddr,
+                mma_scale_taddr,
                 mma_sfb_taddr,
                 iter_k != 0 || mma_k != 0);
         }
 
-        constexpr int16_t cta_mask = (1 << kClusterM) - 1;
-
-        asm volatile("tcgen05.commit.cta_group::%2.mbarrier::arrive::one.shared::cluster.multicast:"
-                     ":cluster.b64 [%0], %1;" ::"r"(mma_mbar_addr),
-            "h"(cta_mask),
-            "n"(kClusterM)
-            : "memory");
+        tcgen05_commit<kClusterM>(mma_mbar_addr);
         if constexpr (DO_PROFILE) {
             profiler.stop();
         }
@@ -1075,13 +1152,7 @@ void nvfp4_gemm_kernel(
                 }
             }
 
-            constexpr int16_t cta_mask = (1 << kClusterM) - 1;
-            asm volatile(
-                "tcgen05.commit.cta_group::%2.mbarrier::arrive::one.shared::cluster.multicast:"
-                ":cluster.b64 [%0], %1;" ::"r"(_base_mainloop_mbar_addr + 8 * mainloop_stage),
-                "h"(cta_mask),
-                "n"(kClusterM)
-                : "memory");
+            tcgen05_commit<kClusterM>(_base_mainloop_mbar_addr + 8 * mainloop_stage);
 
             mainloop_stage = (mainloop_stage + 1) % kAccumulatorStageCount;
             if (mainloop_stage == 0) {
@@ -1190,16 +1261,17 @@ void launch_nvfp4_gemm_impl(
         K,
         kTileM,
         kTileK,
-        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_32B);
+        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B);
     init_fp4_tmap(&B_tmap,
         B_ptr,
         N,
         K,
         kTileN / kClusterM,
         kTileK,
-        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_32B);
-    init_scale_tmap(&SFA_tmap, SFA_ptr, M / kTileM, K / kMmaK);
-    init_scale_tmap(&SFB_tmap, SFB_ptr, N / 128, K / kMmaK);
+        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B);
+    constexpr uint32_t kScaleBoxTiles = kTileK / kMmaK;
+    init_scale_tmap(&SFA_tmap, SFA_ptr, M / kTileM, K / kMmaK, kScaleBoxTiles);
+    init_scale_tmap(&SFB_tmap, SFB_ptr, N / 128, K / kMmaK, kScaleBoxTiles);
     if constexpr (SWAP_AB) {
         init_3D_output_tmap(&C_tmap, C_ptr, logic_M, logic_N, kEpilogueBlockN, kTileM);
     } else if constexpr (kEpilogueBlockN == 32) {
@@ -1208,8 +1280,7 @@ void launch_nvfp4_gemm_impl(
         init_3D_output_tmap(&C_tmap, C_ptr, logic_M, logic_N, kTileM, kEpilogueBlockN);
     }
 
-    constexpr int mbarrier_smem = 256;
-    const int smem_size = kDynamicSmemBytes + mbarrier_smem;
+    const int smem_size = kDynamicSmemBytes + kMbarrierSmemBytes;
 
     int grid = kSmCount;
 

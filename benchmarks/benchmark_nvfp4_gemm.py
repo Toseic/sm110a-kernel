@@ -49,8 +49,10 @@ NVFP4_GEMM_CONFIGS = tuple(
     Nvfp4GemmConfig(
         tile_n=tile_n,
         tile_k=tile_k,
+        cluster_m=cluster_m,
         epilogue_block_n=epilogue_block_n,
     )
+    for cluster_m in (1, 2)
     for tile_n in (64, 128, 256)
     for tile_k in (64, 128, 256)
     for epilogue_block_n in (32, 64, 128)
@@ -97,8 +99,8 @@ def nvfp4_gemm_sol_bounds(m, n, k, config):
 
     packed_tile_bytes = (cluster_tile_m + config.tile_n) * k / 2
     sfa_tile_bytes = cluster_tile_m * k / 16
-    # Rank 0 loads the complete N-wide SFB tile once per CTA cluster and
-    # multicasts it into both CTAs' shared memory.
+    # Load the complete N-wide SFB tile once per CTA cluster.  The two-CTA
+    # configuration multicasts it into both CTAs' shared memory.
     staged_sfb_n = max(config.tile_n, 128)
     sfb_tile_bytes = staged_sfb_n * k / 16
     tile_read_bytes = tile_count * (
@@ -144,9 +146,9 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
         self.validate_timing_args(args, allow_zero_warmup=True)
         shapes = ((args.m, args.n, args.k),) if chosen else DEFAULT_SHAPES
         for m, n, k in shapes:
-            if m % 256 or n % 128 or k % 64:
+            if m % 128 or n % 128 or k % 64:
                 raise SystemExit(
-                    "M must be a multiple of 256, N of 128, and K of 64"
+                    "M and N must be multiples of 128, and K of 64"
                 )
         args.shapes = shapes
         return args
