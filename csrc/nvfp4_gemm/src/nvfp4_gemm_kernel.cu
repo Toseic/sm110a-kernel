@@ -1,32 +1,306 @@
 // =============================================================================
-// SM110A NVFP4 GEMM
+// SM110A NVFP4 GEMM — Overview
 // =============================================================================
 //
-// Computes BF16 C[M,N] from packed E2M1 A[M,K] and B-transpose[N,K] with
-// UE4M3 block-16 scales.  The MMA shape is (128*ClusterM)xTileNx64, where
-// ClusterM is 1 or 2 and TileN is 64, 128, or 256.  A TileK of 64, 128, or
-// 256 is composed from TileK/64 such MMA instructions:
+// Target hardware
+// ---------------
+//   NVIDIA Blackwell SM (SM110A, sm_110a). Assumes first-class support for
+//   Tensor Memory (TMEM), distributed shared memory (DSMEM), thread-block
+//   clusters and the Tensor Memory Accelerator (TMA) bulk-copy engine. Uses
+//   the block-scaled mxf4nvf4 tcgen05.mma instruction family introduced on
+//   Blackwell, together with UE4M3 block-16 micro-scales.
 //
-//   tcgen05.mma.cta_group::ClusterM.kind::mxf4nvf4.block_scale.block16
+// Problem
+// -------
+//   C[M,N] = scale(A[M,K]) @ scale(B[N,K])
+//   with A, B stored as packed E2M1 (NVFP4), scales stored as UE4M3 with one
+//   scale per 16 contiguous K elements, and C stored as nv_bfloat16.
 //
-// Per CTA, each mainloop slot contains 128B-swizzled FP4 tiles
-// A[128,TileK] and B[TileN/ClusterM,TileK], plus contiguous scale-factor
-// tiles covering the entire TileK.  With ClusterM=2 both peer CTAs consume
-// identical SFB data, so cluster rank 0 loads each SFB tile once and
-// TMA-multicasts it into the same shared-memory offset in both CTAs.
+//   - M must be a multiple of kClusterM * kTileM.
+//   - N must be a multiple of 128 (scale-tile boundary) and kTileN.
+//   - K must be a multiple of kTileK (one or more TileK stages per output tile).
 //
-// FP32 accumulation lives in TMEM and is converted to BF16 through the
-// inherited four-warp pipelined TMA epilogue.  TileN=256 uses one accumulator
-// stage because two 256-column stages cannot coexist with scale factors without
-// aliasing live accumulator columns.  TileN=64/128 use their idle TMEM columns to
-// keep one 8-column scale-factor slot per mainloop SMEM stage and K=64 MMA
-// slab, allowing all scale factors for a TileK stage to be prefetched before
-// issuing its MMAs without aliasing any in-flight stage. TileN=256 retains one
-// 12-column scale slot and refreshes it immediately before each MMA.
+//   A "SWAP_AB" template variant reuses the kernel for the transposed
+//   product B[N,K] @ A[K,M] by treating (B,A) as the operands on the host
+//   side and rebuilding the matching C tensor-map encoder
+//   (see launch_nvfp4_gemm_impl).
 //
-// Scale tensors use the same Blackwell SWIZZLE_32_4_4 physical format accepted
-// by torch._scaled_mm/cuBLASLt.  A logical [128,4] tile is stored as 32 rows
-// of 16 bytes: rows r, r+32, r+64, r+96 are concatenated for each r.
+//   MMA shape is (128*ClusterM) x TileN x 64 with TileN ∈ {64, 128, 256},
+//   ClusterM ∈ {1, 2}, and TileK ∈ {64, 128, 256} realized as TileK/64 such
+//   mma instructions:
+//
+//     tcgen05.mma.cta_group::ClusterM.kind::mxf4nvf4.block_scale.block16
+//
+//   Per CTA, each mainloop slot holds a 128B-swizzled FP4 A[128,TileK] tile,
+//   a 128B-swizzled FP4 B[TileN/ClusterM,TileK] tile, and contiguous
+//   scale-factor tiles covering the full TileK span.  With ClusterM=2 both
+//   peer CTAs consume identical SFB data, so cluster rank 0 loads each SFB
+//   tile once and TMA-multicasts it into the same shared-memory offset in
+//   both CTAs.
+//
+// Bottleneck model
+// ----------------
+//   Back-of-the-envelope estimate for the default 128x256x64 tile with
+//   kClusterM == 2 (2 CTAs cooperate along M):
+//
+//     Per-tile loads (one K tile = 64 elements):
+//         A   : 128 rows * 64 elements * 0.5 B  (E2M1)         =   4 KiB / CTA
+//         B   : 128 cols * 64 elements * 0.5 B  (E2M1)         =   4 KiB / CTA
+//         SFA : 128 rows * 4 scales   * 1 B   (UE4M3, kTileK=64) = 512 B / CTA
+//         SFB : 2 tiles    * 512 B     (UE4M3, TileN=256)        =   1 KiB / CTA
+//         Total per output tile: ~ 9.5 KiB of K-resident data per CTA
+//
+//     Over the full problem (M = 128 * Mtiles, N = 256 * Ntiles):
+//         Total bytes moved ~= K * M * N / 128  (operand + scale bytes,
+//                                                count is approximate).
+//         Memory-bound time = total_bytes / peak_L2_or_DRAM_bandwidth.
+//         Compute-bound time = K * M * N / peak_NVFP4_MMA_rate (each mxf4nvf4
+//                              MMA produces twice the elements of an
+//                              equivalent BF16 MMA per cycle).
+//
+//     For a 4K^3 problem the two limits are roughly:
+//         * L2-hit TMA: K * M * N / 128 / ~1.281 TB/s ~= 1.56 ms.
+//         * MMA issue : K * M * N          / ~500 TF/s ~= 0.28 ms.
+//     (Effective rates depend on the deployed Blackwell part; treat these
+//     numbers as a sanity check, not a contract.)
+//
+//     Per-stage latency model (single output tile, kClusterM = 2):
+//         * MMA work        : 128 * 256 * 64 / 16K  ~= 128 cycles.
+//         * DRAM -> L2 fetch: (2 * 128 * 64 * 0.5 + 2 * 128 * 64 * 0.5) / 8 ~= 1024 cycles.
+//         * L2 hit on fetch : (2 * 128 * 64 * 0.5 + 2 * 128 * 64 * 0.5) / 40 ~= 205 cycles.
+//         * Scale cp+mma   : scales live in TMEM (tcgen05.cp) once per K=64
+//                            slab, gating one mma and ~16 cycles per slab.
+//
+//   Reading the three numbers together explains the design pressure points
+//   addressed below:
+//     * The MMA path is comparable to an L2-hit fetch, so compute and memory
+//       must overlap tightly -- that is the role of the multi-stage mainloop.
+//     * An L2 miss inflates the fetch by ~5x, so the macro-swizzle and the
+//       L2-friendly tile order are first-order optimizations, not niceties.
+//     * Scale-factor copy into TMEM is on the critical path of every MMA,
+//       so each stage must have a dedicated TMEM scale slot.  TileN=256 is
+//       capacity constrained and reuses a single 12-column slot, forcing a
+//       serialized cp->mma ordering that narrows the advantage of wider N.
+//     * TMA descriptor prefetch matters because every mainloop iteration
+//       consumes a fresh A/B/SFA/SFB tile, so the very first load cannot
+//       afford to stall on the descriptor fetch.
+//
+// Functional summary
+// ------------------
+//   * Persistent tiled kernel: launches one CTA per SM (grid == kSmCount == 20)
+//     and walks the (grid_m * grid_n) output-tile grid in round-robin so each
+//     CTA accumulates multiple output tiles per launch.
+//   * Each CTA executes a 6-warp pipeline (192 threads):
+//       warp 4              – load warp (TMA gmem→smem for A, B, SFA, SFB)
+//       warp 5 (cta_rank 0) – MMA warp   (tcgen05.mma mxf4nvf4 on TMEM)
+//       warps 0..3          – epilogue warps (tmem→smem→gmem via TMA)
+//   * Clusters of size kClusterM along M cooperate via DSMEM and multicast:
+//     every cluster CTA loads its own A row and its slice of B; rank 0 also
+//     loads SFB and multicasts it to peers; the MMA is issued once with
+//     `cta_group::kClusterM`.
+//   * FP32 accumulator lives in TMEM (kTileN or 2*kTileN columns depending
+//     on TileN) and is drained to shared memory via tcgen05.ld, then to
+//     global memory via 2-D/3-D TMA bulk stores.
+//   * Scale-factor slot policy in TMEM:
+//       - TileN ≤ 128: kStageCount * (TileK/64) distinct slots of 8 columns,
+//         one per in-flight SMEM stage and K=64 slab.  All scales for a
+//         TileK stage can be prefetched before its MMAs without aliasing any
+//         in-flight stage.
+//       - TileN == 256: a single 12-column slot is reused; cp() runs
+//         immediately before each MMA to refresh the live slabs.
+//   * Two entry points:
+//       launch_nvfp4_gemm           – regular, unprofiled path.
+//       launch_nvfp4_gemm_profile   – same kernel with per-stage profiler.
+//   * SWAP_AB template variant reuses the same kernel binary for the
+//     transposed product (no second hand-written kernel); only the host-side
+//     launch swaps pointer/dimension arguments and selects the matching
+//     C tensor-map encoder.
+//
+// Optimizations
+// -------------
+//   1. TMA for all bulk data movement.
+//        * Loads  : 3-D tensor maps for A and B (128 B swizzle); 4-D maps
+//                   for SFA and SFB covering the full TileK scale span.
+//        * Stores : 2-D map for the KEpilogueBlockN==32 fast path, 3-D map
+//                   otherwise; 64 B swizzle. Register traffic on the memory
+//                   side of the pipeline is zero.
+//   2. Multi-stage software pipeline (kStageCount stages for A/B/SFA/SFB in smem).
+//        Stage count is chosen at *compile time* from a 232 KiB smem budget
+//        (cudaDevAttrMaxSharedMemoryPerBlockOptin) minus the epilogue
+//        double buffer and the static/mbarrier reservations
+//        (KernelConfig::kStageCount), capped at six stages.  The largest
+//        configuration that still fits is selected automatically.
+//   3. Single/double-buffered TMEM accumulator (kAccumulatorStageCount).
+//        TileN ≤ 128 keeps two banks (mainloop_stage ∈ {0,1}); TileN=256
+//        falls back to one because two 256-column stages cannot coexist
+//        with the 12-column scale slot without aliasing live accumulator
+//        columns.  Release of each bank is gated by an `epilogue_mbar`
+//        that the epilogue trips only after its TMA store has committed,
+//        hiding the TMEM lifetime from the mainloop.
+//   4. Scale-factor TMEM slot policy (kScaleTmemSlotCount).
+//        Narrow-N keeps every in-flight SMEM stage and K=64 slab's scales in
+//        a distinct TMEM slot, allowing the load warp to prefetch the entire
+//        TileK stage's scales ahead of the MMA consumer.  The mma_mbar
+//        handshake prevents a stage's SMEM and TMEM scale slots from being
+//        reused until its asynchronous MMA has completed.
+//        TileN=256 retains one 12-column scale slot and refreshes it
+//        immediately before each MMA, trading prefetch depth for footprint.
+//   5. SFB cluster multicast (ClusterM=2 only).
+//        Both peer CTAs read identical SFB data, so rank 0 issues a single
+//        TMA with a cta_mask and shares the resulting SMEM bytes with rank 1.
+//        This halves SFB traffic from DRAM.
+//   6. Producer/consumer decoupling with two mbarrier rings:
+//          tma_mbars[kStageCount]   – TMA completion -> MMA consumer.
+//          mma_mbars[kStageCount]   – MMA commit     -> TMA producer.
+//        A separate `mainlooop_mbars[2]` array — note the misspelling kept
+//        on purpose — signals mainloop-stage completion to the epilogue;
+//        `epilogue_mbars[2]` releases accumulator banks back to the MMA
+//        warp.  Phase parity bits per ring track the 2-cycle wrap.
+//   7. L2-friendly tile schedule (`compute_bid`).
+//        The output grid is mapped through an 8x8 macro-swizzle. With
+//        `kMacroSwizzleMFast=true`, M is iterated fastest inside a macro
+//        band so consecutive CTAs read overlapping K-resident operands
+//        and reuse L2 lines.
+//   8. TMA descriptor prefetch (`prefetch.tensormap`) issued once at startup,
+//        so the first TMA does not stall on the descriptor fetch.
+//   9. Pipelined epilogue:
+//          * 2 smem slots per mainloop_stage (`kEpilogueStageCount == 2`).
+//          * `cp.async.bulk.wait_group.read 1` + `bar.sync 1, 128` keeps the
+//            TMA store of slot N concurrent with the tcgen05.ld that fills
+//            slot N+1.
+//  10. `SWAP_AB` template variant reuses the same kernel binary for the
+//      transposed product (no second hand-written kernel); only the host-side
+//      launch swaps pointer/dimension arguments and selects the matching
+//      C tensor-map encoder.
+//  11. Per-stage profiler (DO_PROFILE): tag-based timing of Setup,
+//      WaitMMA, IssueTMA, WaitTMA, IssueMMA, WaitMainloop, WaitEpilogue,
+//      Epilogue via elected leaders, no impact on the unprofiled path.
+//
+// Detailed pipeline
+// -----------------
+//   Legend
+//     L – load warp (warp_id == 4)
+//     M – MMA  warp (warp_id == 5 on cta_rank == 0)
+//     E – epilogue warps (warp_id in {0,1,2,3})
+//
+//   0. Setup (all warps, once per CTA)
+//      ------------------------------------------------
+//      tid==0   : mbarrier.init for tma_mbars[kStageCount] (count=kClusterM),
+//                 mma_mbars[kStageCount] (count=1), mainlooop_mbars[kAccumulatorStageCount] (1),
+//                 epilogue_mbars[kAccumulatorStageCount] (4*kClusterM); then
+//                 `fence.mbarrier_init.release.cluster`.
+//      warp 1   : `tcgen05.alloc.cta_group::kClusterM` reserves kTmemColumnCapacity
+//                 (= 512) TMEM columns (returned in tmem_addr[0]).
+//      warp 0*  : `prefetch.tensormap` for A_tmap / B_tmap / SFA_tmap / SFB_tmap
+//                 / C_tmap.
+//      barrier.cluster.arrive+wait (or __syncthreads when kClusterM==1).
+//
+//   1. Main loop — repeated `K / kTileK` iterations
+//      ------------------------------------------------
+//      ┌─── L (load warp) ──────────────────────────────────────────────┐
+//      │  wait(mma_mbar[mma_stage], mma_phase)        // slot free?     │
+//      │  mbar.arrive.expect_tx(tma_mbar[tma_stage], cp_size)           │
+//      │  cp.async.bulk.tensor.3d A: smem[stage]<-A_tmap(k_off,m_off,0) │
+//      │  cp.async.bulk.tensor.3d B: smem[stage]+A_sz <-                │
+//      │      B_tmap(k_off, n_off + rank*(TileN/Cluster), 0)            │
+//      │  cp.async.bulk.tensor.4d SFA: ... <- SFA_tmap covering all     │
+//      │      (TileK/64) K=64 slabs in this TileK stage (one box)       │
+//      │  for scale_tile in [0, kSFBScaleTileCount):                    │
+//      │      cp.async.bulk.tensor.4d SFB(scale_tile) <- SFA_tmap(...)  │
+//      │      ClusterM==2: rank==0 only, with multicast cta_mask        │
+//      │  mma_stage = (mma_stage+1)%kStageCount;                        │
+//      │  mma_phase ^= 1   when mma_stage wraps to 0                    │
+//      └─── (consumes mma_mbar; produces tma_mbar) ─────────────────────┘
+//
+//      ┌─── M (MMA warp, one issued per cluster) ───────────────────────┐
+//      │  wait(tma_mbar[tma_stage], tma_phase)        // data ready?    │
+//      │  tcgen05.fence::after_thread_sync                              │
+//      │  taddr_use = taddr + mainloop_stage * kAccumulatorStageStride  │
+//      │  for k1 in [0, kTileK/64):                                     │
+//      │    TileN ≤ 128:                                                │
+//      │      tcgen05.cp SFA -> TMEM scale slot                         │
+//      │          (stage_id * TileK/64 + k1) * kScaleColsPerMma         │
+//      │      tcgen05.cp SFB(scale_tile) -> TMEM scale slot             │
+//      │      The cp() chains can be batched ahead of the MMA.          │
+//      │    TileN == 256:                                               │
+//      │      cp() runs immediately before each MMA in slot 0.          │
+//      │    tcgen05.mma.cta_group::kClusterM                            │
+//      │        .kind::mxf4nvf4.block_scale.block16                     │
+//      │        tmem[taddr_use] ^= A_sm^k1 * B_sm^k1                    │
+//      │        scale slots as above                                    │
+//      │  tcgen05.commit.cta_group::kClusterM                           │
+//      │      .mbarrier::arrive::one.shared::cluster.multicast          │
+//      │      mma_mbar[mma_stage]   -> tells L the slot is empty        │
+//      └─── (consumes tma_mbar; produces mma_mbar) ─────────────────────┘
+//
+//   2. End-of-K – hand control to the epilogue
+//      ------------------------------------------------
+//      M issues one extra `tcgen05.commit.cta_group::kClusterM
+//      .mbarrier.arrive::one.shared::cluster.multicast` on
+//      mainlooop_mbar[mainloop_stage], then toggles mainloop_stage and the
+//      epilogue_phase parity bit.
+//
+//   3. Epilogue (warps 0..3; FP32 in TMEM, BF16 to gmem)
+//      ------------------------------------------------
+//      ┌─── E ──────────────────────────────────────────────────────────┐
+//      │  wait(mainloop_mbar[mainloop_stage], mainloop_phase)           │
+//      │  tcgen05.fence::after_thread_sync                              │
+//      │  For n_block in [0, kTileN/kEpilogueBlockN):                   │
+//      │     smem_slot = n_block % kEpilogueStageCount                  │
+//      │     [fill] tmem->smem of (kEpilogueBlockN x kTileM) block      │
+//      │             via tcgen05.ld (x8, .32x32b) + swizzle write,      │
+//      │             fp32 -> bf16 conversion per element                │
+//      │             bar.sync 1, 128                                    │
+//      │     [push] tid==0: cp.async.bulk.tensor.{2|3}d                 │
+//      │             smem_slot -> C_tmap (according to kEpilogueBlockN  │
+//      │             and SWAP_AB)                                       │
+//      │     if more blocks remain:                                     │
+//      │         cp.async.bulk.wait_group.read 1;  bar.sync 1, 128      │
+//      │         fill the *other* slot (next n_block)                   │
+//      │         bar.sync 1, 128                                        │
+//      │         if this is the last block:                             │
+//      │             release_tmem -> epilogue_mbar[mainloop_stage]      │
+//      │  cp.async.bulk.wait_group 0;   bar.sync 1, 128                 │
+//      │  (loop) advance mainloop_stage, flip mainloop_phase            │
+//      └─── (consumes mainloop_mbar; produces epilogue_mbar) ───────────┘
+//
+//   4. Tile cycling (`compute_bid`)
+//      ------------------------------------------------
+//      Linear `bid` is decomposed through the 8x8 macro-swizzle into an
+//      (off_m, off_n) tile coordinate. With `kMacroSwizzleMFast = true` the
+//      inner loop walks M, which empirically keeps the K-resident operand
+//      hot in L2. The triple-nested loop in the launch
+//          for bid = _bid; bid < grid_size; bid += grid_x
+//      turns the grid persistent: kSmCount CTAs share the tile grid evenly.
+//
+//   5. Teardown
+//      ------------------------------------------------
+//      cluster barrier -> warp 0 `tcgen05.dealloc.cta_group::kClusterM`
+//      returns kTmemColumnCapacity TMEM columns. If DO_PROFILE, the elected
+//      leader flushes the profiler buffer.
+//
+// Notes
+// -----
+//   * The `__grid_constant__ CUtensorMap` parameters carry the host-built
+//     TMA descriptors; we never rebuild them on the device.
+//   * The `& 0xFEFFFFFF` mask on mbar addresses sets the "CTA-local" bit
+//     expected by the `mbarrier` PTX (state<->phase packing convention).
+//   * All TMEM addresses are 32-bit shared-memory offsets returned by
+//     `tcgen05.alloc` and stored in `tmem_addr[0]`.
+//   * `kClusterM == 1` falls back to `__syncthreads()` for setup/teardown;
+//     otherwise `barrier.cluster.arrive/wait` is used.
+//   * A 128 B swizzle always reserves a full 128 B span per row, even when
+//     a TileK=64/128 FP4 transfer only populates 32 B/64 B of that span.
+//   * Scale tensors use the Blackwell SWIZZLE_32_4_4 physical format
+//     accepted by torch._scaled_mm/cuBLASLt.  A logical [128,4] tile is
+//     stored as 32 rows of 16 bytes: rows r, r+32, r+64, r+96 are
+//     concatenated for each r.  This is exactly the layout consumed by
+//     `tcgen05.cp.cta_group::C.32x128b.warpx4`.
+//   * TileN=64 is realized by selecting one half of a containing 128-row
+//     blocked scale tile in TMEM; the SFB TMEM column is computed as
+//     `(off_n % 128) / 32`.
+//   * This kernel targets SM110A only. It will not assemble on older SMs
+//     that lack the tcgen05.* / bulk.tensor.* opcodes or the mxf4nvf4 MMA.
 // =============================================================================
 
 #include <cassert>
