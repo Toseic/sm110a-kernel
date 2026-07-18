@@ -214,7 +214,7 @@ def main():
     parser = argparse.ArgumentParser(description="SM110A autotune runner")
     parser.add_argument(
         "workload",
-        choices=("bf16-gemm", "nvfp4-gemm", "grouped-m-gemm", "nvfp4-grouped-m-gemm", "fc1-swiglu", "fc2-finalize"),
+        choices=("bf16-gemm", "nvfp4-gemm", "grouped-m-gemm", "nvfp4-grouped-m-gemm", "fc1-swiglu", "nvfp4-fc1", "fc2-finalize"),
         help="workload to resolve and cache",
     )
     parser.add_argument("args", nargs=argparse.REMAINDER, help="arguments forwarded to the benchmark")
@@ -225,6 +225,7 @@ def main():
         "grouped-m-gemm": "benchmark_bf16_grouped_m_gemm.py",
         "nvfp4-grouped-m-gemm": "benchmark_nvfp4_grouped_m_gemm.py",
         "fc1-swiglu": "benchmark_bf16_fc1_block_interleaved_swiglu.py",
+        "nvfp4-fc1": "benchmark_nvfp4_fc1.py",
         "fc2-finalize": "benchmark_bf16_fc2_finalize.py",
     }
     forwarded = parsed.args[1:] if parsed.args[:1] == ["--"] else parsed.args
