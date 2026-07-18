@@ -28,5 +28,13 @@ from .kernels.grouped_m_gemm import (
     get_bf16_grouped_m_gemm_module,
     prepare_grouped_m_metadata,
 )
+from .kernels.nvfp4_grouped_m_gemm import (
+    Nvfp4GroupedMConfig,
+    compile_nvfp4_grouped_m_gemm,
+    compile_nvfp4_grouped_m_gemm_configs,
+    nvfp4_grouped_m_gemm,
+    nvfp4_grouped_m_gemm_out,
+    prepare_nvfp4_grouped_m_metadata,
+)
 
 __all__ = [name for name in globals() if not name.startswith("_")]

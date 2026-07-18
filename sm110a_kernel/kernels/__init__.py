@@ -39,6 +39,12 @@ from .grouped_m_gemm import (
     bf16_grouped_m_gemm_out,
     get_bf16_grouped_m_gemm_module,
 )
+from .nvfp4_grouped_m_gemm import (
+    Nvfp4GroupedMConfig, compile_nvfp4_grouped_m_gemm,
+    compile_nvfp4_grouped_m_gemm_configs,
+    prepare_nvfp4_grouped_m_metadata, nvfp4_grouped_m_gemm,
+    nvfp4_grouped_m_gemm_out,
+)
 from .moe_routing import pack_routing_metadata
 
 __all__ = [name for name in globals() if not name.startswith("_")]
