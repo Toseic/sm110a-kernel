@@ -114,12 +114,21 @@ def from_blocked_nvfp4_scales(scales, rows: int, k: int):
 
 
 def _pack_e2m1(values):
+    """Pack an in-place, clamped FP32 tensor into E2M1 pairs.
+
+    ``values`` is a quantization temporary, so consuming it here avoids two
+    otherwise full-sized FP32 allocations for ``clamp`` and ``abs``.
+    """
     import torch
 
     midpoints = torch.tensor((0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0),
                              device=values.device, dtype=torch.float32)
-    code = torch.bucketize(values.abs().float(), midpoints).to(torch.uint8)
-    code |= (values < 0).to(torch.uint8) << 3
+    negative = values < 0
+    values.abs_()
+    # E2M1 has only eight magnitude bins.  Request int32 indices explicitly:
+    # bucketize otherwise materializes an int64 tensor for every input value.
+    code = torch.bucketize(values, midpoints, out_int32=True).to(torch.uint8)
+    code |= negative.to(torch.uint8) << 3
     packed = code[..., 0::2] | (code[..., 1::2] << 4)
     return packed.contiguous().view(torch.float4_e2m1fn_x2)
 
@@ -134,8 +143,13 @@ def quantize_nvfp4_rows(matrix):
     blocks = x.view(x.size(0), x.size(1) // 16, 16)
     scale = (blocks.abs().amax(dim=-1) / 6.0).to(torch.float8_e4m3fn)
     scale_f = scale.float()
-    normalized = blocks / torch.where(scale_f == 0, torch.ones_like(scale_f), scale_f).unsqueeze(-1)
-    packed = _pack_e2m1(normalized.clamp(-6.0, 6.0).reshape_as(x))
+    scale_f.masked_fill_(scale_f == 0, 1.0)
+    normalized = blocks / scale_f.unsqueeze(-1)
+    # Neither x nor its blocks view is needed after normalization.  Releasing
+    # them before packing is important for large CUDA-resident matrices.
+    del blocks, x, scale_f
+    normalized.clamp_(-6.0, 6.0)
+    packed = _pack_e2m1(normalized.reshape(matrix.shape))
     return packed, to_blocked_nvfp4_scales(scale)
 
 

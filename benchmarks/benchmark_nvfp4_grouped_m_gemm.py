@@ -30,6 +30,9 @@ from sm110a_kernel import (
 from sm110a_kernel.runner import AutotuneRunner, PreparedKernel, TuneOptions
 
 
+EXPERTS = 256
+N = 4096
+K = 6144
 DEFAULT_TOKENS_PER_EXPERT = (128, 256, 512, 1024)
 NVFP4_GROUPED_M_CONFIGS = tuple(
     Nvfp4GroupedMConfig(
@@ -104,10 +107,30 @@ def nvfp4_grouped_m_gemm_sol_bounds(tokens_per_expert, experts, n, k, config):
 def make_workload(tokens_per_expert, experts, n, k):
     m = tokens_per_expert * experts
     a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
-    b = torch.randn((experts, n, k), device="cuda", dtype=torch.bfloat16)
     aq, sfa = quantize_nvfp4_rows(a)
-    bq_flat, sfb = quantize_nvfp4_rows(b.reshape(experts * n, k))
-    bq = bq_flat.reshape(experts, n, k // 2)
+    del a
+
+    # B is retained by the benchmark only in NVFP4 form.  Quantize one expert
+    # at a time so the 256-expert default never creates full-size FP32
+    # quantization temporaries for the entire [experts, N, K] matrix.
+    bq = None
+    sfb = None
+    for expert in range(experts):
+        b_expert = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
+        bq_expert, sfb_expert = quantize_nvfp4_rows(b_expert)
+        if bq is None:
+            bq = torch.empty(
+                (experts, n, k // 2), device="cuda", dtype=bq_expert.dtype
+            )
+            sfb = torch.empty(
+                (experts * sfb_expert.numel(),),
+                device="cuda",
+                dtype=sfb_expert.dtype,
+            )
+        bq[expert].copy_(bq_expert)
+        offset = expert * sfb_expert.numel()
+        sfb[offset : offset + sfb_expert.numel()].copy_(sfb_expert)
+        del b_expert, bq_expert, sfb_expert
     layout = torch.arange(experts, device="cuda", dtype=torch.int32).repeat_interleave(
         tokens_per_expert
     )
@@ -136,9 +159,9 @@ def run_baseline(aq, bq, sfa, sfb, tokens_per_expert, out):
 class Nvfp4GroupedMGemmBenchmark(BenchmarkBase):
     def build_parser(self):
         parser = argparse.ArgumentParser()
-        parser.add_argument("--experts", type=int, default=8)
-        parser.add_argument("--n", type=int, default=4096)
-        parser.add_argument("--k", type=int, default=4096)
+        parser.add_argument("--experts", type=int, default=EXPERTS)
+        parser.add_argument("--n", type=int, default=N)
+        parser.add_argument("--k", type=int, default=K)
         parser.add_argument(
             "--tokens", type=int, default=0,
             help="single tokens-per-expert value; default runs the standard sweep",
@@ -158,8 +181,8 @@ class Nvfp4GroupedMGemmBenchmark(BenchmarkBase):
         if args.n % 128 or args.k % 64:
             raise SystemExit("N must be a multiple of 128 and K a multiple of 64")
         values = (args.tokens,) if args.tokens else DEFAULT_TOKENS_PER_EXPERT
-        if any(value <= 0 or value % 128 for value in values):
-            raise SystemExit("tokens per expert must be a positive multiple of 128")
+        if any(value <= 0 for value in values):
+            raise SystemExit("tokens per expert must be positive")
         args.tokens_per_expert_values = values
         return args
 
