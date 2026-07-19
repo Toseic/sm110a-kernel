@@ -30,7 +30,7 @@
 #define SM110A_NVFP4_FC1_TILE_K 64
 #endif
 #ifndef SM110A_NVFP4_FC1_EPILOGUE_TILE_N
-#define SM110A_NVFP4_FC1_EPILOGUE_TILE_N 32
+#define SM110A_NVFP4_FC1_EPILOGUE_TILE_N 64
 #endif
 #ifndef SM110A_NVFP4_FC1_CLUSTER_M
 #define SM110A_NVFP4_FC1_CLUSTER_M 1
@@ -53,22 +53,29 @@ constexpr int kMmaWarp = kProducerWarpBase + kProducerWarpCount;
 constexpr int kWarpCount = kMmaWarp + 1;
 constexpr int kBlockThreads = kWarpSize * kWarpCount;
 constexpr int kAProducerThreadCount = kProducerWarpCount * kWarpSize;
-constexpr int kTmemStageCount = 2;
 constexpr int kPersistentTileCount = 2;
 // Each mode-2 CLC worker cluster starts with two tasks.  Once it completes
 // them it steals the work of an unstarted cluster through Cluster Launch Control.
 constexpr int kClcWorkerTileCount = 2;
+constexpr int kInterleaveBlock = 32;
+
+__device__ inline float silu(float x) {
+    return x / (1.0f + expf(-x));
+}
 
 template <int kTileM, int kTileN, int kTileK, int kEpilogueTileN, int kClusterM>
 struct KernelConfig {
-    static_assert(kClusterM == 1, "NVFP4 FC1 gather currently requires cluster_m=1");
+    static_assert(kClusterM == 1 || kClusterM == 2);
     static_assert(kTileM == 4 * kWarpSize);
     // tcgen05.mma.kind::f16 supports N in steps of 8 for cta_group::1
     // and steps of 16 for cta_group::2, up to N=256. The instruction
     // descriptor encodes this dimension as N >> 3 in bits 17-22.
-    static_assert(kTileN == 64 || kTileN == 128);
+    static_assert(kTileN == 64 || kTileN == 128 || kTileN == 256);
     static_assert(kTileK == 64 || kTileK == 128 || kTileK == 256);
-    static_assert(kEpilogueTileN == 32 || kEpilogueTileN == 64 || kEpilogueTileN == 128);
+    // The physical tile contains interleaved gate/up columns.  A 64-column
+    // physical epilogue tile therefore produces a 32-column SwiGLU tile,
+    // matching the BF16 FC1 epilogue and its TMA store granularity.
+    static_assert(kEpilogueTileN == 64 || kEpilogueTileN == 128);
     static_assert(kTileN % kEpilogueTileN == 0);
     static_assert(kTileN % kClusterM == 0);
     static_assert(kTileK % 64 == 0);
@@ -85,7 +92,9 @@ struct KernelConfig {
     static constexpr int kPerStagePayloadBytes =
         kASmemBytes + kBSmemBytes + kSFASmemBytes + kSFBSmemBytes;
     static constexpr int kPerStageSmemBytes = (kPerStagePayloadBytes + 1023) & ~1023;
-    static constexpr int kEpilogueStageBytes = kTileM * kEpilogueTileN * sizeof(nv_bfloat16);
+    static constexpr int kOutputEpilogueTileN = kEpilogueTileN / 2;
+    static constexpr int kEpilogueStageBytes =
+        kTileM * kOutputEpilogueTileN * sizeof(nv_bfloat16);
     // A 128-column epilogue stage occupies 32 KiB. Keeping one such stage
     // leaves enough shared memory for two mainloop stages in the largest
     // supported configuration.
@@ -100,9 +109,16 @@ struct KernelConfig {
     static constexpr int kMainloopSmemBytes = kStageCount * kPerStageSmemBytes;
     static constexpr int kDynamicSmemBytes = kMainloopSmemBytes + kEpilogueSmemBytes;
     static constexpr int kScaleColsPerMma = 4 + 4 * kSFBScaleTileCount;
-    static constexpr int kScaleTmemCols = kStageCount * kMmaStepsPerStage * kScaleColsPerMma;
+    // N=256 cannot keep two accumulator banks alongside every staged scale
+    // fragment.  Reuse one accumulator bank and one scale slot, as the
+    // grouped-M kernel does.  Narrow tiles retain double-buffered TMEM.
+    static constexpr int kTmemStageCount = kTileN == 256 ? 1 : 2;
+    static constexpr int kScaleTmemSlotCount =
+        kTileN < 256 ? kStageCount * kMmaStepsPerStage : 1;
+    static constexpr int kScaleTmemCols = kScaleTmemSlotCount * kScaleColsPerMma;
+    static constexpr int kAccumulatorTmemCols = kTileN * kTmemStageCount;
     static constexpr int kTmemColumnsNeeded = 512;
-    static_assert(kTileN * kTmemStageCount + kScaleTmemCols <= kTmemColumnsNeeded);
+    static_assert(kAccumulatorTmemCols + kScaleTmemCols <= kTmemColumnsNeeded);
     // tcgen05.alloc requires a power-of-two column count. In particular,
     // two N=192 accumulator stages need 384 columns but must allocate 512.
     static constexpr int kTmemAllocationColumns = 512;
@@ -204,7 +220,9 @@ __device__ __forceinline__ void load_gather_a_and_sfa(
     int k,
     char *__restrict__ a_smem,
     char *__restrict__ sfa_smem,
-    int a_mbar_addr) {
+    int a_mbar_addr,
+    bool a_is_tma,
+    bool sfa_is_tma) {
     constexpr int kVectorBytes = 16;
     constexpr int kVectorsPerRow = kTileK / 32;
     constexpr int kMmaSteps = kTileK / 64;
@@ -218,7 +236,7 @@ __device__ __forceinline__ void load_gather_a_and_sfa(
     static_assert(kRowsPerProducerWarp == kWarpSize);
 
     // Match the 128B-swizzled TMA layout consumed by make_k_major_128b_desc.
-    for (int vec = 0; vec < kVectorsPerRow; ++vec) {
+    if (!a_is_tma) for (int vec = 0; vec < kVectorsPerRow; ++vec) {
         // The UMMA K-major SW128 atom reserves a full 128-byte row even when
         // this stage carries only K=64 or K=128. This is why kASmemBytes is
         // fixed at TileM*128 rather than the TMA transaction byte count.
@@ -239,7 +257,7 @@ __device__ __forceinline__ void load_gather_a_and_sfa(
     // Rebuild each gathered logical [128,4] scale tile directly in
     // SWIZZLE_32_4_4 order. Each thread moves all four scales for one row,
     // replacing the old byte-at-a-time gather.
-    for (int mma_k = 0; mma_k < kMmaSteps; ++mma_k) {
+    if (!sfa_is_tma) for (int mma_k = 0; mma_k < kMmaSteps; ++mma_k) {
         uint32_t value = 0;
         if (row < valid_rows) {
             const int source_row = source_rows[row];
@@ -308,6 +326,24 @@ __device__ inline void tma_load_4d(
             "r"(mbar_addr)
             : "memory");
     }
+}
+
+template <int kClusterM>
+__device__ inline void tma_load_4d_multicast(
+    int dst_smem,
+    const void *tensor_map,
+    int x,
+    int y,
+    int z,
+    int w,
+    int mbar_addr,
+    int16_t cta_mask) {
+    static_assert(kClusterM == 2);
+    asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global."
+                 "mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2 "
+                 "[%0], [%1, {%2, %3, %4, %5}], [%6], %7;" ::
+            "r"(dst_smem), "l"(tensor_map), "r"(x), "r"(y), "r"(z), "r"(w),
+            "r"(mbar_addr), "h"(cta_mask) : "memory");
 }
 
 __device__ inline void tma_store_3d(
@@ -379,6 +415,19 @@ __device__ inline void tcgen05_commit(
             "h"(static_cast<int16_t>((1 << kClusterM) - 1))
             : "memory");
     }
+}
+
+template <int kTileM, int kTileK>
+inline bool init_a_tensor_map(CUtensorMap *map, const uint8_t *ptr, uint64_t m, uint64_t k) {
+    constexpr uint32_t rank = 4;
+    uint64_t dims[rank] = {k, m, 1, 1};
+    uint64_t strides[rank - 1] = {k / 2, m * k / 2, m * k / 2};
+    uint32_t box[rank] = {kTileK, kTileM, 1, 1};
+    uint32_t elem[rank] = {1, 1, 1, 1};
+    return cuTensorMapEncodeTiled(map, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, rank,
+        const_cast<uint8_t *>(ptr), dims, strides, box, elem, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
 
 template <int kTileN, int kTileK, int kClusterM>
@@ -480,8 +529,10 @@ template <
 __global__ __cluster_dims__(kClusterM, 1, 1)
 __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
     const uint8_t *a,
+    const __grid_constant__ CUtensorMap a_tensor_map,
     const __grid_constant__ CUtensorMap b_tensor_map,
     const uint8_t *sfa,
+    const __grid_constant__ CUtensorMap sfa_tensor_map,
     const __grid_constant__ CUtensorMap sfb_tensor_map,
     const __grid_constant__ CUtensorMap c_tensor_map,
     const int *source_rows,
@@ -503,12 +554,14 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
     constexpr int kMainloopSmemBytes = Config::kMainloopSmemBytes;
     constexpr int kEpilogueStageBytes = Config::kEpilogueStageBytes;
     constexpr int kEpilogueStageCount = Config::kEpilogueStageCount;
-    constexpr int kEpilogueStoreTileN = kEpilogueTileN < 64 ? kEpilogueTileN : 64;
-    constexpr int kEpilogueStoreTiles = kEpilogueTileN / kEpilogueStoreTileN;
+    constexpr int kOutputEpilogueTileN = Config::kOutputEpilogueTileN;
+    constexpr int kEpilogueStoreTileN = kOutputEpilogueTileN < 64 ? kOutputEpilogueTileN : 64;
+    constexpr int kEpilogueStoreTiles = kOutputEpilogueTileN / kEpilogueStoreTileN;
     constexpr int kChunksPerStoreTile = kEpilogueStoreTileN / 8;
     constexpr int kSwizzlePhaseMask = kEpilogueStoreTileN == 32 ? 3 : 7;
     constexpr int kStoreTileBytes = kTileM * kEpilogueStoreTileN * sizeof(nv_bfloat16);
     constexpr int kMmaStepsPerStage = kTileK / kMmaK;
+    constexpr int kTmemStageCount = Config::kTmemStageCount;
     constexpr int kTmemAllocationColumns = Config::kTmemAllocationColumns;
     const int tid = threadIdx.x;
     const int warp_id = tid / kWarpSize;
@@ -530,6 +583,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
     __shared__ __align__(16) uint4 clc_response[1];
     __shared__ __align__(8) uint64_t clc_mbar[1];
     __shared__ int task_source_rows[kTileM];
+    __shared__ int task_gather_tma[2];
     __shared__ uint64_t tma_mbars[kStageCount];
     __shared__ uint64_t a_mbars[kStageCount];
     __shared__ uint64_t mma_mbars[kStageCount];
@@ -547,7 +601,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
 
     if (tid == 0) {
         for (int stage = 0; stage < kStageCount; ++stage) {
-            mbarrier_init(base_tma_mbar_addr + stage * sizeof(uint64_t), 1);
+            mbarrier_init(base_tma_mbar_addr + stage * sizeof(uint64_t), kClusterM);
             mbarrier_init(
                 base_a_mbar_addr + stage * sizeof(uint64_t), kAProducerThreadCount);
             mbarrier_init(base_mma_mbar_addr + stage * sizeof(uint64_t), 1);
@@ -578,7 +632,9 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
         }
     }
     if (warp_id == 0 && elect_sync()) {
+        prefetch_tensor_map(&a_tensor_map);
         prefetch_tensor_map(&b_tensor_map);
+        prefetch_tensor_map(&sfa_tensor_map);
         prefetch_tensor_map(&sfb_tensor_map);
         prefetch_tensor_map(&c_tensor_map);
     }
@@ -600,29 +656,43 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                             int valid_rows = kTileM) {
         char *stage_smem = dynamic_smem + kMainloopSmemBytes + smem_stage * kEpilogueStageBytes;
 
-        for (int n_group = 0; n_group < kEpilogueTileN / 8; ++n_group) {
-            const int tmem_col = mainloop_stage * kTileN + n_block * kEpilogueTileN + n_group * 8;
+        for (int n_group = 0; n_group < kOutputEpilogueTileN / 8; ++n_group) {
+            const int logical_col = n_block * kOutputEpilogueTileN + n_group * 8;
+            const int logical_block = logical_col / kInterleaveBlock;
+            const int logical_in_block = logical_col % kInterleaveBlock;
+            const int gate_tmem_col = mainloop_stage * kTileN +
+                logical_block * (2 * kInterleaveBlock) + logical_in_block;
+            const int up_tmem_col = gate_tmem_col + kInterleaveBlock;
+            // Kept for the unused swap-AB specialization below.
+            const int tmem_col = gate_tmem_col;
 
             if constexpr (!kSwapAB) {
-                float values[8];
+                float gate_values[8];
+                float up_values[8];
                 const int tmem_row = cta_rank * kTileM + warp_id * kWarpSize;
-                const int load_addr = tmem_addr + (tmem_row << 16) + tmem_col;
+                const int gate_load_addr = tmem_addr + (tmem_row << 16) + gate_tmem_col;
+                const int up_load_addr = tmem_addr + (tmem_row << 16) + up_tmem_col;
                 asm volatile("tcgen05.ld.sync.aligned.32x32b.x8.b32 "
                              "{%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                    : "=f"(values[0]),
-                    "=f"(values[1]),
-                    "=f"(values[2]),
-                    "=f"(values[3]),
-                    "=f"(values[4]),
-                    "=f"(values[5]),
-                    "=f"(values[6]),
-                    "=f"(values[7])
-                    : "r"(load_addr));
+                    : "=f"(gate_values[0]), "=f"(gate_values[1]),
+                    "=f"(gate_values[2]), "=f"(gate_values[3]),
+                    "=f"(gate_values[4]), "=f"(gate_values[5]),
+                    "=f"(gate_values[6]), "=f"(gate_values[7])
+                    : "r"(gate_load_addr));
+                asm volatile("tcgen05.ld.sync.aligned.32x32b.x8.b32 "
+                             "{%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                    : "=f"(up_values[0]), "=f"(up_values[1]),
+                    "=f"(up_values[2]), "=f"(up_values[3]),
+                    "=f"(up_values[4]), "=f"(up_values[5]),
+                    "=f"(up_values[6]), "=f"(up_values[7])
+                    : "r"(up_load_addr));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
 
                 nv_bfloat162 packed[4];
                 for (int i = 0; i < 4; ++i) {
-                    packed[i] = __float22bfloat162_rn({values[2 * i], values[2 * i + 1]});
+                    packed[i] = __float22bfloat162_rn({
+                        silu(gate_values[2 * i]) * up_values[2 * i],
+                        silu(gate_values[2 * i + 1]) * up_values[2 * i + 1]});
                 }
 
                 if constexpr (kDirectGmem) {
@@ -630,8 +700,8 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                     // to global memory, bypassing shared memory.
                     if (tid < valid_rows) {
                         const int gmem_row = cta_row + tid;
-                        const int gmem_col = tile_col + n_block * kEpilogueTileN + n_group * 8;
-                        reinterpret_cast<int4 *>(c + gmem_row * n + gmem_col)[0] =
+                        const int gmem_col = tile_col / 2 + logical_col;
+                        reinterpret_cast<int4 *>(c + gmem_row * (n / 2) + gmem_col)[0] =
                             reinterpret_cast<int4 *>(packed)[0];
                     }
                 } else {
@@ -780,7 +850,22 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                         row < valid_rows ? __ldg(source_rows + cta_row + row) : 0;
                     __syncwarp();
                     cached_source_row_start = cta_row;
+                    // Cache this classification for all adjacent N tiles of
+                    // the same routed-row run.  This keeps the normal gather
+                    // path from repeatedly scanning the 128-entry map.
+                    asm volatile("bar.sync 2, 128;" ::: "memory");
+                    if (producer_rank == 0 && (tid & (kWarpSize - 1)) == 0) {
+                        const int base = task_source_rows[0];
+                        bool contiguous = valid_rows == kTileM;
+                        for (int row = 1; row < kTileM && contiguous; ++row)
+                            contiguous = task_source_rows[row] == base + row;
+                        task_gather_tma[0] = contiguous;
+                        task_gather_tma[1] = contiguous && !(base & (kTileM - 1));
+                    }
+                    asm volatile("bar.sync 2, 128;" ::: "memory");
                 }
+                const bool gather_a_tma = task_gather_tma[0];
+                const bool gather_sfa_tma = task_gather_tma[1];
 
                 for (int tile_k = 0; tile_k < k_tiles; ++tile_k) {
                     const int mma_mbar_addr =
@@ -801,16 +886,35 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                     if (producer_rank == 0 && elect_sync()) {
                         asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 "
                                      "_, [%0], %1;" ::"r"(tma_transaction_mbar_addr),
-                            "r"(Config::kBTmaBytes + kSFBSmemBytes)
+                            "r"(Config::kBTmaBytes + kSFBSmemBytes +
+                                (gather_a_tma ? Config::kATmaBytes : 0) +
+                                (gather_sfa_tma ? kSFASmemBytes : 0))
                             : "memory");
                         tma_load_4d<kClusterM>(b_smem, &b_tensor_map, off_k,
-                            tile_col, 0, task.expert, tma_transaction_mbar_addr);
-                        for (int scale_tile = 0; scale_tile < kSFBScaleTileCount; ++scale_tile)
-                            tma_load_4d<kClusterM>(
-                                sfb_smem + scale_tile * Config::kMmaStepsPerStage * 512,
-                                &sfb_tensor_map, 0, 0, off_k64,
-                                task.expert * (n / 128) + tile_col / 128 + scale_tile,
+                            tile_col + cta_rank * (kTileN / kClusterM), 0, task.expert,
+                            tma_transaction_mbar_addr);
+                        for (int scale_tile = 0; scale_tile < kSFBScaleTileCount; ++scale_tile) {
+                            const int sfb_tile_smem =
+                                sfb_smem + scale_tile * Config::kMmaStepsPerStage * 512;
+                            const int sfb_tile_index =
+                                task.expert * (n / 128) + tile_col / 128 + scale_tile;
+                            if constexpr (kClusterM == 1) {
+                                tma_load_4d<1>(sfb_tile_smem, &sfb_tensor_map, 0, 0, off_k64,
+                                    sfb_tile_index, tma_transaction_mbar_addr);
+                            } else if (cta_rank == 0) {
+                                tma_load_4d_multicast<2>(sfb_tile_smem, &sfb_tensor_map,
+                                    0, 0, off_k64, sfb_tile_index, tma_transaction_mbar_addr, 3);
+                            }
+                        }
+                        if (gather_a_tma) {
+                            tma_load_4d<kClusterM>(a_smem, &a_tensor_map, off_k,
+                                task_source_rows[0], 0, 0, tma_transaction_mbar_addr);
+                        }
+                        if (gather_sfa_tma) {
+                            tma_load_4d<kClusterM>(sfa_smem, &sfa_tensor_map, 0, 0,
+                                off_k64, task_source_rows[0] / kTileM,
                                 tma_transaction_mbar_addr);
+                        }
                     }
 
                     load_gather_a_and_sfa<kTileM, kTileK>(a, sfa, task_source_rows,
@@ -818,7 +922,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                         dynamic_smem + producer_stage * kStageSmemBytes,
                         dynamic_smem + producer_stage * kStageSmemBytes +
                             kASmemBytes + kBSmemBytes,
-                        a_mbar_addr);
+                        a_mbar_addr, gather_a_tma, gather_sfa_tma);
 
                     producer_stage = (producer_stage + 1) % kStageCount;
                     if (producer_stage == 0) {
@@ -858,9 +962,11 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                         const int sfa_smem = b_smem + kBSmemBytes;
                         const int sfb_smem = sfa_smem + kSFASmemBytes;
                         for (int mma_k = 0; mma_k < kMmaStepsPerStage; ++mma_k) {
-                            const int scale_addr = tmem_addr + 2 * kTileN +
-                                (consumer_stage * kMmaStepsPerStage + mma_k) *
-                                    Config::kScaleColsPerMma;
+                            const int scale_slot = kTileN < 256
+                                ? consumer_stage * kMmaStepsPerStage + mma_k
+                                : 0;
+                            const int scale_addr = tmem_addr + Config::kAccumulatorTmemCols +
+                                scale_slot * Config::kScaleColsPerMma;
                             tcgen05_cp_scale<kClusterM>(scale_addr,
                                 make_scale_desc(sfa_smem + mma_k * 512));
                             for (int scale_tile = 0; scale_tile < kSFBScaleTileCount; ++scale_tile)
@@ -941,7 +1047,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                         // Direct gmem: data already written by tmem_to_smem.
                         // Only the SMEM→TMA path needs TMA store / fallback.
                         if constexpr (!kDirectGmem) {
-                            const int block_col = tile_col + n_block * kEpilogueTileN;
+                            const int block_col = tile_col / 2 + n_block * kOutputEpilogueTileN;
                             if (valid_rows == kTileM) {
                                 if (tid == 0) {
                                     for (int store_tile = 0; store_tile < kEpilogueStoreTiles;
@@ -957,7 +1063,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                             } else if (tid < valid_rows) {
                                 char *stage_smem_ptr = dynamic_smem + kMainloopSmemBytes +
                                                        smem_stage * kEpilogueStageBytes;
-                                for (int n_group = 0; n_group < kEpilogueTileN / 8; ++n_group) {
+                                for (int n_group = 0; n_group < kOutputEpilogueTileN / 8; ++n_group) {
                                     const int store_tile = n_group / kChunksPerStoreTile;
                                     const int chunk_in_store =
                                         tid * kChunksPerStoreTile + n_group % kChunksPerStoreTile;
@@ -969,7 +1075,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                                         stage_smem_ptr +
                                         store_tile * kStoreTileBytes)[swizzled_chunk];
                                     const int output_offset =
-                                        (cta_row + tid) * n + block_col + n_group * 8;
+                                        (cta_row + tid) * (n / 2) + block_col + n_group * 8;
                                     reinterpret_cast<int4 *>(c + output_offset)[0] = value;
                                 }
                             }
@@ -1143,15 +1249,20 @@ void launch_nvfp4_fc1_impl(
         return;
     }
 
+    CUtensorMap a_tensor_map;
     CUtensorMap b_tensor_map;
+    CUtensorMap sfa_tensor_map;
     CUtensorMap sfb_tensor_map;
     CUtensorMap c_tensor_map;
     bool tensor_maps_ok;
     tensor_maps_ok =
+        init_a_tensor_map<kTileM, kTileK>(&a_tensor_map, d_a, tokens, k) &&
         init_b_tensor_map<kTileN, kTileK, kClusterM>(&b_tensor_map, d_b, experts, n, k) &&
+        init_scale_tensor_map(&sfa_tensor_map, d_sfa, tokens / 128,
+            k / 64, kTileK / 64) &&
         init_scale_tensor_map(&sfb_tensor_map, d_sfb, experts * (n / 128),
             k / 64, kTileK / 64) &&
-        init_c_tensor_map<kTileM, kEpilogueTileN>(&c_tensor_map, d_c, m, n);
+        init_c_tensor_map<kTileM, Config::kOutputEpilogueTileN>(&c_tensor_map, d_c, m, n / 2);
     if (!tensor_maps_ok) {
         return;
     }
@@ -1203,7 +1314,7 @@ void launch_nvfp4_fc1_impl(
                 kDynamicSmemBytes);
         }
         kernel<<<kClusterM * worker_clusters, kBlockThreads, kDynamicSmemBytes, stream>>>(
-            d_a, b_tensor_map, d_sfa, sfb_tensor_map, c_tensor_map, d_source_rows, tasks, task_count,
+            d_a, a_tensor_map, b_tensor_map, d_sfa, sfa_tensor_map, sfb_tensor_map, c_tensor_map, d_source_rows, tasks, task_count,
             next_cluster_tile, d_c, n, k);
     } else if constexpr (SM110A_NVFP4_FC1_MODE == 1) {
         const int persistent_clusters =
@@ -1240,7 +1351,7 @@ void launch_nvfp4_fc1_impl(
         const int launched_clusters =
             resident_clusters < persistent_clusters ? resident_clusters : persistent_clusters;
         kernel<<<kClusterM * launched_clusters, kBlockThreads, kDynamicSmemBytes, stream>>>(
-            d_a, b_tensor_map, d_sfa, sfb_tensor_map, c_tensor_map, d_source_rows, tasks, task_count,
+            d_a, a_tensor_map, b_tensor_map, d_sfa, sfa_tensor_map, sfb_tensor_map, c_tensor_map, d_source_rows, tasks, task_count,
             next_cluster_tile, d_c, n, k);
     } else {
         auto kernel = nvfp4_fc1_kernel<kTileM,
@@ -1258,7 +1369,7 @@ void launch_nvfp4_fc1_impl(
                 kDynamicSmemBytes);
         }
         kernel<<<kClusterM * max_tasks, kBlockThreads, kDynamicSmemBytes, stream>>>(
-            d_a, b_tensor_map, d_sfa, sfb_tensor_map, c_tensor_map, d_source_rows, tasks, task_count,
+            d_a, a_tensor_map, b_tensor_map, d_sfa, sfa_tensor_map, sfb_tensor_map, c_tensor_map, d_source_rows, tasks, task_count,
             next_cluster_tile, d_c, n, k);
     }
 }

@@ -103,9 +103,14 @@ def make_fc1_layout(tokens, experts, topk, i):
     # selected-expert routing weights sum to one.
     routing_weights = torch.softmax(topk_result.values, dim=1).to(torch.bfloat16).contiguous()
     grouped_order = torch.argsort(selected, stable=True)
-    fc1_unordered = torch.empty((tokens * topk, i), device="cuda", dtype=torch.bfloat16).uniform_(-1.0, 1.0)
     routing = pack_routing_metadata(selected, experts)
-    return (fc1_unordered.index_select(0, grouped_order).contiguous(), routing, routing_weights,
+    # FC2 consumes expert-grouped rows.  Their values are synthetic benchmark
+    # inputs, so generate that final layout directly instead of holding an
+    # unordered tensor plus a full index-select result.
+    fc1 = torch.empty(
+        (tokens * topk, i), device="cuda", dtype=torch.bfloat16
+    ).uniform_(-1.0, 1.0)
+    return (fc1, routing, routing_weights,
             router_scores, selected, grouped_order)
 
 

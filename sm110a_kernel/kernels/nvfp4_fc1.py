@@ -1,4 +1,4 @@
-"""NVFP4 routed FC1 with fused token permutation."""
+"""NVFP4 routed FC1 with fused permutation and block-interleaved SwiGLU."""
 
 from __future__ import annotations
 
@@ -19,22 +19,28 @@ class Nvfp4Fc1Config:
     tile_m: int = 128
     tile_n: int = 128
     tile_k: int = 64
-    epilogue_tile_n: int = 32
+    epilogue_tile_n: int = 64
     cluster_m: int = 1
     mode: int = 0
     direct_gmem: bool = False
+    macro_swizzle_n_major: bool = True
+    macro_swizzle_serpentine: bool = False
 
     def validate(self) -> None:
-        if self.tile_m != 128 or self.tile_n not in (64, 128):
-            raise ValueError("tile_m must be 128 and tile_n must be 64 or 128")
+        if self.tile_m != 128 or self.tile_n not in (64, 128, 256):
+            raise ValueError("tile_m must be 128 and tile_n must be 64, 128, or 256")
         if self.tile_k not in (64, 128, 256):
             raise ValueError("tile_k must be 64, 128, or 256")
-        if self.epilogue_tile_n not in (32, 64, 128) or self.tile_n % self.epilogue_tile_n:
+        if self.epilogue_tile_n not in (64, 128) or self.tile_n % self.epilogue_tile_n:
             raise ValueError("invalid epilogue_tile_n")
-        if self.cluster_m != 1:
-            raise ValueError("NVFP4 FC1 fused gather currently supports cluster_m=1")
+        if self.cluster_m not in (1, 2):
+            raise ValueError("cluster_m must be 1 or 2")
         if self.mode not in (0, 1, 2):
             raise ValueError("mode must be 0, 1, or 2")
+        if not isinstance(self.macro_swizzle_n_major, bool) or not isinstance(
+            self.macro_swizzle_serpentine, bool
+        ):
+            raise ValueError("macro swizzle settings must be bool")
 
 
 @dataclass(frozen=True)
@@ -102,7 +108,9 @@ def _flags(config: Nvfp4Fc1Config, variant):
         ("TILE_M", config.tile_m), ("TILE_N", config.tile_n),
         ("TILE_K", config.tile_k), ("EPILOGUE_TILE_N", config.epilogue_tile_n),
         ("CLUSTER_M", config.cluster_m), ("MODE", config.mode),
-        ("DIRECT_GMEM", int(config.direct_gmem))))
+        ("DIRECT_GMEM", int(config.direct_gmem)),
+        ("MACRO_SWIZZLE_N_MAJOR", int(config.macro_swizzle_n_major)),
+        ("MACRO_SWIZZLE_SERPENTINE", int(config.macro_swizzle_serpentine))))
 
 
 _JIT = SplitCudaJit(

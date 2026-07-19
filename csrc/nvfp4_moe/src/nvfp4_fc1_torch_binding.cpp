@@ -27,7 +27,8 @@ std::vector<torch::Tensor> prepare(torch::Tensor layout, int64_t experts, int64_
       layout.dim() == 1 && layout.is_contiguous(), "layout must be contiguous CUDA int32");
   TORCH_CHECK(layout.numel() % 128 == 0 && n % tile_n == 0,
       "M and N must satisfy NVFP4 blocked layout constraints");
-  TORCH_CHECK(address != 0 && cluster_m == 1, "invalid NVFP4 FC1 task launcher/config");
+  TORCH_CHECK(address != 0 && (cluster_m == 1 || cluster_m == 2),
+      "invalid NVFP4 FC1 task launcher/config");
   const int64_t max_tasks = ((layout.numel() + cluster_m * tile_m - 1) /
       (cluster_m * tile_m) + experts) * (n / tile_n);
   auto offsets = torch::empty({experts}, layout.options());
@@ -50,7 +51,7 @@ torch::Tensor run_out(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch
   const int64_t tokens = a.size(0), m = out.size(0);
   const int64_t e = b.size(0), n = b.size(1), k = a.size(1) * 2;
   TORCH_CHECK(address != 0 && tokens % 128 == 0 && n % 128 == 0 && k % 64 == 0,
-      "NVFP4 FC1 requires tokens/N/K divisible by 128/128/64");
+      "NVFP4 FC1 requires tokens/physical-N/K divisible by 128/128/64");
   TORCH_CHECK(b.size(2) * 2 == k && a.device() == b.device(), "incompatible A/B");
   check_scale(sfa, tokens * (k / 16), "SFA");
   check_scale(sfb, e * n * (k / 16), "SFB");
@@ -62,7 +63,8 @@ torch::Tensor run_out(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch
   TORCH_CHECK(state.is_cuda() && state.scalar_type() == torch::kInt32 && state.numel() == 2,
       "state must be CUDA int32[2]");
   TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kBFloat16 && out.is_contiguous() &&
-      out.sizes() == torch::IntArrayRef({m, n}), "output must be contiguous BF16 [M,N]");
+      out.sizes() == torch::IntArrayRef({m, n / 2}),
+      "output must be contiguous BF16 [M, physical-N/2]");
   TORCH_CHECK(a.device() == sfa.device() && a.device() == sfb.device() &&
       a.device() == source_rows.device() && a.device() == tasks.device() &&
       a.device() == state.device() && a.device() == out.device(),
@@ -79,7 +81,8 @@ torch::Tensor run_out(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch
 }
 torch::Tensor run(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb,
     torch::Tensor source_rows, torch::Tensor tasks, torch::Tensor state, uint64_t address) {
-  auto out = torch::empty({source_rows.numel(), b.size(1)}, a.options().dtype(torch::kBFloat16));
+  auto out = torch::empty({source_rows.numel(), b.size(1) / 2},
+      a.options().dtype(torch::kBFloat16));
   return run_out(a,b,sfa,sfb,source_rows,tasks,state,out,address);
 }
 }

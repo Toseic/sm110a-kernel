@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Runner-backed config and token sweep for fused-permute NVFP4 FC1."""
+"""Runner-backed config and token sweep for fused-permute NVFP4 SwiGLU FC1."""
 
 import argparse
 import math
@@ -44,13 +44,15 @@ NVFP4_FC1_CONFIGS = tuple(
         tile_n=tile_n,
         tile_k=tile_k,
         epilogue_tile_n=epilogue_tile_n,
+        cluster_m=cluster_m,
         mode=mode,
         direct_gmem=direct_gmem,
     )
-    for tile_n in (64, 128)
+    for tile_n in (64, 128, 256)
     for tile_k in (64, 128, 256)
-    for epilogue_tile_n in (32, 64, 128)
-    for mode in (0, 1, 2)
+    for epilogue_tile_n in (64, 128)
+    for cluster_m in (1, 2)
+    for mode in ( 1, 2)
     for direct_gmem in (False, True)
     if tile_n % epilogue_tile_n == 0
 )
@@ -60,7 +62,8 @@ def format_candidate(config):
     epilogue = "dg" if config.direct_gmem else "tma"
     return (
         f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
-        f"/e{config.epilogue_tile_n}/{_MODE_LABELS[config.mode]}/{epilogue}"
+        f"/e{config.epilogue_tile_n}/c{config.cluster_m}"
+        f"/{_MODE_LABELS[config.mode]}/{epilogue}"
     )
 
 
@@ -81,6 +84,8 @@ def selected_candidates(n, k, args):
         candidates = tuple(
             c for c in candidates if c.epilogue_tile_n == args.epilogue_tile_n
         )
+    if args.cluster_m is not None:
+        candidates = tuple(c for c in candidates if c.cluster_m == args.cluster_m)
     if args.mode is not None:
         candidates = tuple(c for c in candidates if c.mode == args.mode)
     if args.direct_gmem:
@@ -101,13 +106,14 @@ def nvfp4_fc1_sol_bounds(router_scores, topk, n, k, config):
     active_experts = int((expert_rows > 0).sum().item())
     m = selected.numel()
     m_tasks = sum(
-        math.ceil(rows / config.tile_m) for rows in expert_rows.tolist() if rows
+        math.ceil(rows / (config.cluster_m * config.tile_m))
+        for rows in expert_rows.tolist() if rows
     )
-    task_count = m_tasks * (n // config.tile_n)
+    task_count = m_tasks * ((2 * n) // config.tile_n)
 
-    flops = 2 * m * n * k
+    flops = 4 * m * n * k
     routed_a_bytes = m * (k / 2 + k / 16)
-    b_bytes = active_experts * n * (k / 2 + k / 16)
+    b_bytes = active_experts * (2 * n) * (k / 2 + k / 16)
     c_bytes = 2 * m * n
     staged_sfb_n = max(config.tile_n, 128)
     tile_read_bytes = task_count * (
@@ -137,18 +143,50 @@ def build_reference(aq, bq, sfa, sfb, metadata, experts, n, k, out):
             aq,
             bq[expert].t(),
             sfa,
-            sfb[expert * n * (k // 16):(expert + 1) * n * (k // 16)],
-            out_dtype=torch.bfloat16,
+            sfb[expert * (2 * n) * (k // 16):(expert + 1) * (2 * n) * (k // 16)],
+            # The fused kernel applies SwiGLU to FP32 MMA accumulators and
+            # converts only the final result to BF16.  Keep the reference in
+            # the same order; rounding gate/up to BF16 first substantially
+            # magnifies error at large K.
+            out_dtype=torch.float32,
         )
         row_end = row_start + row_count
         if not torch.all(grouped_layout[row_start:row_end] == expert):
             raise AssertionError("metadata rows are not grouped by expert")
+        blocks = full_expert.reshape(full_expert.size(0), n // 32, 64)
+        gate = blocks[:, :, :32].reshape(full_expert.size(0), n)
+        up = blocks[:, :, 32:].reshape(full_expert.size(0), n)
+        swiglu = (torch.nn.functional.silu(gate.float()) * up.float()).to(torch.bfloat16)
         out[row_start:row_end].copy_(
-            full_expert.index_select(
-                0, metadata.source_rows[row_start:row_end].long()
-            )
-        )
+            swiglu.index_select(0, metadata.source_rows[row_start:row_end].long()))
         row_start = row_end
+
+
+def make_quantized_interleaved_weights(experts, n, k):
+    """Create physical `[gate, up]` weights without all-expert temporaries."""
+    bq = None
+    sfb = None
+    for expert in range(experts):
+        # The physical layout is already block-interleaved; independently
+        # generated entries are equivalent to generating gate and up first.
+        b_expert = torch.randn(
+            (2 * n, k), device="cuda", dtype=torch.bfloat16
+        )
+        bq_expert, sfb_expert = quantize_nvfp4_rows(b_expert)
+        if bq is None:
+            bq = torch.empty(
+                (experts, 2 * n, k // 2), device="cuda", dtype=bq_expert.dtype
+            )
+            sfb = torch.empty(
+                (experts * sfb_expert.numel(),),
+                device="cuda",
+                dtype=sfb_expert.dtype,
+            )
+        bq[expert].copy_(bq_expert)
+        offset = expert * sfb_expert.numel()
+        sfb[offset : offset + sfb_expert.numel()].copy_(sfb_expert)
+        del b_expert, bq_expert, sfb_expert
+    return bq, sfb
 
 
 class Nvfp4Fc1Benchmark(BenchmarkBase):
@@ -168,10 +206,13 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
         self.add_sol_arg(parser)
         parser.add_argument("--debug", action="store_true")
         parser.add_argument("--no-accuracy", action="store_true")
+        parser.add_argument("--atol", type=float, default=2e-2)
+        parser.add_argument("--rtol", type=float, default=2e-2)
         parser.add_argument("--seed", type=int, default=self.seed)
-        parser.add_argument("--tile-n", type=int, choices=(64, 128))
+        parser.add_argument("--tile-n", type=int, choices=(64, 128, 256))
         parser.add_argument("--tile-k", type=int, choices=(64, 128, 256))
-        parser.add_argument("--epilogue-tile-n", type=int, choices=(32, 64, 128))
+        parser.add_argument("--epilogue-tile-n", type=int, choices=(64, 128))
+        parser.add_argument("--cluster-m", type=int, choices=(1, 2))
         parser.add_argument("--mode", type=int, choices=(0, 1, 2))
         parser.add_argument(
             "--direct-gmem",
@@ -191,17 +232,17 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
         token_values = (args.token,) if args.token else DEFAULT_TOKEN_VALUES
         if any(tokens <= 0 or tokens % 128 for tokens in token_values):
             raise SystemExit("every token count must be a positive multiple of 128")
-        if not selected_candidates(args.n, args.k, args):
+        if not selected_candidates(2 * args.n, args.k, args):
             raise SystemExit("no compatible NVFP4 FC1 configs match the filters")
         args.token_values = token_values
         return args
 
     def resolve_kernel(self, aq, bq, sfa, sfb, router, out, args):
-        candidates = selected_candidates(args.n, args.k, args)
+        candidates = selected_candidates(2 * args.n, args.k, args)
 
         def prepare(config):
             metadata = prepare_nvfp4_fc1_metadata(
-                router, args.topk, args.n, config=config
+                router, args.topk, 2 * args.n, config=config
             )
             run = lambda: nvfp4_fc1_out(
                 aq, bq, sfa, sfb, metadata, out, config=config
@@ -253,14 +294,11 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
 
     def run_with_args(self, args):
         torch.manual_seed(args.seed)
-        b = torch.randn(
-            (args.experts, args.n, args.k), device="cuda", dtype=torch.bfloat16
+        # Retain weights only in NVFP4 form.  Quantizing a single expert at a
+        # time caps the FP32 quantization workspace independently of E.
+        bq, sfb = make_quantized_interleaved_weights(
+            args.experts, args.n, args.k
         )
-        bq_flat, sfb = quantize_nvfp4_rows(
-            b.reshape(args.experts * args.n, args.k)
-        )
-        del b
-        bq = bq_flat.reshape(args.experts, args.n, args.k // 2)
 
         print(
             f"[config] experts={args.experts} topk={args.topk} "
@@ -298,7 +336,7 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
                 selection.prepared.run()
                 torch.cuda.synchronize()
                 max_diff = (out.float() - reference.float()).abs().max().item()
-                if not torch.equal(out, reference):
+                if not torch.allclose(out.float(), reference.float(), atol=args.atol, rtol=args.rtol):
                     raise AssertionError(f"NVFP4 FC1 mismatch: max diff {max_diff}")
 
             elapsed = selection.stats["median_ms"]

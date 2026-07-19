@@ -364,13 +364,14 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
         torch.manual_seed(args.seed)
         token_values = (args.token,) if args.token > 0 else DEFAULT_TOKEN_VALUES
 
-        gate_w = torch.empty(
-            (args.experts, args.n, args.k), device="cuda", dtype=torch.bfloat16
+        # The fused kernel consumes only this physical `[gate, up]` layout.
+        # Initialize it in place rather than retaining gate, up, and a third
+        # interleaved copy of the complete expert-weight set.
+        interleaved_w = torch.empty(
+            (args.experts, 2 * args.n, args.k),
+            device="cuda",
+            dtype=torch.bfloat16,
         ).uniform_(-1.0, 1.0)
-        up_w = torch.empty(
-            (args.experts, args.n, args.k), device="cuda", dtype=torch.bfloat16
-        ).uniform_(-1.0, 1.0)
-        interleaved_w = interleave_gate_up_weights(gate_w, up_w)
 
         baseline_config = GroupedMConfig(
             tile_m=128,
@@ -413,6 +414,18 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
 
             max_abs_diff = 0.0
             if args.check:
+                # Materialize the separate baseline operands only for an
+                # explicit correctness check, after tuning has completed.
+                weight_blocks = interleaved_w.view(
+                    args.experts, args.n // INTERLEAVE_BLOCK, 2,
+                    INTERLEAVE_BLOCK, args.k,
+                )
+                gate_w = weight_blocks[:, :, 0].reshape(
+                    args.experts, args.n, args.k
+                )
+                up_w = weight_blocks[:, :, 1].reshape(
+                    args.experts, args.n, args.k
+                )
                 grouped_a, grouped_layout = build_routed_reference(
                     a, router_scores, args.topk
                 )
@@ -424,6 +437,7 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
                     baseline_out,
                     baseline_config,
                 )
+                del gate_w, up_w, weight_blocks
                 selection.prepared.run()
                 torch.cuda.synchronize()
                 max_abs_diff = (baseline_out.float() - test_out.float()).abs().max().item()
