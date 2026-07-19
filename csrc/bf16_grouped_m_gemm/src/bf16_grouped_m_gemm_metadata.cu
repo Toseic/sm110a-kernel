@@ -3,6 +3,9 @@
 
 namespace {
 constexpr int kThreads = 256;
+#ifndef SM110A_NVFP4_GROUPED_TASK_N_MAJOR
+#define SM110A_NVFP4_GROUPED_TASK_N_MAJOR 1
+#endif
 constexpr int kMacroSwizzleM = 8;
 constexpr int kMacroSwizzleN = 8;
 
@@ -46,9 +49,20 @@ __global__ void build_expert_tile_tasks(
             const int group_end = min(group_row + kMacroSwizzleM * task_tile_rows, rows);
             for (int macro_n = 0; macro_n < grid_n; macro_n += kMacroSwizzleN) {
                 const int band_end = min(macro_n + kMacroSwizzleN, grid_n);
+#if SM110A_NVFP4_GROUPED_TASK_N_MAJOR
+                // Keep the B/SFB tile resident while traversing the M tiles.
+                // This matters most for large per-expert M, where the persistent
+                // scheduler has enough concurrent clusters to otherwise cycle
+                // through several N tiles before a B tile is revisited.
+                for (int tile_n = macro_n; tile_n < band_end; ++tile_n)
+                    for (int tile_row = group_row; tile_row < group_end;
+                         tile_row += task_tile_rows)
+                        tasks[next++] = {start, rows, tile_row, expert, tile_n};
+#else
                 for (int tile_row = group_row; tile_row < group_end; tile_row += task_tile_rows)
                     for (int tile_n = macro_n; tile_n < band_end; ++tile_n)
                         tasks[next++] = {start, rows, tile_row, expert, tile_n};
+#endif
             }
         }
     }

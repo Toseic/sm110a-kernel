@@ -46,7 +46,10 @@ class Nvfp4GroupedMModule:
 def _flags(c, variant):
     return tuple(f"-DSM110A_NVFP4_GROUPED_{k}={v}" for k,v in (
         ("TILE_M",c.tile_m),("TILE_N",c.tile_n),("TILE_K",c.tile_k),
-        ("EPILOGUE_TILE_N",c.epilogue_tile_n),("CLUSTER_M",c.cluster_m),("MODE",c.mode)))
+        ("EPILOGUE_TILE_N",c.epilogue_tile_n),("CLUSTER_M",c.cluster_m),("MODE",c.mode),
+        # The grouped-M task builder is compiled into this NVFP4 module too.
+        # N-major task order retains a B/SFB tile across consecutive M tiles.
+        ("TASK_N_MAJOR",1)))
 
 _JIT = SplitCudaJit(name="sm110a_nvfp4_grouped_m", root=_ROOT,
     binding_sources=(_SRC / "nvfp4_grouped_m_gemm_torch_binding.cpp",),
