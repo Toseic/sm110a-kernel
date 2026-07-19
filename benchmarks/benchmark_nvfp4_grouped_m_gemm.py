@@ -23,6 +23,7 @@ from common import (
 )
 from sm110a_kernel import (
     Nvfp4GroupedMConfig,
+    compile_nvfp4_grouped_m_gemm,
     nvfp4_grouped_m_gemm_out,
     prepare_nvfp4_grouped_m_metadata,
     quantize_nvfp4_rows,
@@ -168,6 +169,7 @@ class Nvfp4GroupedMGemmBenchmark(BenchmarkBase):
         )
         self.add_timing_args(parser, warmup=2, iters=5, samples=3)
         self.add_cache_args(parser)
+        self.add_pre_parallel_jit_arg(parser)
         self.add_sol_arg(parser)
         parser.add_argument("--debug", action="store_true")
         parser.add_argument("--no-accuracy", action="store_true")
@@ -253,6 +255,7 @@ class Nvfp4GroupedMGemmBenchmark(BenchmarkBase):
             warmup=args.warmup, iters=args.iters, samples=args.samples,
             cold_l2_flush=args._cold_l2_flush, cache_path=args.cache_path,
             force_sweep=args.force_sweep, debug=args.debug,
+            pre_parallel_jit=args.pre_parallel_jit,
         )
         m = tokens * args.experts
         return AutotuneRunner(options).resolve(
@@ -271,6 +274,7 @@ class Nvfp4GroupedMGemmBenchmark(BenchmarkBase):
             metric_formatter=lambda _config, stats: (
                 f"{tflops_from_ms(m,args.n,args.k,stats['median_ms']):.1f} TF/s"
             ),
+            pre_jit=compile_nvfp4_grouped_m_gemm,
         )
 
 

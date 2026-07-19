@@ -23,6 +23,9 @@ from sm110a_kernel import (
     bf16_grouped_m_gemm_out,
     prepare_grouped_m_metadata,
 )
+from sm110a_kernel.kernels.fc1_block_interleaved_swiglu import (
+    compile_fc1_block_interleaved_swiglu,
+)
 from sm110a_kernel.runner import AutotuneRunner, PreparedKernel, TuneOptions
 
 
@@ -215,6 +218,7 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
         parser = super().build_parser()
         self.add_timing_args(parser, warmup=2, iters=3, samples=3)
         self.add_cache_args(parser)
+        self.add_pre_parallel_jit_arg(parser)
         self.add_sol_arg(parser)
         parser.add_argument("--experts", type=int, default=DEFAULT_EXPERTS)
         parser.add_argument("--topk", type=int, default=DEFAULT_TOPK)
@@ -334,6 +338,7 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
             warmup=args.warmup, iters=args.iters, samples=args.samples,
             cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             cache_path=args.cache_path, force_sweep=args.force_sweep, debug=args.debug,
+            pre_parallel_jit=args.pre_parallel_jit,
         )
         return AutotuneRunner(options).resolve(
             candidates,
@@ -349,6 +354,7 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
             format_candidate=format_candidate,
             namespace="fc1_block_interleaved_swiglu",
             key=(a.size(0), interleaved_w.size(1) // 2, a.size(1), topk),
+            pre_jit=compile_fc1_block_interleaved_swiglu,
             metric_formatter=lambda _config, stats: (
                 f"{routed_fc1_swiglu_tflops_from_ms(a.size(0), topk, interleaved_w.size(1) // 2, a.size(1), stats['median_ms']):.1f} TF/s"
             ),

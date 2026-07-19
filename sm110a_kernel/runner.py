@@ -15,6 +15,7 @@ import json
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Generic, Sequence, TypeVar
@@ -38,6 +39,7 @@ class TuneOptions:
     cache_path: Path | str | None = None
     force_sweep: bool = False
     debug: bool = False
+    pre_parallel_jit: bool = False
 
 
 @dataclass
@@ -146,6 +148,7 @@ class AutotuneRunner:
         probe: Callable[[PreparedKernel[T]], float] | None,
         format_candidate: Callable[[T], str],
         metric_formatter: Callable[[T, dict], str] | None = None,
+        pre_jit: Callable[[T], object] | None = None,
     ) -> Selection[T]:
         candidates = tuple(candidates)
         if not candidates:
@@ -167,6 +170,46 @@ class AutotuneRunner:
                 f"{elapsed_ms:>12.4f}  {metric:<12}  {'*' if best else ''}",
                 flush=True,
             )
+
+        if self.options.pre_parallel_jit:
+            if pre_jit is None:
+                raise ValueError(
+                    "pre_parallel_jit requires a pre_jit callback"
+                )
+            workers = min(
+                len(candidates),
+                int(os.environ.get("SM110A_JIT_MAX_WORKERS", "10")),
+            )
+            if workers <= 0:
+                raise ValueError("SM110A_JIT_MAX_WORKERS must be positive")
+            if self.options.debug:
+                print(
+                    f"[jit] pre-parallel {namespace}: "
+                    f"{len(candidates)} configs, {workers} workers",
+                    flush=True,
+                )
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(pre_jit, candidate) for candidate in candidates]
+                if self.options.debug:
+                    from tqdm import tqdm
+
+                    with tqdm(
+                        total=len(futures),
+                        desc=f"pre-parallel {namespace}",
+                        unit="config",
+                    ) as progress:
+                        for future in as_completed(futures):
+                            future.result()
+                            progress.update(1)
+                else:
+                    for future in futures:
+                        future.result()
+            if self.options.debug:
+                print(
+                    f"[jit] pre-parallel {namespace} complete: "
+                    f"{len(candidates)} configs",
+                    flush=True,
+                )
 
         if not self.options.force_sweep:
             entry = self._load().get("environments", {}).get(self.fingerprint, {}).get(namespace, {}).get(key_string)

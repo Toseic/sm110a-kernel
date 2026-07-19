@@ -75,6 +75,22 @@ class BenchmarkBase:
             ),
         )
 
+    def add_pre_parallel_jit_arg(self, parser):
+        group = parser.add_mutually_exclusive_group()
+        group.add_argument(
+            "--pre-parallel-jit",
+            action="store_true",
+            dest="pre_parallel_jit",
+            default=True,
+            help="compile all compatible JIT configurations in parallel before benchmarking",
+        )
+        group.add_argument(
+            "--no-pre-parallel-jit",
+            action="store_false",
+            dest="pre_parallel_jit",
+            help="disable parallel JIT precompilation",
+        )
+
     def add_timing_args(self, parser, *, warmup=20, iters=20, samples=7):
         parser.add_argument("--warmup", type=int, default=warmup)
         parser.add_argument("--iters", type=int, default=iters)
@@ -170,6 +186,7 @@ class BenchmarkBase:
     def make_table_printer(self, columns):
         return TablePrinter(columns)
 
+
 class GemmBenchmarkBase(BenchmarkBase):
     """Base class for benchmarks that sweep M/N/K GEMM shapes."""
 
@@ -193,6 +210,7 @@ class GemmBenchmarkBase(BenchmarkBase):
             default="cublaslt",
         )
         self.add_cache_args(parser)
+        self.add_pre_parallel_jit_arg(parser)
         self.add_sol_arg(parser)
         self.add_arguments(parser)
         return parser

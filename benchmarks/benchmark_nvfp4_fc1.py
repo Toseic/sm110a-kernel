@@ -23,6 +23,7 @@ from common import (
 )
 from sm110a_kernel import (
     Nvfp4Fc1Config,
+    compile_nvfp4_fc1,
     nvfp4_fc1_out,
     prepare_nvfp4_fc1_metadata,
     quantize_nvfp4_rows,
@@ -163,6 +164,7 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
         )
         self.add_timing_args(parser, warmup=2, iters=5, samples=3)
         self.add_cache_args(parser)
+        self.add_pre_parallel_jit_arg(parser)
         self.add_sol_arg(parser)
         parser.add_argument("--debug", action="store_true")
         parser.add_argument("--no-accuracy", action="store_true")
@@ -223,6 +225,7 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
             cache_path=args.cache_path,
             force_sweep=args.force_sweep,
             debug=args.debug,
+            pre_parallel_jit=args.pre_parallel_jit,
         )
         routed_m = aq.size(0) * args.topk
         selection = AutotuneRunner(options).resolve(
@@ -244,6 +247,7 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
             metric_formatter=lambda _config, stats: (
                 f"{tflops_from_ms(routed_m, args.n, args.k, stats['median_ms']):.1f} TF/s"
             ),
+            pre_jit=compile_nvfp4_fc1,
         )
         return selection, prepared_metadata[selection.candidate]
 

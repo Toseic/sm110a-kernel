@@ -20,6 +20,7 @@ from common import (
 )
 from sm110a_kernel import (
     GroupedMConfig,
+    compile_bf16_grouped_m_gemm,
     bf16_grouped_m_gemm_out,
     prepare_grouped_m_metadata,
 )
@@ -275,6 +276,7 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
         )
         self.add_torch_blas_arg(parser)
         self.add_cache_args(parser)
+        self.add_pre_parallel_jit_arg(parser)
         self.add_sol_arg(parser)
         parser.add_argument(
             "--token",
@@ -380,6 +382,7 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
             warmup=args.warmup, iters=args.iters, samples=args.samples,
             cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             cache_path=args.cache_path, force_sweep=args.force_sweep, debug=args.debug,
+            pre_parallel_jit=args.pre_parallel_jit,
         )
         return AutotuneRunner(options).resolve(
             candidates,
@@ -399,6 +402,7 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
             metric_formatter=lambda _candidate, stats: (
                 f"{tflops_from_ms(a.size(0), n, k, stats['median_ms']):.1f} TF/s"
             ),
+            pre_jit=lambda candidate: compile_bf16_grouped_m_gemm(candidate[0]),
         )
 
 

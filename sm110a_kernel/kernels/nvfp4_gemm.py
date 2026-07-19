@@ -50,6 +50,7 @@ def _kernel_cflags(config: Nvfp4GemmConfig) -> tuple[str, ...]:
 
 _MODULE_CACHE = {}
 _CACHE_LOCK = threading.Lock()
+_MODULE_LOCKS = {}
 
 
 def compile_nvfp4_gemm(config: Nvfp4GemmConfig | None = None):
@@ -74,8 +75,17 @@ def compile_nvfp4_gemm(config: Nvfp4GemmConfig | None = None):
                       source_digest(paths, _ROOT)))
     name = "sm110a_nvfp4_gemm_jit_" + hashlib.sha256(signature.encode()).hexdigest()[:16]
     with _CACHE_LOCK:
-        if name in _MODULE_CACHE:
-            return _MODULE_CACHE[name]
+        cached = _MODULE_CACHE.get(name)
+        if cached is not None:
+            return cached
+        module_lock = _MODULE_LOCKS.setdefault(name, threading.Lock())
+    # Serialize only callers compiling the same module.  Different configs
+    # must be allowed to build concurrently for --pre-parallel-jit.
+    with module_lock:
+        with _CACHE_LOCK:
+            cached = _MODULE_CACHE.get(name)
+            if cached is not None:
+                return cached
         flags = list(_kernel_cflags(config))
         module = load(
             name=name,
@@ -87,7 +97,8 @@ def compile_nvfp4_gemm(config: Nvfp4GemmConfig | None = None):
             build_directory=jit_build_directory(name),
             verbose=os.environ.get("SM110A_JIT_VERBOSE", "0") == "1",
         )
-        _MODULE_CACHE[name] = module
+        with _CACHE_LOCK:
+            _MODULE_CACHE[name] = module
         return module
 
 

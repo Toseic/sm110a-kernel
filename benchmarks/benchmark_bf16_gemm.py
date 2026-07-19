@@ -22,6 +22,7 @@ from common import (
 )
 from sm110a_kernel import (
     Bf16GemmConfig,
+    compile_bf16_gemm,
     bf16_gemm_out,
     bf16_gemm_nt_out,
     CuteDslBf16GemmRunner,
@@ -288,6 +289,7 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
                     cache_path=getattr(args, "cache_path", None),
                     force_sweep=getattr(args, "force_sweep", False),
                     debug=args.debug,
+                    pre_parallel_jit=args.pre_parallel_jit,
                 )
             )
             baseline_name = "CuTE DSL"
@@ -348,6 +350,7 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
             cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             cache_path=getattr(args, "cache_path", None),
             force_sweep=getattr(args, "force_sweep", False), debug=args.debug,
+            pre_parallel_jit=args.pre_parallel_jit,
         )
         return AutotuneRunner(options).resolve(
             candidates,
@@ -367,6 +370,7 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
             metric_formatter=lambda _candidate, stats: (
                 f"{tflops_from_ms(m, n, k, stats['median_ms']):.1f} TF/s"
             ),
+            pre_jit=lambda candidate: compile_bf16_gemm(candidate[0]),
         )
 
     def print_result(self, shape, result):

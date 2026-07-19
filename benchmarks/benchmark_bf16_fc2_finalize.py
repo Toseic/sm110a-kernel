@@ -20,6 +20,8 @@ from common import (
 from sm110a_kernel import (
     Fc2FinalizeConfig,
     GroupedMConfig,
+    compile_bf16_grouped_m_gemm,
+    compile_fc2_finalize,
     fc2_finalize_with_routing_out,
     pack_routing_metadata,
     prepare_grouped_m_metadata,
@@ -159,6 +161,7 @@ class Fc2FinalizeBenchmark(BenchmarkBase):
         parser = super().build_parser()
         self.add_timing_args(parser, warmup=2, iters=3, samples=3)
         self.add_cache_args(parser)
+        self.add_pre_parallel_jit_arg(parser)
         self.add_sol_arg(parser)
         parser.add_argument("--experts", type=int, default=DEFAULT_EXPERTS)
         parser.add_argument("--topk", type=int, default=DEFAULT_TOPK)
@@ -219,6 +222,7 @@ class Fc2FinalizeBenchmark(BenchmarkBase):
                 warmup=args.warmup, iters=args.iters, samples=args.samples,
                 cold_l2_flush=args._cold_l2_flush, cache_path=args.cache_path,
                 force_sweep=args.force_sweep, debug=args.debug,
+                pre_parallel_jit=args.pre_parallel_jit,
             )
             selection = AutotuneRunner(options).resolve(
                 candidates,
@@ -233,6 +237,19 @@ class Fc2FinalizeBenchmark(BenchmarkBase):
                 format_candidate=format_candidate,
                 namespace="fc2_finalize",
                 key=(tokens, args.experts, args.topk, args.h, args.i),
+                pre_jit=lambda config: (
+                    compile_fc2_finalize(config),
+                    compile_bf16_grouped_m_gemm(
+                        GroupedMConfig(
+                            tile_m=config.tile_m,
+                            tile_n=config.tile_n,
+                            tile_k=config.tile_k,
+                            epilogue_tile_n=config.epilogue_tile_n,
+                            cluster_m=config.cluster_m,
+                            mode=1,
+                        )
+                    ),
+                ),
                 metric_formatter=lambda _config, result: f"{fc2_tflops(tokens, args.topk, args.h, args.i, result['median_ms']):.1f} TF/s",
             )
             best_config, stats = selection.candidate, selection.stats

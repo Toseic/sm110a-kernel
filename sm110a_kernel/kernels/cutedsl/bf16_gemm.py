@@ -189,6 +189,13 @@ class CuteDslBf16GemmRunner:
         )
 
     def _prepare(self, config: CuteDslBf16GemmConfig) -> PreparedKernel[CuteDslBf16GemmConfig]:
+        compiled = self._compile(config)
+        run = lambda: compiled(self.a, self.b, self.c, self.stream)
+        run()
+        torch.cuda.synchronize()
+        return PreparedKernel(config, run)
+
+    def _compile(self, config: CuteDslBf16GemmConfig):
         gemm = PersistentDenseGemmKernel(
             cutlass.Float32, config.use_2cta_instrs,
             (config.mma_tile_m, config.mma_tile_n),
@@ -202,10 +209,7 @@ class CuteDslBf16GemmRunner:
                 _launch_dense_gemm, gemm, self.a, self.b, self.c, active_clusters,
                 make_fake_stream(), options="--opt-level 2",
             )
-        run = lambda: compiled(self.a, self.b, self.c, self.stream)
-        run()
-        torch.cuda.synchronize()
-        return PreparedKernel(config, run)
+        return compiled
 
     def autotune(self, options: TuneOptions | None = None) -> Selection[CuteDslBf16GemmConfig]:
         options = options or TuneOptions()
@@ -220,6 +224,7 @@ class CuteDslBf16GemmRunner:
             metric_formatter=lambda _config, stats: (
                 f"{2.0 * self.m * self.n * self.k / (stats['median_ms'] * 1.0e9):.1f} TF/s"
             ),
+            pre_jit=self._compile,
         )
         return self.selection
 

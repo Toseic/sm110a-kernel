@@ -23,6 +23,7 @@ from common import (
 )
 from sm110a_kernel import (
     Nvfp4GemmConfig,
+    compile_nvfp4_gemm,
     nvfp4_gemm_out,
     quantize_nvfp4_gemm,
 )
@@ -121,6 +122,7 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
             help="print per-config runner probe and timing details",
         )
         self.add_cache_args(parser)
+        self.add_pre_parallel_jit_arg(parser)
         parser.add_argument(
             "--cache-path", default=None,
             help="autotune cache path (default: profiles/autotune_cache.json)",
@@ -214,6 +216,7 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
             cache_path=args.cache_path,
             force_sweep=args.force_sweep,
             debug=args.debug,
+            pre_parallel_jit=args.pre_parallel_jit,
         )
         return AutotuneRunner(options).resolve(
             candidates,
@@ -236,6 +239,7 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
             metric_formatter=lambda _config, stats: (
                 f"{tflops_from_ms(m, n, k, stats['median_ms']):.1f} TF/s"
             ),
+            pre_jit=compile_nvfp4_gemm,
         )
 
 
