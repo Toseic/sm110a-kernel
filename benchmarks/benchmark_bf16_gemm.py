@@ -126,18 +126,18 @@ def print_result(m, n, k, kernel_stats, baseline_stats, max_abs_diff, best_candi
 def run_accuracy_check(args):
     print("[accuracy] small shape with correctness check")
     print("[runner] resolving kernel config")
-    accuracy_args = argparse.Namespace(
+    # Keep every command-line option (notably the local kernel's
+    # ``pre_parallel_jit`` flag) and override only the short accuracy run's
+    # timing/check settings.  A hand-maintained Namespace easily drifts when
+    # new benchmark options are added.
+    accuracy_options = vars(args).copy()
+    accuracy_options.update(
         warmup=2,
         iters=20,
         samples=7,
         skip_check=False,
-        baseline=args.baseline,
-        debug=args.debug,
-        cold_l2=getattr(args, "cold_l2", True),
-        _cold_l2_flush=getattr(args, "_cold_l2_flush", None),
-        cache_path=getattr(args, "cache_path", None),
-        force_sweep=getattr(args, "force_sweep", False),
     )
+    accuracy_args = argparse.Namespace(**accuracy_options)
     bench = Bf16GemmBenchmark()
     kernel_stats, baseline_stats, max_abs_diff, baseline_name, best_candidate = bench.run_case(
         *ACCURACY_SHAPE, args=accuracy_args
@@ -173,6 +173,15 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
             "--debug",
             action="store_true",
             help="Print per-config sweep details",
+        )
+        parser.add_argument(
+            "--cutedsl-pre-parallel-jit",
+            action="store_true",
+            help=(
+                "compile CuTE DSL baseline configurations in parallel before "
+                "benchmarking (disabled by default because CuTE DSL JIT is "
+                "not thread-safe)"
+            ),
         )
 
     def validate_args(self, args):
@@ -289,7 +298,10 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
                     cache_path=getattr(args, "cache_path", None),
                     force_sweep=getattr(args, "force_sweep", False),
                     debug=args.debug,
-                    pre_parallel_jit=args.pre_parallel_jit,
+                    # CuTE DSL's compiler has process-global session state and
+                    # cannot safely compile configurations concurrently.  Keep
+                    # this separate from the local kernel's parallel JIT flag.
+                    pre_parallel_jit=args.cutedsl_pre_parallel_jit,
                 )
             )
             baseline_name = "CuTE DSL"

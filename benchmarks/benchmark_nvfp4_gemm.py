@@ -22,6 +22,7 @@ from common import (
     tflops_from_ms,
 )
 from sm110a_kernel import (
+    CuteDslNvfp4GemmRunner,
     Nvfp4GemmConfig,
     compile_nvfp4_gemm,
     nvfp4_gemm_out,
@@ -114,12 +115,25 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
         parser.add_argument("--no-accuracy", action="store_true")
         parser.add_argument("--seed", type=int, default=1234)
         parser.add_argument(
+            "--baseline", choices=("torch", "cutedsl"), default="torch",
+            help="reference implementation to benchmark",
+        )
+        parser.add_argument(
             "--sol", action="store_true",
             help="print analytical NVFP4 MMA/HBM/L2 SOL bounds",
         )
         parser.add_argument(
             "--debug", action="store_true",
             help="print per-config runner probe and timing details",
+        )
+        parser.add_argument(
+            "--cutedsl-pre-parallel-jit",
+            action="store_true",
+            help=(
+                "compile CuTE DSL baseline configurations in parallel before "
+                "benchmarking (disabled by default because CuTE DSL JIT is "
+                "not thread-safe)"
+            ),
         )
         self.add_cache_args(parser)
         self.add_pre_parallel_jit_arg(parser)
@@ -148,10 +162,13 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
         table = TablePrinter((
             ("M", 8), ("N", 8), ("K", 8),
             ("Kernel(ms)", 14), ("Kernel TF/s", 15),
-            ("Torch(ms)", 14), ("Torch TF/s", 15),
+            ("Baseline(ms)", 14), ("Baseline TF/s", 15),
             ("Speedup", 10), ("MaxDiff", 12), ("BestConfig", 24),
         ))
-        print("[baseline] torch._scaled_mm NVFP4")
+        if args.baseline == "cutedsl":
+            print("[baseline] CuTE DSL persistent NVFP4 GEMM (autotuned)")
+        else:
+            print("[baseline] torch._scaled_mm NVFP4")
         print("[runner] config selection is cached per workload and CUDA environment")
         table.print_header()
         for m, n, k in args.shapes:
@@ -160,9 +177,21 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
             aq, bq, sfa, sfb = quantize_nvfp4_gemm(a, b)
             out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
             ref = torch.empty_like(out)
-            baseline_fn = lambda: torch._scaled_mm(
-                aq, bq.t(), sfa, sfb, out_dtype=torch.bfloat16, out=ref
-            )
+            if args.baseline == "cutedsl":
+                cute_dsl_runner = CuteDslNvfp4GemmRunner(aq, bq, sfa, sfb, ref)
+                cute_dsl_runner.autotune(TuneOptions(
+                    warmup=args.warmup, iters=args.iters, samples=args.samples,
+                    cold_l2_flush=args._cold_l2_flush, cache_path=args.cache_path,
+                    force_sweep=args.force_sweep, debug=args.debug,
+                    # Keep this separate from the local kernel's JIT option:
+                    # CuTE DSL compilation has process-global session state.
+                    pre_parallel_jit=args.cutedsl_pre_parallel_jit,
+                ))
+                baseline_fn = cute_dsl_runner.run
+            else:
+                baseline_fn = lambda: torch._scaled_mm(
+                    aq, bq.t(), sfa, sfb, out_dtype=torch.bfloat16, out=ref
+                )
             baseline_stats = benchmark_with_stats(
                 baseline_fn, args.warmup, args.iters, args.samples,
                 cold_l2_flush=args._cold_l2_flush,
@@ -177,7 +206,7 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
                 baseline_fn()
                 torch.cuda.synchronize()
                 max_diff = (out.float() - ref.float()).abs().max().item()
-                if not torch.equal(out, ref):
+                if args.baseline == "torch" and not torch.equal(out, ref):
                     raise AssertionError(
                         f"NVFP4 mismatch for {m}x{n}x{k}: max diff {max_diff}"
                     )
