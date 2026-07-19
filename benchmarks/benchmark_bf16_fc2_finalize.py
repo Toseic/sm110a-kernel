@@ -134,8 +134,11 @@ def benchmark_fc2(fc1, weights, routing_weights, routing, topk, out, config, arg
 
 def probe_fc2(fc1, weights, routing_weights, routing, topk, out, config, args):
     grouped_metadata = prepare_fc2_metadata(routing, weights, fc1, config)
-    return quick_probe(lambda: run_fc2(fc1, weights, routing_weights, routing, grouped_metadata, topk, out, config),
-                       cold_l2_flush=args._cold_l2_flush)
+    return quick_probe(
+        lambda: run_fc2(fc1, weights, routing_weights, routing, grouped_metadata, topk, out, config),
+        args.iters,
+        cold_l2_flush=args._cold_l2_flush,
+    )
 
 
 def reference_fc2(fc1, weights, routing_weights, selected, grouped_order, tokens, topk, h):
@@ -225,7 +228,7 @@ class Fc2FinalizeBenchmark(BenchmarkBase):
                     cold_l2_flush=args._cold_l2_flush,
                 ),
                 probe=lambda prepared: quick_probe(
-                    prepared.run, cold_l2_flush=args._cold_l2_flush,
+                    prepared.run, args.iters, cold_l2_flush=args._cold_l2_flush,
                 ),
                 format_candidate=format_candidate,
                 namespace="fc2_finalize",

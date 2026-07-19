@@ -134,6 +134,7 @@ def probe_grouped_kernel(a, b, layout, out, config, swap_ab, args):
         lambda: bf16_grouped_m_gemm_out(
             a, b, metadata, out, config=config, swap_ab=swap_ab
         ),
+        args.iters,
         cold_l2_flush=getattr(args, "_cold_l2_flush", None),
     )
 
@@ -388,7 +389,8 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
                 cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             ),
             probe=lambda prepared: quick_probe(
-                prepared.run, cold_l2_flush=getattr(args, "_cold_l2_flush", None)
+                prepared.run, args.iters,
+                cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             ),
             format_candidate=lambda candidate: format_candidate(
                 candidate[0], candidate[1]

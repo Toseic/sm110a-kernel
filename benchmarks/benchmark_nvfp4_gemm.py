@@ -39,10 +39,6 @@ DEFAULT_SHAPES = (
     (11008, 4096, 4096),
 )
 
-CALIBRATION_REFERENCE_WORK = 1024 * 1024 * 1024
-CALIBRATION_REFERENCE_MS = 50.0
-CALIBRATION_MIN_MS = 1.0
-CALIBRATION_MAX_MS = 50.0
 NVFP4_MMA_PEAK_TFLOPS = 4.0 * 250.0
 
 NVFP4_GEMM_CONFIGS = tuple(
@@ -75,14 +71,6 @@ def format_candidate(config):
     return (
         f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
         f"/c{config.cluster_m}/e{config.epilogue_block_n}"
-    )
-
-
-def calibration_target_ms(m, n, k):
-    work_scale = (m * n * k) / CALIBRATION_REFERENCE_WORK
-    return min(
-        CALIBRATION_MAX_MS,
-        max(CALIBRATION_MIN_MS, CALIBRATION_REFERENCE_MS * work_scale),
     )
 
 
@@ -165,13 +153,6 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
         print("[runner] config selection is cached per workload and CUDA environment")
         table.print_header()
         for m, n, k in args.shapes:
-            target_ms = calibration_target_ms(m, n, k)
-            if args.debug:
-                print(
-                    f"[runner] resolving {m}x{n}x{k}; "
-                    f"target sample {target_ms:.2f} ms",
-                    flush=True,
-                )
             a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
             b = torch.randn((k, n), device="cuda", dtype=torch.bfloat16)
             aq, bq, sfa, sfb = quantize_nvfp4_gemm(a, b)
@@ -183,7 +164,6 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
             baseline_stats = benchmark_with_stats(
                 baseline_fn, args.warmup, args.iters, args.samples,
                 cold_l2_flush=args._cold_l2_flush,
-                target_ms=target_ms,
             )
             selection = self.resolve_kernel(
                 aq, bq, sfa, sfb, out, m, n, k, args,
@@ -218,8 +198,6 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
         candidates = compatible_candidates(m, n, k)
         if not candidates:
             raise RuntimeError(f"no NVFP4 config supports M={m}, N={n}, K={k}")
-        target_ms = calibration_target_ms(m, n, k)
-
         def prepare(config):
             run = lambda: nvfp4_gemm_out(
                 aq, bq, sfa, sfb, out, config=config,
@@ -248,12 +226,11 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
                 args.iters,
                 args.samples,
                 cold_l2_flush=getattr(args, "_cold_l2_flush", None),
-                target_ms=target_ms,
             ),
             probe=lambda prepared: quick_probe(
                 prepared.run,
+                args.iters,
                 cold_l2_flush=getattr(args, "_cold_l2_flush", None),
-                target_ms=target_ms,
             ),
             format_candidate=format_candidate,
             metric_formatter=lambda _config, stats: (

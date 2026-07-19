@@ -205,6 +205,7 @@ def probe_fused_kernel(a, interleaved_w, router_scores, topk, out, config, args)
     torch.cuda.synchronize()
     return quick_probe(
         lambda: run_fused(a, interleaved_w, metadata, out, config),
+        args.iters,
         cold_l2_flush=getattr(args, "_cold_l2_flush", None),
     )
 
@@ -342,7 +343,8 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
                 cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             ),
             probe=lambda prepared: quick_probe(
-                prepared.run, cold_l2_flush=getattr(args, "_cold_l2_flush", None)
+                prepared.run, args.iters,
+                cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             ),
             format_candidate=format_candidate,
             namespace="fc1_block_interleaved_swiglu",

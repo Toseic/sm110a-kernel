@@ -7,8 +7,6 @@ import statistics
 import torch
 
 
-TARGET_SAMPLE_MS = 50.0
-PROBE_TARGET_MS = 10.0       # quick probe target — small enough to be fast
 EARLY_STOP_RATIO = 1.3       # skip config if probe > best_probe * this
 MMA_PEAK_TFLOPS = 250.0
 GMEM_BW_GBPS = 273.0
@@ -177,6 +175,9 @@ class GemmBenchmarkBase(BenchmarkBase):
 
     default_shapes = ()
 
+    def baseline_choices(self):
+        return ("torch", "cublaslt")
+
     def build_parser(self):
         parser = argparse.ArgumentParser()
         parser.add_argument("--m", type=int, default=0)
@@ -188,7 +189,7 @@ class GemmBenchmarkBase(BenchmarkBase):
         self.add_torch_blas_arg(parser)
         parser.add_argument(
             "--baseline",
-            choices=("torch", "cublaslt"),
+            choices=self.baseline_choices(),
             default="cublaslt",
         )
         self.add_cache_args(parser)
@@ -304,16 +305,6 @@ def print_sol_report(bounds, measured_ms, *, label="SOL"):
     print(f"      tile-read:    {bounds['tile_read_bytes'] / _DECIMAL_MB:.1f} MB")
 
 
-def calibrate_iters(initial_ms, requested_iters, target_ms=TARGET_SAMPLE_MS):
-    if initial_ms <= 0.0:
-        return requested_iters
-    total_ms = initial_ms * requested_iters
-    if total_ms >= target_ms:
-        return requested_iters
-    scale = target_ms / total_ms
-    return max(requested_iters, math.ceil(requested_iters * scale))
-
-
 def summarize_samples(samples, measured_iters):
     samples = sorted(samples)
     return {
@@ -383,38 +374,22 @@ def benchmark_once_batched(fn, warmup, iters, cold_l2_flush=None):
     return sum(start.elapsed_time(end) for start, end in events) / iters
 
 
-def benchmark_with_stats(
-    fn, warmup, iters, samples, cold_l2_flush=None, target_ms=TARGET_SAMPLE_MS
-):
-    probe_ms = benchmark_once(fn, warmup, iters, cold_l2_flush)
-    measured_iters = calibrate_iters(probe_ms, iters, target_ms=target_ms)
-
-    timings = [benchmark_once(fn, warmup, measured_iters, cold_l2_flush)]
+def benchmark_with_stats(fn, warmup, iters, samples, cold_l2_flush=None):
+    """Time exactly ``iters`` kernel launches per sample."""
+    timings = [benchmark_once(fn, warmup, iters, cold_l2_flush)]
     for _ in range(1, samples):
-        timings.append(benchmark_once(fn, 0, measured_iters, cold_l2_flush))
-    return summarize_samples(timings, measured_iters)
+        timings.append(benchmark_once(fn, 0, iters, cold_l2_flush))
+    return summarize_samples(timings, iters)
 
 
-def benchmark_with_stats_batched(
-    fn, warmup, iters, samples, cold_l2_flush=None, target_ms=TARGET_SAMPLE_MS
-):
-    probe_ms = benchmark_once_batched(fn, warmup, iters, cold_l2_flush)
-    measured_iters = calibrate_iters(probe_ms, iters, target_ms=target_ms)
-
-    timings = [benchmark_once_batched(fn, warmup, measured_iters, cold_l2_flush)]
+def benchmark_with_stats_batched(fn, warmup, iters, samples, cold_l2_flush=None):
+    """Time exactly ``iters`` batched kernel launches per sample."""
+    timings = [benchmark_once_batched(fn, warmup, iters, cold_l2_flush)]
     for _ in range(1, samples):
-        timings.append(
-            benchmark_once_batched(fn, 0, measured_iters, cold_l2_flush)
-        )
-    return summarize_samples(timings, measured_iters)
+        timings.append(benchmark_once_batched(fn, 0, iters, cold_l2_flush))
+    return summarize_samples(timings, iters)
 
 
-def quick_probe(
-    fn, cold_l2_flush=None, target_ms=PROBE_TARGET_MS
-):
-    """Lightweight size-aware probe for early-stop decisions."""
-    ms = benchmark_once(fn, warmup=2, iters=5, cold_l2_flush=cold_l2_flush)
-    iters = calibrate_iters(ms, 5, target_ms=target_ms)
-    return benchmark_once(
-        fn, warmup=0, iters=iters, cold_l2_flush=cold_l2_flush
-    )
+def quick_probe(fn, iters, cold_l2_flush=None):
+    """Probe using exactly ``iters`` launches for early-stop decisions."""
+    return benchmark_once(fn, warmup=2, iters=iters, cold_l2_flush=cold_l2_flush)

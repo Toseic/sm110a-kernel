@@ -265,7 +265,7 @@ class Nvfp4GroupedMGemmBenchmark(BenchmarkBase):
                 cold_l2_flush=args._cold_l2_flush,
             ),
             probe=lambda prepared: quick_probe(
-                prepared.run, cold_l2_flush=args._cold_l2_flush
+                prepared.run, args.iters, cold_l2_flush=args._cold_l2_flush
             ),
             format_candidate=format_candidate,
             metric_formatter=lambda _config, stats: (

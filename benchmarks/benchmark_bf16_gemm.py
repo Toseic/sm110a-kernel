@@ -23,6 +23,8 @@ from common import (
 from sm110a_kernel import (
     Bf16GemmConfig,
     bf16_gemm_out,
+    bf16_gemm_nt_out,
+    CuteDslBf16GemmRunner,
     cublaslt_gemm_out,
     cublaslt_gemm_out_batched,
 )
@@ -42,13 +44,6 @@ DEFAULT_SHAPES = [
 ]
 ACCURACY_SHAPE = (512, 512, 512)
 CUBLASLT_WORKSPACE_BYTES = 32 * 1024 * 1024
-# Keep the per-config measurement work proportional to GEMM work.  The
-# bounds prevent tiny GEMMs from being dominated by launch/event overhead and
-# large GEMMs from making a sweep unnecessarily long.
-CALIBRATION_REFERENCE_WORK = 1024 * 1024 * 1024
-CALIBRATION_REFERENCE_MS = 50.0
-CALIBRATION_MIN_MS = 1.0
-CALIBRATION_MAX_MS = 50.0
 BF16_GEMM_CONFIGS = tuple(
     Bf16GemmConfig(
         tile_m=128,
@@ -99,15 +94,6 @@ def format_candidate(candidate):
     )
 
 
-def calibration_target_ms(m, n, k):
-    """Return a size-aware target duration for one timing sample."""
-    work_scale = (m * n * k) / CALIBRATION_REFERENCE_WORK
-    return min(
-        CALIBRATION_MAX_MS,
-        max(CALIBRATION_MIN_MS, CALIBRATION_REFERENCE_MS * work_scale),
-    )
-
-
 def gemm_sol_bounds(m, n, k, config, swap_ab=False):
     """SOL model for the selected standard-GEMM mainloop configuration."""
     if swap_ab:
@@ -148,6 +134,8 @@ def run_accuracy_check(args):
         debug=args.debug,
         cold_l2=getattr(args, "cold_l2", True),
         _cold_l2_flush=getattr(args, "_cold_l2_flush", None),
+        cache_path=getattr(args, "cache_path", None),
+        force_sweep=getattr(args, "force_sweep", False),
     )
     bench = Bf16GemmBenchmark()
     kernel_stats, baseline_stats, max_abs_diff, baseline_name, best_candidate = bench.run_case(
@@ -175,6 +163,9 @@ def run_accuracy_check(args):
 
 class Bf16GemmBenchmark(GemmBenchmarkBase):
     default_shapes = DEFAULT_SHAPES
+
+    def baseline_choices(self):
+        return ("torch", "cublaslt", "cutedsl")
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -218,6 +209,9 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
             run_accuracy_check(args)
 
     def emit_runtime_banner(self, args, actual_blas):
+        if args.baseline == "cutedsl":
+            print("[baseline] CuTE DSL persistent BF16 GEMM (autotuned)")
+            return "CuTE DSL"
         baseline_name = super().emit_runtime_banner(args, actual_blas)
         print(
             "[runner] config selection is cached per workload and CUDA environment"
@@ -245,20 +239,18 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
         self.make_result_table(baseline_name).print_header()
 
     def run_case(self, m, n, k, args):
-        target_ms = calibration_target_ms(m, n, k)
-        if args.debug:
-            print(
-                f"[calibration] work={m}x{n}x{k} target={target_ms:.2f}ms",
-                flush=True,
-            )
         a = torch.empty((m, k), device="cuda", dtype=torch.bfloat16)
         b = torch.empty((k, n), device="cuda", dtype=torch.bfloat16)
         a.uniform_(-1.0, 1.0)
         b.uniform_(-1.0, 1.0)
+        # Native TMA loads B as contiguous (N, K).  Pack once before all
+        # measurements; the benchmark operation remains a(M,K) @ b(K,N).
+        b_kernel = b.transpose(0, 1).contiguous()
 
         out_kernel = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
         out_baseline = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
         workspace = None
+        cute_dsl_runner = None
 
         if args.baseline == "torch":
             baseline_name = "Torch"
@@ -284,13 +276,34 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
                 args.iters,
                 args.samples,
                 cold_l2_flush=getattr(args, "_cold_l2_flush", None),
-                target_ms=target_ms,
+            )
+        elif args.baseline == "cutedsl":
+            cute_dsl_runner = CuteDslBf16GemmRunner(a, b, out_baseline)
+            cute_dsl_runner.autotune(
+                TuneOptions(
+                    warmup=args.warmup,
+                    iters=args.iters,
+                    samples=args.samples,
+                    cold_l2_flush=getattr(args, "_cold_l2_flush", None),
+                    cache_path=getattr(args, "cache_path", None),
+                    force_sweep=getattr(args, "force_sweep", False),
+                    debug=args.debug,
+                )
+            )
+            baseline_name = "CuTE DSL"
+            baseline_fn = cute_dsl_runner.run
+            baseline_stats = benchmark_with_stats(
+                baseline_fn,
+                args.warmup,
+                args.iters,
+                args.samples,
+                cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             )
         else:
             raise SystemExit(f"unsupported --baseline value: {args.baseline}")
 
         selection = self.resolve_kernel(
-            a, b, out_kernel, m, n, k, args
+            a, b_kernel, out_kernel, m, n, k, args
         )
         best_candidate, kernel_stats = selection.candidate, selection.stats
 
@@ -300,8 +313,10 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
             selection.prepared.run()
             if args.baseline == "torch":
                 baseline_fn()
-            else:
+            elif args.baseline == "cublaslt":
                 cublaslt_gemm_out(a, b, out_baseline, workspace)
+            else:
+                cute_dsl_runner.run()
             max_abs_diff = (
                 (out_kernel.float() - out_baseline.float()).abs().max().item()
             )
@@ -314,15 +329,16 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
             best_candidate,
         )
 
-    def resolve_kernel(self, a, b, out, m, n, k, args):
-        target_ms = calibration_target_ms(m, n, k)
+    def resolve_kernel(self, a, b_kernel, out, m, n, k, args):
         candidates = compatible_candidates(m, n, k)
         if not candidates:
             raise RuntimeError(f"no JIT config supports M={m}, N={n}, K={k}")
 
         def prepare(candidate):
             config, swap_ab = candidate
-            run = lambda: bf16_gemm_out(a, b, out, config=config, swap_ab=swap_ab)
+            run = lambda: bf16_gemm_nt_out(
+                a, b_kernel, out, config=config, swap_ab=swap_ab
+            )
             run()
             torch.cuda.synchronize()
             return PreparedKernel(candidate, run)
@@ -335,16 +351,17 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
         )
         return AutotuneRunner(options).resolve(
             candidates,
-            namespace="bf16_gemm", key=(m, n, k), prepare=prepare,
+            # B is now prepacked as (N, K), so prior selections measured the
+            # incorrect B interpretation and must not be reused.
+            namespace="bf16_gemm_nt_v2", key=(m, n, k), prepare=prepare,
             benchmark=lambda prepared: benchmark_with_stats(
                 prepared.run, args.warmup, args.iters, args.samples,
                 cold_l2_flush=getattr(args, "_cold_l2_flush", None),
-                target_ms=target_ms,
             ),
             probe=lambda prepared: quick_probe(
                 prepared.run,
+                args.iters,
                 cold_l2_flush=getattr(args, "_cold_l2_flush", None),
-                target_ms=target_ms,
             ),
             format_candidate=format_candidate,
             metric_formatter=lambda _candidate, stats: (
