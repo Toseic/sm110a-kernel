@@ -70,13 +70,23 @@ from .kernels.nvfp4_fc1 import (
     prepare_nvfp4_fc1_metadata, nvfp4_fc1, nvfp4_fc1_out,
 )
 _RUNNER_EXPORTS = {"AutotuneRunner", "PreparedKernel", "Selection", "TuneOptions"}
+_CUTEDSL_EXPORTS = {
+    "CuteDslBf16GemmConfig",
+    "CuteDslBf16GemmRunner",
+    "cute_dsl_bf16_gemm_out",
+}
 
 
 def __getattr__(name):
     if name in _RUNNER_EXPORTS:
         from . import runner
         return getattr(runner, name)
+    if name in _CUTEDSL_EXPORTS:
+        from .kernels import cutedsl
+        return getattr(cutedsl, name)
     raise AttributeError(name)
 
 
-__all__ = [name for name in globals() if not name.startswith("_")] + sorted(_RUNNER_EXPORTS)
+__all__ = [name for name in globals() if not name.startswith("_")] + sorted(
+    _RUNNER_EXPORTS | _CUTEDSL_EXPORTS
+)
