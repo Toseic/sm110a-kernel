@@ -1,9 +1,12 @@
 import dataclasses
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
+from sm110a_kernel.jit_runtime import ConcurrentModuleCache
 from sm110a_kernel.runner import AutotuneRunner, PreparedKernel, TuneOptions
 
 
@@ -113,6 +116,34 @@ class RunnerCacheTest(unittest.TestCase):
 
             self.assertEqual(selection.candidate, Config(1))
             self.assertEqual(calls, [1])
+
+
+class ConcurrentModuleCacheTest(unittest.TestCase):
+    def test_different_modules_build_concurrently(self):
+        """The JIT lock deduplicates a module without serializing all modules."""
+        names = ("config-a", "config-b")
+        active = 0
+        peak_active = 0
+        active_lock = threading.Lock()
+        both_started = threading.Barrier(len(names))
+
+        def fake_load(**_kwargs):
+            nonlocal active, peak_active
+            with active_lock:
+                active += 1
+                peak_active = max(peak_active, active)
+            try:
+                both_started.wait(timeout=2)
+            finally:
+                with active_lock:
+                    active -= 1
+            return object()
+
+        cache = ConcurrentModuleCache()
+        with ThreadPoolExecutor(max_workers=len(names)) as executor:
+            list(executor.map(lambda name: cache.get_or_create(name, fake_load), names))
+
+        self.assertEqual(peak_active, len(names))
 
 
 if __name__ == "__main__":

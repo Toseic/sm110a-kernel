@@ -6,7 +6,15 @@ module remains as a stable import path for existing callers.
 
 from .kernels.bf16_gemm import (
     Bf16GemmConfig, bf16_gemm, bf16_gemm_out, compile_bf16_gemm,
+    compile_bf16_gemm_configs,
     get_bf16_gemm_module,
+)
+from .kernels.nvfp4_gemm import (
+    Nvfp4GemmConfig,
+    compile_nvfp4_gemm,
+    compile_nvfp4_gemm_configs,
+    nvfp4_gemm,
+    nvfp4_gemm_out,
 )
 from .kernels.fc1_block_interleaved_swiglu import (
     Fc1BlockInterleavedSwiGLUConfig,

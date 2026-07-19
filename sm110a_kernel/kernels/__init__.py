@@ -11,7 +11,15 @@ from .bf16_gemm import (
     bf16_gemm_out,
     bf16_gemm_nt_out,
     compile_bf16_gemm,
+    compile_bf16_gemm_configs,
     get_bf16_gemm_module,
+)
+from .nvfp4_gemm import (
+    Nvfp4GemmConfig,
+    compile_nvfp4_gemm,
+    compile_nvfp4_gemm_configs,
+    nvfp4_gemm,
+    nvfp4_gemm_out,
 )
 from .fc1_block_interleaved_swiglu import (
     Fc1BlockInterleavedSwiGLUConfig,

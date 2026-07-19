@@ -35,6 +35,7 @@ Run the benchmark and bit-exact comparison against PyTorch NVFP4:
 
 ```bash
 /home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_nvfp4_gemm.py
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_nvfp4_gemm.py --baseline cutedsl
 /home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_nvfp4_gemm.py \
   --m 4096 --n 4096 --k 4096 --warmup 5 --iters 20 --sol
 ```

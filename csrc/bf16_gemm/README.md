@@ -121,7 +121,9 @@ baseline.
 ## Contents
 
 - `src/bf16_gemm_kernel.cu`: BF16 GEMM implementation
-- `src/bf16_gemm_torch_binding.cpp`: PyTorch binding entry points
+- `src/bf16_gemm_split_torch_binding.cpp`: stable PyTorch binding for the
+  configuration-specialized CUDA libraries
+- `src/bf16_gemm_torch_binding.cpp`: cuBLASLt baseline binding
 - `../../benchmarks/benchmark_bf16_gemm.py`: Python benchmark driver
 - `../../benchmarks/benchmark_bf16_grouped_m_gemm.py`: Python benchmark driver for grouped M GEMM
 - `../../sm110a_kernel/__init__.py`: Python API and core extension loader

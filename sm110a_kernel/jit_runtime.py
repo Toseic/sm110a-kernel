@@ -15,6 +15,7 @@ from typing import Callable, Generic, Hashable, Iterable, Optional, TypeVar
 
 
 __all__ = [
+    "ConcurrentModuleCache",
     "LoadedCudaLibrary",
     "SplitCudaJit",
     "jit_build_directory",
@@ -24,6 +25,7 @@ __all__ = [
 
 ConfigT = TypeVar("ConfigT")
 FacadeT = TypeVar("FacadeT")
+ValueT = TypeVar("ValueT")
 
 
 @dataclass(frozen=True)
@@ -34,6 +36,35 @@ class LoadedCudaLibrary:
     path: str
     handle: ctypes.CDLL
     entry_address: int
+
+
+class ConcurrentModuleCache(Generic[ValueT]):
+    """Cache build results while allowing distinct module names to build together.
+
+    PyTorch extensions are keyed by a unique module name.  A lock per name
+    prevents duplicate builds of that extension, without serializing unrelated
+    configuration-specialized builds submitted by ``--pre-parallel-jit``.
+    """
+
+    def __init__(self) -> None:
+        self._cache: dict[str, ValueT] = {}
+        self._cache_lock = threading.Lock()
+        self._build_locks: dict[str, threading.Lock] = {}
+
+    def get_or_create(self, name: str, build: Callable[[], ValueT]) -> ValueT:
+        with self._cache_lock:
+            if name in self._cache:
+                return self._cache[name]
+            build_lock = self._build_locks.setdefault(name, threading.Lock())
+
+        with build_lock:
+            with self._cache_lock:
+                if name in self._cache:
+                    return self._cache[name]
+            value = build()
+            with self._cache_lock:
+                self._cache[name] = value
+            return value
 
 
 def source_digest(paths: Iterable[Path], root: Path) -> str:

@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import hashlib
-import os
-import sys
-import threading
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
-from ..jit_runtime import jit_build_directory, source_digest
+from ..jit_runtime import SplitCudaJit
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_DIR = _ROOT / "csrc/nvfp4_gemm/src"
@@ -37,7 +34,7 @@ class Nvfp4GemmConfig:
             raise ValueError("epilogue_block_n must be 32, 64, or 128")
 
 
-def _kernel_cflags(config: Nvfp4GemmConfig) -> tuple[str, ...]:
+def _kernel_cflags(config: Nvfp4GemmConfig, _variant) -> tuple[str, ...]:
     return tuple(
         f"-DSM110A_NVFP4_{name}={value}"
         for name, value in (
@@ -48,58 +45,58 @@ def _kernel_cflags(config: Nvfp4GemmConfig) -> tuple[str, ...]:
     )
 
 
-_MODULE_CACHE = {}
-_CACHE_LOCK = threading.Lock()
-_MODULE_LOCKS = {}
+class Nvfp4GemmModule:
+    def __init__(self, binding, library, config: Nvfp4GemmConfig):
+        self._binding = binding
+        self._launcher = library.entry_address
+        self._config = config
+
+    def _args(self):
+        c = self._config
+        return self._launcher, c.tile_m, c.tile_n, c.tile_k, c.cluster_m
+
+    def nvfp4_gemm(self, a, b, sfa, sfb):
+        return self._binding.nvfp4_gemm(a, b, sfa, sfb, *self._args())
+
+    def nvfp4_gemm_out(self, a, b, sfa, sfb, out):
+        return self._binding.nvfp4_gemm_out(a, b, sfa, sfb, out, *self._args())
 
 
-def compile_nvfp4_gemm(config: Nvfp4GemmConfig | None = None):
+_JIT = SplitCudaJit(
+    name="sm110a_nvfp4_gemm",
+    root=_ROOT,
+    binding_sources=(_SOURCE_DIR / "nvfp4_gemm_split_torch_binding.cpp",),
+    kernel_sources=(_SOURCE_DIR / "nvfp4_gemm_kernel.cu",),
+    kernel_dependencies=(
+        _INCLUDE_DIR / "nvfp4_gemm.h",
+        _INCLUDE_DIR / "common.h",
+        _INCLUDE_DIR / "profiler.h",
+    ),
+    kernel_symbol="sm110a_nvfp4_gemm_launch",
+    config_key=lambda config: config,
+    kernel_cflags=_kernel_cflags,
+    make_facade=Nvfp4GemmModule,
+    include_paths=(_INCLUDE_DIR,),
+)
+
+
+def compile_nvfp4_gemm(config: Nvfp4GemmConfig | None = None) -> Nvfp4GemmModule:
     config = config or Nvfp4GemmConfig()
     if not isinstance(config, Nvfp4GemmConfig):
         raise TypeError("config must be an Nvfp4GemmConfig")
     config.validate()
-    import torch
-    from torch.utils.cpp_extension import load
+    return _JIT.compile(config)
 
-    cuda_arch = os.environ.get("CUDA_ARCH", "sm_110a")
-    compute_arch = os.environ.get("COMPUTE_CUDA_ARCH", "compute_110a")
-    paths = (
-        _SOURCE_DIR / "nvfp4_gemm_jit_binding.cpp",
-        _SOURCE_DIR / "nvfp4_gemm_kernel.cu",
-        _INCLUDE_DIR / "nvfp4_gemm.h",
-        _INCLUDE_DIR / "common.h",
-        _INCLUDE_DIR / "profiler.h",
-    )
-    signature = repr((config, cuda_arch, compute_arch, torch.__version__,
-                      torch.version.cuda, sys.implementation.cache_tag,
-                      source_digest(paths, _ROOT)))
-    name = "sm110a_nvfp4_gemm_jit_" + hashlib.sha256(signature.encode()).hexdigest()[:16]
-    with _CACHE_LOCK:
-        cached = _MODULE_CACHE.get(name)
-        if cached is not None:
-            return cached
-        module_lock = _MODULE_LOCKS.setdefault(name, threading.Lock())
-    # Serialize only callers compiling the same module.  Different configs
-    # must be allowed to build concurrently for --pre-parallel-jit.
-    with module_lock:
-        with _CACHE_LOCK:
-            cached = _MODULE_CACHE.get(name)
-            if cached is not None:
-                return cached
-        flags = list(_kernel_cflags(config))
-        module = load(
-            name=name,
-            sources=[str(paths[0]), str(paths[1])],
-            extra_include_paths=[str(_INCLUDE_DIR)],
-            extra_cuda_cflags=["-O3", "-lineinfo", f"-gencode=arch={compute_arch},code={cuda_arch}", *flags],
-            extra_cflags=["-O3", "-std=c++17", *flags],
-            extra_ldflags=["-lcuda"],
-            build_directory=jit_build_directory(name),
-            verbose=os.environ.get("SM110A_JIT_VERBOSE", "0") == "1",
-        )
-        with _CACHE_LOCK:
-            _MODULE_CACHE[name] = module
-        return module
+
+def compile_nvfp4_gemm_configs(
+    configs: Iterable[Nvfp4GemmConfig], max_workers=None
+) -> tuple[Nvfp4GemmModule, ...]:
+    configs = tuple(configs)
+    for config in configs:
+        if not isinstance(config, Nvfp4GemmConfig):
+            raise TypeError("configs must contain Nvfp4GemmConfig instances")
+        config.validate()
+    return _JIT.compile_many(configs, max_workers)
 
 
 def to_blocked_nvfp4_scales(scales):

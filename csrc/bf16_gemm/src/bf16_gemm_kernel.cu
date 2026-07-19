@@ -1178,6 +1178,13 @@ void launch_bf16_gemm(
     }
 }
 
+extern "C" void sm110a_bf16_gemm_launch(
+    const __nv_bfloat16* d_a, const __nv_bfloat16* d_b,
+    __nv_bfloat16* d_c, int m, int n, int k, bool swap_ab,
+    cudaStream_t stream) {
+  launch_bf16_gemm(d_a, d_b, d_c, m, n, k, swap_ab, stream);
+}
+
 void launch_bf16_gemm_profile(
     const __nv_bfloat16 *A_ptr,
     const __nv_bfloat16 *B_ptr,

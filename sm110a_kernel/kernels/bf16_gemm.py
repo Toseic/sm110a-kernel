@@ -2,15 +2,11 @@
 
 from __future__ import annotations
 
-import hashlib
-import os
-import sys
-import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
-from ..jit_runtime import jit_build_directory, source_digest
+from ..jit_runtime import SplitCudaJit
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_DIR = _ROOT / "csrc/bf16_gemm/src"
@@ -52,30 +48,38 @@ def _default_config(a, b) -> Bf16GemmConfig:
     return Bf16GemmConfig(cluster_m=1 if a.size(0) <= 128 else 2)
 
 
-def _kernel_cflags(config: Bf16GemmConfig, variant) -> tuple[str, ...]:
-    return tuple(
-        f"-DSM110A_BF16_{name}={value}"
-        for name, value in (
-            ("TILE_M", config.tile_m), ("TILE_N", config.tile_n),
-            ("TILE_K", config.tile_k), ("CLUSTER_M", config.cluster_m),
-            ("EPILOGUE_BLOCK_N", config.epilogue_block_n),
-        )
-    )
+class Bf16GemmModule:
+    def __init__(self, binding, library, config: Bf16GemmConfig):
+        self._binding, self._launcher, self._config = binding, library.entry_address, config
+
+    def _args(self):
+        c = self._config
+        return (self._launcher, c.tile_m, c.tile_n, c.tile_k, c.cluster_m)
+
+    def bf16_gemm(self, a, b, swap_ab=False):
+        return self._binding.bf16_gemm(a, b, *self._args(), swap_ab)
+    def bf16_gemm_out(self, a, b, out, swap_ab=False):
+        return self._binding.bf16_gemm_out(a, b, out, *self._args(), swap_ab)
+    def bf16_gemm_nt(self, a, b_nt, swap_ab=False):
+        return self._binding.bf16_gemm_nt(a, b_nt, *self._args(), swap_ab)
+    def bf16_gemm_nt_out(self, a, b_nt, out, swap_ab=False):
+        return self._binding.bf16_gemm_nt_out(a, b_nt, out, *self._args(), swap_ab)
 
 
-_MODULE_CACHE = {}
-_CACHE_LOCK = threading.Lock()
+def _kernel_cflags(config, _variant):
+    return tuple(f"-DSM110A_BF16_{name}={value}" for name, value in (
+        ("TILE_M", config.tile_m), ("TILE_N", config.tile_n),
+        ("TILE_K", config.tile_k), ("CLUSTER_M", config.cluster_m),
+        ("EPILOGUE_BLOCK_N", config.epilogue_block_n)))
 
 
-def _module_name(config, cuda_arch, torch):
-    digest = source_digest(
-        (_SOURCE_DIR / "bf16_gemm_jit_binding.cpp", _SOURCE_DIR / "bf16_gemm_kernel.cu",
-         _INCLUDE_DIR / "bf16_gemm.h", _INCLUDE_DIR / "common.h", _INCLUDE_DIR / "profiler.h"),
-        _ROOT,
-    )
-    signature = repr((config, cuda_arch, os.environ.get("COMPUTE_CUDA_ARCH", "compute_110a"),
-                      torch.__version__, torch.version.cuda, sys.implementation.cache_tag, digest))
-    return "sm110a_bf16_gemm_jit_" + hashlib.sha256(signature.encode()).hexdigest()[:16]
+_JIT = SplitCudaJit(
+    name="sm110a_bf16_gemm", root=_ROOT,
+    binding_sources=(_SOURCE_DIR / "bf16_gemm_split_torch_binding.cpp",),
+    kernel_sources=(_SOURCE_DIR / "bf16_gemm_kernel.cu",),
+    kernel_dependencies=(_INCLUDE_DIR / "bf16_gemm.h", _INCLUDE_DIR / "common.h", _INCLUDE_DIR / "profiler.h"),
+    kernel_symbol="sm110a_bf16_gemm_launch", config_key=lambda config: config,
+    kernel_cflags=_kernel_cflags, make_facade=Bf16GemmModule, include_paths=(_INCLUDE_DIR,))
 
 
 def compile_bf16_gemm(config: Optional[Bf16GemmConfig] = None) -> Bf16GemmModule:
@@ -83,31 +87,16 @@ def compile_bf16_gemm(config: Optional[Bf16GemmConfig] = None) -> Bf16GemmModule
     if not isinstance(config, Bf16GemmConfig):
         raise TypeError("config must be a Bf16GemmConfig")
     config.validate()
-    try:
-        import torch
-        from torch.utils.cpp_extension import load
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError("JIT compilation requires PyTorch with CUDA support installed.") from exc
-    with _CACHE_LOCK:
-        cuda_arch = os.environ.get("CUDA_ARCH", "sm_110a")
-        compute_arch = os.environ.get("COMPUTE_CUDA_ARCH", "compute_110a")
-        name = _module_name(config, cuda_arch, torch)
-        cached = _MODULE_CACHE.get(name)
-        if cached is not None:
-            return cached
-        definitions = list(_kernel_cflags(config, None))
-        module = load(
-            name=name,
-            sources=[str(_SOURCE_DIR / "bf16_gemm_jit_binding.cpp"), str(_SOURCE_DIR / "bf16_gemm_kernel.cu")],
-            extra_include_paths=[str(_INCLUDE_DIR)],
-            extra_cuda_cflags=["-O3", "-lineinfo", f"-gencode=arch={compute_arch},code={cuda_arch}", *definitions],
-            extra_cflags=["-O3", "-std=c++17", *definitions],
-            extra_ldflags=["-lcuda"],
-            build_directory=jit_build_directory(name),
-            verbose=os.environ.get("SM110A_JIT_VERBOSE", "0") == "1",
-        )
-        _MODULE_CACHE[name] = module
-        return module
+    return _JIT.compile(config)
+
+
+def compile_bf16_gemm_configs(configs: Iterable[Bf16GemmConfig], max_workers=None):
+    configs = tuple(configs)
+    for config in configs:
+        if not isinstance(config, Bf16GemmConfig):
+            raise TypeError("configs must contain Bf16GemmConfig instances")
+        config.validate()
+    return _JIT.compile_many(configs, max_workers)
 
 
 def get_bf16_gemm_module(a, b, config=None):

@@ -13,11 +13,13 @@ from .kernels.bf16_gemm import (
     bf16_gemm_out,
     bf16_gemm_nt_out,
     compile_bf16_gemm,
+    compile_bf16_gemm_configs,
     get_bf16_gemm_module,
 )
 from .kernels.nvfp4_gemm import (
     Nvfp4GemmConfig,
     compile_nvfp4_gemm,
+    compile_nvfp4_gemm_configs,
     from_blocked_nvfp4_scales,
     nvfp4_gemm,
     nvfp4_gemm_out,

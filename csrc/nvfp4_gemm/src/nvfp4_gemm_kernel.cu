@@ -1597,6 +1597,13 @@ void launch_nvfp4_gemm(
         false>(A_ptr, B_ptr, SFA_ptr, SFB_ptr, C_ptr, M, N, K, nullptr, 0, stream);
 }
 
+extern "C" void sm110a_nvfp4_gemm_launch(
+    const uint8_t* a, const uint8_t* b, const uint8_t* sfa,
+    const uint8_t* sfb, __nv_bfloat16* c, int m, int n, int k,
+    cudaStream_t stream) {
+  launch_nvfp4_gemm(a, b, sfa, sfb, c, m, n, k, stream);
+}
+
 void launch_nvfp4_gemm_profile(
     const uint8_t *A_ptr,
     const uint8_t *B_ptr,
