@@ -3,8 +3,11 @@
 
 namespace {
 constexpr int kThreads = 256;
-#ifndef SM110A_NVFP4_GROUPED_TASK_N_MAJOR
-#define SM110A_NVFP4_GROUPED_TASK_N_MAJOR 1
+#ifndef SM110A_NVFP4_GROUPED_MACRO_SWIZZLE_N_MAJOR
+#define SM110A_NVFP4_GROUPED_MACRO_SWIZZLE_N_MAJOR 1
+#endif
+#ifndef SM110A_NVFP4_GROUPED_MACRO_SWIZZLE_SERPENTINE
+#define SM110A_NVFP4_GROUPED_MACRO_SWIZZLE_SERPENTINE 0
 #endif
 constexpr int kMacroSwizzleM = 8;
 constexpr int kMacroSwizzleN = 8;
@@ -49,7 +52,22 @@ __global__ void build_expert_tile_tasks(
             const int group_end = min(group_row + kMacroSwizzleM * task_tile_rows, rows);
             for (int macro_n = 0; macro_n < grid_n; macro_n += kMacroSwizzleN) {
                 const int band_end = min(macro_n + kMacroSwizzleN, grid_n);
-#if SM110A_NVFP4_GROUPED_TASK_N_MAJOR
+#if SM110A_NVFP4_GROUPED_MACRO_SWIZZLE_N_MAJOR && SM110A_NVFP4_GROUPED_MACRO_SWIZZLE_SERPENTINE
+                // N-major S traversal: M=0..7, then M=7..0 for the next N.
+                const int tile_row_count =
+                    (group_end - group_row + task_tile_rows - 1) / task_tile_rows;
+                for (int tile_n = macro_n; tile_n < band_end; ++tile_n) {
+                    const bool reverse_m = (tile_n - macro_n) & 1;
+                    for (int tile_row_index = 0; tile_row_index < tile_row_count;
+                         ++tile_row_index) {
+                        const int ordered_index = reverse_m
+                            ? tile_row_count - 1 - tile_row_index
+                            : tile_row_index;
+                        const int tile_row = group_row + ordered_index * task_tile_rows;
+                        tasks[next++] = {start, rows, tile_row, expert, tile_n};
+                    }
+                }
+#elif SM110A_NVFP4_GROUPED_MACRO_SWIZZLE_N_MAJOR
                 // Keep the B/SFB tile resident while traversing the M tiles.
                 // This matters most for large per-expert M, where the persistent
                 // scheduler has enough concurrent clusters to otherwise cycle
@@ -58,8 +76,26 @@ __global__ void build_expert_tile_tasks(
                     for (int tile_row = group_row; tile_row < group_end;
                          tile_row += task_tile_rows)
                         tasks[next++] = {start, rows, tile_row, expert, tile_n};
+#elif SM110A_NVFP4_GROUPED_MACRO_SWIZZLE_SERPENTINE
+                // M-major S traversal: N=0..7, then N=7..0 for the next M.
+                const int tile_row_count =
+                    (group_end - group_row + task_tile_rows - 1) / task_tile_rows;
+                for (int tile_row_index = 0; tile_row_index < tile_row_count;
+                     ++tile_row_index) {
+                    const int tile_row = group_row + tile_row_index * task_tile_rows;
+                    const bool reverse_n = tile_row_index & 1;
+                    for (int tile_n_index = 0; tile_n_index < band_end - macro_n;
+                         ++tile_n_index) {
+                        const int ordered_index = reverse_n
+                            ? band_end - macro_n - 1 - tile_n_index
+                            : tile_n_index;
+                        const int tile_n = macro_n + ordered_index;
+                        tasks[next++] = {start, rows, tile_row, expert, tile_n};
+                    }
+                }
 #else
-                for (int tile_row = group_row; tile_row < group_end; tile_row += task_tile_rows)
+                for (int tile_row = group_row; tile_row < group_end;
+                     tile_row += task_tile_rows)
                     for (int tile_n = macro_n; tile_n < band_end; ++tile_n)
                         tasks[next++] = {start, rows, tile_row, expert, tile_n};
 #endif

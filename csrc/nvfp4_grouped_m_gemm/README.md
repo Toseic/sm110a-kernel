@@ -23,6 +23,21 @@ The sweep covers compatible combinations of tile-N 64/128/256, tile-K
 persistent, or CLC scheduling. Results are cached by CUDA environment and
 `(experts, N, K, tokens_per_expert)`.
 
+`macro_swizzle_n_major` and `macro_swizzle_serpentine` are independent
+compile-time switches for the traversal inside each 8x8 macro tile. This gives
+all four M-major/N-major × normal/S-shaped combinations. The defaults retain
+N-major B/SFB reuse. S-shaped N-major reverses M on alternating N tiles;
+S-shaped M-major reverses N on alternating M tiles:
+
+```python
+from sm110a_kernel.kernels.nvfp4_grouped_m_gemm import Nvfp4GroupedMConfig
+
+config = Nvfp4GroupedMConfig(
+    macro_swizzle_n_major=True,
+    macro_swizzle_serpentine=True,
+)
+```
+
 `--sol` reports NVFP4 MMA, compulsory HBM, repeated tile-read GMEM/L2, and
 mixed HBM/L2 bounds for the runner-selected configuration. The traffic model
 accounts for packed E2M1 operands, UE4M3 block scales, BF16 output, and the

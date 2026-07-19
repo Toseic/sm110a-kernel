@@ -20,6 +20,10 @@ class Nvfp4GroupedMConfig:
     epilogue_tile_n: int = 32
     cluster_m: int = 2
     mode: int = 0
+    # Independent 8x8 macro-tile traversal switches.  N-major maximizes B/SFB
+    # reuse; serpentine reverses the inner axis on every adjacent outer tile.
+    macro_swizzle_n_major: bool = True
+    macro_swizzle_serpentine: bool = False
     def validate(self):
         if self.tile_m != 128 or self.tile_n not in (64, 128, 256):
             raise ValueError("tile_m must be 128 and tile_n must be 64, 128, or 256")
@@ -28,6 +32,10 @@ class Nvfp4GroupedMConfig:
         if self.epilogue_tile_n not in (32, 64, 128) or self.tile_n % self.epilogue_tile_n:
             raise ValueError("invalid epilogue_tile_n")
         if self.mode not in (0, 1, 2): raise ValueError("mode must be 0, 1, or 2")
+        if not isinstance(self.macro_swizzle_n_major, bool) or not isinstance(
+            self.macro_swizzle_serpentine, bool
+        ):
+            raise ValueError("macro_swizzle_n_major and macro_swizzle_serpentine must be bool")
 
 class Nvfp4GroupedMModule:
     def __init__(self, binding, library, config):
@@ -48,8 +56,8 @@ def _flags(c, variant):
         ("TILE_M",c.tile_m),("TILE_N",c.tile_n),("TILE_K",c.tile_k),
         ("EPILOGUE_TILE_N",c.epilogue_tile_n),("CLUSTER_M",c.cluster_m),("MODE",c.mode),
         # The grouped-M task builder is compiled into this NVFP4 module too.
-        # N-major task order retains a B/SFB tile across consecutive M tiles.
-        ("TASK_N_MAJOR",1)))
+        ("MACRO_SWIZZLE_N_MAJOR", int(c.macro_swizzle_n_major)),
+        ("MACRO_SWIZZLE_SERPENTINE", int(c.macro_swizzle_serpentine))))
 
 _JIT = SplitCudaJit(name="sm110a_nvfp4_grouped_m", root=_ROOT,
     binding_sources=(_SRC / "nvfp4_grouped_m_gemm_torch_binding.cpp",),
