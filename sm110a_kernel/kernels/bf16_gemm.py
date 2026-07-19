@@ -120,3 +120,8 @@ def bf16_gemm(a, b, config=None, swap_ab=False):
 
 def bf16_gemm_out(a, b, out, config=None, swap_ab=False):
     return get_bf16_gemm_module(a, b, config).bf16_gemm_out(a, b, out, swap_ab)
+
+
+def bf16_gemm_nt_out(a, b_nt, out, config=None, swap_ab=False):
+    """Compute ``a @ b_nt.T`` for a contiguous, pretransposed ``b_nt(N, K)``."""
+    return compile_bf16_gemm(config).bf16_gemm_nt_out(a, b_nt, out, swap_ab)

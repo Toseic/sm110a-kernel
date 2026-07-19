@@ -9,6 +9,7 @@ from .bf16_gemm import (
     Bf16GemmConfig,
     bf16_gemm,
     bf16_gemm_out,
+    bf16_gemm_nt_out,
     compile_bf16_gemm,
     get_bf16_gemm_module,
 )
