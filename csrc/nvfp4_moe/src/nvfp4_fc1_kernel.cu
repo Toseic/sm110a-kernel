@@ -294,6 +294,31 @@ __device__ inline void clc_mbarrier_wait(
         : "memory");
 }
 
+// Map a shared-memory object to the address at which it is hosted by another
+// CTA in the cluster.  The CTA-group::2 pipeline uses rank 0 as the owner for
+// barriers that aggregate work completed independently by both CTAs.
+__device__ inline int map_shared_to_cluster_cta(
+    int local_smem_addr,
+    int target_cta_rank) {
+    int remote_addr;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;"
+        : "=r"(remote_addr)
+        : "r"(local_smem_addr), "r"(target_cta_rank));
+    return remote_addr;
+}
+
+__device__ inline void mbarrier_arrive_on_cluster_cta(
+    int local_mbar_addr,
+    int target_cta_rank) {
+    const int remote_mbar_addr =
+        map_shared_to_cluster_cta(local_mbar_addr, target_cta_rank);
+    asm volatile("mbarrier.arrive.release.cta.shared::cluster.b64 "
+                 "_, [%0];"
+        :
+        : "r"(remote_mbar_addr)
+        : "memory");
+}
+
 template <int kClusterM>
 __device__ inline void tma_load_4d(
     int dst_smem,
@@ -586,6 +611,10 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
     __shared__ int task_gather_tma[2];
     __shared__ uint64_t tma_mbars[kStageCount];
     __shared__ uint64_t a_mbars[kStageCount];
+    // CTA 0 owns this barrier.  Each CTA arrives only after its local A/SFA
+    // gather is complete, so the CTA-group::2 MMA cannot consume a partially
+    // produced operand from CTA 1.
+    __shared__ uint64_t a_cluster_mbars[kStageCount];
     __shared__ uint64_t mma_mbars[kStageCount];
     __shared__ uint64_t mainloop_mbars[kTmemStageCount];
     __shared__ uint64_t epilogue_mbars[kTmemStageCount];
@@ -595,6 +624,8 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
     const int epilogue_smem = mainloop_smem + kMainloopSmemBytes;
     const int base_tma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(tma_mbars));
     const int base_a_mbar_addr = static_cast<int>(__cvta_generic_to_shared(a_mbars));
+    const int base_a_cluster_mbar_addr =
+        static_cast<int>(__cvta_generic_to_shared(a_cluster_mbars));
     const int base_mma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(mma_mbars));
     const int base_mainloop_mbar_addr = static_cast<int>(__cvta_generic_to_shared(mainloop_mbars));
     const int base_epilogue_mbar_addr = static_cast<int>(__cvta_generic_to_shared(epilogue_mbars));
@@ -604,6 +635,12 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
             mbarrier_init(base_tma_mbar_addr + stage * sizeof(uint64_t), kClusterM);
             mbarrier_init(
                 base_a_mbar_addr + stage * sizeof(uint64_t), kAProducerThreadCount);
+            if constexpr (kClusterM > 1) {
+                if (cta_rank == 0) {
+                    mbarrier_init(
+                        base_a_cluster_mbar_addr + stage * sizeof(uint64_t), kClusterM);
+                }
+            }
             mbarrier_init(base_mma_mbar_addr + stage * sizeof(uint64_t), 1);
         }
         for (int stage = 0; stage < kTmemStageCount; ++stage) {
@@ -880,6 +917,11 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                     const int sfb_smem = sfa_smem + kSFASmemBytes;
 
                     mbarrier_wait(mma_mbar_addr, producer_mma_phase);
+                    // SFB uses a multicast TMA whose completion is delivered
+                    // to each destination CTA's local transaction barrier.
+                    // Keep this barrier local; unlike BF16's independent B
+                    // loads, aggregating it at rank 0 breaks multicast byte
+                    // accounting.
                     const int tma_transaction_mbar_addr = tma_mbar_addr & 0xFEFFFFFF;
                     const int off_k = tile_k * kTileK;
                     const int off_k64 = tile_k * Config::kMmaStepsPerStage;
@@ -932,6 +974,30 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
             }
         }
 
+        // Rank 1's MMA warp is otherwise idle.  Forward that CTA's local
+        // A/SFA completion to the rank-0 aggregate barrier without occupying
+        // a producer warp that must keep issuing TMA loads.
+        if constexpr (kClusterM > 1) {
+            if (cta_rank != 0 && warp_id == kMmaWarp && elect_sync()) {
+                for (int cluster_bid = first_cluster_bid; cluster_bid < last_cluster_bid;
+                    ++cluster_bid) {
+                    for (int tile_k = 0; tile_k < k_tiles; ++tile_k) {
+                        mbarrier_wait(
+                            base_a_mbar_addr + consumer_stage * sizeof(uint64_t),
+                            consumer_a_phase);
+                        mbarrier_arrive_on_cluster_cta(
+                            base_a_cluster_mbar_addr + consumer_stage * sizeof(uint64_t), 0);
+
+                        consumer_stage = (consumer_stage + 1) % kStageCount;
+                        if (consumer_stage == 0) {
+                            consumer_a_phase ^= 1;
+                            consumer_tma_phase ^= 1;
+                        }
+                    }
+                }
+            }
+        }
+
         // The consumer advances independently and releases each stage after MMA has
         // finished reading it.
         if (cta_rank == 0 && warp_id == kMmaWarp && elect_sync()) {
@@ -954,6 +1020,13 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                         base_mma_mbar_addr + consumer_stage * sizeof(uint64_t);
 
                     mbarrier_wait(a_mbar_addr, consumer_a_phase);
+                    if constexpr (kClusterM > 1) {
+                        mbarrier_arrive_on_cluster_cta(
+                            base_a_cluster_mbar_addr + consumer_stage * sizeof(uint64_t), 0);
+                        mbarrier_wait(
+                            base_a_cluster_mbar_addr + consumer_stage * sizeof(uint64_t),
+                            consumer_a_phase);
+                    }
                     mbarrier_wait(tma_mbar_addr, consumer_tma_phase);
                     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
                     {
@@ -1024,9 +1097,11 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                 auto release_tmem = [&]() {
                     if constexpr (kPersistent || kDynamicClc) {
                         if (elect_sync()) {
-                            const int mbar_addr = (base_epilogue_mbar_addr +
-                                                      epilogue_mainloop_stage * sizeof(uint64_t)) &
-                                                  0xFEFFFFFF;
+                            const int pair_root_rank = cta_rank & ~1;
+                            const int mbar_addr = map_shared_to_cluster_cta(
+                                base_epilogue_mbar_addr +
+                                    epilogue_mainloop_stage * sizeof(uint64_t),
+                                pair_root_rank);
                             asm volatile("mbarrier.arrive.release.cta.shared::cluster.b64 "
                                          "_, [%0];" ::"r"(mbar_addr)
                                 : "memory");
