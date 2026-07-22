@@ -22,11 +22,14 @@ from common import (
     tflops_from_ms,
 )
 from sm110a_kernel import (
+    CuteDslNvfp4Fc1Runner,
     Nvfp4Fc1Config,
     compile_nvfp4_fc1,
     nvfp4_fc1_out,
     prepare_nvfp4_fc1_metadata,
     quantize_nvfp4_rows,
+    from_blocked_nvfp4_scales,
+    to_blocked_nvfp4_scales,
 )
 from sm110a_kernel.runner import AutotuneRunner, PreparedKernel, TuneOptions
 
@@ -48,7 +51,7 @@ NVFP4_FC1_CONFIGS = tuple(
         mode=mode,
         direct_gmem=direct_gmem,
     )
-    for tile_n in (64, 128, 256)
+    for tile_n in (128, 256)
     for tile_k in (64, 128, 256)
     for epilogue_tile_n in (64, 128)
     for cluster_m in (1, 2)
@@ -130,48 +133,97 @@ def nvfp4_fc1_sol_bounds(router_scores, topk, n, k, config):
     )
 
 
-def build_reference(aq, bq, sfa, sfb, metadata, experts, n, k, out):
-    """Build the routed result without materializing [experts,tokens,N]."""
-    rows = metadata.source_rows.numel()
-    grouped_layout = metadata.routing[2 * experts:2 * experts + rows]
-    counts = metadata.routing[:experts].cpu().tolist()
-    row_start = 0
-    for expert, row_count in enumerate(counts):
-        if not row_count:
-            continue
-        full_expert = torch._scaled_mm(
-            aq,
-            bq[expert].t(),
-            sfa,
-            sfb[expert * (2 * n) * (k // 16):(expert + 1) * (2 * n) * (k // 16)],
-            # The fused kernel applies SwiGLU to FP32 MMA accumulators and
-            # converts only the final result to BF16.  Keep the reference in
-            # the same order; rounding gate/up to BF16 first substantially
-            # magnifies error at large K.
-            out_dtype=torch.float32,
-        )
-        row_end = row_start + row_count
-        if not torch.all(grouped_layout[row_start:row_end] == expert):
-            raise AssertionError("metadata rows are not grouped by expert")
-        blocks = full_expert.reshape(full_expert.size(0), n // 32, 64)
-        gate = blocks[:, :, :32].reshape(full_expert.size(0), n)
-        up = blocks[:, :, 32:].reshape(full_expert.size(0), n)
-        swiglu = (torch.nn.functional.silu(gate.float()) * up.float()).to(torch.bfloat16)
-        out[row_start:row_end].copy_(
-            swiglu.index_select(0, metadata.source_rows[row_start:row_end].long()))
-        row_start = row_end
+def fc1_tflops_from_ms(m, n, k, elapsed_ms):
+    """FC1 computes both gate and up projections: 2 GEMMs, or 4MNK FLOPs."""
+    return 2.0 * tflops_from_ms(m, n, k, elapsed_ms)
+
+
+class TorchNvfp4Fc1Runner:
+    """Pre-gather routed rows, then run per-expert scaled GEMMs and SwiGLU."""
+
+    def __init__(self, aq, bq, sfa, sfb, metadata, experts, n, k, out):
+        rows = metadata.source_rows.numel()
+        grouped_layout = metadata.routing[2 * experts:2 * experts + rows]
+        counts = metadata.routing[:experts].cpu().tolist()
+        a_bytes = aq.view(torch.uint8).reshape(aq.size(0), -1)
+        sfa_logical = from_blocked_nvfp4_scales(sfa, aq.size(0), k)
+        sfb_expert_elems = (2 * n) * (k // 16)
+
+        expert_inputs = []
+        row_start = 0
+        for expert, row_count in enumerate(counts):
+            if not row_count:
+                continue
+            row_end = row_start + row_count
+            if not torch.all(grouped_layout[row_start:row_end] == expert):
+                raise AssertionError("metadata rows are not grouped by expert")
+
+            source_rows = metadata.source_rows[row_start:row_end].long()
+            padding = (-row_count) % 128
+            if padding:
+                source_rows = torch.cat(
+                    (source_rows, source_rows[:1].expand(padding))
+                )
+
+            # Packed E2M1 has no advanced indexing implementation. Gather its
+            # byte representation, then restore the original scalar type.
+            gathered_a = a_bytes[source_rows].contiguous()
+            gathered_a = gathered_a.view(torch.float4_e2m1fn_x2).reshape(
+                source_rows.numel(), -1
+            )
+            gathered_sfa = to_blocked_nvfp4_scales(
+                sfa_logical[source_rows].contiguous()
+            )
+            sfb_start = expert * sfb_expert_elems
+            expert_inputs.append((
+                gathered_a,
+                gathered_sfa,
+                bq[expert].t(),
+                sfb[sfb_start:sfb_start + sfb_expert_elems],
+                row_start,
+                row_count,
+            ))
+            row_start = row_end
+
+        if row_start != rows:
+            raise AssertionError("expert counts do not cover all routed rows")
+        self.expert_inputs = tuple(expert_inputs)
+        self.n = n
+        self.out = out
+
+    def run(self):
+        for aq, sfa, bq_t, sfb, row_start, row_count in self.expert_inputs:
+            full_expert = torch._scaled_mm(
+                aq,
+                bq_t,
+                sfa,
+                sfb,
+                # The fused kernel applies SwiGLU to FP32 MMA accumulators and
+                # converts only the final result to BF16.
+                out_dtype=torch.float32,
+            )
+            # FC1 stores every logical 32-column pair as [gate:32, up:32].
+            blocks = full_expert.reshape(full_expert.size(0), self.n // 32, 64)
+            gate = blocks[:, :, :32].reshape(full_expert.size(0), self.n)
+            up = blocks[:, :, 32:].reshape(full_expert.size(0), self.n)
+            swiglu = (
+                torch.nn.functional.silu(gate.float()) * up.float()
+            ).to(torch.bfloat16)
+            self.out[row_start:row_start + row_count].copy_(swiglu[:row_count])
+
+        return self.out
 
 
 def make_quantized_interleaved_weights(experts, n, k):
-    """Create physical `[gate, up]` weights without all-expert temporaries."""
+    """Create NVFP4 weights in physical ``[gate:32, up:32]`` block order."""
     bq = None
     sfb = None
     for expert in range(experts):
-        # The physical layout is already block-interleaved; independently
-        # generated entries are equivalent to generating gate and up first.
-        b_expert = torch.randn(
-            (2 * n, k), device="cuda", dtype=torch.bfloat16
-        )
+        gate = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
+        up = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
+        b_expert = torch.stack(
+            (gate.view(n // 32, 32, k), up.view(n // 32, 32, k)), dim=1
+        ).reshape(2 * n, k)
         bq_expert, sfb_expert = quantize_nvfp4_rows(b_expert)
         if bq is None:
             bq = torch.empty(
@@ -185,7 +237,7 @@ def make_quantized_interleaved_weights(experts, n, k):
         bq[expert].copy_(bq_expert)
         offset = expert * sfb_expert.numel()
         sfb[offset : offset + sfb_expert.numel()].copy_(sfb_expert)
-        del b_expert, bq_expert, sfb_expert
+        del gate, up, b_expert, bq_expert, sfb_expert
     return bq, sfb
 
 
@@ -219,6 +271,19 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
             action="store_true",
             help="only tune direct-GMEM epilogue candidates",
         )
+        parser.add_argument(
+            "--baseline", choices=("torch", "cutedsl"), default="torch",
+            help="reference implementation to benchmark (default: torch)",
+        )
+        parser.add_argument(
+            "--cutedsl-pre-parallel-jit",
+            action="store_true",
+            help=(
+                "compile CuTE DSL baseline configurations in parallel before "
+                "benchmarking (disabled by default because CuTE DSL JIT is "
+                "not thread-safe)"
+            ),
+        )
         return parser
 
     def validate_args(self, args):
@@ -232,9 +297,9 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
         token_values = (args.token,) if args.token else DEFAULT_TOKEN_VALUES
         if any(tokens <= 0 or tokens % 128 for tokens in token_values):
             raise SystemExit("every token count must be a positive multiple of 128")
+        args.token_values = token_values
         if not selected_candidates(2 * args.n, args.k, args):
             raise SystemExit("no compatible NVFP4 FC1 configs match the filters")
-        args.token_values = token_values
         return args
 
     def resolve_kernel(self, aq, bq, sfa, sfb, router, out, args):
@@ -286,7 +351,7 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
             ),
             format_candidate=format_candidate,
             metric_formatter=lambda _config, stats: (
-                f"{tflops_from_ms(routed_m, args.n, args.k, stats['median_ms']):.1f} TF/s"
+                f"{fc1_tflops_from_ms(routed_m, args.n, args.k, stats['median_ms']):.1f} TF/s"
             ),
             pre_jit=compile_nvfp4_fc1,
         )
@@ -305,10 +370,15 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
             f"n={args.n} k={args.k} tokens={args.token_values}"
         )
         print("[runner] config selection cached by tokens/experts/topk/N/K")
+        if args.baseline == "cutedsl":
+            print("[baseline] CuTE DSL persistent NVFP4 FC1 (autotuned)")
+        else:
+            print("[baseline] pre-gathered per-expert torch._scaled_mm + SwiGLU")
         table = TablePrinter((
             ("Tokens", 9), ("M", 10), ("TopK", 7), ("E", 6),
-            ("N", 8), ("K", 8), ("Kernel(ms)", 14), ("TF/s", 12),
-            ("MaxDiff", 12), ("Cache", 8), ("BestConfig", 34),
+            ("N", 8), ("K", 8), ("Kernel(ms)", 14), ("Kernel TF/s", 15),
+            ("Baseline(ms)", 14), ("Baseline TF/s", 15),
+            ("Speedup", 10), ("MaxDiff", 12), ("Cache", 8), ("BestConfig", 34),
         ))
         table.print_header()
 
@@ -326,25 +396,55 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
                 aq, bq, sfa, sfb, router, out, args
             )
 
+            # Build baseline
+            if args.baseline == "cutedsl":
+                baseline_out = torch.empty_like(out)
+                baseline_runner = CuteDslNvfp4Fc1Runner(
+                    aq, bq, sfa, sfb, baseline_out,
+                    metadata.source_rows, metadata.tasks, metadata.state,
+                )
+                baseline_runner.autotune(TuneOptions(
+                    warmup=args.warmup, iters=args.iters, samples=args.samples,
+                    cold_l2_flush=args._cold_l2_flush, cache_path=args.cache_path,
+                    force_sweep=args.force_sweep, debug=args.debug,
+                    pre_parallel_jit=args.cutedsl_pre_parallel_jit,
+                ))
+                baseline_fn = baseline_runner.run
+            else:
+                baseline_out = torch.empty_like(out)
+                baseline_runner = TorchNvfp4Fc1Runner(
+                    aq, bq, sfa, sfb, metadata,
+                    args.experts, args.n, args.k, baseline_out,
+                )
+                baseline_runner.run()
+                baseline_fn = baseline_runner.run
+
+            baseline_stats = benchmark_with_stats(
+                baseline_fn, args.warmup, args.iters, args.samples,
+                cold_l2_flush=args._cold_l2_flush,
+            )
+
             max_diff = 0.0
             if not args.no_accuracy:
-                reference = torch.empty_like(out)
-                build_reference(
-                    aq, bq, sfa, sfb, metadata,
-                    args.experts, args.n, args.k, reference,
-                )
                 selection.prepared.run()
+                baseline_fn()
                 torch.cuda.synchronize()
-                max_diff = (out.float() - reference.float()).abs().max().item()
-                if not torch.allclose(out.float(), reference.float(), atol=args.atol, rtol=args.rtol):
+                max_diff = (out.float() - baseline_out.float()).abs().max().item()
+                if not torch.allclose(
+                    out.float(), baseline_out.float(), atol=args.atol, rtol=args.rtol
+                ):
                     raise AssertionError(f"NVFP4 FC1 mismatch: max diff {max_diff}")
 
-            elapsed = selection.stats["median_ms"]
+            kernel_ms = selection.stats["median_ms"]
+            baseline_ms = baseline_stats["median_ms"]
             routed_m = tokens * args.topk
             table.print_row(
                 tokens, routed_m, args.topk, args.experts, args.n, args.k,
-                f"{elapsed:.4f}",
-                f"{tflops_from_ms(routed_m, args.n, args.k, elapsed):.2f}",
+                f"{kernel_ms:.4f}",
+                f"{fc1_tflops_from_ms(routed_m, args.n, args.k, kernel_ms):.2f}",
+                f"{baseline_ms:.4f}",
+                f"{fc1_tflops_from_ms(routed_m, args.n, args.k, baseline_ms):.2f}",
+                f"{baseline_ms / kernel_ms:.2f}x" if kernel_ms > 0 else "N/A",
                 f"{max_diff:.6f}",
                 "hit" if selection.cache_hit else "miss",
                 format_candidate(selection.candidate),
@@ -354,7 +454,7 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
                     nvfp4_fc1_sol_bounds(
                         router, args.topk, args.n, args.k, selection.candidate
                     ),
-                    elapsed,
+                    kernel_ms,
                     label="NVFP4 FC1 main kernel (routing excluded)",
                 )
 

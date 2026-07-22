@@ -13,7 +13,6 @@ _ROOT = Path(__file__).resolve().parents[2]
 _SRC = _ROOT / "csrc/nvfp4_moe/src"
 _INC = _ROOT / "include"
 
-
 @dataclass(frozen=True)
 class Nvfp4Fc1Config:
     tile_m: int = 128

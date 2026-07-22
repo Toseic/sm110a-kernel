@@ -1,0 +1,615 @@
+"""Autotuned TensorRT-LLM CuTE DSL NVFP4 FC1 baseline (grouped GEMM + SwiGLU).
+
+Pre-gathers activations on the Python side (using ``source_rows``), then
+delegates to ``Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel`` for
+persistent grouped GEMM with fused SwiGLU epilogue and BF16 output.
+"""
+from __future__ import annotations
+
+import statistics
+import sys
+import warnings
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+import torch
+from cutlass.cute.runtime import make_fake_stream
+
+from ...runner import AutotuneRunner, PreparedKernel, Selection, TuneOptions
+
+_POINTER_DEPRECATION = "Use explicit `struct.scalar.ptr` for pointer instead."
+_PROBE_WARMUP = 2
+_ROOT = Path(__file__).resolve().parents[3]
+_KERNEL_ROOT = _ROOT / "baselinedir" / "TensorRT-LLM" / "tensorrt_llm" / "_torch" / "cute_dsl_kernels"
+if str(_KERNEL_ROOT) not in sys.path:
+    sys.path.insert(0, str(_KERNEL_ROOT))
+from blackwell.blockscaled_contiguous_grouped_gemm_swiglu_fusion import (
+    Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel,
+)
+
+
+@contextmanager
+def _suppress_cutlass_pointer_deprecation():
+    showwarning = warnings.showwarning
+
+    def filtered(message, category, filename, lineno, file=None, line=None):
+        if category is DeprecationWarning and str(message) == _POINTER_DEPRECATION:
+            return
+        showwarning(message, category, filename, lineno, file, line)
+
+    warnings.showwarning = filtered
+    try:
+        yield
+    finally:
+        warnings.showwarning = showwarning
+
+
+@dataclass(frozen=True)
+class CuteDslNvfp4Fc1Config:
+    mma_tile_m: int = 128
+    mma_tile_n: int = 128
+    cluster_m: int = 1
+    cluster_n: int = 1
+
+    def validate(self) -> None:
+        if self.mma_tile_m not in (128, 256):
+            raise ValueError("mma_tile_m must be 128 or 256")
+        if self.mma_tile_n not in (64, 128, 256):
+            raise ValueError("mma_tile_n must be 64, 128, or 256")
+        if self.cluster_m not in (1, 2):
+            raise ValueError("cluster_m must be 1 or 2")
+        if self.cluster_n != 1:
+            raise ValueError("cluster_n must be 1")
+        if self.cluster_m * self.cluster_n > 8:
+            raise ValueError("cluster size must be ≤ 8")
+        if self.mma_tile_m == 256 and self.cluster_m % 2 != 0:
+            raise ValueError("cluster_m must be even when mma_tile_m is 256")
+
+
+DEFAULT_CONFIGS = tuple(
+    CuteDslNvfp4Fc1Config(tile_m, tile_n, cluster_m, 1)
+    for tile_m in (128,) for tile_n in (64, 128, 256)
+    for cluster_m in (1, 2)
+)
+
+
+def format_config(config):
+    return f"{config.mma_tile_m}x{config.mma_tile_n}/c{config.cluster_m}x{config.cluster_n}"
+
+
+# ---------------------------------------------------------------------------
+# Custom CuTE JIT launch function for the SwiGLU-fusion kernel.
+# Mirrors the kernel's ``wrapper`` but passes ``c_sf_ptr=None`` and
+# ``global_sf_ptr=None`` → ``generate_sfc=False`` → raw BF16 output.
+# A is pre-permuted on the Python side; this kernel does NOT do a gather.
+# ---------------------------------------------------------------------------
+@cute.jit
+def _launch_fc1(
+    gemm_op: cutlass.Constexpr,
+    a_ptr: cute.Pointer,
+    b_ptr: cute.Pointer,
+    a_sf_ptr: cute.Pointer,
+    b_sf_ptr: cute.Pointer,
+    c_ptr: cute.Pointer,
+    alpha_ptr: cute.Pointer,
+    tile_idx_to_expert_idx_ptr: cute.Pointer,
+    num_non_exiting_tiles_ptr: cute.Pointer,
+    m: cutlass.Int64,
+    n: cutlass.Int64,
+    k: cutlass.Int64,
+    l: cutlass.Int64,  # noqa: E741
+    tile_size: cutlass.Constexpr,
+    scaling_vector_size: cutlass.Constexpr,
+    max_active_clusters: cutlass.Constexpr,
+    stream: cuda.CUstream,
+):
+    """Construct CuTE tensors and call the kernel with no scale-factor-C output."""
+    scale_k = k // scaling_vector_size
+    interm_size = n // 2  # SwiGLU collapses gate/up pairs
+    num_tiles = m // tile_size
+
+    a = cute.make_tensor(
+        a_ptr, layout=cute.make_ordered_layout((m, k, 1), order=(1, 0, 2))
+    )
+    b = cute.make_tensor(
+        b_ptr, layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2))
+    )
+    a_sf = cute.make_tensor(
+        a_sf_ptr,
+        layout=cute.make_ordered_layout(
+            (32, 4, m // 128, 4, scale_k // 4, 1), order=(2, 1, 4, 0, 3, 5)
+        ),
+    )
+    b_sf = cute.make_tensor(
+        b_sf_ptr,
+        layout=cute.make_ordered_layout(
+            (32, 4, n // 128, 4, scale_k // 4, l), order=(2, 1, 4, 0, 3, 5)
+        ),
+    )
+    c = cute.make_tensor(
+        c_ptr, layout=cute.make_ordered_layout((m, interm_size, 1), order=(1, 0, 2))
+    )
+    alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l,)))
+    tile_idx_to_expert_idx = cute.make_tensor(
+        tile_idx_to_expert_idx_ptr, layout=cute.make_layout((num_tiles,))
+    )
+    num_non_exiting_tiles = cute.make_tensor(
+        num_non_exiting_tiles_ptr, layout=cute.make_layout((1,))
+    )
+
+    # Bypass SFC generation: the SwiGLU-fusion kernel checks
+    #   generate_sfc = sfc_tensor is not None and norm_const_tensor is not None
+    # Passing None for both keeps the epilogue in BF16 direct-store mode.
+    gemm_op(
+        a,
+        b,
+        c,
+        a_sf,
+        b_sf,
+        None,   # sfc_tensor
+        None,   # norm_const_tensor
+        tile_idx_to_expert_idx,
+        num_non_exiting_tiles,
+        alpha,
+        max_active_clusters,
+        stream,
+    )
+
+
+def _measure(run, iters, cold_l2_flush):
+    if cold_l2_flush is None:
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(iters):
+            run()
+        end.record()
+        end.synchronize()
+        return start.elapsed_time(end) / iters
+    events = []
+    for _ in range(iters):
+        cold_l2_flush()
+        start, end = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+        start.record()
+        run()
+        end.record()
+        events.append((start, end))
+    events[-1][1].synchronize()
+    return sum(start.elapsed_time(end) for start, end in events) / iters
+
+
+def _stats(run, options):
+    for _ in range(options.warmup):
+        run()
+    torch.cuda.synchronize()
+    samples = sorted(
+        _measure(run, options.iters, options.cold_l2_flush)
+        for _ in range(options.samples)
+    )
+    return {
+        "min_ms": samples[0],
+        "median_ms": statistics.median(samples),
+        "max_ms": samples[-1],
+    }
+
+
+def _quick_probe(run, options):
+    for _ in range(_PROBE_WARMUP):
+        run()
+    torch.cuda.synchronize()
+    return _measure(run, options.iters, options.cold_l2_flush)
+
+
+class CuteDslNvfp4Fc1Runner:
+    """Prepare, autotune, and run CuTE DSL NVFP4 FC1 with fused SwiGLU.
+
+    Pre-gathers A + SFA via ``source_rows`` on the Python side, then invokes
+    the CuTE DSL persistent grouped-GEMM + SwiGLU kernel.
+
+    Accepts the same tensor interface as the native ``nvfp4_fc1`` plus
+    metadata (``source_rows``, ``tasks``, ``state``) from
+    ``prepare_nvfp4_fc1_metadata``.
+    """
+
+    def __init__(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        sfa: torch.Tensor,
+        sfb: torch.Tensor,
+        out: torch.Tensor,
+        source_rows: torch.Tensor,
+        tasks: torch.Tensor,
+        state: torch.Tensor,
+    ):
+        if not all(
+            t.is_cuda for t in (a, b, sfa, sfb, out, source_rows, tasks, state)
+        ):
+            raise ValueError("all CuTE DSL NVFP4 FC1 tensors must be CUDA tensors")
+        if a.dtype != torch.float4_e2m1fn_x2 or b.dtype != torch.float4_e2m1fn_x2:
+            raise ValueError("a and b must be packed torch.float4_e2m1fn_x2 tensors")
+        if sfa.dtype != torch.float8_e4m3fn or sfb.dtype != torch.float8_e4m3fn:
+            raise ValueError("expected E4M3 scale factors")
+        if out.dtype != torch.bfloat16:
+            raise ValueError("expected BF16 output")
+        if a.ndim != 2 or b.ndim != 3 or out.ndim != 2:
+            raise ValueError(
+                "expected a[tokens,K/2], b[experts,2*N,K/2], out[permuted_m,N]"
+            )
+        if source_rows.dtype != torch.int32 or tasks.dtype != torch.int32 or state.dtype != torch.int32:
+            raise ValueError("metadata tensors must be int32")
+
+        self.tokens, packed_k = a.shape
+        self.experts, double_n, packed_k_b = b.shape
+        self.k = packed_k * 2
+        self.n = double_n  # gate+up interleaved (2 * N)
+        if packed_k != packed_k_b:
+            raise ValueError("K dimension mismatch between a and b")
+        if self.n % 128 != 0:
+            raise ValueError("B dim 1 (2*N) must be divisible by 128")
+        # SFA/SFB may be flat (1D blocked layout) or 2D — accept either.
+        expected_sfa_elems = self.tokens * (self.k // 16)
+        if sfa.numel() != expected_sfa_elems:
+            raise ValueError(
+                f"sfa has {sfa.numel()} elements, expected {expected_sfa_elems}"
+            )
+        expected_sfb_elems = self.experts * self.n * (self.k // 16)
+        if sfb.numel() != expected_sfb_elems:
+            raise ValueError(
+                f"sfb has {sfb.numel()} elements, expected {expected_sfb_elems}"
+            )
+
+        self.logical_m = source_rows.numel()  # permuted rows = tokens * topk
+        if out.shape != (self.logical_m, self.n // 2):
+            raise ValueError(
+                f"out shape mismatch: {out.shape} vs ({self.logical_m},{self.n // 2})"
+            )
+
+        # ExpertTileTask is {row_start, row_count, tile_row, expert, tile_n}.
+        # The native list contains one entry per M/N tile; retain just the
+        # first entry of each expert range.
+        if state.numel() < 1:
+            raise ValueError("state tensor must contain the native task count")
+        if tasks.numel() % 5:
+            raise ValueError("tasks tensor must contain 5 int32 values per task")
+        self.num_tasks = int(state[0].item())
+        if self.num_tasks < 0 or tasks.numel() < self.num_tasks * 5:
+            raise ValueError("tasks tensor is too small for the declared task count")
+        task_rows = tasks.reshape(-1, 5)[: self.num_tasks].cpu().tolist()
+        native_ranges = tuple(sorted(
+            (row_start, row_count, expert)
+            for row_start, row_count, tile_row, expert, tile_n in task_rows
+            if (
+                tile_row == 0
+                and tile_n == 0
+                and row_count > 0
+                and 0 <= expert < self.experts
+                and 0 <= row_start < self.logical_m
+                and row_start + row_count <= self.logical_m
+            )
+        ))
+        if not native_ranges:
+            raise ValueError("native FC1 metadata contains no expert ranges")
+        expected_row_start = 0
+        for row_start, row_count, _expert in native_ranges:
+            if row_start != expected_row_start:
+                raise ValueError(
+                    "native FC1 expert ranges do not contiguously cover routed rows"
+                )
+            expected_row_start += row_count
+        if expected_row_start != self.logical_m:
+            raise ValueError(
+                "native FC1 expert ranges do not cover every routed row"
+            )
+
+        # Match TensorRT-LLM's UT: pad each expert group to the CTA M tile
+        # (128 for the configurations exposed here), then scatter only valid
+        # rows back to the caller's output.
+        padded_source_chunks = []
+        valid_padded_chunks = []
+        valid_output_chunks = []
+        padded_ranges = []
+        padded_start = 0
+        for row_start, row_count, expert in native_ranges:
+            padding = (-row_count) % 128
+            rows = source_rows[row_start:row_start + row_count]
+            if padding:
+                rows = torch.cat((rows, rows[:1].expand(padding)))
+            padded_source_chunks.append(rows)
+            valid_padded_chunks.append(
+                torch.arange(
+                    padded_start, padded_start + row_count,
+                    device=source_rows.device, dtype=torch.long,
+                )
+            )
+            valid_output_chunks.append(
+                torch.arange(
+                    row_start, row_start + row_count,
+                    device=source_rows.device, dtype=torch.long,
+                )
+            )
+            padded_ranges.append((padded_start, row_count + padding, expert))
+            padded_start += row_count + padding
+        padded_source_rows = torch.cat(padded_source_chunks)
+        self._valid_padded_rows = torch.cat(valid_padded_chunks)
+        self._valid_output_rows = torch.cat(valid_output_chunks)
+        self._expert_ranges = tuple(padded_ranges)
+        self.m = padded_start
+        self.out_target = out
+
+        # Gather/reorder scales in their logical form.  The imported CuTE
+        # kernel consumes the same SWIZZLE_32_4_4 physical format as native
+        # NVFP4 GEMM, so repack with ``to_blocked_nvfp4_scales`` afterwards.
+        from sm110a_kernel.kernels.nvfp4_gemm import (
+            from_blocked_nvfp4_scales,
+            to_blocked_nvfp4_scales,
+        )
+
+        sfa_logical_2d = from_blocked_nvfp4_scales(sfa, self.tokens, self.k)
+        sfb_logical_2d = from_blocked_nvfp4_scales(
+            sfb, self.experts * self.n, self.k
+        )
+
+        # Pre-gather A and SFA: the SwiGLU kernel expects pre-permuted data.
+        # float4_e2m1fn_x2 doesn't support indexing — view as uint8, gather,
+        # then view back.  Each E2M1 row is k/2 bytes.
+        a_bytes = a.view(torch.uint8).reshape(self.tokens, -1)
+        a_gathered = a_bytes[padded_source_rows.long()].contiguous()
+        self.a_storage = a_gathered.view(torch.float4_e2m1fn_x2).reshape(self.m, -1)
+        # Gather SFA rows and restore the physical NVFP4 scale layout.
+        sfa_gathered_2d = sfa_logical_2d[padded_source_rows.long()].contiguous()
+        self.sfa_storage = to_blocked_nvfp4_scales(sfa_gathered_2d)
+        # Native FC1 stores output channels as [gate:32, up:32]; the CuTE
+        # SwiGLU epilogue consumes [up:64, gate:64].  Reorder B and its
+        # logical SFB rows together before converting SFB to CuTE layout.
+        swiglu_blocks = self.n // 128
+        b_bytes = b.view(torch.uint8).reshape(
+            self.experts, swiglu_blocks, 4, 32, self.k // 2
+        )
+        self.b_storage = b_bytes[:, :, (1, 3, 0, 2)].reshape_as(
+            b.view(torch.uint8)
+        ).contiguous().view(torch.float4_e2m1fn_x2).reshape_as(b)
+        sfb_cute_logical_2d = sfb_logical_2d.reshape(
+            self.experts, swiglu_blocks, 4, 32, self.k // 16
+        )[:, :, (1, 3, 0, 2)].reshape_as(sfb_logical_2d)
+        self.sfb_storage = to_blocked_nvfp4_scales(sfb_cute_logical_2d)
+        self.out_storage = torch.empty(
+            (self.m, self.n // 2), device=out.device, dtype=out.dtype
+        )
+
+        # One alpha per expert (multiplicative identity).
+        self.alpha = torch.ones((self.experts,), device=a.device, dtype=torch.float32)
+
+        self.stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        self.selection: Optional[Selection] = None
+
+    def _cute_tile_metadata(self, config: CuteDslNvfp4Fc1Config):
+        """Return CuTE's ``tile_idx_to_expert_idx`` and valid-tile count.
+
+        CuTE's grouped kernel schedules tiles only along M; its N dimension
+        is handled inside each scheduled GEMM tile.  Do not pass native
+        ``state[0]`` here: that count also includes every native N tile.
+        """
+        cta_m = config.mma_tile_m
+        if self.m % cta_m:
+            raise ValueError(f"permuted M={self.m} must be divisible by CuTE CTA M={cta_m}")
+
+        tile_experts = []
+        for row in range(0, self.m, cta_m):
+            matching = next(
+                (expert for start, count, expert in self._expert_ranges
+                 if start <= row < start + count),
+                None,
+            )
+            if matching is None:
+                raise ValueError(f"no expert metadata covers CuTE M tile at row {row}")
+            tile_experts.append(matching)
+
+        tile_expert_idx = torch.tensor(
+            tile_experts, device=self.a_storage.device, dtype=torch.int32
+        )
+        num_non_exiting = torch.tensor(
+            [len(tile_experts)], device=self.a_storage.device, dtype=torch.int32
+        )
+        return tile_expert_idx, num_non_exiting
+
+    def compatible_configs(self):
+        """Return configs that pass ``can_implement`` for this problem shape."""
+        valid = []
+        for config in DEFAULT_CONFIGS:
+            config.validate()
+            if self.m % config.mma_tile_m != 0:
+                continue
+            if self.n % config.mma_tile_n != 0:
+                continue
+            if not Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel.can_implement(
+                ab_dtype=cutlass.Float4E2M1FN,
+                sf_dtype=cutlass.Float8E4M3FN,
+                sf_vec_size=16,  # NVFP4
+                c_dtype=cutlass.BFloat16,
+                mma_tiler_mn=(config.mma_tile_m, config.mma_tile_n),
+                cluster_shape_mn=(config.cluster_m, config.cluster_n),
+                m=self.m,
+                n=self.n,
+                k=self.k,
+                l=self.experts,
+                a_major="k",
+                b_major="k",
+                c_major="n",
+            ):
+                continue
+            valid.append(config)
+        return tuple(valid)
+
+    def _compile(self, config: CuteDslNvfp4Fc1Config):
+        tile_expert_idx, num_non_exiting = self._cute_tile_metadata(config)
+        gemm = Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel(
+            sf_vec_size=16,
+            mma_tiler_mn=(config.mma_tile_m, config.mma_tile_n),
+            cluster_shape_mn=(config.cluster_m, config.cluster_n),
+            vectorized_f32=True,
+        )
+        hardware_info = cutlass.utils.HardwareInfo()
+        max_active_clusters = hardware_info.get_max_active_clusters(
+            config.cluster_m * config.cluster_n
+        )
+
+        a_ptr = cutlass.cute.runtime.make_ptr(
+            cutlass.Float4E2M1FN, self.a_storage.data_ptr(),
+            cutlass.cute.AddressSpace.gmem, assumed_align=32)
+        b_ptr = cutlass.cute.runtime.make_ptr(
+            cutlass.Float4E2M1FN, self.b_storage.data_ptr(),
+            cutlass.cute.AddressSpace.gmem, assumed_align=32)
+        a_sf_ptr = cutlass.cute.runtime.make_ptr(
+            cutlass.Float8E4M3FN, self.sfa_storage.data_ptr(),
+            cutlass.cute.AddressSpace.gmem, assumed_align=16)
+        b_sf_ptr = cutlass.cute.runtime.make_ptr(
+            cutlass.Float8E4M3FN, self.sfb_storage.data_ptr(),
+            cutlass.cute.AddressSpace.gmem, assumed_align=16)
+        c_ptr = cutlass.cute.runtime.make_ptr(
+            cutlass.BFloat16, self.out_storage.data_ptr(),
+            cutlass.cute.AddressSpace.gmem, assumed_align=16)
+        alpha_ptr = cutlass.cute.runtime.make_ptr(
+            cutlass.Float32, self.alpha.data_ptr(),
+            cutlass.cute.AddressSpace.gmem)
+        tile_expert_ptr = cutlass.cute.runtime.make_ptr(
+            cutlass.Int32, tile_expert_idx.data_ptr(),
+            cutlass.cute.AddressSpace.gmem)
+        num_tiles_ptr = cutlass.cute.runtime.make_ptr(
+            cutlass.Int32, num_non_exiting.data_ptr(),
+            cutlass.cute.AddressSpace.gmem)
+
+        compile_args = [
+            a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha_ptr,
+            tile_expert_ptr, num_tiles_ptr,
+            self.m, self.n, self.k, self.experts,
+        ]
+
+        fake_stream = make_fake_stream()
+        with _suppress_cutlass_pointer_deprecation():
+            return cute.compile(
+                _launch_fc1, gemm, *compile_args,
+                tile_size=config.mma_tile_m,
+                scaling_vector_size=16,
+                max_active_clusters=max_active_clusters,
+                stream=fake_stream,
+                options="--opt-level 2",
+            )
+
+    def _prepare(self, config: CuteDslNvfp4Fc1Config):
+        compiled = self._compile(config)
+        tile_expert_idx, num_non_exiting = self._cute_tile_metadata(config)
+
+        a_ptr = cutlass.cute.runtime.make_ptr(
+            cutlass.Float4E2M1FN, self.a_storage.data_ptr(),
+            cutlass.cute.AddressSpace.gmem, assumed_align=32)
+        b_ptr = cutlass.cute.runtime.make_ptr(
+            cutlass.Float4E2M1FN, self.b_storage.data_ptr(),
+            cutlass.cute.AddressSpace.gmem, assumed_align=32)
+        a_sf_ptr = cutlass.cute.runtime.make_ptr(
+            cutlass.Float8E4M3FN, self.sfa_storage.data_ptr(),
+            cutlass.cute.AddressSpace.gmem, assumed_align=16)
+        b_sf_ptr = cutlass.cute.runtime.make_ptr(
+            cutlass.Float8E4M3FN, self.sfb_storage.data_ptr(),
+            cutlass.cute.AddressSpace.gmem, assumed_align=16)
+        c_ptr = cutlass.cute.runtime.make_ptr(
+            cutlass.BFloat16, self.out_storage.data_ptr(),
+            cutlass.cute.AddressSpace.gmem, assumed_align=16)
+        alpha_ptr = cutlass.cute.runtime.make_ptr(
+            cutlass.Float32, self.alpha.data_ptr(),
+            cutlass.cute.AddressSpace.gmem)
+        tile_expert_ptr = cutlass.cute.runtime.make_ptr(
+            cutlass.Int32, tile_expert_idx.data_ptr(),
+            cutlass.cute.AddressSpace.gmem)
+        num_tiles_ptr = cutlass.cute.runtime.make_ptr(
+            cutlass.Int32, num_non_exiting.data_ptr(),
+            cutlass.cute.AddressSpace.gmem)
+
+        def run():
+            # Keep metadata tensors alive for the lifetime of this closure:
+            # ``compiled`` only receives their raw device pointers.
+            _ = tile_expert_idx, num_non_exiting
+            compiled(
+                a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha_ptr,
+                tile_expert_ptr, num_tiles_ptr,
+                self.m, self.n, self.k, self.experts,
+                stream=self.stream,
+            )
+            self.out_target.index_copy_(
+                0,
+                self._valid_output_rows,
+                self.out_storage.index_select(0, self._valid_padded_rows),
+            )
+
+        run()
+        torch.cuda.synchronize()
+        return PreparedKernel(config, run)
+
+    def autotune(self, options: TuneOptions | None = None):
+        options = options or TuneOptions()
+        configs = self.compatible_configs()
+        if not configs:
+            raise RuntimeError(
+                f"no CuTE DSL FC1 config supports "
+                f"tokens={self.tokens}, N={self.n // 2}, K={self.k}, "
+                f"experts={self.experts}"
+            )
+        self.selection = AutotuneRunner(options).resolve(
+            configs,
+            namespace="cute_dsl_nvfp4_fc1",
+            key=(self.tokens, self.experts, self.m, self.n // 2, self.k),
+            prepare=self._prepare,
+            benchmark=lambda prepared: _stats(prepared.run, options),
+            probe=lambda prepared: _quick_probe(prepared.run, options),
+            format_candidate=format_config,
+            metric_formatter=lambda _c, stats: (
+                f"{2.0 * self.m * (self.n // 2) * self.k / (stats['median_ms'] * 1e9):.1f} TF/s"
+            ),
+            pre_jit=self._compile,
+        )
+        return self.selection
+
+    def run(self):
+        if self.selection is None:
+            self.autotune()
+        self.selection.prepared.run()
+
+
+def cute_dsl_nvfp4_fc1_out(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    sfa: torch.Tensor,
+    sfb: torch.Tensor,
+    out: torch.Tensor,
+    source_rows: torch.Tensor,
+    tasks: torch.Tensor,
+    state: torch.Tensor,
+    options: TuneOptions | None = None,
+):
+    """Autotuned CuTE DSL NVFP4 FC1: grouped GEMM + fused SwiGLU → BF16.
+
+    Pre-gathers A and SFA via ``source_rows`` on the Python side, then
+    delegates to the persistent grouped-GEMM SwiGLU kernel.
+
+    Args:
+        a: Packed E2M1 activations ``(tokens, K/2)``.
+        b: Packed E2M1 weights ``(experts, 2*N, K/2)`` (interleaved gate/up).
+        sfa: E4M3 activation scales ``(tokens, K/16)``.
+        sfb: E4M3 weight scales ``(experts*2*N, K/16)``, flat.
+        out: BF16 output ``(tokens*topk, N)`` (pre-allocated).
+        source_rows: int32 map from permuted row → source token.
+        tasks: int32 flat ExpertTileTask array.
+        state: int32 ``[num_tasks, 0]``.
+        options: Autotune options.
+    """
+    runner = CuteDslNvfp4Fc1Runner(a, b, sfa, sfb, out, source_rows, tasks, state)
+    runner.autotune(options)
+    runner.run()
+    return runner
