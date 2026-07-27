@@ -2,6 +2,7 @@
 """Runner-backed config and token sweep for fused-permute NVFP4 SwiGLU FC1."""
 
 import argparse
+from dataclasses import replace
 import math
 import sys
 from pathlib import Path
@@ -50,24 +51,33 @@ NVFP4_FC1_CONFIGS = tuple(
         cluster_m=cluster_m,
         mode=mode,
         direct_gmem=direct_gmem,
+        output_evict_first=True,
+        operand_cache_policy=operand_cache_policy,
     )
-    for tile_n in (128, 256)
-    for tile_k in (64, 128, 256)
+    for tile_n in (64, 128, 256)
+    for tile_k in (256,)
     for epilogue_tile_n in (64, 128)
     for cluster_m in (1, 2)
-    for mode in ( 1, 2)
+    for mode in (0, 1, 2)
     for direct_gmem in (False, True)
+    for operand_cache_policy in (False, True)
     if tile_n % epilogue_tile_n == 0
 )
 
 
 def format_candidate(config):
     epilogue = "dg" if config.direct_gmem else "tma"
-    return (
-        f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
-        f"/e{config.epilogue_tile_n}/c{config.cluster_m}"
-        f"/{_MODE_LABELS[config.mode]}/{epilogue}"
-    )
+    fields = [
+        f"{config.tile_m}x{config.tile_n}x{config.tile_k}",
+        f"e{config.epilogue_tile_n}",
+        f"c{config.cluster_m}",
+        _MODE_LABELS[config.mode],
+        epilogue,
+    ]
+    if not config.output_evict_first:
+        fields.append("keep")
+    fields.append("cache" if config.operand_cache_policy else "nocache")
+    return "/".join(fields)
 
 
 def compatible_candidates(n, k):
@@ -79,6 +89,27 @@ def compatible_candidates(n, k):
 
 def selected_candidates(n, k, args):
     candidates = compatible_candidates(n, k)
+    if args.extended_tuning:
+        candidates = tuple(
+            replace(
+                config,
+                output_evict_first=output_evict_first,
+                macro_swizzle_n_major=n_major,
+            )
+            for config in candidates
+            for output_evict_first in (False, True)
+            for n_major in (False, True)
+        )
+    else:
+        updates = {}
+        if args.output_cache is not None:
+            updates["output_evict_first"] = args.output_cache == "evict-first"
+        if updates:
+            candidates = tuple(replace(config, **updates) for config in candidates)
+    if args.no_operand_cache_policy:
+        candidates = tuple(
+            config for config in candidates if not config.operand_cache_policy
+        )
     if args.tile_n is not None:
         candidates = tuple(c for c in candidates if c.tile_n == args.tile_n)
     if args.tile_k is not None:
@@ -93,6 +124,11 @@ def selected_candidates(n, k, args):
         candidates = tuple(c for c in candidates if c.mode == args.mode)
     if args.direct_gmem:
         candidates = tuple(c for c in candidates if c.direct_gmem)
+    if args.tma_epilogue:
+        candidates = tuple(c for c in candidates if not c.direct_gmem)
+    if args.output_cache is not None:
+        evict_first = args.output_cache == "evict-first"
+        candidates = tuple(c for c in candidates if c.output_evict_first == evict_first)
     return candidates
 
 
@@ -266,10 +302,24 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
         parser.add_argument("--epilogue-tile-n", type=int, choices=(64, 128))
         parser.add_argument("--cluster-m", type=int, choices=(1, 2))
         parser.add_argument("--mode", type=int, choices=(0, 1, 2))
+        parser.add_argument("--output-cache", choices=("evict-first", "keep"))
+        parser.add_argument(
+            "--no-operand-cache-policy",
+            action="store_true",
+            help="disable A/SFA retention and B/SFB streaming cache hints",
+        )
+        parser.add_argument(
+            "--extended-tuning", action="store_true",
+            help="also tune output cache and macro traversal",
+        )
         parser.add_argument(
             "--direct-gmem",
             action="store_true",
             help="only tune direct-GMEM epilogue candidates",
+        )
+        parser.add_argument(
+            "--tma-epilogue", action="store_true",
+            help="only tune shared-memory/TMA epilogue candidates",
         )
         parser.add_argument(
             "--baseline", choices=("torch", "cutedsl"), default="torch",
@@ -294,6 +344,8 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
             raise SystemExit("N must be a positive multiple of 128 and K of 64")
         if args.token < 0:
             raise SystemExit("token must be non-negative")
+        if args.direct_gmem and args.tma_epilogue:
+            raise SystemExit("--direct-gmem and --tma-epilogue are mutually exclusive")
         token_values = (args.token,) if args.token else DEFAULT_TOKEN_VALUES
         if any(tokens <= 0 or tokens % 128 for tokens in token_values):
             raise SystemExit("every token count must be a positive multiple of 128")
@@ -337,7 +389,7 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
         selection = AutotuneRunner(options).resolve(
             candidates,
             namespace="nvfp4_fc1",
-            key=(aq.size(0), args.experts, args.topk, args.n, args.k),
+            key=("v8", aq.size(0), args.experts, args.topk, args.n, args.k),
             prepare=prepare_for_runner,
             benchmark=lambda prepared: benchmark_with_stats(
                 prepared.run,

@@ -41,18 +41,31 @@
 #ifndef SM110A_NVFP4_FC1_DIRECT_GMEM
 #define SM110A_NVFP4_FC1_DIRECT_GMEM 0
 #endif
+#ifndef SM110A_NVFP4_FC1_OUTPUT_EVICT_FIRST
+#define SM110A_NVFP4_FC1_OUTPUT_EVICT_FIRST 1
+#endif
+#ifndef SM110A_NVFP4_FC1_OPERAND_CACHE_POLICY
+#define SM110A_NVFP4_FC1_OPERAND_CACHE_POLICY 1
+#endif
 
 namespace {
 
 constexpr int kMmaK = 64;
 constexpr int kWarpSize = 32;
 constexpr int kEpilogueWarpCount = 4;
-constexpr int kProducerWarpCount = 4;
+// BF16 only gathers A, so four producer warps are sufficient. NVFP4 also
+// gathers SFA; on cta_group::2, dedicate four warps to each operand so the
+// two independent random-access streams can overlap.
+constexpr bool kSplitGatherWarps = SM110A_NVFP4_FC1_CLUSTER_M == 2;
+constexpr int kAProducerWarpCount = 4;
+constexpr int kSfaProducerWarpCount = kAProducerWarpCount;
+constexpr int kProducerWarpCount =
+    kSplitGatherWarps ? kAProducerWarpCount + kSfaProducerWarpCount : kAProducerWarpCount;
 constexpr int kProducerWarpBase = kEpilogueWarpCount;
 constexpr int kMmaWarp = kProducerWarpBase + kProducerWarpCount;
 constexpr int kWarpCount = kMmaWarp + 1;
 constexpr int kBlockThreads = kWarpSize * kWarpCount;
-constexpr int kAProducerThreadCount = kProducerWarpCount * kWarpSize;
+constexpr int kProducerThreadCount = kProducerWarpCount * kWarpSize;
 constexpr int kPersistentTileCount = 2;
 // Each mode-2 CLC worker cluster starts with two tasks.  Once it completes
 // them it steals the work of an unstarted cluster through Cluster Launch Control.
@@ -100,11 +113,15 @@ struct KernelConfig {
     // supported configuration.
     static constexpr int kEpilogueStageCount = kEpilogueTileN == 128 ? 1 : 2;
     static constexpr int kEpilogueSmemBytes = kEpilogueStageCount * kEpilogueStageBytes;
-    // Pack as many mainloop pipeline stages as shared memory allows for this
-    // configuration. Blackwell has ~228 KB of SMEM per CTA; leave a small
-    // margin for statically allocated barriers and bookkeeping.
-    static constexpr int kMaxSmemBytes = 227 * 1024;
-    static constexpr int kStageCount = (kMaxSmemBytes - kEpilogueSmemBytes) / kPerStageSmemBytes;
+    // Dynamic and static shared memory share the same per-CTA budget.  Use
+    // every mainloop stage that fits after reserving the epilogue and the
+    // kernel's static/driver shared-memory allocations.
+    static constexpr int kMaxOptInSmemBytes = 232448;
+    static constexpr int kStaticSmemReserve = 3 * 1024;
+    static constexpr int kSmemLimitedStageCount =
+        (kMaxOptInSmemBytes - kStaticSmemReserve - kEpilogueSmemBytes) /
+        kPerStageSmemBytes;
+    static constexpr int kStageCount = kSmemLimitedStageCount;
     static_assert(kStageCount >= 2);
     static constexpr int kMainloopSmemBytes = kStageCount * kPerStageSmemBytes;
     static constexpr int kDynamicSmemBytes = kMainloopSmemBytes + kEpilogueSmemBytes;
@@ -191,8 +208,20 @@ __device__ inline void mbarrier_wait(
 __device__ __forceinline__ void cp_async_a_16b(
     int dst_smem,
     const void *src_gmem,
-    bool valid) {
+    bool valid,
+    uint64_t cache_policy) {
     const uint32_t ignore_src = valid ? 0u : 1u;
+#if SM110A_NVFP4_FC1_OPERAND_CACHE_POLICY
+    asm volatile("{\n\t"
+                 ".reg .pred p_ignore_src;\n\t"
+                 "setp.ne.u32 p_ignore_src, %2, 0;\n\t"
+                 "cp.async.ca.shared::cta.global.L2::cache_hint "
+                 "[%0], [%1], 16, p_ignore_src, %3;\n\t"
+                 "}\n"
+        :
+        : "r"(dst_smem), "l"(src_gmem), "r"(ignore_src), "l"(cache_policy)
+        : "memory");
+#else
     asm volatile("{\n\t"
                  ".reg .pred p_ignore_src;\n\t"
                  "setp.ne.u32 p_ignore_src, %2, 0;\n\t"
@@ -201,6 +230,35 @@ __device__ __forceinline__ void cp_async_a_16b(
         :
         : "r"(dst_smem), "l"(src_gmem), "r"(ignore_src)
         : "memory");
+#endif
+}
+
+__device__ __forceinline__ void cp_async_sfa_4b(
+    int dst_smem,
+    const void *src_gmem,
+    bool valid,
+    uint64_t cache_policy) {
+    const uint32_t ignore_src = valid ? 0u : 1u;
+#if SM110A_NVFP4_FC1_OPERAND_CACHE_POLICY
+    asm volatile("{\n\t"
+                 ".reg .pred p_ignore_src;\n\t"
+                 "setp.ne.u32 p_ignore_src, %2, 0;\n\t"
+                 "cp.async.ca.shared::cta.global.L2::cache_hint "
+                 "[%0], [%1], 4, p_ignore_src, %3;\n\t"
+                 "}\n"
+        :
+        : "r"(dst_smem), "l"(src_gmem), "r"(ignore_src), "l"(cache_policy)
+        : "memory");
+#else
+    asm volatile("{\n\t"
+                 ".reg .pred p_ignore_src;\n\t"
+                 "setp.ne.u32 p_ignore_src, %2, 0;\n\t"
+                 "cp.async.ca.shared::cta.global [%0], [%1], 4, p_ignore_src;\n\t"
+                 "}\n"
+        :
+        : "r"(dst_smem), "l"(src_gmem), "r"(ignore_src)
+        : "memory");
+#endif
 }
 
 __device__ __forceinline__ void cp_async_a_mbarrier_arrive_noinc(int mbar_addr) {
@@ -222,21 +280,128 @@ __device__ __forceinline__ void load_gather_a_and_sfa(
     char *__restrict__ sfa_smem,
     int a_mbar_addr,
     bool a_is_tma,
-    bool sfa_is_tma) {
+    bool sfa_is_tma,
+    uint64_t cache_policy) {
     constexpr int kVectorBytes = 16;
     constexpr int kVectorsPerRow = kTileK / 32;
     constexpr int kMmaSteps = kTileK / 64;
-    constexpr int kRowsPerProducerWarp = kTileM / kProducerWarpCount;
+    constexpr int kRowsPerAWarp = kTileM / kAProducerWarpCount;
+    constexpr int kRowsPerSfaWarp = kTileM / kSfaProducerWarpCount;
+    constexpr int kRowsPerIssue = kWarpSize / kVectorsPerRow;
+    constexpr int kRowGroupCount = kRowsPerAWarp / kRowsPerIssue;
     const int warp_id = threadIdx.x / kWarpSize;
     const int producer_rank = warp_id - kProducerWarpBase;
     const int lane = threadIdx.x & 31;
-    const int row = producer_rank * kRowsPerProducerWarp + lane;
 
-    static_assert(kTileM % kProducerWarpCount == 0);
-    static_assert(kRowsPerProducerWarp == kWarpSize);
+    if constexpr (!kSplitGatherWarps) {
+        constexpr int kRowsPerProducerWarp = kTileM / kProducerWarpCount;
+        const int row = producer_rank * kRowsPerProducerWarp + lane;
+
+        static_assert(kTileM % kProducerWarpCount == 0);
+        static_assert(kRowsPerProducerWarp == kWarpSize);
+
+        // Match the 128B-swizzled TMA layout consumed by
+        // make_k_major_128b_desc.
+        if (!a_is_tma)
+            for (int vec = 0; vec < kVectorsPerRow; ++vec) {
+                constexpr int kSmemVectorsPerRow = 128 / kVectorBytes;
+                const int physical_linear =
+                    row * kSmemVectorsPerRow + vec;
+                const int swizzled =
+                    (physical_linear & ~7) +
+                    ((physical_linear & 7) ^
+                        ((physical_linear >> 3) & 7));
+                const bool valid = row < valid_rows;
+                const int source_row = valid ? source_rows[row] : 0;
+                const size_t offset =
+                    static_cast<size_t>(source_row) * (k / 2) +
+                    static_cast<size_t>(tile_k) * (kTileK / 2) +
+                    vec * kVectorBytes;
+                const int dst_smem =
+                    static_cast<int>(__cvta_generic_to_shared(
+                        reinterpret_cast<uint4 *>(a_smem) + swizzled));
+                cp_async_a_16b(
+                    dst_smem, a + offset, valid, cache_policy);
+            }
+
+        if (!sfa_is_tma)
+            for (int mma_k = 0; mma_k < kMmaSteps; ++mma_k) {
+                const bool valid = row < valid_rows;
+                const int source_row = valid ? source_rows[row] : 0;
+                const int source_in_tile =
+                    (source_row & 31) * 16 +
+                    ((source_row >> 5) & 3) * 4;
+                const size_t source_tile =
+                    static_cast<size_t>(source_row >> 7);
+                const size_t global_mma_k =
+                    static_cast<size_t>(tile_k) * kMmaSteps + mma_k;
+                const int dst_in_tile =
+                    (row & 31) * 16 + ((row >> 5) & 3) * 4;
+                const int dst_smem =
+                    static_cast<int>(__cvta_generic_to_shared(
+                        sfa_smem + mma_k * 512 + dst_in_tile));
+                cp_async_sfa_4b(dst_smem,
+                    sfa + (source_tile * (k / 64) + global_mma_k) * 512 +
+                        source_in_tile,
+                    valid, cache_policy);
+            }
+
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        cp_async_a_mbarrier_arrive_noinc(a_mbar_addr);
+        return;
+    }
+
+    const bool a_producer =
+        !kSplitGatherWarps || producer_rank < kAProducerWarpCount;
+    const bool sfa_producer =
+        !kSplitGatherWarps || producer_rank >= kAProducerWarpCount;
+    const int a_rank = producer_rank;
+    const int sfa_rank = kSplitGatherWarps
+        ? producer_rank - kAProducerWarpCount
+        : producer_rank;
+    const int a_row_begin = a_rank * kRowsPerAWarp;
+    const int sfa_row_begin = sfa_rank * kRowsPerSfaWarp;
+
+    static_assert(kTileM % kAProducerWarpCount == 0);
+    static_assert(kTileM % kSfaProducerWarpCount == 0);
+    static_assert(kRowsPerAWarp == kWarpSize);
+    static_assert(kWarpSize % kVectorsPerRow == 0);
+    static_assert(kRowsPerAWarp % kRowsPerIssue == 0);
+
+    // Rebuild each gathered logical [128,4] scale tile directly in
+    // SWIZZLE_32_4_4 order. Each thread moves all four scales for one row.
+    if (sfa_producer && !sfa_is_tma && lane < kRowsPerSfaWarp)
+        for (int mma_k = 0; mma_k < kMmaSteps; ++mma_k) {
+            const int row = sfa_row_begin + lane;
+            const bool valid = row < valid_rows;
+            // Rank 1 is often empty for small expert buckets. Its output rows
+            // are discarded, so do not spend issue slots on zero-fill copies.
+            if (!kSplitGatherWarps || valid) {
+                const int source_row = valid ? source_rows[row] : 0;
+                const int source_in_tile = (source_row & 31) * 16 +
+                                           ((source_row >> 5) & 3) * 4;
+                const size_t source_tile =
+                    static_cast<size_t>(source_row >> 7);
+                const size_t global_mma_k =
+                    static_cast<size_t>(tile_k) * kMmaSteps + mma_k;
+                const int dst_in_tile =
+                    (row & 31) * 16 + ((row >> 5) & 3) * 4;
+                const int dst_smem =
+                    static_cast<int>(__cvta_generic_to_shared(
+                        sfa_smem + mma_k * 512 + dst_in_tile));
+                cp_async_sfa_4b(dst_smem,
+                    sfa + (source_tile * (k / 64) + global_mma_k) * 512 +
+                        source_in_tile,
+                    valid, cache_policy);
+            }
+        }
 
     // Match the 128B-swizzled TMA layout consumed by make_k_major_128b_desc.
-    if (!a_is_tma) for (int vec = 0; vec < kVectorsPerRow; ++vec) {
+    if (a_producer && !a_is_tma)
+        for (int row_group = 0; row_group < kRowGroupCount; ++row_group) {
+        const int row = a_row_begin + row_group * kRowsPerIssue +
+                        lane / kVectorsPerRow;
+        const int vec = lane % kVectorsPerRow;
         // The UMMA K-major SW128 atom reserves a full 128-byte row even when
         // this stage carries only K=64 or K=128. This is why kASmemBytes is
         // fixed at TileM*128 rather than the TMA transaction byte count.
@@ -245,33 +410,18 @@ __device__ __forceinline__ void load_gather_a_and_sfa(
         const int swizzled = (physical_linear & ~7) +
                              ((physical_linear & 7) ^ ((physical_linear >> 3) & 7));
         const bool valid = row < valid_rows;
-        const int source_row = valid ? source_rows[row] : 0;
-        const size_t offset = static_cast<size_t>(source_row) * (k / 2) +
-                              static_cast<size_t>(tile_k) * (kTileK / 2) +
-                              vec * kVectorBytes;
-        const int dst_smem = static_cast<int>(__cvta_generic_to_shared(
-            reinterpret_cast<uint4 *>(a_smem) + swizzled));
-        cp_async_a_16b(dst_smem, a + offset, valid);
-    }
-
-    // Rebuild each gathered logical [128,4] scale tile directly in
-    // SWIZZLE_32_4_4 order. Each thread moves all four scales for one row,
-    // replacing the old byte-at-a-time gather.
-    if (!sfa_is_tma) for (int mma_k = 0; mma_k < kMmaSteps; ++mma_k) {
-        uint32_t value = 0;
-        if (row < valid_rows) {
-            const int source_row = source_rows[row];
-            const int source_in_tile = (source_row & 31) * 16 +
-                                       ((source_row >> 5) & 3) * 4;
-            const size_t source_tile = static_cast<size_t>(source_row >> 7);
-            const size_t global_mma_k = static_cast<size_t>(tile_k) * kMmaSteps + mma_k;
-            value = *reinterpret_cast<const uint32_t *>(
-                sfa + (source_tile * (k / 64) + global_mma_k) * 512 + source_in_tile);
+        // Preserve the original c1 zero-fill behavior; c2 can skip invalid
+        // rows because those accumulator rows are never stored.
+        if (!kSplitGatherWarps || valid) {
+            const int source_row = valid ? source_rows[row] : 0;
+            const size_t offset = static_cast<size_t>(source_row) * (k / 2) +
+                                  static_cast<size_t>(tile_k) * (kTileK / 2) +
+                                  vec * kVectorBytes;
+            const int dst_smem = static_cast<int>(__cvta_generic_to_shared(
+                reinterpret_cast<uint4 *>(a_smem) + swizzled));
+            cp_async_a_16b(dst_smem, a + offset, valid, cache_policy);
         }
-        const int dst_in_tile = (row & 31) * 16 + ((row >> 5) & 3) * 4;
-        *reinterpret_cast<uint32_t *>(sfa_smem + mma_k * 512 + dst_in_tile) = value;
     }
-
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     cp_async_a_mbarrier_arrive_noinc(a_mbar_addr);
 }
@@ -327,8 +477,16 @@ __device__ inline void tma_load_4d(
     int y,
     int z,
     int w,
-    int mbar_addr) {
+    int mbar_addr,
+    uint64_t cache_policy) {
     if constexpr (kClusterM == 1) {
+#if SM110A_NVFP4_FC1_OPERAND_CACHE_POLICY
+        asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global."
+                     "mbarrier::complete_tx::bytes.cta_group::1.L2::cache_hint "
+                     "[%0], [%1, {%2, %3, %4, %5}], [%6], %7;" ::"r"(dst_smem),
+            "l"(tensor_map), "r"(x), "r"(y), "r"(z), "r"(w), "r"(mbar_addr),
+            "l"(cache_policy) : "memory");
+#else
         asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global."
                      "mbarrier::complete_tx::bytes.cta_group::1 "
                      "[%0], [%1, {%2, %3, %4, %5}], [%6];" ::"r"(dst_smem),
@@ -339,7 +497,15 @@ __device__ inline void tma_load_4d(
             "r"(w),
             "r"(mbar_addr)
             : "memory");
+#endif
     } else {
+#if SM110A_NVFP4_FC1_OPERAND_CACHE_POLICY
+        asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global."
+                     "mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint "
+                     "[%0], [%1, {%2, %3, %4, %5}], [%6], %7;" ::"r"(dst_smem),
+            "l"(tensor_map), "r"(x), "r"(y), "r"(z), "r"(w), "r"(mbar_addr),
+            "l"(cache_policy) : "memory");
+#else
         asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global."
                      "mbarrier::complete_tx::bytes.cta_group::2 "
                      "[%0], [%1, {%2, %3, %4, %5}], [%6];" ::"r"(dst_smem),
@@ -350,6 +516,7 @@ __device__ inline void tma_load_4d(
             "r"(w),
             "r"(mbar_addr)
             : "memory");
+#endif
     }
 }
 
@@ -362,29 +529,79 @@ __device__ inline void tma_load_4d_multicast(
     int z,
     int w,
     int mbar_addr,
-    int16_t cta_mask) {
+    int16_t cta_mask,
+    uint64_t cache_policy) {
     static_assert(kClusterM == 2);
+#if SM110A_NVFP4_FC1_OPERAND_CACHE_POLICY
+    asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global."
+                 "mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2."
+                 "L2::cache_hint "
+                 "[%0], [%1, {%2, %3, %4, %5}], [%6], %7, %8;" ::
+            "r"(dst_smem), "l"(tensor_map), "r"(x), "r"(y), "r"(z), "r"(w),
+            "r"(mbar_addr), "h"(cta_mask), "l"(cache_policy) : "memory");
+#else
     asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global."
                  "mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2 "
                  "[%0], [%1, {%2, %3, %4, %5}], [%6], %7;" ::
             "r"(dst_smem), "l"(tensor_map), "r"(x), "r"(y), "r"(z), "r"(w),
             "r"(mbar_addr), "h"(cta_mask) : "memory");
+#endif
 }
 
+__device__ inline uint64_t make_reuse_cache_policy() {
+    uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;"
+        : "=l"(policy));
+    return policy;
+}
+
+__device__ inline uint64_t make_streaming_cache_policy() {
+    uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;"
+        : "=l"(policy));
+    return policy;
+}
+
+__device__ inline uint64_t make_epilogue_cache_policy() {
+    uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;"
+        : "=l"(policy));
+    return policy;
+}
+
+template <bool kEvictFirst>
+__device__ inline void store_output_16b(int4 *ptr, int4 value) {
+    if constexpr (kEvictFirst) {
+        // PTX only accepts an L2 eviction priority on stores of at least
+        // 32 bytes.  This path emits 16-byte row fragments, so bypass L1 and
+        // leave the L2 policy to the cache replacement hardware.
+        asm volatile("st.global.L1::no_allocate.v4.b32 "
+                     "[%0], {%1, %2, %3, %4};" ::
+            "l"(ptr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w)
+            : "memory");
+    } else {
+        ptr[0] = value;
+    }
+}
+
+template <bool kEvictFirst>
 __device__ inline void tma_store_3d(
     int src_smem,
     const void *tensor_map,
     int x,
     int y,
-    int z) {
+    int z,
+    uint64_t cache_policy) {
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-    asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.bulk_group "
-                 "[%0, {%1, %2, %3}], [%4];" ::"l"(tensor_map),
-        "r"(x),
-        "r"(y),
-        "r"(z),
-        "r"(src_smem)
-        : "memory");
+    if constexpr (kEvictFirst) {
+        asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.bulk_group.L2::cache_hint "
+                     "[%0, {%1, %2, %3}], [%4], %5;" ::"l"(tensor_map),
+            "r"(x), "r"(y), "r"(z), "r"(src_smem), "l"(cache_policy) : "memory");
+    } else {
+        asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.bulk_group "
+                     "[%0, {%1, %2, %3}], [%4];" ::"l"(tensor_map),
+            "r"(x), "r"(y), "r"(z), "r"(src_smem) : "memory");
+    }
 }
 
 __device__ inline void tma_store_commit_group() {
@@ -634,7 +851,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
         for (int stage = 0; stage < kStageCount; ++stage) {
             mbarrier_init(base_tma_mbar_addr + stage * sizeof(uint64_t), kClusterM);
             mbarrier_init(
-                base_a_mbar_addr + stage * sizeof(uint64_t), kAProducerThreadCount);
+                base_a_mbar_addr + stage * sizeof(uint64_t), kProducerThreadCount);
             if constexpr (kClusterM > 1) {
                 if (cta_rank == 0) {
                     mbarrier_init(
@@ -679,6 +896,16 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
     asm volatile("barrier.cluster.wait.acquire.aligned;");
 
     const int tmem_addr = tmem_base[0];
+    uint64_t reuse_cache_policy = 0;
+    uint64_t streaming_cache_policy = 0;
+#if SM110A_NVFP4_FC1_OPERAND_CACHE_POLICY
+    reuse_cache_policy = make_reuse_cache_policy();
+    streaming_cache_policy = make_streaming_cache_policy();
+#endif
+    uint64_t epilogue_cache_policy = 0;
+    if constexpr (!kDirectGmem && SM110A_NVFP4_FC1_OUTPUT_EVICT_FIRST != 0) {
+        if (tid == 0) epilogue_cache_policy = make_epilogue_cache_policy();
+    }
     constexpr uint32_t instruction_desc = (1U << 7U) | (1U << 10U) |
                                           (static_cast<uint32_t>(kTileN) >> 3U << 17U) |
                                           (static_cast<uint32_t>(kClusterTileM) >> 7U << 27U);
@@ -738,8 +965,9 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                     if (tid < valid_rows) {
                         const int gmem_row = cta_row + tid;
                         const int gmem_col = tile_col / 2 + logical_col;
-                        reinterpret_cast<int4 *>(c + gmem_row * (n / 2) + gmem_col)[0] =
-                            reinterpret_cast<int4 *>(packed)[0];
+                        store_output_16b<(SM110A_NVFP4_FC1_OUTPUT_EVICT_FIRST != 0)>(
+                            reinterpret_cast<int4 *>(c + gmem_row * (n / 2) + gmem_col),
+                            reinterpret_cast<int4 *>(packed)[0]);
                     }
                 } else {
                     const int store_tile = n_group / kChunksPerStoreTile;
@@ -883,14 +1111,15 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                 if (cta_row != cached_source_row_start) {
                     const int lane = tid & (kWarpSize - 1);
                     const int row = producer_rank * kWarpSize + lane;
-                    task_source_rows[row] =
-                        row < valid_rows ? __ldg(source_rows + cta_row + row) : 0;
+                    if (producer_rank < kAProducerWarpCount)
+                        task_source_rows[row] =
+                            row < valid_rows ? __ldg(source_rows + cta_row + row) : 0;
                     __syncwarp();
                     cached_source_row_start = cta_row;
                     // Cache this classification for all adjacent N tiles of
                     // the same routed-row run.  This keeps the normal gather
                     // path from repeatedly scanning the 128-entry map.
-                    asm volatile("bar.sync 2, 128;" ::: "memory");
+                    asm volatile("bar.sync 2, %0;" :: "n"(kProducerThreadCount) : "memory");
                     if (producer_rank == 0 && (tid & (kWarpSize - 1)) == 0) {
                         const int base = task_source_rows[0];
                         bool contiguous = valid_rows == kTileM;
@@ -899,7 +1128,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                         task_gather_tma[0] = contiguous;
                         task_gather_tma[1] = contiguous && !(base & (kTileM - 1));
                     }
-                    asm volatile("bar.sync 2, 128;" ::: "memory");
+                    asm volatile("bar.sync 2, %0;" :: "n"(kProducerThreadCount) : "memory");
                 }
                 const bool gather_a_tma = task_gather_tma[0];
                 const bool gather_sfa_tma = task_gather_tma[1];
@@ -934,7 +1163,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                             : "memory");
                         tma_load_4d<kClusterM>(b_smem, &b_tensor_map, off_k,
                             tile_col + cta_rank * (kTileN / kClusterM), 0, task.expert,
-                            tma_transaction_mbar_addr);
+                            tma_transaction_mbar_addr, streaming_cache_policy);
                         for (int scale_tile = 0; scale_tile < kSFBScaleTileCount; ++scale_tile) {
                             const int sfb_tile_smem =
                                 sfb_smem + scale_tile * Config::kMmaStepsPerStage * 512;
@@ -942,20 +1171,23 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                                 task.expert * (n / 128) + tile_col / 128 + scale_tile;
                             if constexpr (kClusterM == 1) {
                                 tma_load_4d<1>(sfb_tile_smem, &sfb_tensor_map, 0, 0, off_k64,
-                                    sfb_tile_index, tma_transaction_mbar_addr);
+                                    sfb_tile_index, tma_transaction_mbar_addr,
+                                    streaming_cache_policy);
                             } else if (cta_rank == 0) {
                                 tma_load_4d_multicast<2>(sfb_tile_smem, &sfb_tensor_map,
-                                    0, 0, off_k64, sfb_tile_index, tma_transaction_mbar_addr, 3);
+                                    0, 0, off_k64, sfb_tile_index, tma_transaction_mbar_addr,
+                                    3, streaming_cache_policy);
                             }
                         }
                         if (gather_a_tma) {
                             tma_load_4d<kClusterM>(a_smem, &a_tensor_map, off_k,
-                                task_source_rows[0], 0, 0, tma_transaction_mbar_addr);
+                                task_source_rows[0], 0, 0, tma_transaction_mbar_addr,
+                                reuse_cache_policy);
                         }
                         if (gather_sfa_tma) {
                             tma_load_4d<kClusterM>(sfa_smem, &sfa_tensor_map, 0, 0,
                                 off_k64, task_source_rows[0] / kTileM,
-                                tma_transaction_mbar_addr);
+                                tma_transaction_mbar_addr, reuse_cache_policy);
                         }
                     }
 
@@ -964,7 +1196,8 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                         dynamic_smem + producer_stage * kStageSmemBytes,
                         dynamic_smem + producer_stage * kStageSmemBytes +
                             kASmemBytes + kBSmemBytes,
-                        a_mbar_addr, gather_a_tma, gather_sfa_tma);
+                        a_mbar_addr, gather_a_tma, gather_sfa_tma,
+                        reuse_cache_policy);
 
                     producer_stage = (producer_stage + 1) % kStageCount;
                     if (producer_stage == 0) {
@@ -1127,11 +1360,13 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                                 if (tid == 0) {
                                     for (int store_tile = 0; store_tile < kEpilogueStoreTiles;
                                         ++store_tile) {
-                                        tma_store_3d(stage_smem + store_tile * kStoreTileBytes,
+                                        tma_store_3d<(SM110A_NVFP4_FC1_OUTPUT_EVICT_FIRST != 0)>(
+                                            stage_smem + store_tile * kStoreTileBytes,
                                             &c_tensor_map,
                                             block_col + store_tile * kEpilogueStoreTileN,
                                             cta_row,
-                                            0);
+                                            0,
+                                            epilogue_cache_policy);
                                     }
                                     tma_store_commit_group();
                                 }
@@ -1151,7 +1386,9 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                                         store_tile * kStoreTileBytes)[swizzled_chunk];
                                     const int output_offset =
                                         (cta_row + tid) * (n / 2) + block_col + n_group * 8;
-                                    reinterpret_cast<int4 *>(c + output_offset)[0] = value;
+                                    store_output_16b<
+                                        (SM110A_NVFP4_FC1_OUTPUT_EVICT_FIRST != 0)>(
+                                        reinterpret_cast<int4 *>(c + output_offset), value);
                                 }
                             }
                         }
@@ -1172,11 +1409,13 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                                 constexpr int kSwappedStoreBytes =
                                     kEpilogueTileN * kSwappedStoreColumns * sizeof(nv_bfloat16);
                                 for (int atom = 0; atom < 2; ++atom) {
-                                    tma_store_3d(stage_smem + atom * kSwappedStoreBytes,
+                                    tma_store_3d<(SM110A_NVFP4_FC1_OUTPUT_EVICT_FIRST != 0)>(
+                                        stage_smem + atom * kSwappedStoreBytes,
                                         &c_tensor_map,
                                         0,
                                         block_col / kSwappedStoreColumns + atom,
-                                        block_row);
+                                        block_row,
+                                        epilogue_cache_policy);
                                 }
                                 tma_store_commit_group();
                             }

@@ -24,4 +24,11 @@ rows in a task are consecutive, FC1 switches A to a swizzled TMA load; sparse
 or fragmented routing continues to use the vectorized `cp.async` gather.
 
 Routing metadata is produced entirely on GPU with a cooperative stable top-k,
-stable expert compaction, and a parallel per-expert task builder.
+stable expert compaction, and a parallel per-expert task builder.  The mainloop
+automatically uses the maximum stage count that fits in shared memory.  Output
+cache policy, scheduler traversal, and direct/TMA epilogue are available to the
+benchmark autotuner. SiLU always uses the precise implementation.
+The main kernel marks repeatedly consumed A/SFA loads as L2 evict-last and
+streaming B/SFB loads as evict-first. Operand cache policy on/off is included
+in the regular autotune candidate set; use `--no-operand-cache-policy` to
+restrict a benchmark run to the no-hint candidates.
