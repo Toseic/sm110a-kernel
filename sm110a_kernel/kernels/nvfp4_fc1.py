@@ -23,7 +23,6 @@ class Nvfp4Fc1Config:
     mode: int = 0
     direct_gmem: bool = False
     macro_swizzle_n_major: bool = True
-    macro_swizzle_serpentine: bool = False
 
     def validate(self) -> None:
         if self.tile_m != 128 or self.tile_n not in (64, 128, 256):
@@ -36,10 +35,8 @@ class Nvfp4Fc1Config:
             raise ValueError("cluster_m must be 1 or 2")
         if self.mode not in (0, 1, 2):
             raise ValueError("mode must be 0, 1, or 2")
-        if not isinstance(self.macro_swizzle_n_major, bool) or not isinstance(
-            self.macro_swizzle_serpentine, bool
-        ):
-            raise ValueError("macro swizzle settings must be bool")
+        if not isinstance(self.macro_swizzle_n_major, bool):
+            raise ValueError("macro_swizzle_n_major must be bool")
 
 
 @dataclass(frozen=True)
@@ -59,6 +56,8 @@ class Nvfp4Fc1Module:
         self.config = config
         symbol = getattr(library.handle, "sm110a_nvfp4_fc1_tasks_prepare")
         self._metadata_address = ctypes.cast(symbol, ctypes.c_void_p).value
+        routing_symbol = getattr(library.handle, "sm110a_nvfp4_fc1_routing_prepare")
+        self._routing_address = ctypes.cast(routing_symbol, ctypes.c_void_p).value
 
     def prepare_metadata(self, router_scores, topk: int, n: int) -> Nvfp4Fc1Metadata:
         import torch
@@ -71,24 +70,9 @@ class Nvfp4Fc1Module:
         if n <= 0 or n % self.config.tile_n:
             raise ValueError("N is incompatible with the NVFP4 FC1 config")
 
-        scores = torch.nan_to_num(router_scores.float(), nan=-float("inf"))
-        selected = torch.argsort(scores, dim=1, descending=True, stable=True)[:, :topk].reshape(-1)
-        order = torch.argsort(selected, stable=True)
-        grouped_layout = selected[order].to(torch.int32).contiguous()
-        source_rows = torch.div(order, topk, rounding_mode="floor").to(torch.int32).contiguous()
-
-        counts = torch.bincount(selected, minlength=experts).to(torch.int32)
-        offsets = counts.cumsum(0) - counts
-        grouped_assignments = order.to(torch.int32)
-        assignment_to_grouped = torch.empty_like(grouped_assignments)
-        assignment_to_grouped[grouped_assignments.long()] = torch.arange(
-            grouped_assignments.numel(), device=router_scores.device, dtype=torch.int32)
-        routing = torch.cat((counts, offsets, grouped_layout, grouped_assignments,
-                             assignment_to_grouped))
-
-        _, _, tasks, state = self._binding.prepare_nvfp4_fc1_tasks(
-            grouped_layout, experts, n, self._metadata_address, self.config.tile_m,
-            self.config.tile_n, self.config.cluster_m)
+        routing, source_rows, tasks, state = self._binding.prepare_nvfp4_fc1_routing(
+            router_scores, topk, n, self.config.tile_m, self.config.tile_n,
+            self.config.cluster_m, self._routing_address)
         return Nvfp4Fc1Metadata(routing, source_rows, tasks, state)
 
     def nvfp4_fc1_out(self, a, b, sfa, sfb, metadata: Nvfp4Fc1Metadata, out):
@@ -97,9 +81,11 @@ class Nvfp4Fc1Module:
             out, self._address)
 
     def nvfp4_fc1(self, a, b, sfa, sfb, metadata: Nvfp4Fc1Metadata):
-        return self._binding.nvfp4_fc1(
-            a, b, sfa, sfb, metadata.source_rows, metadata.tasks, metadata.state,
-            self._address)
+        import torch
+        out = torch.empty(
+            (metadata.source_rows.numel(), b.size(1) // 2),
+            device=a.device, dtype=torch.bfloat16)
+        return self.nvfp4_fc1_out(a, b, sfa, sfb, metadata, out)
 
 
 def _flags(config: Nvfp4Fc1Config, variant):
@@ -108,14 +94,14 @@ def _flags(config: Nvfp4Fc1Config, variant):
         ("TILE_K", config.tile_k), ("EPILOGUE_TILE_N", config.epilogue_tile_n),
         ("CLUSTER_M", config.cluster_m), ("MODE", config.mode),
         ("DIRECT_GMEM", int(config.direct_gmem)),
-        ("MACRO_SWIZZLE_N_MAJOR", int(config.macro_swizzle_n_major)),
-        ("MACRO_SWIZZLE_SERPENTINE", int(config.macro_swizzle_serpentine))))
+        ("MACRO_SWIZZLE_N_MAJOR", int(config.macro_swizzle_n_major))))
 
 
 _JIT = SplitCudaJit(
     name="sm110a_nvfp4_fc1", root=_ROOT,
     binding_sources=(_SRC / "nvfp4_fc1_torch_binding.cpp",),
-    kernel_sources=(_SRC / "nvfp4_fc1_kernel.cu", _SRC / "nvfp4_fc1_metadata.cu"),
+    kernel_sources=(_SRC / "nvfp4_fc1_kernel.cu", _SRC / "nvfp4_fc1_metadata.cu",
+                    _SRC / "nvfp4_fc1_routing.cu"),
     kernel_dependencies=(_INC / "nvfp4_moe_fc1.h", _INC / "common.h"),
     kernel_symbol="sm110a_nvfp4_fc1_launch", config_key=lambda config: config,
     kernel_cflags=_flags, make_facade=Nvfp4Fc1Module, include_paths=(_INC,))

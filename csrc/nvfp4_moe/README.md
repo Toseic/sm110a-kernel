@@ -18,7 +18,10 @@ out = nvfp4_fc1(aq, bq, sfa, sfb, metadata, config)
 
 The fused gather path supports `cluster_m=1` and `cluster_m=2` (with B/SFB
 cluster multicast), tile N of 64, 128, or 256, tile K of 64, 128, or 256,
-and all three grouped scheduler modes.  Tasks use the same configurable
-N-major/serpentine macro traversal as grouped-M GEMM.  When all 128 routed
+and all three grouped scheduler modes. Tasks support configurable N-major or
+M-major macro traversal without serpentine ordering. When all 128 routed
 rows in a task are consecutive, FC1 switches A to a swizzled TMA load; sparse
 or fragmented routing continues to use the vectorized `cp.async` gather.
+
+Routing metadata is produced entirely on GPU with a cooperative stable top-k,
+stable expert compaction, and a parallel per-expert task builder.

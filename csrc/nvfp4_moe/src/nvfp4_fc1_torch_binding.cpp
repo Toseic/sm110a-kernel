@@ -11,6 +11,8 @@ using Launcher = void (*)(const uint8_t*, const uint8_t*, const uint8_t*, const 
     int, int, cudaStream_t);
 using MetadataLauncher = void (*)(const int32_t*, int32_t*, int32_t*, int32_t*, int32_t*,
     int, int, int, int, int, int, bool, cudaStream_t);
+using RoutingLauncher = void (*)(const __nv_bfloat16*, int, int, int, int32_t*, int32_t*,
+    int32_t*, int32_t*, int32_t*, int, int, int, int, cudaStream_t);
 
 void check_fp4(const torch::Tensor& x, const char* name, int dim) {
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kFloat4_e2m1fn_x2 &&
@@ -42,6 +44,34 @@ std::vector<torch::Tensor> prepare(torch::Tensor layout, int64_t experts, int64_
       layout.numel(), experts, n, tile_m, tile_n, cluster_m, false, stream);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {offsets, counts, tasks, state};
+}
+
+std::vector<torch::Tensor> prepare_routing(
+    torch::Tensor router, int64_t topk, int64_t n, int64_t tile_m,
+    int64_t tile_n, int64_t cluster_m, uint64_t address) {
+  TORCH_CHECK(router.is_cuda() && router.scalar_type() == torch::kBFloat16 &&
+      router.dim() == 2 && router.is_contiguous(),
+      "router_scores must be contiguous CUDA BF16 [tokens,experts]");
+  TORCH_CHECK(topk > 0 && topk <= router.size(1) && address != 0, "invalid top-k routing input");
+  const int64_t tokens = router.size(0), experts = router.size(1), rows = tokens * topk;
+  auto options = router.options().dtype(torch::kInt32);
+  auto routing = torch::empty({2 * experts + 3 * rows}, options);
+  auto source_rows = torch::empty({rows}, options);
+  auto selected = torch::empty({rows}, options);
+  const int64_t max_tasks =
+      ((rows + cluster_m * tile_m - 1) / (cluster_m * tile_m) + experts) *
+      (n / tile_n);
+  auto tasks = torch::empty({max_tasks, 5}, options);
+  auto state = torch::empty({2}, options);
+  c10::cuda::CUDAGuard guard(router.device());
+  auto stream = c10::cuda::getCurrentCUDAStream(router.device().index());
+  reinterpret_cast<RoutingLauncher>(address)(
+      reinterpret_cast<const __nv_bfloat16*>(router.data_ptr<at::BFloat16>()),
+      tokens, experts, topk, routing.data_ptr<int32_t>(), source_rows.data_ptr<int32_t>(),
+      selected.data_ptr<int32_t>(), tasks.data_ptr<int32_t>(), state.data_ptr<int32_t>(),
+      n, tile_m, tile_n, cluster_m, stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {routing, source_rows, tasks, state};
 }
 
 torch::Tensor run_out(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb,
@@ -88,6 +118,7 @@ torch::Tensor run(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Te
 }
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("prepare_nvfp4_fc1_tasks", &prepare);
+  m.def("prepare_nvfp4_fc1_routing", &prepare_routing);
   m.def("nvfp4_fc1", &run);
   m.def("nvfp4_fc1_out", &run_out);
 }

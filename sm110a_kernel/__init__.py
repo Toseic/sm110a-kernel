@@ -68,8 +68,9 @@ from .kernels.nvfp4_grouped_m_gemm import (
     nvfp4_grouped_m_gemm_out,
 )
 from .kernels.nvfp4_fc1 import (
-    Nvfp4Fc1Config, Nvfp4Fc1Metadata, compile_nvfp4_fc1, compile_nvfp4_fc1_configs,
-    prepare_nvfp4_fc1_metadata, nvfp4_fc1, nvfp4_fc1_out,
+    Nvfp4Fc1Config, Nvfp4Fc1Metadata, compile_nvfp4_fc1,
+    compile_nvfp4_fc1_configs, prepare_nvfp4_fc1_metadata, nvfp4_fc1,
+    nvfp4_fc1_out,
 )
 _RUNNER_EXPORTS = {"AutotuneRunner", "PreparedKernel", "Selection", "TuneOptions"}
 _CUTEDSL_EXPORTS = {

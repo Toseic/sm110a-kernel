@@ -6,9 +6,6 @@ constexpr int kThreads = 256;
 #ifndef SM110A_NVFP4_FC1_MACRO_SWIZZLE_N_MAJOR
 #define SM110A_NVFP4_FC1_MACRO_SWIZZLE_N_MAJOR 1
 #endif
-#ifndef SM110A_NVFP4_FC1_MACRO_SWIZZLE_SERPENTINE
-#define SM110A_NVFP4_FC1_MACRO_SWIZZLE_SERPENTINE 0
-#endif
 constexpr int kMacroSwizzleM = 8;
 constexpr int kMacroSwizzleN = 8;
 
@@ -40,46 +37,23 @@ __global__ void build_expert_tile_tasks(
     int task_tile_rows,
     ExpertTileTask *tasks,
     int32_t *state) {
-    if (blockIdx.x || threadIdx.x)
-        return;
-    int next = 0;
-    for (int expert = 0; expert < experts; ++expert) {
-        const int rows = counts[expert];
-        if (!rows)
-            continue;
-        const int start = offsets[expert];
+    const int expert = blockIdx.x * blockDim.x + threadIdx.x;
+    if (expert >= experts) return;
+    const int rows = counts[expert];
+    if (!rows) return;
+    const int start = offsets[expert];
+    const int m_tasks = (rows + task_tile_rows - 1) / task_tile_rows;
+    int next = atomicAdd(state, m_tasks * grid_n);
         for (int group_row = 0; group_row < rows; group_row += kMacroSwizzleM * task_tile_rows) {
             const int group_end = min(group_row + kMacroSwizzleM * task_tile_rows, rows);
             for (int macro_n = 0; macro_n < grid_n; macro_n += kMacroSwizzleN) {
                 const int band_end = min(macro_n + kMacroSwizzleN, grid_n);
-#if SM110A_NVFP4_FC1_MACRO_SWIZZLE_N_MAJOR && SM110A_NVFP4_FC1_MACRO_SWIZZLE_SERPENTINE
-                const int tile_row_count =
-                    (group_end - group_row + task_tile_rows - 1) / task_tile_rows;
-                for (int tile_n = macro_n; tile_n < band_end; ++tile_n) {
-                    const bool reverse_m = (tile_n - macro_n) & 1;
-                    for (int index = 0; index < tile_row_count; ++index) {
-                        const int ordered = reverse_m ? tile_row_count - 1 - index : index;
-                        tasks[next++] = {start, rows, group_row + ordered * task_tile_rows,
-                                         expert, tile_n};
-                    }
-                }
-#elif SM110A_NVFP4_FC1_MACRO_SWIZZLE_N_MAJOR
+#if SM110A_NVFP4_FC1_MACRO_SWIZZLE_N_MAJOR
                 // Reuse the same expert B/SFB tile over adjacent M tiles.
                 for (int tile_n = macro_n; tile_n < band_end; ++tile_n)
                     for (int tile_row = group_row; tile_row < group_end;
                          tile_row += task_tile_rows)
                         tasks[next++] = {start, rows, tile_row, expert, tile_n};
-#elif SM110A_NVFP4_FC1_MACRO_SWIZZLE_SERPENTINE
-                const int tile_row_count =
-                    (group_end - group_row + task_tile_rows - 1) / task_tile_rows;
-                for (int index = 0; index < tile_row_count; ++index) {
-                    const bool reverse_n = index & 1;
-                    for (int col = 0; col < band_end - macro_n; ++col) {
-                        const int ordered = reverse_n ? band_end - macro_n - 1 - col : col;
-                        tasks[next++] = {start, rows, group_row + index * task_tile_rows,
-                                         expert, macro_n + ordered};
-                    }
-                }
 #else
                 for (int tile_row = group_row; tile_row < group_end; tile_row += task_tile_rows)
                     for (int tile_n = macro_n; tile_n < band_end; ++tile_n)
@@ -87,9 +61,6 @@ __global__ void build_expert_tile_tasks(
 #endif
             }
         }
-    }
-    state[0] = next;
-    state[1] = 0;
 }
 } // namespace
 
@@ -115,16 +86,29 @@ extern "C" void sm110a_nvfp4_fc1_tasks_prepare(
         return;
     cudaMemsetAsync(offsets, 0x7f, experts * sizeof(int32_t), stream);
     cudaMemsetAsync(counts, 0, experts * sizeof(int32_t), stream);
+    cudaMemsetAsync(state, 0, 2 * sizeof(int32_t), stream);
     collect_expert_metadata<<<(m + kThreads - 1) / kThreads, kThreads, 0, stream>>>(layout,
         m,
         experts,
         offsets,
         counts);
-    build_expert_tile_tasks<<<1, 1, 0, stream>>>(offsets,
+    build_expert_tile_tasks<<<(experts + kThreads - 1) / kThreads, kThreads, 0, stream>>>(offsets,
         counts,
         experts,
         n / logical_n_tile,
         task_tile_rows,
         reinterpret_cast<ExpertTileTask *>(tasks),
         state);
+}
+
+extern "C" void sm110a_nvfp4_fc1_tasks_from_ranges(
+    const int32_t *offsets, const int32_t *counts, int32_t *tasks,
+    int32_t *state, int experts, int n, int tile_m, int tile_n,
+    int cluster_m, cudaStream_t stream) {
+    if (!offsets || !counts || !tasks || !state || experts <= 0 || n <= 0 ||
+        tile_n <= 0 || n % tile_n) return;
+    cudaMemsetAsync(state, 0, 2 * sizeof(int32_t), stream);
+    build_expert_tile_tasks<<<(experts + kThreads - 1) / kThreads,
+        kThreads, 0, stream>>>(offsets, counts, experts, n / tile_n,
+        cluster_m * tile_m, reinterpret_cast<ExpertTileTask *>(tasks), state);
 }
