@@ -70,7 +70,7 @@ constexpr int kPersistentTileCount = 2;
 // Each mode-2 CLC worker cluster starts with two tasks.  Once it completes
 // them it steals the work of an unstarted cluster through Cluster Launch Control.
 constexpr int kClcWorkerTileCount = 2;
-constexpr int kInterleaveBlock = 32;
+constexpr int kInterleaveBlock = 64;
 
 __device__ inline float silu(float x) {
     return x / (1.0f + expf(-x));
@@ -203,6 +203,78 @@ __device__ inline void mbarrier_wait(
         "r"(phase),
         "r"(kSuspendTicks)
         : "memory");
+}
+
+// Analysis-only split: these helpers deliberately keep identical PTX while
+// giving SourceCounters a distinct line-info location for each pipeline edge.
+__device__ inline void mbarrier_wait_mma_reuse(int mbar_addr, int phase) {
+    constexpr uint32_t kSuspendTicks = 0x989680;
+    asm volatile(
+        "{ .reg .pred done; WAIT_MMA_REUSE: "
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 done, [%0], %1, %2; "
+        "@done bra.uni COMPLETE_MMA_REUSE; bra.uni WAIT_MMA_REUSE; "
+        "COMPLETE_MMA_REUSE: }" ::"r"(mbar_addr),
+        "r"(phase), "r"(kSuspendTicks) : "memory");
+}
+
+__device__ inline void mbarrier_wait_forward_a_ready(int mbar_addr, int phase) {
+    constexpr uint32_t kSuspendTicks = 0x989680;
+    asm volatile(
+        "{ .reg .pred done; WAIT_FORWARD_A: "
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 done, [%0], %1, %2; "
+        "@done bra.uni COMPLETE_FORWARD_A; bra.uni WAIT_FORWARD_A; "
+        "COMPLETE_FORWARD_A: }" ::"r"(mbar_addr),
+        "r"(phase), "r"(kSuspendTicks) : "memory");
+}
+
+__device__ inline void mbarrier_wait_epilogue_slot(int mbar_addr, int phase) {
+    constexpr uint32_t kSuspendTicks = 0x989680;
+    asm volatile(
+        "{ .reg .pred done; WAIT_EPILOGUE_SLOT: "
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 done, [%0], %1, %2; "
+        "@done bra.uni COMPLETE_EPILOGUE_SLOT; bra.uni WAIT_EPILOGUE_SLOT; "
+        "COMPLETE_EPILOGUE_SLOT: }" ::"r"(mbar_addr),
+        "r"(phase), "r"(kSuspendTicks) : "memory");
+}
+
+__device__ inline void mbarrier_wait_consumer_a_ready(int mbar_addr, int phase) {
+    constexpr uint32_t kSuspendTicks = 0x989680;
+    asm volatile(
+        "{ .reg .pred done; WAIT_CONSUMER_A: "
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 done, [%0], %1, %2; "
+        "@done bra.uni COMPLETE_CONSUMER_A; bra.uni WAIT_CONSUMER_A; "
+        "COMPLETE_CONSUMER_A: }" ::"r"(mbar_addr),
+        "r"(phase), "r"(kSuspendTicks) : "memory");
+}
+
+__device__ inline void mbarrier_wait_consumer_cluster_a_ready(int mbar_addr, int phase) {
+    constexpr uint32_t kSuspendTicks = 0x989680;
+    asm volatile(
+        "{ .reg .pred done; WAIT_CLUSTER_A: "
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 done, [%0], %1, %2; "
+        "@done bra.uni COMPLETE_CLUSTER_A; bra.uni WAIT_CLUSTER_A; "
+        "COMPLETE_CLUSTER_A: }" ::"r"(mbar_addr),
+        "r"(phase), "r"(kSuspendTicks) : "memory");
+}
+
+__device__ inline void mbarrier_wait_tma_ready(int mbar_addr, int phase) {
+    constexpr uint32_t kSuspendTicks = 0x989680;
+    asm volatile(
+        "{ .reg .pred done; WAIT_TMA: "
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 done, [%0], %1, %2; "
+        "@done bra.uni COMPLETE_TMA; bra.uni WAIT_TMA; "
+        "COMPLETE_TMA: }" ::"r"(mbar_addr),
+        "r"(phase), "r"(kSuspendTicks) : "memory");
+}
+
+__device__ inline void mbarrier_wait_mainloop_output(int mbar_addr, int phase) {
+    constexpr uint32_t kSuspendTicks = 0x989680;
+    asm volatile(
+        "{ .reg .pred done; WAIT_MAINLOOP_OUTPUT: "
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 done, [%0], %1, %2; "
+        "@done bra.uni COMPLETE_MAINLOOP_OUTPUT; bra.uni WAIT_MAINLOOP_OUTPUT; "
+        "COMPLETE_MAINLOOP_OUTPUT: }" ::"r"(mbar_addr),
+        "r"(phase), "r"(kSuspendTicks) : "memory");
 }
 
 __device__ __forceinline__ void cp_async_a_16b(
@@ -642,6 +714,7 @@ __device__ inline void tcgen05_mma_nvfp4(
                "r"(sfa_addr), "r"(sfb_addr), "r"(accumulate) : "memory");
     }
 }
+
 template <int kClusterM>
 __device__ inline void tcgen05_commit(
     int mbar_addr) {
@@ -1145,7 +1218,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                     const int sfa_smem = b_smem + kBSmemBytes;
                     const int sfb_smem = sfa_smem + kSFASmemBytes;
 
-                    mbarrier_wait(mma_mbar_addr, producer_mma_phase);
+                    mbarrier_wait_mma_reuse(mma_mbar_addr, producer_mma_phase);
                     // SFB uses a multicast TMA whose completion is delivered
                     // to each destination CTA's local transaction barrier.
                     // Keep this barrier local; unlike BF16's independent B
@@ -1215,7 +1288,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                 for (int cluster_bid = first_cluster_bid; cluster_bid < last_cluster_bid;
                     ++cluster_bid) {
                     for (int tile_k = 0; tile_k < k_tiles; ++tile_k) {
-                        mbarrier_wait(
+                        mbarrier_wait_forward_a_ready(
                             base_a_mbar_addr + consumer_stage * sizeof(uint64_t),
                             consumer_a_phase);
                         mbarrier_arrive_on_cluster_cta(
@@ -1237,7 +1310,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
             for (int cluster_bid = first_cluster_bid; cluster_bid < last_cluster_bid;
                 ++cluster_bid) {
                 if constexpr (kPersistent || kDynamicClc) {
-                    mbarrier_wait(
+                    mbarrier_wait_epilogue_slot(
                         base_epilogue_mbar_addr + consumer_mainloop_stage * sizeof(uint64_t),
                         consumer_epilogue_phase);
                 }
@@ -1252,15 +1325,15 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                     const int mma_mbar_addr =
                         base_mma_mbar_addr + consumer_stage * sizeof(uint64_t);
 
-                    mbarrier_wait(a_mbar_addr, consumer_a_phase);
+                    mbarrier_wait_consumer_a_ready(a_mbar_addr, consumer_a_phase);
                     if constexpr (kClusterM > 1) {
                         mbarrier_arrive_on_cluster_cta(
                             base_a_cluster_mbar_addr + consumer_stage * sizeof(uint64_t), 0);
-                        mbarrier_wait(
+                        mbarrier_wait_consumer_cluster_a_ready(
                             base_a_cluster_mbar_addr + consumer_stage * sizeof(uint64_t),
                             consumer_a_phase);
                     }
-                    mbarrier_wait(tma_mbar_addr, consumer_tma_phase);
+                    mbarrier_wait_tma_ready(tma_mbar_addr, consumer_tma_phase);
                     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
                     {
                         const int a_smem = mainloop_smem + consumer_stage * kStageSmemBytes;
@@ -1314,7 +1387,8 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
 
             for (int cluster_bid = first_cluster_bid; cluster_bid < last_cluster_bid;
                 ++cluster_bid) {
-                mbarrier_wait(base_mainloop_mbar_addr + epilogue_mainloop_stage * sizeof(uint64_t),
+                mbarrier_wait_mainloop_output(
+                    base_mainloop_mbar_addr + epilogue_mainloop_stage * sizeof(uint64_t),
                     epilogue_mainloop_phase);
                 asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
@@ -1343,7 +1417,9 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                 };
 
                 tmem_to_smem(epilogue_mainloop_stage, 0, 0, cta_row, tile_col, valid_rows);
-                asm volatile("bar.sync 1, 128;" ::: "memory");
+                if constexpr (!kDirectGmem || kSwapAB) {
+                    asm volatile("bar.sync 1, 128;" ::: "memory");
+                }
                 if constexpr (kEpilogueBlockCount == 1) {
                     release_tmem();
                 }
@@ -1451,8 +1527,8 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                                         : "n"(kEpilogueStageCount - 1)
                                         : "memory");
                                 }
+                                asm volatile("bar.sync 1, 128;" ::: "memory");
                             }
-                            asm volatile("bar.sync 1, 128;" ::: "memory");
                         }
 
                         const int next_stage = (n_block + 1) % kEpilogueStageCount;
@@ -1462,17 +1538,21 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                             cta_row,
                             tile_col,
                             valid_rows);
-                        asm volatile("bar.sync 1, 128;" ::: "memory");
+                        if constexpr (!kDirectGmem || kSwapAB) {
+                            asm volatile("bar.sync 1, 128;" ::: "memory");
+                        }
                         if (n_block + 2 == kEpilogueBlockCount) {
                             release_tmem();
                         }
                     }
                 }
 
-                if (tid == 0) {
-                    asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+                if constexpr (!kDirectGmem || kSwapAB) {
+                    if (tid == 0) {
+                        asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+                    }
+                    asm volatile("bar.sync 1, 128;" ::: "memory");
                 }
-                asm volatile("bar.sync 1, 128;" ::: "memory");
 
                 epilogue_mainloop_stage = (epilogue_mainloop_stage + 1) % kTmemStageCount;
                 if (epilogue_mainloop_stage == 0) {

@@ -73,6 +73,7 @@ def format_candidate(config):
         f"c{config.cluster_m}",
         _MODE_LABELS[config.mode],
         epilogue,
+        "nmaj" if config.macro_swizzle_n_major else "mmaj",
     ]
     if not config.output_evict_first:
         fields.append("keep")
@@ -156,7 +157,7 @@ def nvfp4_fc1_sol_bounds(router_scores, topk, n, k, config):
     c_bytes = 2 * m * n
     staged_sfb_n = max(config.tile_n, 128)
     tile_read_bytes = task_count * (
-        config.tile_m * (k / 2 + k / 16)
+        config.cluster_m * config.tile_m * (k / 2 + k / 16)
         + config.tile_n * k / 2
         + staged_sfb_n * k / 16
     )
@@ -238,10 +239,10 @@ class TorchNvfp4Fc1Runner:
                 # converts only the final result to BF16.
                 out_dtype=torch.float32,
             )
-            # FC1 stores every logical 32-column pair as [gate:32, up:32].
-            blocks = full_expert.reshape(full_expert.size(0), self.n // 32, 64)
-            gate = blocks[:, :, :32].reshape(full_expert.size(0), self.n)
-            up = blocks[:, :, 32:].reshape(full_expert.size(0), self.n)
+            # FC1 stores every logical 64-column pair as [gate:64, up:64].
+            blocks = full_expert.reshape(full_expert.size(0), self.n // 64, 128)
+            gate = blocks[:, :, :64].reshape(full_expert.size(0), self.n)
+            up = blocks[:, :, 64:].reshape(full_expert.size(0), self.n)
             swiglu = (
                 torch.nn.functional.silu(gate.float()) * up.float()
             ).to(torch.bfloat16)
@@ -251,14 +252,14 @@ class TorchNvfp4Fc1Runner:
 
 
 def make_quantized_interleaved_weights(experts, n, k):
-    """Create NVFP4 weights in physical ``[gate:32, up:32]`` block order."""
+    """Create NVFP4 weights in physical ``[gate:64, up:64]`` block order."""
     bq = None
     sfb = None
     for expert in range(experts):
         gate = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
         up = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
         b_expert = torch.stack(
-            (gate.view(n // 32, 32, k), up.view(n // 32, 32, k)), dim=1
+            (gate.view(n // 64, 64, k), up.view(n // 64, 64, k)), dim=1
         ).reshape(2 * n, k)
         bq_expert, sfb_expert = quantize_nvfp4_rows(b_expert)
         if bq is None:
@@ -423,7 +424,7 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
         )
         print("[runner] config selection cached by tokens/experts/topk/N/K")
         if args.baseline == "cutedsl":
-            print("[baseline] CuTE DSL persistent NVFP4 FC1 (autotuned)")
+            print("[baseline] CuTE DSL fused-gather NVFP4 FC1 (autotuned)")
         else:
             print("[baseline] pre-gathered per-expert torch._scaled_mm + SwiGLU")
         table = TablePrinter((

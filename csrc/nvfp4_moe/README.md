@@ -5,7 +5,7 @@ from the NVFP4 grouped-M GEMM pipeline. It consumes unpermuted token rows and
 fuses `source_rows` gathering for both packed E2M1 activations and their
 blocked UE4M3 scales into the mainloop producer stage.
 
-Weights use the same 32-column block-interleaved `[gate, up]` layout as the
+Weights use a 64-column block-interleaved `[gate, up]` layout.
 BF16 FC1 path. The main kernel applies `silu(gate) * up` in its epilogue, so
 the result width is half the physical weight width. The public Python API
 mirrors the BF16 FC1 metadata/main split (pass the physical, interleaved N to
