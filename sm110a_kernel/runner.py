@@ -216,7 +216,9 @@ class AutotuneRunner:
             if entry is not None:
                 try:
                     candidate = _deserialize(entry, config_cls)
-                    prepared = prepare(candidate)
+                    if candidate not in candidates:
+                        candidate = None
+                    prepared = prepare(candidate) if candidate is not None else None
                 except (TypeError, ValueError, KeyError):
                     candidate = None
                 if candidate is not None:
