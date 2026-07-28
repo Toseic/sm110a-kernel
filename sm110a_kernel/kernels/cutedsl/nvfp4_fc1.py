@@ -1,16 +1,13 @@
-"""Autotuned TensorRT-LLM CuTE DSL NVFP4 FC1 baseline (grouped GEMM + SwiGLU).
-
-Pre-gathers activations on the Python side (using ``source_rows``), then
-delegates to ``Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel`` for
-persistent grouped GEMM with fused SwiGLU epilogue and BF16 output.
-"""
+"""Autotuned TensorRT-LLM CuTE DSL NVFP4 FC1 baseline with fused gather."""
 from __future__ import annotations
 
 import statistics
 import sys
+import types
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import IntEnum
 from pathlib import Path
 from typing import Optional
 
@@ -25,11 +22,35 @@ from ...runner import AutotuneRunner, PreparedKernel, Selection, TuneOptions
 _POINTER_DEPRECATION = "Use explicit `struct.scalar.ptr` for pointer instead."
 _PROBE_WARMUP = 2
 _ROOT = Path(__file__).resolve().parents[3]
-_KERNEL_ROOT = _ROOT / "baselinedir" / "TensorRT-LLM" / "tensorrt_llm" / "_torch" / "cute_dsl_kernels"
-if str(_KERNEL_ROOT) not in sys.path:
-    sys.path.insert(0, str(_KERNEL_ROOT))
-from blackwell.blockscaled_contiguous_grouped_gemm_swiglu_fusion import (
-    Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel,
+_TRTLLM_PACKAGE_ROOT = _ROOT / "baselinedir" / "TensorRT-LLM" / "tensorrt_llm"
+
+
+def _namespace_package(name: str, path: Path) -> None:
+    module = types.ModuleType(name)
+    module.__path__ = [str(path)]
+    sys.modules.setdefault(name, module)
+
+
+# Import only CuTE DSL sources.  Importing TensorRT-LLM's top-level package
+# initializes MPI in this development environment, which a standalone kernel
+# benchmark neither needs nor can assume is available.
+_namespace_package("sm110a_trtllm", _TRTLLM_PACKAGE_ROOT)
+_namespace_package("sm110a_trtllm._torch", _TRTLLM_PACKAGE_ROOT / "_torch")
+_utils = types.ModuleType("sm110a_trtllm._torch.utils")
+
+
+class _ActivationType(IntEnum):
+    Swiglu = 5
+    Relu2 = 8
+
+
+_utils.ActivationType = _ActivationType
+_utils.is_gated_activation = lambda activation: activation == _ActivationType.Swiglu
+sys.modules.setdefault("sm110a_trtllm._torch.utils", _utils)
+
+from sm110a_trtllm._torch.cute_dsl_kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
+    ActivationType,
+    BlockScaledContiguousGatherGroupedGemmKernel,
 )
 
 
@@ -63,8 +84,8 @@ class CuteDslNvfp4Fc1Config:
             raise ValueError("mma_tile_n must be 64, 128, or 256")
         if self.cluster_m not in (1, 2):
             raise ValueError("cluster_m must be 1 or 2")
-        if self.cluster_n != 1:
-            raise ValueError("cluster_n must be 1")
+        if self.cluster_n not in (1, 2, 4):
+            raise ValueError("cluster_n must be 1, 2, or 4")
         if self.cluster_m * self.cluster_n > 8:
             raise ValueError("cluster size must be ≤ 8")
         if self.mma_tile_m == 256 and self.cluster_m % 2 != 0:
@@ -72,9 +93,10 @@ class CuteDslNvfp4Fc1Config:
 
 
 DEFAULT_CONFIGS = tuple(
-    CuteDslNvfp4Fc1Config(tile_m, tile_n, cluster_m, 1)
-    for tile_m in (128,) for tile_n in (64, 128, 256)
-    for cluster_m in (1, 2)
+    CuteDslNvfp4Fc1Config(tile_m, tile_n, tile_m // 128, cluster_n)
+    for tile_m in (128, 256)
+    for tile_n in (128, 256)
+    for cluster_n in (1, 2, 4)
 )
 
 
@@ -83,10 +105,8 @@ def format_config(config):
 
 
 # ---------------------------------------------------------------------------
-# Custom CuTE JIT launch function for the SwiGLU-fusion kernel.
-# Mirrors the kernel's ``wrapper`` but passes ``c_sf_ptr=None`` and
-# ``global_sf_ptr=None`` → ``generate_sfc=False`` → raw BF16 output.
-# A is pre-permuted on the Python side; this kernel does NOT do a gather.
+# Custom CuTE JIT launch for TensorRT-LLM's fused gather FC1 kernel.  It
+# deliberately passes no SFC tensors so the fused epilogue writes BF16.
 # ---------------------------------------------------------------------------
 @cute.jit
 def _launch_fc1(
@@ -98,7 +118,10 @@ def _launch_fc1(
     c_ptr: cute.Pointer,
     alpha_ptr: cute.Pointer,
     tile_idx_to_expert_idx_ptr: cute.Pointer,
+    tile_idx_to_mn_limit_ptr: cute.Pointer,
+    token_id_mapping_ptr: cute.Pointer,
     num_non_exiting_tiles_ptr: cute.Pointer,
+    orig_m: cutlass.Int64,
     m: cutlass.Int64,
     n: cutlass.Int64,
     k: cutlass.Int64,
@@ -108,22 +131,20 @@ def _launch_fc1(
     max_active_clusters: cutlass.Constexpr,
     stream: cuda.CUstream,
 ):
-    """Construct CuTE tensors and call the kernel with no scale-factor-C output."""
+    """Construct tensors and invoke gather + grouped GEMM + SwiGLU."""
     scale_k = k // scaling_vector_size
     interm_size = n // 2  # SwiGLU collapses gate/up pairs
     num_tiles = m // tile_size
 
     a = cute.make_tensor(
-        a_ptr, layout=cute.make_ordered_layout((m, k, 1), order=(1, 0, 2))
+        a_ptr, layout=cute.make_ordered_layout((orig_m, k, 1), order=(1, 0, 2))
     )
     b = cute.make_tensor(
         b_ptr, layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2))
     )
     a_sf = cute.make_tensor(
         a_sf_ptr,
-        layout=cute.make_ordered_layout(
-            (32, 4, m // 128, 4, scale_k // 4, 1), order=(2, 1, 4, 0, 3, 5)
-        ),
+        layout=cute.make_ordered_layout((orig_m, scale_k, 1), order=(1, 0, 2)),
     )
     b_sf = cute.make_tensor(
         b_sf_ptr,
@@ -138,13 +159,16 @@ def _launch_fc1(
     tile_idx_to_expert_idx = cute.make_tensor(
         tile_idx_to_expert_idx_ptr, layout=cute.make_layout((num_tiles,))
     )
+    tile_idx_to_mn_limit = cute.make_tensor(
+        tile_idx_to_mn_limit_ptr, layout=cute.make_layout((num_tiles,))
+    )
+    token_id_mapping = cute.make_tensor(
+        token_id_mapping_ptr, layout=cute.make_layout((m,))
+    )
     num_non_exiting_tiles = cute.make_tensor(
         num_non_exiting_tiles_ptr, layout=cute.make_layout((1,))
     )
 
-    # Bypass SFC generation: the SwiGLU-fusion kernel checks
-    #   generate_sfc = sfc_tensor is not None and norm_const_tensor is not None
-    # Passing None for both keeps the epilogue in BF16 direct-store mode.
     gemm_op(
         a,
         b,
@@ -154,6 +178,8 @@ def _launch_fc1(
         None,   # sfc_tensor
         None,   # norm_const_tensor
         tile_idx_to_expert_idx,
+        tile_idx_to_mn_limit,
+        token_id_mapping,
         num_non_exiting_tiles,
         alpha,
         max_active_clusters,
@@ -208,10 +234,7 @@ def _quick_probe(run, options):
 
 
 class CuteDslNvfp4Fc1Runner:
-    """Prepare, autotune, and run CuTE DSL NVFP4 FC1 with fused SwiGLU.
-
-    Pre-gathers A + SFA via ``source_rows`` on the Python side, then invokes
-    the CuTE DSL persistent grouped-GEMM + SwiGLU kernel.
+    """Prepare, autotune, and run CuTE DSL FC1 with fused A/SFA gather.
 
     Accepts the same tensor interface as the native ``nvfp4_fc1`` plus
     metadata (``source_rows``, ``tasks``, ``state``) from
@@ -309,19 +332,20 @@ class CuteDslNvfp4Fc1Runner:
                 "native FC1 expert ranges do not cover every routed row"
             )
 
-        # Match TensorRT-LLM's UT: pad each expert group to the CTA M tile
-        # (128 for the configurations exposed here), then scatter only valid
-        # rows back to the caller's output.
+        # Pad groups to 256 rows.  The token mapping uses -1 for these entries,
+        # which the gather kernel predicates away; no routed activation is
+        # materialized before the timed launch.
         padded_source_chunks = []
         valid_padded_chunks = []
         valid_output_chunks = []
         padded_ranges = []
         padded_start = 0
         for row_start, row_count, expert in native_ranges:
-            padding = (-row_count) % 128
+            padding = (-row_count) % 256
             rows = source_rows[row_start:row_start + row_count]
             if padding:
-                rows = torch.cat((rows, rows[:1].expand(padding)))
+                rows = torch.cat((rows, torch.full(
+                    (padding,), -1, device=rows.device, dtype=rows.dtype)))
             padded_source_chunks.append(rows)
             valid_padded_chunks.append(
                 torch.arange(
@@ -335,7 +359,9 @@ class CuteDslNvfp4Fc1Runner:
                     device=source_rows.device, dtype=torch.long,
                 )
             )
-            padded_ranges.append((padded_start, row_count + padding, expert))
+            padded_ranges.append((
+                padded_start, row_count + padding, expert, row_count
+            ))
             padded_start += row_count + padding
         padded_source_rows = torch.cat(padded_source_chunks)
         self._valid_padded_rows = torch.cat(valid_padded_chunks)
@@ -344,9 +370,8 @@ class CuteDslNvfp4Fc1Runner:
         self.m = padded_start
         self.out_target = out
 
-        # Gather/reorder scales in their logical form.  The imported CuTE
-        # kernel consumes the same SWIZZLE_32_4_4 physical format as native
-        # NVFP4 GEMM, so repack with ``to_blocked_nvfp4_scales`` afterwards.
+        # The fused-gather kernel consumes logical A/SFA rows, retaining the
+        # native physical scale layout only at this API boundary.
         from sm110a_kernel.kernels.nvfp4_gemm import (
             from_blocked_nvfp4_scales,
             to_blocked_nvfp4_scales,
@@ -357,29 +382,26 @@ class CuteDslNvfp4Fc1Runner:
             sfb, self.experts * self.n, self.k
         )
 
-        # Pre-gather A and SFA: the SwiGLU kernel expects pre-permuted data.
-        # float4_e2m1fn_x2 doesn't support indexing — view as uint8, gather,
-        # then view back.  Each E2M1 row is k/2 bytes.
-        a_bytes = a.view(torch.uint8).reshape(self.tokens, -1)
-        a_gathered = a_bytes[padded_source_rows.long()].contiguous()
-        self.a_storage = a_gathered.view(torch.float4_e2m1fn_x2).reshape(self.m, -1)
-        # Gather SFA rows and restore the physical NVFP4 scale layout.
-        sfa_gathered_2d = sfa_logical_2d[padded_source_rows.long()].contiguous()
-        self.sfa_storage = to_blocked_nvfp4_scales(sfa_gathered_2d)
-        # Native FC1 stores output channels as [gate:32, up:32]; the CuTE
-        # SwiGLU epilogue consumes [up:64, gate:64].  Reorder B and its
-        # logical SFB rows together before converting SFB to CuTE layout.
+        self.a_storage = a
+        self.sfa_storage = sfa_logical_2d.contiguous()
+        # TensorRT-LLM maps a permuted row to an *expanded* token index and
+        # divides by top-k in the LDGSTS producer.  Our native metadata stores
+        # the token row directly, so lift it into that expanded-index domain.
+        self.topk = self.logical_m // self.tokens
+        self.token_id_mapping = (padded_source_rows * self.topk).contiguous()
+        # Native FC1 stores [gate:64, up:64]; CuTE's gather epilogue consumes
+        # [up:64, gate:64]. Reorder B and SFB together.
         swiglu_blocks = self.n // 128
         b_bytes = b.view(torch.uint8).reshape(
-            self.experts, swiglu_blocks, 4, 32, self.k // 2
+            self.experts, swiglu_blocks, 2, 64, self.k // 2
         )
-        self.b_storage = b_bytes[:, :, (1, 3, 0, 2)].reshape_as(
+        self.b_storage = b_bytes[:, :, (1, 0)].reshape_as(
             b.view(torch.uint8)
         ).contiguous().view(torch.float4_e2m1fn_x2).reshape_as(b)
         sfb_cute_logical_2d = sfb_logical_2d.reshape(
-            self.experts, swiglu_blocks, 4, 32, self.k // 16
-        )[:, :, (1, 3, 0, 2)].reshape_as(sfb_logical_2d)
-        self.sfb_storage = to_blocked_nvfp4_scales(sfb_cute_logical_2d)
+            self.experts, swiglu_blocks, 2, 64, self.k // 16
+        )[:, :, (1, 0)].reshape_as(sfb_logical_2d)
+        self.sfb_storage = to_blocked_nvfp4_scales(sfb_cute_logical_2d.contiguous())
         self.out_storage = torch.empty(
             (self.m, self.n // 2), device=out.device, dtype=out.dtype
         )
@@ -391,34 +413,28 @@ class CuteDslNvfp4Fc1Runner:
         self.selection: Optional[Selection] = None
 
     def _cute_tile_metadata(self, config: CuteDslNvfp4Fc1Config):
-        """Return CuTE's ``tile_idx_to_expert_idx`` and valid-tile count.
-
-        CuTE's grouped kernel schedules tiles only along M; its N dimension
-        is handled inside each scheduled GEMM tile.  Do not pass native
-        ``state[0]`` here: that count also includes every native N tile.
-        """
+        """Return gather kernel's per-M-tile expert and valid-row metadata."""
         cta_m = config.mma_tile_m
         if self.m % cta_m:
             raise ValueError(f"permuted M={self.m} must be divisible by CuTE CTA M={cta_m}")
 
-        tile_experts = []
-        for row in range(0, self.m, cta_m):
-            matching = next(
-                (expert for start, count, expert in self._expert_ranges
-                 if start <= row < start + count),
-                None,
-            )
-            if matching is None:
-                raise ValueError(f"no expert metadata covers CuTE M tile at row {row}")
-            tile_experts.append(matching)
+        tile_experts, tile_mn_limits = [], []
+        for start, count, expert, valid_count in self._expert_ranges:
+            valid_end = start + valid_count
+            for row in range(start, start + count, cta_m):
+                tile_experts.append(expert)
+                tile_mn_limits.append(min(row + cta_m, valid_end))
 
         tile_expert_idx = torch.tensor(
             tile_experts, device=self.a_storage.device, dtype=torch.int32
         )
+        tile_idx_to_mn_limit = torch.tensor(
+            tile_mn_limits, device=self.a_storage.device, dtype=torch.int32
+        )
         num_non_exiting = torch.tensor(
             [len(tile_experts)], device=self.a_storage.device, dtype=torch.int32
         )
-        return tile_expert_idx, num_non_exiting
+        return tile_expert_idx, tile_idx_to_mn_limit, num_non_exiting
 
     def compatible_configs(self):
         """Return configs that pass ``can_implement`` for this problem shape."""
@@ -429,7 +445,7 @@ class CuteDslNvfp4Fc1Runner:
                 continue
             if self.n % config.mma_tile_n != 0:
                 continue
-            if not Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel.can_implement(
+            if not BlockScaledContiguousGatherGroupedGemmKernel.can_implement(
                 ab_dtype=cutlass.Float4E2M1FN,
                 sf_dtype=cutlass.Float8E4M3FN,
                 sf_vec_size=16,  # NVFP4
@@ -449,12 +465,14 @@ class CuteDslNvfp4Fc1Runner:
         return tuple(valid)
 
     def _compile(self, config: CuteDslNvfp4Fc1Config):
-        tile_expert_idx, num_non_exiting = self._cute_tile_metadata(config)
-        gemm = Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel(
+        tile_expert_idx, tile_mn_limits, num_non_exiting = self._cute_tile_metadata(config)
+        gemm = BlockScaledContiguousGatherGroupedGemmKernel(
             sf_vec_size=16,
             mma_tiler_mn=(config.mma_tile_m, config.mma_tile_n),
             cluster_shape_mn=(config.cluster_m, config.cluster_n),
             vectorized_f32=True,
+            topk=self.topk,
+            activation_type=ActivationType.Swiglu,
         )
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(
@@ -482,14 +500,20 @@ class CuteDslNvfp4Fc1Runner:
         tile_expert_ptr = cutlass.cute.runtime.make_ptr(
             cutlass.Int32, tile_expert_idx.data_ptr(),
             cutlass.cute.AddressSpace.gmem)
+        tile_mn_limit_ptr = cutlass.cute.runtime.make_ptr(
+            cutlass.Int32, tile_mn_limits.data_ptr(),
+            cutlass.cute.AddressSpace.gmem)
+        token_mapping_ptr = cutlass.cute.runtime.make_ptr(
+            cutlass.Int32, self.token_id_mapping.data_ptr(),
+            cutlass.cute.AddressSpace.gmem)
         num_tiles_ptr = cutlass.cute.runtime.make_ptr(
             cutlass.Int32, num_non_exiting.data_ptr(),
             cutlass.cute.AddressSpace.gmem)
 
         compile_args = [
             a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha_ptr,
-            tile_expert_ptr, num_tiles_ptr,
-            self.m, self.n, self.k, self.experts,
+            tile_expert_ptr, tile_mn_limit_ptr, token_mapping_ptr, num_tiles_ptr,
+            self.tokens, self.m, self.n, self.k, self.experts,
         ]
 
         fake_stream = make_fake_stream()
@@ -505,7 +529,7 @@ class CuteDslNvfp4Fc1Runner:
 
     def _prepare(self, config: CuteDslNvfp4Fc1Config):
         compiled = self._compile(config)
-        tile_expert_idx, num_non_exiting = self._cute_tile_metadata(config)
+        tile_expert_idx, tile_mn_limits, num_non_exiting = self._cute_tile_metadata(config)
 
         a_ptr = cutlass.cute.runtime.make_ptr(
             cutlass.Float4E2M1FN, self.a_storage.data_ptr(),
@@ -528,6 +552,12 @@ class CuteDslNvfp4Fc1Runner:
         tile_expert_ptr = cutlass.cute.runtime.make_ptr(
             cutlass.Int32, tile_expert_idx.data_ptr(),
             cutlass.cute.AddressSpace.gmem)
+        tile_mn_limit_ptr = cutlass.cute.runtime.make_ptr(
+            cutlass.Int32, tile_mn_limits.data_ptr(),
+            cutlass.cute.AddressSpace.gmem)
+        token_mapping_ptr = cutlass.cute.runtime.make_ptr(
+            cutlass.Int32, self.token_id_mapping.data_ptr(),
+            cutlass.cute.AddressSpace.gmem)
         num_tiles_ptr = cutlass.cute.runtime.make_ptr(
             cutlass.Int32, num_non_exiting.data_ptr(),
             cutlass.cute.AddressSpace.gmem)
@@ -535,11 +565,11 @@ class CuteDslNvfp4Fc1Runner:
         def run():
             # Keep metadata tensors alive for the lifetime of this closure:
             # ``compiled`` only receives their raw device pointers.
-            _ = tile_expert_idx, num_non_exiting
+            _ = tile_expert_idx, tile_mn_limits, num_non_exiting
             compiled(
                 a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha_ptr,
-                tile_expert_ptr, num_tiles_ptr,
-                self.m, self.n, self.k, self.experts,
+                tile_expert_ptr, tile_mn_limit_ptr, token_mapping_ptr, num_tiles_ptr,
+                self.tokens, self.m, self.n, self.k, self.experts,
                 stream=self.stream,
             )
             self.out_target.index_copy_(
@@ -564,7 +594,7 @@ class CuteDslNvfp4Fc1Runner:
         self.selection = AutotuneRunner(options).resolve(
             configs,
             namespace="cute_dsl_nvfp4_fc1",
-            key=(self.tokens, self.experts, self.m, self.n // 2, self.k),
+            key=("v5-gather64", self.tokens, self.experts, self.m, self.n // 2, self.k),
             prepare=self._prepare,
             benchmark=lambda prepared: _stats(prepared.run, options),
             probe=lambda prepared: _quick_probe(prepared.run, options),
