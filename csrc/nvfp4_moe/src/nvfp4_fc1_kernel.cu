@@ -35,6 +35,9 @@
 #ifndef SM110A_NVFP4_FC1_CLUSTER_M
 #define SM110A_NVFP4_FC1_CLUSTER_M 1
 #endif
+#ifndef SM110A_NVFP4_FC1_CLUSTER_N
+#define SM110A_NVFP4_FC1_CLUSTER_N 1
+#endif
 #ifndef SM110A_NVFP4_FC1_MODE
 #define SM110A_NVFP4_FC1_MODE 0
 #endif
@@ -76,9 +79,19 @@ __device__ inline float silu(float x) {
     return x / (1.0f + expf(-x));
 }
 
-template <int kTileM, int kTileN, int kTileK, int kEpilogueTileN, int kClusterM>
+template <int kTileM, int kTileN, int kTileK, int kEpilogueTileN, int kClusterM,
+          int kClusterN = 1>
 struct KernelConfig {
     static_assert(kClusterM == 1 || kClusterM == 2);
+    static_assert(kClusterN == 1 || kClusterN == 2 || kClusterN == 4);
+    static_assert(kClusterN == 1 || kClusterM == 2,
+        "cluster_n reuses a cta_group::2 M pair");
+    static_assert(kClusterN != 4 || kTileN == 64,
+        "cluster_n=4 requires tile_n=64 to fit per-CTA TMEM");
+    static_assert(kClusterN != 4 || kTileK == 256,
+        "cluster_n=4 currently requires tile_k=256");
+    static_assert(kClusterN != 2 || kTileN <= 128,
+        "cluster_n=2 supports tile_n up to 128");
     static_assert(kTileM == 4 * kWarpSize);
     // tcgen05.mma.kind::f16 supports N in steps of 8 for cta_group::1
     // and steps of 16 for cta_group::2, up to N=256. The instruction
@@ -121,15 +134,21 @@ struct KernelConfig {
     static constexpr int kSmemLimitedStageCount =
         (kMaxOptInSmemBytes - kStaticSmemReserve - kEpilogueSmemBytes) /
         kPerStageSmemBytes;
-    static constexpr int kStageCount = kSmemLimitedStageCount;
-    static_assert(kStageCount >= 2);
+    // Each cta_group::2 M-pair in an N cluster owns one TMEM allocation. Cap
+    // the pipeline depth so every N-pair fits in the 512-column TMEM pool
+    // (cluster_n=2: 256 columns per pair, cluster_n=4: 128 per pair).
+    static constexpr int kStageCount = kClusterN == 1 ? kSmemLimitedStageCount :
+        (kClusterN == 2 ? (kSmemLimitedStageCount < 3 ? kSmemLimitedStageCount : 3) :
+            (kSmemLimitedStageCount < 2 ? kSmemLimitedStageCount : 2));
+    static_assert(kStageCount >= 1);
     static constexpr int kMainloopSmemBytes = kStageCount * kPerStageSmemBytes;
     static constexpr int kDynamicSmemBytes = kMainloopSmemBytes + kEpilogueSmemBytes;
     static constexpr int kScaleColsPerMma = 4 + 4 * kSFBScaleTileCount;
     // N=256 cannot keep two accumulator banks alongside every staged scale
     // fragment.  Reuse one accumulator bank and one scale slot, as the
     // grouped-M kernel does.  Narrow tiles retain double-buffered TMEM.
-    static constexpr int kTmemStageCount = kTileN == 256 ? 1 : 2;
+    static constexpr int kTmemStageCount =
+        kClusterN == 1 && kTileN < 256 ? 2 : 1;
     static constexpr int kScaleTmemSlotCount =
         kTileN < 256 ? kStageCount * kMmaStepsPerStage : 1;
     static constexpr int kScaleTmemCols = kScaleTmemSlotCount * kScaleColsPerMma;
@@ -138,8 +157,9 @@ struct KernelConfig {
     static_assert(kAccumulatorTmemCols + kScaleTmemCols <= kTmemColumnsNeeded);
     // tcgen05.alloc requires a power-of-two column count. In particular,
     // two N=192 accumulator stages need 384 columns but must allocate 512.
-    static constexpr int kTmemAllocationColumns = 512;
-    static_assert(kTmemColumnsNeeded <= 512);
+    static constexpr int kTmemAllocationColumns = kTmemColumnsNeeded <= 128 ? 128 :
+        kTmemColumnsNeeded <= 256 ? 256 : 512;
+    static_assert(kTmemColumnsNeeded <= kTmemAllocationColumns);
     // Backward-compat alias used inside the kernel function body.
     static constexpr int kStageSmemBytes = kPerStageSmemBytes;
 };
@@ -163,6 +183,19 @@ __device__ inline uint32_t elect_sync() {
         : "r"(0xFFFFFFFF));
     return elected;
 }
+
+// `cluster_n` keeps each MMA CTA-group along M. Its N-pairs compute separate
+// N tiles, while N-rank 0 distributes both M-ranks' gathered A/SFA stages
+// through cluster shared memory.
+template <int kClusterM, int kClusterN>
+struct ClusterShape {
+    static_assert(kClusterM == 1 || kClusterM == 2);
+    static_assert(kClusterN == 1 || kClusterN == 2 || kClusterN == 4);
+    static_assert(kClusterN == 1 || kClusterM == 2,
+        "NVFP4 FC1 cluster_n requires cluster_m=2");
+    static_assert(kClusterN == 1 || SM110A_NVFP4_FC1_MODE == 0,
+        "cluster_n currently supports the non-persistent scheduler only");
+};
 
 __device__ inline constexpr uint64_t matrix_desc_encode(
     uint64_t value) {
@@ -541,6 +574,24 @@ __device__ inline void mbarrier_arrive_on_cluster_cta(
         : "memory");
 }
 
+// Complete a bulk shared-memory transfer into one peer CTA and signal that
+// peer's local ready barrier.
+template <int kBytes>
+__device__ inline void bulk_copy_stage_to_cluster_cta(
+    int src_smem,
+    int dst_smem,
+    int local_mbar_addr,
+    int target_cta_rank) {
+    static_assert(kBytes % 16 == 0);
+    const int remote_dst = map_shared_to_cluster_cta(dst_smem, target_cta_rank);
+    const int remote_mbar = map_shared_to_cluster_cta(local_mbar_addr, target_cta_rank);
+    asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 "
+                 "_, [%0], %1;" :: "r"(remote_mbar), "r"(kBytes) : "memory");
+    asm volatile("cp.async.bulk.shared::cluster.shared::cta."
+                 "mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::
+                 "r"(remote_dst), "r"(src_smem), "r"(kBytes), "r"(remote_mbar) : "memory");
+}
+
 template <int kClusterM>
 __device__ inline void tma_load_4d(
     int dst_smem,
@@ -717,17 +768,19 @@ __device__ inline void tcgen05_mma_nvfp4(
 
 template <int kClusterM>
 __device__ inline void tcgen05_commit(
-    int mbar_addr) {
+    int mbar_addr,
+    int cta_rank = 0) {
     if constexpr (kClusterM == 1) {
         asm volatile("tcgen05.commit.cta_group::1."
                      "mbarrier::arrive::one.shared::cluster.b64 "
                      "[%0];" ::"r"(mbar_addr)
             : "memory");
     } else {
+        const uint16_t pair_mask = static_cast<uint16_t>(0x3u << (cta_rank & ~1));
         asm volatile("tcgen05.commit.cta_group::2."
                      "mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 "
                      "[%0], %1;" ::"r"(mbar_addr),
-            "h"(static_cast<int16_t>((1 << kClusterM) - 1))
+            "h"(pair_mask)
             : "memory");
     }
 }
@@ -837,11 +890,12 @@ template <
     int kTileK,
     int kEpilogueTileN,
     int kClusterM,
+    int kClusterN,
     bool kPersistent,
     bool kDynamicClc = false,
     bool kSwapAB = false,
     bool kDirectGmem = false>
-__global__ __cluster_dims__(kClusterM, 1, 1)
+__global__ __cluster_dims__(kClusterM, kClusterN, 1)
 __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
     const uint8_t *a,
     const __grid_constant__ CUtensorMap a_tensor_map,
@@ -857,7 +911,9 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
     nv_bfloat16 *c,
     int n,
     int k) {
-    using Config = KernelConfig<kTileM, kTileN, kTileK, kEpilogueTileN, kClusterM>;
+    using Config = KernelConfig<kTileM, kTileN, kTileK, kEpilogueTileN, kClusterM, kClusterN>;
+    using Shape = ClusterShape<kClusterM, kClusterN>;
+    (void)sizeof(Shape);
     constexpr int kClusterTileM = Config::kClusterTileM;
     constexpr int kStageCount = Config::kStageCount;
     constexpr int kASmemBytes = Config::kASmemBytes;
@@ -882,6 +938,8 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
     const int warp_id = tid / kWarpSize;
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
+    const int m_rank = cta_rank % kClusterM;
+    const int n_rank = cta_rank / kClusterM;
     const int worker_id = blockIdx.x / kClusterM;
     const int cluster_tiles = *task_count;
     constexpr int kWorkerTileCount = kDynamicClc ? kClcWorkerTileCount :
@@ -901,6 +959,9 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
     __shared__ int task_gather_tma[2];
     __shared__ uint64_t tma_mbars[kStageCount];
     __shared__ uint64_t a_mbars[kStageCount];
+    // In the cluster-N path, SFA uses a second transaction barrier. A single
+    // mbarrier cannot have two outstanding expect_tx transactions at once.
+    __shared__ uint64_t sfa_mbars[kStageCount];
     // CTA 0 owns this barrier.  Each CTA arrives only after its local A/SFA
     // gather is complete, so the CTA-group::2 MMA cannot consume a partially
     // produced operand from CTA 1.
@@ -914,6 +975,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
     const int epilogue_smem = mainloop_smem + kMainloopSmemBytes;
     const int base_tma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(tma_mbars));
     const int base_a_mbar_addr = static_cast<int>(__cvta_generic_to_shared(a_mbars));
+    const int base_sfa_mbar_addr = static_cast<int>(__cvta_generic_to_shared(sfa_mbars));
     const int base_a_cluster_mbar_addr =
         static_cast<int>(__cvta_generic_to_shared(a_cluster_mbars));
     const int base_mma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(mma_mbars));
@@ -923,10 +985,15 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
     if (tid == 0) {
         for (int stage = 0; stage < kStageCount; ++stage) {
             mbarrier_init(base_tma_mbar_addr + stage * sizeof(uint64_t), kClusterM);
-            mbarrier_init(
-                base_a_mbar_addr + stage * sizeof(uint64_t), kProducerThreadCount);
+            // In an N cluster, only rank 0 gathers A/SFA. Each peer receives
+            // A via its local A barrier and SFA via the separate barrier below.
+            const int a_arrival_count =
+                kClusterN > 1 && n_rank != 0 ? 1 : kProducerThreadCount;
+            mbarrier_init(base_a_mbar_addr + stage * sizeof(uint64_t), a_arrival_count);
+            if constexpr (kClusterN > 1)
+                mbarrier_init(base_sfa_mbar_addr + stage * sizeof(uint64_t), 1);
             if constexpr (kClusterM > 1) {
-                if (cta_rank == 0) {
+                if (m_rank == 0) {
                     mbarrier_init(
                         base_a_cluster_mbar_addr + stage * sizeof(uint64_t), kClusterM);
                 }
@@ -1006,7 +1073,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
             if constexpr (!kSwapAB) {
                 float gate_values[8];
                 float up_values[8];
-                const int tmem_row = cta_rank * kTileM + warp_id * kWarpSize;
+                const int tmem_row = m_rank * kTileM + warp_id * kWarpSize;
                 const int gate_load_addr = tmem_addr + (tmem_row << 16) + gate_tmem_col;
                 const int up_load_addr = tmem_addr + (tmem_row << 16) + up_tmem_col;
                 asm volatile("tcgen05.ld.sync.aligned.32x32b.x8.b32 "
@@ -1057,7 +1124,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                 // Match STSM's register fragment directly: each warp reads
                 // lanes 0-15 and 16-31 as two .16x256b TMEM fragments.
                 uint32_t values[8];
-                const int row_base = cta_rank * kTileM + warp_id * kWarpSize;
+                const int row_base = m_rank * kTileM + warp_id * kWarpSize;
                 const int load_addr0 = tmem_addr + (row_base << 16) + tmem_col;
                 const int load_addr1 = tmem_addr + ((row_base + 16) << 16) + tmem_col;
                 asm volatile("tcgen05.ld.sync.aligned.16x256b.x1.b32 "
@@ -1173,15 +1240,15 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
             for (int cluster_bid = first_cluster_bid; cluster_bid < last_cluster_bid;
                 ++cluster_bid) {
                 const ExpertTileTask task = tasks[cluster_bid];
-                const int tile_n = task.tile_n;
-                const int cta_row = task.row_start + task.tile_row + cta_rank * kTileM;
+                const int tile_n = task.tile_n * kClusterN + n_rank;
+                const int cta_row = task.row_start + task.tile_row + m_rank * kTileM;
                 const int tile_col = tile_n * kTileN;
-                const int cta_tile_row = task.tile_row + cta_rank * kTileM;
+                const int cta_tile_row = task.tile_row + m_rank * kTileM;
                 const int remaining_rows = task.row_count - cta_tile_row;
                 const int valid_rows = remaining_rows < 0 ? 0 :
                     (remaining_rows < kTileM ? remaining_rows : kTileM);
 
-                if (cta_row != cached_source_row_start) {
+                if ((kClusterN == 1 || n_rank == 0) && cta_row != cached_source_row_start) {
                     const int lane = tid & (kWarpSize - 1);
                     const int row = producer_rank * kWarpSize + lane;
                     if (producer_rank < kAProducerWarpCount)
@@ -1203,8 +1270,11 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                     }
                     asm volatile("bar.sync 2, %0;" :: "n"(kProducerThreadCount) : "memory");
                 }
-                const bool gather_a_tma = task_gather_tma[0];
-                const bool gather_sfa_tma = task_gather_tma[1];
+                // The N-cluster path needs one owner-visible gathered stage
+                // that can be copied to peers. Keep it in the vectorized
+                // layout for both contiguous and sparse routes.
+                const bool gather_a_tma = kClusterN == 1 ? task_gather_tma[0] : false;
+                const bool gather_sfa_tma = kClusterN == 1 ? task_gather_tma[1] : false;
 
                 for (int tile_k = 0; tile_k < k_tiles; ++tile_k) {
                     const int mma_mbar_addr =
@@ -1235,7 +1305,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                                 (gather_sfa_tma ? kSFASmemBytes : 0))
                             : "memory");
                         tma_load_4d<kClusterM>(b_smem, &b_tensor_map, off_k,
-                            tile_col + cta_rank * (kTileN / kClusterM), 0, task.expert,
+                            tile_col + m_rank * (kTileN / kClusterM), 0, task.expert,
                             tma_transaction_mbar_addr, streaming_cache_policy);
                         for (int scale_tile = 0; scale_tile < kSFBScaleTileCount; ++scale_tile) {
                             const int sfb_tile_smem =
@@ -1246,10 +1316,11 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                                 tma_load_4d<1>(sfb_tile_smem, &sfb_tensor_map, 0, 0, off_k64,
                                     sfb_tile_index, tma_transaction_mbar_addr,
                                     streaming_cache_policy);
-                            } else if (cta_rank == 0) {
+                            } else if (m_rank == 0) {
                                 tma_load_4d_multicast<2>(sfb_tile_smem, &sfb_tensor_map,
                                     0, 0, off_k64, sfb_tile_index, tma_transaction_mbar_addr,
-                                    3, streaming_cache_policy);
+                                    static_cast<int16_t>(3 << (n_rank * kClusterM)),
+                                    streaming_cache_policy);
                             }
                         }
                         if (gather_a_tma) {
@@ -1264,13 +1335,22 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                         }
                     }
 
-                    load_gather_a_and_sfa<kTileM, kTileK>(a, sfa, task_source_rows,
-                        valid_rows, tile_k, k,
-                        dynamic_smem + producer_stage * kStageSmemBytes,
-                        dynamic_smem + producer_stage * kStageSmemBytes +
-                            kASmemBytes + kBSmemBytes,
-                        a_mbar_addr, gather_a_tma, gather_sfa_tma,
-                        reuse_cache_policy);
+                    if constexpr (kClusterN == 1) {
+                        load_gather_a_and_sfa<kTileM, kTileK>(a, sfa, task_source_rows,
+                            valid_rows, tile_k, k,
+                            dynamic_smem + producer_stage * kStageSmemBytes,
+                            dynamic_smem + producer_stage * kStageSmemBytes +
+                                kASmemBytes + kBSmemBytes,
+                            a_mbar_addr, gather_a_tma, gather_sfa_tma,
+                            reuse_cache_policy);
+                    } else if (n_rank == 0) {
+                        load_gather_a_and_sfa<kTileM, kTileK>(a, sfa, task_source_rows,
+                            valid_rows, tile_k, k,
+                            dynamic_smem + producer_stage * kStageSmemBytes,
+                            dynamic_smem + producer_stage * kStageSmemBytes +
+                                kASmemBytes + kBSmemBytes,
+                            a_mbar_addr, false, false, reuse_cache_policy);
+                    }
 
                     producer_stage = (producer_stage + 1) % kStageCount;
                     if (producer_stage == 0) {
@@ -1284,15 +1364,41 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
         // A/SFA completion to the rank-0 aggregate barrier without occupying
         // a producer warp that must keep issuing TMA loads.
         if constexpr (kClusterM > 1) {
-            if (cta_rank != 0 && warp_id == kMmaWarp && elect_sync()) {
+            if (m_rank != 0 && warp_id == kMmaWarp && elect_sync()) {
                 for (int cluster_bid = first_cluster_bid; cluster_bid < last_cluster_bid;
                     ++cluster_bid) {
                     for (int tile_k = 0; tile_k < k_tiles; ++tile_k) {
                         mbarrier_wait_forward_a_ready(
                             base_a_mbar_addr + consumer_stage * sizeof(uint64_t),
                             consumer_a_phase);
+                        if constexpr (kClusterN > 1) {
+                            if (n_rank != 0) {
+                                mbarrier_wait_forward_a_ready(
+                                    base_sfa_mbar_addr + consumer_stage * sizeof(uint64_t),
+                                    consumer_a_phase);
+                            }
+                        }
                         mbarrier_arrive_on_cluster_cta(
-                            base_a_cluster_mbar_addr + consumer_stage * sizeof(uint64_t), 0);
+                            base_a_cluster_mbar_addr + consumer_stage * sizeof(uint64_t),
+                            n_rank * kClusterM);
+                        if constexpr (kClusterN > 1) {
+                            if (n_rank == 0) {
+                                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                                const int a_smem =
+                                    mainloop_smem + consumer_stage * kStageSmemBytes;
+                                const int sfa_smem = a_smem + kASmemBytes + kBSmemBytes;
+                                for (int target_n_rank = 1; target_n_rank < kClusterN;
+                                     ++target_n_rank) {
+                                    const int target_rank = target_n_rank * kClusterM + m_rank;
+                                    bulk_copy_stage_to_cluster_cta<kASmemBytes>(a_smem, a_smem,
+                                        base_a_mbar_addr + consumer_stage * sizeof(uint64_t),
+                                        target_rank);
+                                    bulk_copy_stage_to_cluster_cta<kSFASmemBytes>(sfa_smem, sfa_smem,
+                                        base_sfa_mbar_addr + consumer_stage * sizeof(uint64_t),
+                                        target_rank);
+                                }
+                            }
+                        }
 
                         consumer_stage = (consumer_stage + 1) % kStageCount;
                         if (consumer_stage == 0) {
@@ -1306,7 +1412,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
 
         // The consumer advances independently and releases each stage after MMA has
         // finished reading it.
-        if (cta_rank == 0 && warp_id == kMmaWarp && elect_sync()) {
+        if (m_rank == 0 && warp_id == kMmaWarp && elect_sync()) {
             for (int cluster_bid = first_cluster_bid; cluster_bid < last_cluster_bid;
                 ++cluster_bid) {
                 if constexpr (kPersistent || kDynamicClc) {
@@ -1316,19 +1422,45 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                 }
 
                 const int stage_tmem_addr = tmem_addr + consumer_mainloop_stage * kTileN;
-                const int tile_col = tasks[cluster_bid].tile_n * kTileN;
+                const int tile_col =
+                    (tasks[cluster_bid].tile_n * kClusterN + n_rank) * kTileN;
                 for (int tile_k = 0; tile_k < k_tiles; ++tile_k) {
                     const int tma_mbar_addr =
                         base_tma_mbar_addr + consumer_stage * sizeof(uint64_t);
                     const int a_mbar_addr =
                         base_a_mbar_addr + consumer_stage * sizeof(uint64_t);
+                    const int sfa_mbar_addr =
+                        base_sfa_mbar_addr + consumer_stage * sizeof(uint64_t);
                     const int mma_mbar_addr =
                         base_mma_mbar_addr + consumer_stage * sizeof(uint64_t);
 
                     mbarrier_wait_consumer_a_ready(a_mbar_addr, consumer_a_phase);
+                    if constexpr (kClusterN > 1) {
+                        // N-rank 0 owns the gathered TileM. Once its local
+                        // gather is visible, fan out A and SFA to every N
+                        // rank. Peers wait on separate A and SFA transaction
+                        // barriers before their pair enters MMA.
+                        if (n_rank == 0) {
+                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                            const int a_smem =
+                                mainloop_smem + consumer_stage * kStageSmemBytes;
+                            const int sfa_smem = a_smem + kASmemBytes + kBSmemBytes;
+                            for (int target_n_rank = 1; target_n_rank < kClusterN;
+                                 ++target_n_rank) {
+                                const int target_rank = target_n_rank * kClusterM + m_rank;
+                                bulk_copy_stage_to_cluster_cta<kASmemBytes>(a_smem, a_smem,
+                                    a_mbar_addr, target_rank);
+                                bulk_copy_stage_to_cluster_cta<kSFASmemBytes>(sfa_smem, sfa_smem,
+                                    sfa_mbar_addr, target_rank);
+                            }
+                        } else {
+                            mbarrier_wait_consumer_a_ready(sfa_mbar_addr, consumer_a_phase);
+                        }
+                    }
                     if constexpr (kClusterM > 1) {
                         mbarrier_arrive_on_cluster_cta(
-                            base_a_cluster_mbar_addr + consumer_stage * sizeof(uint64_t), 0);
+                            base_a_cluster_mbar_addr + consumer_stage * sizeof(uint64_t),
+                            n_rank * kClusterM);
                         mbarrier_wait_consumer_cluster_a_ready(
                             base_a_cluster_mbar_addr + consumer_stage * sizeof(uint64_t),
                             consumer_a_phase);
@@ -1360,7 +1492,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                                 scale_addr + 4 + (tile_col % 128) / 32, accumulate);
                         }
                     }
-                    tcgen05_commit<kClusterM>(mma_mbar_addr);
+                    tcgen05_commit<kClusterM>(mma_mbar_addr, cta_rank);
 
                     consumer_stage = (consumer_stage + 1) % kStageCount;
                     if (consumer_stage == 0) {
@@ -1371,7 +1503,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
 
                 const int mainloop_mbar_addr =
                     base_mainloop_mbar_addr + consumer_mainloop_stage * sizeof(uint64_t);
-                tcgen05_commit<kClusterM>(mainloop_mbar_addr);
+                tcgen05_commit<kClusterM>(mainloop_mbar_addr, cta_rank);
 
                 consumer_mainloop_stage = (consumer_mainloop_stage + 1) % kTmemStageCount;
                 if (consumer_mainloop_stage == 0) {
@@ -1393,8 +1525,8 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                 asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
                 const ExpertTileTask task = tasks[cluster_bid];
-                const int tile_n = task.tile_n;
-                const int cta_tile_row = task.tile_row + cta_rank * kTileM;
+                const int tile_n = task.tile_n * kClusterN + n_rank;
+                const int cta_tile_row = task.tile_row + m_rank * kTileM;
                 const int cta_row = task.row_start + cta_tile_row;
                 const int remaining_rows = task.row_count - cta_tile_row;
                 const int valid_rows =
@@ -1478,7 +1610,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                                 ? 0
                                 : (remaining_block_rows < kEpilogueTileN ? remaining_block_rows
                                                                          : kEpilogueTileN);
-                        const int block_col = tile_col + cta_rank * kTileM;
+                        const int block_col = tile_col + m_rank * kTileM;
                         if (valid_block_rows == kEpilogueTileN) {
                             if (tid == 0) {
                                 constexpr int kSwappedStoreColumns = 64;
@@ -1618,7 +1750,8 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
     }
 }
 
-template <int kTileM, int kTileN, int kTileK, int kEpilogueTileN, int kClusterM, bool kSwapAB>
+template <int kTileM, int kTileN, int kTileK, int kEpilogueTileN, int kClusterM,
+          int kClusterN, bool kSwapAB>
 void launch_nvfp4_fc1_impl(
     const uint8_t *d_a,
     const uint8_t *d_b,
@@ -1635,11 +1768,13 @@ void launch_nvfp4_fc1_impl(
     int k,
     int max_tasks,
     cudaStream_t stream) {
-    using Config = KernelConfig<kTileM, kTileN, kTileK, kEpilogueTileN, kClusterM>;
+    using Config = KernelConfig<kTileM, kTileN, kTileK, kEpilogueTileN, kClusterM, kClusterN>;
+    using Shape = ClusterShape<kClusterM, kClusterN>;
+    (void)sizeof(Shape);
     constexpr int kClusterTileM = Config::kClusterTileM;
     constexpr int kDynamicSmemBytes = Config::kDynamicSmemBytes;
     static_assert(!kSwapAB, "NVFP4 FC1 does not support swap_ab");
-    if (tokens % 128 || n % kTileN != 0 || n % 128 || k % kTileK != 0) {
+    if (tokens % 128 || n % (kTileN * kClusterN) != 0 || n % 128 || k % kTileK != 0) {
         return;
     }
 
@@ -1698,6 +1833,7 @@ void launch_nvfp4_fc1_impl(
             kTileK,
             kEpilogueTileN,
             kClusterM,
+            kClusterN,
             false,
             true,
             kSwapAB,
@@ -1707,7 +1843,8 @@ void launch_nvfp4_fc1_impl(
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 kDynamicSmemBytes);
         }
-        kernel<<<kClusterM * worker_clusters, kBlockThreads, kDynamicSmemBytes, stream>>>(
+        kernel<<<dim3(kClusterM * worker_clusters, kClusterN, 1), kBlockThreads,
+            kDynamicSmemBytes, stream>>>(
             d_a, a_tensor_map, b_tensor_map, d_sfa, sfa_tensor_map, sfb_tensor_map, c_tensor_map, d_source_rows, tasks, task_count,
             next_cluster_tile, d_c, n, k);
     } else if constexpr (SM110A_NVFP4_FC1_MODE == 1) {
@@ -1718,6 +1855,7 @@ void launch_nvfp4_fc1_impl(
             kTileK,
             kEpilogueTileN,
             kClusterM,
+            kClusterN,
             true,
             false,
             kSwapAB,
@@ -1728,7 +1866,7 @@ void launch_nvfp4_fc1_impl(
                 kDynamicSmemBytes);
         }
         cudaLaunchConfig_t launch_config{};
-        launch_config.gridDim = dim3(kClusterM * persistent_clusters, 1, 1);
+        launch_config.gridDim = dim3(kClusterM * persistent_clusters, kClusterN, 1);
         launch_config.blockDim = dim3(kBlockThreads, 1, 1);
         launch_config.dynamicSmemBytes = kDynamicSmemBytes;
         launch_config.stream = stream;
@@ -1740,11 +1878,13 @@ void launch_nvfp4_fc1_impl(
             int sm_count = 0;
             cudaGetDevice(&device);
             cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
-            resident_clusters = sm_count / kClusterM > 0 ? sm_count / kClusterM : 1;
+            constexpr int kClusterCtas = kClusterM * kClusterN;
+            resident_clusters = sm_count / kClusterCtas > 0 ? sm_count / kClusterCtas : 1;
         }
         const int launched_clusters =
             resident_clusters < persistent_clusters ? resident_clusters : persistent_clusters;
-        kernel<<<kClusterM * launched_clusters, kBlockThreads, kDynamicSmemBytes, stream>>>(
+        kernel<<<dim3(kClusterM * launched_clusters, kClusterN, 1), kBlockThreads,
+            kDynamicSmemBytes, stream>>>(
             d_a, a_tensor_map, b_tensor_map, d_sfa, sfa_tensor_map, sfb_tensor_map, c_tensor_map, d_source_rows, tasks, task_count,
             next_cluster_tile, d_c, n, k);
     } else {
@@ -1753,6 +1893,7 @@ void launch_nvfp4_fc1_impl(
             kTileK,
             kEpilogueTileN,
             kClusterM,
+            kClusterN,
             false,
             false,
             kSwapAB,
@@ -1762,7 +1903,8 @@ void launch_nvfp4_fc1_impl(
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 kDynamicSmemBytes);
         }
-        kernel<<<kClusterM * max_tasks, kBlockThreads, kDynamicSmemBytes, stream>>>(
+        kernel<<<dim3(kClusterM * max_tasks, kClusterN, 1), kBlockThreads,
+            kDynamicSmemBytes, stream>>>(
             d_a, a_tensor_map, b_tensor_map, d_sfa, sfa_tensor_map, sfb_tensor_map, c_tensor_map, d_source_rows, tasks, task_count,
             next_cluster_tile, d_c, n, k);
     }
@@ -1778,6 +1920,7 @@ void launch_nvfp4_fc1_entry(
     launch_nvfp4_fc1_impl<SM110A_NVFP4_FC1_TILE_M,
         SM110A_NVFP4_FC1_TILE_N, SM110A_NVFP4_FC1_TILE_K,
         SM110A_NVFP4_FC1_EPILOGUE_TILE_N, SM110A_NVFP4_FC1_CLUSTER_M,
+        SM110A_NVFP4_FC1_CLUSTER_N,
         false>(a, b, sfa, sfb, source_rows, tasks, state, c, tokens, m, experts,
             n, k, max_tasks, stream);
 }

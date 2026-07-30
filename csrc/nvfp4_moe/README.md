@@ -17,8 +17,10 @@ out = nvfp4_fc1(aq, bq, sfa, sfb, metadata, config)
 ```
 
 The fused gather path supports `cluster_m=1` and `cluster_m=2` (with B/SFB
-cluster multicast), tile N of 64, 128, or 256, tile K of 64, 128, or 256,
-and all three grouped scheduler modes. Tasks support configurable N-major or
+cluster multicast), plus `cluster_n=2` for TileN 64/128 and `cluster_n=4`
+for TileN 64 with TileK 256. Cluster-N reuses each gathered TileM A/SFA pair
+across adjacent N tiles and currently uses the non-persistent scheduler.
+Tile K may be 64, 128, or 256. Tasks support configurable N-major or
 M-major macro traversal without serpentine ordering. When all 128 routed
 rows in a task are consecutive, FC1 switches A to a swizzled TMA load; sparse
 or fragmented routing continues to use the vectorized `cp.async` gather.

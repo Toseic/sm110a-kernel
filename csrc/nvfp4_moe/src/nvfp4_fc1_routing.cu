@@ -13,6 +13,9 @@ extern "C" void sm110a_nvfp4_fc1_tasks_from_ranges(
 namespace {
 constexpr int kThreads = 256;
 constexpr int kWarpSize = 32;
+#ifndef SM110A_NVFP4_FC1_CLUSTER_N
+#define SM110A_NVFP4_FC1_CLUSTER_N 1
+#endif
 
 __global__ void topk_router_kernel(
     const __nv_bfloat16 *scores, int tokens, int experts, int topk,
@@ -168,5 +171,6 @@ extern "C" void sm110a_nvfp4_fc1_routing_prepare(
     invert_assignments<<<(m + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
         grouped_assignments, m, assignment_to_grouped);
     sm110a_nvfp4_fc1_tasks_from_ranges(
-        offsets, counts, tasks, state, experts, n, tile_m, tile_n, cluster_m, stream);
+        offsets, counts, tasks, state, experts, n, tile_m,
+        tile_n * SM110A_NVFP4_FC1_CLUSTER_N, cluster_m, stream);
 }

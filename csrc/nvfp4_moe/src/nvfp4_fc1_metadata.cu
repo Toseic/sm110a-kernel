@@ -6,6 +6,9 @@ constexpr int kThreads = 256;
 #ifndef SM110A_NVFP4_FC1_MACRO_SWIZZLE_N_MAJOR
 #define SM110A_NVFP4_FC1_MACRO_SWIZZLE_N_MAJOR 1
 #endif
+#ifndef SM110A_NVFP4_FC1_CLUSTER_N
+#define SM110A_NVFP4_FC1_CLUSTER_N 1
+#endif
 constexpr int kMacroSwizzleM = 8;
 constexpr int kMacroSwizzleN = 8;
 
@@ -81,7 +84,8 @@ extern "C" void sm110a_nvfp4_fc1_tasks_prepare(
     if (!layout || !offsets || !counts || !tasks || !state || m <= 0 || experts <= 0)
         return;
     const int task_tile_rows = swap_ab ? tile_n : cluster_m * tile_m;
-    const int logical_n_tile = swap_ab ? cluster_m * tile_m : tile_n;
+    const int logical_n_tile = swap_ab ? cluster_m * tile_m :
+        tile_n * SM110A_NVFP4_FC1_CLUSTER_N;
     if (n % logical_n_tile)
         return;
     cudaMemsetAsync(offsets, 0x7f, experts * sizeof(int32_t), stream);

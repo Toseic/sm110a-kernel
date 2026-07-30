@@ -20,6 +20,7 @@ class Nvfp4Fc1Config:
     tile_k: int = 64
     epilogue_tile_n: int = 64
     cluster_m: int = 1
+    cluster_n: int = 1
     mode: int = 0
     direct_gmem: bool = False
     output_evict_first: bool = True
@@ -35,6 +36,20 @@ class Nvfp4Fc1Config:
             raise ValueError("invalid epilogue_tile_n")
         if self.cluster_m not in (1, 2):
             raise ValueError("cluster_m must be 1 or 2")
+        if self.cluster_n not in (1, 2, 4):
+            raise ValueError("cluster_n must be 1, 2, or 4")
+        if self.cluster_n > 1 and self.cluster_m != 2:
+            raise ValueError("cluster_n > 1 requires cluster_m=2")
+        if self.cluster_n == 2 and self.tile_n > 128:
+            raise ValueError("cluster_n=2 requires tile_n <= 128")
+        if self.cluster_n == 4 and self.tile_n != 64:
+            raise ValueError("cluster_n=4 requires tile_n=64")
+        if self.cluster_n == 4 and self.tile_k != 256:
+            raise ValueError("cluster_n=4 currently requires tile_k=256")
+        if self.cluster_n > 1 and self.mode != 0:
+            raise ValueError("cluster_n > 1 currently requires mode=0")
+        if self.tile_n % self.cluster_n:
+            raise ValueError("tile_n must be divisible by cluster_n")
         if self.mode not in (0, 1, 2):
             raise ValueError("mode must be 0, 1, or 2")
         if not isinstance(self.output_evict_first, bool):
@@ -73,7 +88,7 @@ class Nvfp4Fc1Module:
         tokens, experts = router_scores.shape
         if tokens % 128 or topk <= 0 or topk > experts:
             raise ValueError("tokens must be divisible by 128 and topk must be in [1, experts]")
-        if n <= 0 or n % self.config.tile_n:
+        if n <= 0 or n % (self.config.tile_n * self.config.cluster_n):
             raise ValueError("N is incompatible with the NVFP4 FC1 config")
 
         routing, source_rows, tasks, state = self._binding.prepare_nvfp4_fc1_routing(
@@ -98,7 +113,8 @@ def _flags(config: Nvfp4Fc1Config, variant):
     return tuple(f"-DSM110A_NVFP4_FC1_{key}={value}" for key, value in (
         ("TILE_M", config.tile_m), ("TILE_N", config.tile_n),
         ("TILE_K", config.tile_k), ("EPILOGUE_TILE_N", config.epilogue_tile_n),
-        ("CLUSTER_M", config.cluster_m), ("MODE", config.mode),
+        ("CLUSTER_M", config.cluster_m), ("CLUSTER_N", config.cluster_n),
+        ("MODE", config.mode),
         ("DIRECT_GMEM", int(config.direct_gmem)),
         ("OUTPUT_EVICT_FIRST", int(config.output_evict_first)),
         ("OPERAND_CACHE_POLICY", int(config.operand_cache_policy)),

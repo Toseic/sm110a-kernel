@@ -49,6 +49,7 @@ NVFP4_FC1_CONFIGS = tuple(
         tile_k=tile_k,
         epilogue_tile_n=epilogue_tile_n,
         cluster_m=cluster_m,
+        cluster_n=cluster_n,
         mode=mode,
         direct_gmem=direct_gmem,
         output_evict_first=True,
@@ -58,10 +59,16 @@ NVFP4_FC1_CONFIGS = tuple(
     for tile_k in (256,)
     for epilogue_tile_n in (64, 128)
     for cluster_m in (1, 2)
+    for cluster_n in (1, 2, 4)
     for mode in (0, 1, 2)
     for direct_gmem in (False, True)
     for operand_cache_policy in (False, True)
     if tile_n % epilogue_tile_n == 0
+    if cluster_n == 1 or cluster_m == 2
+    if cluster_n != 2 or tile_n <= 128
+    if cluster_n != 4 or tile_n == 64
+    if cluster_n != 4 or tile_k == 256
+    if cluster_n == 1 or mode == 0
 )
 
 
@@ -70,7 +77,7 @@ def format_candidate(config):
     fields = [
         f"{config.tile_m}x{config.tile_n}x{config.tile_k}",
         f"e{config.epilogue_tile_n}",
-        f"c{config.cluster_m}",
+        f"c{config.cluster_m}n{config.cluster_n}",
         _MODE_LABELS[config.mode],
         epilogue,
         "nmaj" if config.macro_swizzle_n_major else "mmaj",
@@ -84,7 +91,7 @@ def format_candidate(config):
 def compatible_candidates(n, k):
     return tuple(
         config for config in NVFP4_FC1_CONFIGS
-        if n % config.tile_n == 0 and n % 128 == 0 and k % config.tile_k == 0
+        if n % (config.tile_n * config.cluster_n) == 0 and n % 128 == 0 and k % config.tile_k == 0
     )
 
 
@@ -121,6 +128,8 @@ def selected_candidates(n, k, args):
         )
     if args.cluster_m is not None:
         candidates = tuple(c for c in candidates if c.cluster_m == args.cluster_m)
+    if args.cluster_n is not None:
+        candidates = tuple(c for c in candidates if c.cluster_n == args.cluster_n)
     if args.mode is not None:
         candidates = tuple(c for c in candidates if c.mode == args.mode)
     if args.direct_gmem:
@@ -149,7 +158,7 @@ def nvfp4_fc1_sol_bounds(router_scores, topk, n, k, config):
         math.ceil(rows / (config.cluster_m * config.tile_m))
         for rows in expert_rows.tolist() if rows
     )
-    task_count = m_tasks * ((2 * n) // config.tile_n)
+    task_count = m_tasks * ((2 * n) // (config.tile_n * config.cluster_n))
 
     flops = 4 * m * n * k
     routed_a_bytes = m * (k / 2 + k / 16)
@@ -302,6 +311,7 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
         parser.add_argument("--tile-k", type=int, choices=(64, 128, 256))
         parser.add_argument("--epilogue-tile-n", type=int, choices=(64, 128))
         parser.add_argument("--cluster-m", type=int, choices=(1, 2))
+        parser.add_argument("--cluster-n", type=int, choices=(1, 2, 4))
         parser.add_argument("--mode", type=int, choices=(0, 1, 2))
         parser.add_argument("--output-cache", choices=("evict-first", "keep"))
         parser.add_argument(
