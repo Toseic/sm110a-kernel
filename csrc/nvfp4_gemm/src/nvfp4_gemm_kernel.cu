@@ -130,13 +130,13 @@
 //        double buffer and the static/mbarrier reservations
 //        (KernelConfig::kStageCount), capped at six stages.  The largest
 //        configuration that still fits is selected automatically.
-//   3. Single/double-buffered TMEM accumulator (kAccumulatorStageCount).
-//        TileN ≤ 128 keeps two banks (mainloop_stage ∈ {0,1}); TileN=256
-//        falls back to one because two 256-column stages cannot coexist
-//        with the 12-column scale slot without aliasing live accumulator
-//        columns.  Release of each bank is gated by an `epilogue_mbar`
-//        that the epilogue trips only after its TMA store has committed,
-//        hiding the TMEM lifetime from the mainloop.
+//   3. Double-buffered TMEM accumulator (kAccumulatorStageCount).
+//        TileN ≤ 128 uses disjoint banks.  TileN=256 makes two logical
+//        256-column banks overlap by 16 columns, leaving room for its
+//        12-column scale slot within the 512-column TMEM allocation.  The
+//        epilogue drains the shared edge first and releases the bank as soon
+//        as that TMEM load has completed, letting MMA overwrite the shared
+//        columns while the epilogue stores the disjoint remainder.
 //   4. Scale-factor TMEM slot policy (kScaleTmemSlotCount).
 //        Narrow-N keeps every in-flight SMEM stage and K=64 slab's scales in
 //        a distinct TMEM slot, allowing the load warp to prefetch the entire
@@ -329,6 +329,9 @@
 #ifndef SM110A_NVFP4_EPILOGUE_BLOCK_N
 #define SM110A_NVFP4_EPILOGUE_BLOCK_N 32
 #endif
+#ifndef SM110A_NVFP4_USE_TMA_PREFETCH
+#define SM110A_NVFP4_USE_TMA_PREFETCH 0
+#endif
 
 namespace {
 
@@ -345,6 +348,10 @@ constexpr int kMaxOptInSmemBytes = 232448;
 constexpr int kMbarrierSmemBytes = 256;
 constexpr int kStaticBarrierSmemBytes = 1024;
 constexpr bool kPrefetchTmaDesc = true;
+// Keep the TMA load pipeline's worth of future K tiles resident in L2.  The
+// producer issues an initial window and then replenishes it after every
+// regular TMA load, so every K tile is hinted exactly once.
+constexpr bool kPrefetchTmaData = SM110A_NVFP4_USE_TMA_PREFETCH != 0;
 constexpr int kSmCount = 20;
 
 constexpr int kMacroSwizzleM = 8;
@@ -401,12 +408,20 @@ struct KernelConfig {
         kTileN < 256 ? kStageCount * kMmaStepsPerStage : 1;
     static constexpr int kScaleTmemCols =
         kScaleColsPerMma * kScaleTmemSlotCount;
-    static constexpr int kAccumulatorStageCount = kTileN <= 128 ? 2 : 1;
-    static constexpr int kAccumulatorOverlapCols = 0;
-    static constexpr int kAccumulatorStageStride = kTileN;
-    static constexpr int kAccumulatorTmemCols = kAccumulatorStageCount * kTileN;
+    // A 16-column overlap is aligned for tcgen05.ld (.x8 values per thread)
+    // and fits in every supported epilogue block size.  At TileN=256 this
+    // changes the footprint from 2*256 + 12 (impossible) to
+    // 2*256 - 16 + 12 = 508 columns.
+    static constexpr int kAccumulatorOverlapCols = kTileN == 256 ? 16 : 0;
+    static constexpr int kAccumulatorStageCount = 2;
+    static constexpr int kAccumulatorStageStride =
+        kTileN - kAccumulatorOverlapCols;
+    static constexpr int kAccumulatorTmemCols =
+        kAccumulatorStageCount * kTileN - kAccumulatorOverlapCols;
     static_assert(kAccumulatorTmemCols + kScaleTmemCols <= kTmemColumnCapacity);
-    static_assert(kAccumulatorStageCount == (kTileN <= 128 ? 2 : 1));
+    static_assert(kAccumulatorOverlapCols == 0 ||
+                  (kAccumulatorOverlapCols == 16 &&
+                   kEpilogueBlockN >= kAccumulatorOverlapCols));
     static constexpr int kMainloopSmemBytes = kStageCount * kPerStageSmemBytes;
     static constexpr int kDynamicSmemBytes = kMainloopSmemBytes + kEpilogueSmemBytes;
     static_assert(kStaticBarrierSmemBytes + kDynamicSmemBytes +
@@ -455,6 +470,20 @@ __device__ inline void tma_4d_gmem2smem_multicast(
         "[%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
         :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(w),
            "r"(mbar_addr), "h"(cta_mask), "n"(CTA_GROUP) : "memory");
+}
+
+__device__ inline void tma_3d_prefetch_l2(
+    const void *tmap_ptr, int x, int y, int z) {
+    asm volatile(
+        "cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];"
+        :: "l"(tmap_ptr), "r"(x), "r"(y), "r"(z) : "memory");
+}
+
+__device__ inline void tma_4d_prefetch_l2(
+    const void *tmap_ptr, int x, int y, int z, int w) {
+    asm volatile(
+        "cp.async.bulk.prefetch.tensor.4d.L2.global.tile [%0, {%1, %2, %3, %4}];"
+        :: "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(w) : "memory");
 }
 
 __device__ inline uint64_t make_epilogue_cache_policy() {
@@ -921,6 +950,37 @@ void nvfp4_gemm_kernel(
     }
 
     const int taddr = tmem_addr[0];
+
+    // Hint the exact tiles consumed by a future TMA load into L2.  This has
+    // no completion barrier: it is only a cache residency hint, while the
+    // corresponding regular TMA transfer remains responsible for SMEM
+    // visibility and mbarrier completion.
+    auto prefetch = [&](int iter_k, int off_m, int off_n) {
+        const int off_k = iter_k * kTileK;
+        const int off_k_64 = iter_k * kMmaStepsPerStage;
+        tma_3d_prefetch_l2(&A_tmap, off_k, off_m, 0);
+        tma_3d_prefetch_l2(&B_tmap,
+            off_k,
+            off_n + cta_rank * (kTileN / kClusterM),
+            0);
+        tma_4d_prefetch_l2(&SFA_tmap,
+            0,
+            0,
+            off_k_64,
+            off_m / kTileM);
+        #pragma unroll
+        for (int scale_tile = 0; scale_tile < kSFBScaleTileCount; ++scale_tile) {
+            // Match the regular multicast load: rank 0 is the sole cluster
+            // producer for SFB, so avoid redundant L2 prefetch requests.
+            if constexpr (kClusterM == 1) {
+                tma_4d_prefetch_l2(&SFB_tmap,
+                    0, 0, off_k_64, off_n / 128 + scale_tile);
+            } else if (cta_rank == 0) {
+                tma_4d_prefetch_l2(&SFB_tmap,
+                    0, 0, off_k_64, off_n / 128 + scale_tile);
+            }
+        }
+    };
 
     // tma load
     auto load = [&](int iter_k, int mma_phase, int stage_id, int off_m, int off_n) {
@@ -1390,8 +1450,27 @@ void nvfp4_gemm_kernel(
         int mma_phase = 1;
         for (int bid = _bid; bid < grid_size; bid += grid_x) {
             auto [off_m, off_n] = compute_bid(bid);
-            for (int iter_k = 0; iter_k < K / kTileK; ++iter_k) {
+            constexpr int kPrefetchDistance = kStageCount;
+            const int k_tile_count = K / kTileK;
+
+            if constexpr (kPrefetchTmaData) {
+                // Prime a full pipeline-distance window.  The rolling issue
+                // below visits every later K tile exactly once.
+                for (int iter_k = 0;
+                     iter_k < min(kPrefetchDistance, k_tile_count);
+                     ++iter_k) {
+                    prefetch(iter_k, off_m, off_n);
+                }
+            }
+
+            for (int iter_k = 0; iter_k < k_tile_count; ++iter_k) {
                 load(iter_k, mma_phase, mma_stage, off_m, off_n);
+                if constexpr (kPrefetchTmaData) {
+                    const int future_k = iter_k + kPrefetchDistance;
+                    if (future_k < k_tile_count) {
+                        prefetch(future_k, off_m, off_n);
+                    }
+                }
                 mma_stage = (mma_stage + 1) % kStageCount;
                 if (mma_stage == 0) {
                     mma_phase ^= 1;

@@ -20,6 +20,7 @@ class Nvfp4GemmConfig:
     tile_k: int = 64
     cluster_m: int = 2
     epilogue_block_n: int = 32
+    use_prefetch: bool = False
 
     def validate(self) -> None:
         if self.tile_m != 128:
@@ -32,6 +33,8 @@ class Nvfp4GemmConfig:
             raise ValueError("tile_k must be 64, 128, or 256")
         if self.epilogue_block_n not in (32, 64, 128) or self.tile_n % self.epilogue_block_n:
             raise ValueError("epilogue_block_n must be 32, 64, or 128")
+        if not isinstance(self.use_prefetch, bool):
+            raise TypeError("use_prefetch must be a bool")
 
 
 def _kernel_cflags(config: Nvfp4GemmConfig, _variant) -> tuple[str, ...]:
@@ -41,6 +44,7 @@ def _kernel_cflags(config: Nvfp4GemmConfig, _variant) -> tuple[str, ...]:
             ("TILE_M", config.tile_m), ("TILE_N", config.tile_n),
             ("TILE_K", config.tile_k), ("CLUSTER_M", config.cluster_m),
             ("EPILOGUE_BLOCK_N", config.epilogue_block_n),
+            ("USE_TMA_PREFETCH", int(config.use_prefetch)),
         )
     )
 

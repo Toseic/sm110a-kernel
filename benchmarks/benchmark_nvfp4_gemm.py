@@ -49,16 +49,21 @@ NVFP4_GEMM_CONFIGS = tuple(
         tile_k=tile_k,
         cluster_m=cluster_m,
         epilogue_block_n=epilogue_block_n,
+        use_prefetch=use_prefetch,
     )
     for cluster_m in (1, 2)
     for tile_n in (64, 128, 256)
     for tile_k in (64, 128, 256)
     for epilogue_block_n in (32, 64, 128)
+    for use_prefetch in (False, True)
     if tile_n % epilogue_block_n == 0
 )
 
 
 def compatible_candidates(m, n, k):
+    sm_count = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
     return tuple(
         config
         for config in NVFP4_GEMM_CONFIGS
@@ -66,6 +71,15 @@ def compatible_candidates(m, n, k):
         and n % config.tile_n == 0
         and n % 128 == 0
         and k % config.tile_k == 0
+        # Match CuTE's pruning: rolling L2 prefetch is a tactic for large K
+        # or an incomplete CTA wave, rather than a universally profitable
+        # instruction stream.
+        and (not config.use_prefetch or
+             k >= 8192 or
+             0.5 < (
+                 math.ceil(m / (config.tile_m * config.cluster_m)) *
+                 math.ceil(n / config.tile_n) / sm_count
+             ) < 1.0)
     )
 
 
@@ -73,6 +87,7 @@ def format_candidate(config):
     return (
         f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
         f"/c{config.cluster_m}/e{config.epilogue_block_n}"
+        f"/{'prefetch' if config.use_prefetch else 'noprefetch'}"
     )
 
 
@@ -270,7 +285,7 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
         )
         return AutotuneRunner(options).resolve(
             candidates,
-            namespace="nvfp4_gemm",
+            namespace="nvfp4_gemm_prefetch_v1",
             key=(m, n, k),
             prepare=prepare,
             benchmark=lambda prepared: benchmark_with_stats(
