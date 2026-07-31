@@ -26,7 +26,7 @@ from sm110a_kernel import (
 from sm110a_kernel.kernels.fc1_block_interleaved_swiglu import (
     compile_fc1_block_interleaved_swiglu,
 )
-from sm110a_kernel.runner import AutotuneRunner, PreparedKernel, TuneOptions
+from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
 
 
 DEFAULT_EXPERTS = 256
@@ -334,10 +334,9 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
             torch.cuda.synchronize()
             return PreparedKernel(config, run)
 
-        options = TuneOptions(
-            warmup=args.warmup, iters=args.iters, samples=args.samples,
-            cold_l2_flush=getattr(args, "_cold_l2_flush", None),
-            cache_path=args.cache_path, force_sweep=args.force_sweep, debug=args.debug,
+        options = self.make_tune_options(
+            args,
+            role="ours",
             pre_parallel_jit=args.pre_parallel_jit,
         )
         return AutotuneRunner(options).resolve(

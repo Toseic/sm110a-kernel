@@ -51,3 +51,7 @@ a new sweep or prewarm the cache with:
 /home/bifrost/miniforge3/bin/python3 -m sm110a_kernel.runner nvfp4-gemm -- \
   --m 4096 --n 4096 --k 4096
 ```
+
+With `--baseline cutedsl`, use `--force-sweep-ours` or
+`--force-sweep-baseline` to re-run only the local-kernel or CuTE DSL config
+sweep. `--force-sweep` remains the shorthand for both.

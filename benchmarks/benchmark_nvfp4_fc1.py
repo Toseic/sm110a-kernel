@@ -32,7 +32,7 @@ from sm110a_kernel import (
     from_blocked_nvfp4_scales,
     to_blocked_nvfp4_scales,
 )
-from sm110a_kernel.runner import AutotuneRunner, PreparedKernel, TuneOptions
+from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
 
 
 DEFAULT_EXPERTS = 256
@@ -386,14 +386,9 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
             prepared_metadata[config] = metadata
             return prepared
 
-        options = TuneOptions(
-            warmup=args.warmup,
-            iters=args.iters,
-            samples=args.samples,
-            cold_l2_flush=args._cold_l2_flush,
-            cache_path=args.cache_path,
-            force_sweep=args.force_sweep,
-            debug=args.debug,
+        options = self.make_tune_options(
+            args,
+            role="ours",
             pre_parallel_jit=args.pre_parallel_jit,
         )
         routed_m = aq.size(0) * args.topk
@@ -466,10 +461,8 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
                     aq, bq, sfa, sfb, baseline_out,
                     metadata.source_rows, metadata.tasks, metadata.state,
                 )
-                baseline_runner.autotune(TuneOptions(
-                    warmup=args.warmup, iters=args.iters, samples=args.samples,
-                    cold_l2_flush=args._cold_l2_flush, cache_path=args.cache_path,
-                    force_sweep=args.force_sweep, debug=args.debug,
+                baseline_runner.autotune(self.make_tune_options(
+                    args, role="baseline",
                     pre_parallel_jit=args.cutedsl_pre_parallel_jit,
                 ))
                 baseline_fn = baseline_runner.run

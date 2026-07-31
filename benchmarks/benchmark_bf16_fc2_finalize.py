@@ -26,7 +26,7 @@ from sm110a_kernel import (
     pack_routing_metadata,
     prepare_grouped_m_metadata,
 )
-from sm110a_kernel.runner import AutotuneRunner, PreparedKernel, TuneOptions
+from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
 
 
 DEFAULT_EXPERTS = 256
@@ -223,10 +223,9 @@ class Fc2FinalizeBenchmark(BenchmarkBase):
                 torch.cuda.synchronize()
                 return PreparedKernel(config, run)
 
-            options = TuneOptions(
-                warmup=args.warmup, iters=args.iters, samples=args.samples,
-                cold_l2_flush=args._cold_l2_flush, cache_path=args.cache_path,
-                force_sweep=args.force_sweep, debug=args.debug,
+            options = self.make_tune_options(
+                args,
+                role="ours",
                 pre_parallel_jit=args.pre_parallel_jit,
             )
             selection = AutotuneRunner(options).resolve(

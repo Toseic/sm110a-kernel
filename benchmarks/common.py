@@ -53,12 +53,51 @@ class BenchmarkBase:
         return args
 
     def add_cache_args(self, parser):
-        """Register the --force-sweep and --cache-path flags."""
+        """Register cache controls shared by local and baseline autotuners."""
         parser.add_argument(
             "--force-sweep",
             action="store_true",
-            help="ignore the cached best config and re-run the full autotune sweep",
+            help=(
+                "ignore cached configs and re-run both the local-kernel and "
+                "baseline autotune sweeps"
+            ),
         )
+        parser.add_argument(
+            "--force-sweep-ours",
+            action="store_true",
+            help="ignore the cached local-kernel config and re-run its autotune sweep",
+        )
+        parser.add_argument(
+            "--force-sweep-baseline",
+            action="store_true",
+            help="ignore the cached baseline config and re-run its autotune sweep",
+        )
+
+    @staticmethod
+    def make_tune_options(args, *, role="ours", **overrides):
+        """Build runner options for one side of a benchmark comparison.
+
+        ``role`` keeps cache-bypass policy consistent across benchmarks.  The
+        legacy ``--force-sweep`` remains a shorthand for forcing both sides.
+        """
+        if role not in {"ours", "baseline"}:
+            raise ValueError(f"unsupported autotune role: {role}")
+        from sm110a_kernel.runner import TuneOptions
+
+        values = dict(
+            warmup=args.warmup,
+            iters=args.iters,
+            samples=args.samples,
+            cold_l2_flush=getattr(args, "_cold_l2_flush", None),
+            cache_path=getattr(args, "cache_path", None),
+            force_sweep=(
+                getattr(args, "force_sweep", False)
+                or getattr(args, f"force_sweep_{role}", False)
+            ),
+            debug=getattr(args, "debug", False),
+        )
+        values.update(overrides)
+        return TuneOptions(**values)
 
     def add_sol_arg(self, parser):
         parser.add_argument(

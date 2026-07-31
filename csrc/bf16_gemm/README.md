@@ -33,7 +33,9 @@ python3 -m sm110a_kernel.runner bf16-gemm -- --m 4096 --n 4096 --k 4096
 
 The runner records results in `profiles/autotune_cache.json`, partitioned by
 the CUDA device, software stack, architecture settings, and source revision.
-Use `--force-sweep` to re-run selection for an existing workload.
+Use `--force-sweep` to re-run selection for an existing workload.  When using
+the autotuned CuTE DSL baseline, `--force-sweep-ours` and
+`--force-sweep-baseline` can re-run only the local-kernel or baseline sweep.
 
 This runs a small `512 x 512 x 512` accuracy check first, then the default
 performance sweep.

@@ -28,7 +28,7 @@ from sm110a_kernel import (
     nvfp4_gemm_out,
     quantize_nvfp4_gemm,
 )
-from sm110a_kernel.runner import AutotuneRunner, PreparedKernel, TuneOptions
+from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
 
 
 DEFAULT_SHAPES = (
@@ -179,10 +179,8 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
             ref = torch.empty_like(out)
             if args.baseline == "cutedsl":
                 cute_dsl_runner = CuteDslNvfp4GemmRunner(aq, bq, sfa, sfb, ref)
-                cute_dsl_runner.autotune(TuneOptions(
-                    warmup=args.warmup, iters=args.iters, samples=args.samples,
-                    cold_l2_flush=args._cold_l2_flush, cache_path=args.cache_path,
-                    force_sweep=args.force_sweep, debug=args.debug,
+                cute_dsl_runner.autotune(self.make_tune_options(
+                    args, role="baseline",
                     # Keep this separate from the local kernel's JIT option:
                     # CuTE DSL compilation has process-global session state.
                     pre_parallel_jit=args.cutedsl_pre_parallel_jit,
@@ -237,14 +235,9 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
             torch.cuda.synchronize()
             return PreparedKernel(config, run)
 
-        options = TuneOptions(
-            warmup=args.warmup,
-            iters=args.iters,
-            samples=args.samples,
-            cold_l2_flush=getattr(args, "_cold_l2_flush", None),
-            cache_path=args.cache_path,
-            force_sweep=args.force_sweep,
-            debug=args.debug,
+        options = self.make_tune_options(
+            args,
+            role="ours",
             pre_parallel_jit=args.pre_parallel_jit,
         )
         return AutotuneRunner(options).resolve(

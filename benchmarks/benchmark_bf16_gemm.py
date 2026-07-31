@@ -29,7 +29,7 @@ from sm110a_kernel import (
     cublaslt_gemm_out,
     cublaslt_gemm_out_batched,
 )
-from sm110a_kernel.runner import AutotuneRunner, PreparedKernel, TuneOptions
+from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
 
 
 DEFAULT_SHAPES = [
@@ -290,14 +290,9 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
         elif args.baseline == "cutedsl":
             cute_dsl_runner = CuteDslBf16GemmRunner(a, b, out_baseline)
             cute_dsl_runner.autotune(
-                TuneOptions(
-                    warmup=args.warmup,
-                    iters=args.iters,
-                    samples=args.samples,
-                    cold_l2_flush=getattr(args, "_cold_l2_flush", None),
-                    cache_path=getattr(args, "cache_path", None),
-                    force_sweep=getattr(args, "force_sweep", False),
-                    debug=args.debug,
+                self.make_tune_options(
+                    args,
+                    role="baseline",
                     # CuTE DSL's compiler has process-global session state and
                     # cannot safely compile configurations concurrently.  Keep
                     # this separate from the local kernel's parallel JIT flag.
@@ -357,11 +352,9 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
             torch.cuda.synchronize()
             return PreparedKernel(candidate, run)
 
-        options = TuneOptions(
-            warmup=args.warmup, iters=args.iters, samples=args.samples,
-            cold_l2_flush=getattr(args, "_cold_l2_flush", None),
-            cache_path=getattr(args, "cache_path", None),
-            force_sweep=getattr(args, "force_sweep", False), debug=args.debug,
+        options = self.make_tune_options(
+            args,
+            role="ours",
             pre_parallel_jit=args.pre_parallel_jit,
         )
         return AutotuneRunner(options).resolve(
