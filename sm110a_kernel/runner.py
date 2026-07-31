@@ -40,6 +40,10 @@ class TuneOptions:
     force_sweep: bool = False
     debug: bool = False
     pre_parallel_jit: bool = False
+    cutedsl_sweep_scheduler: bool = False
+    cutedsl_nvmmh: bool = False
+    cutedsl_nvmmh_fields: str = "tile,cluster"
+    cutedsl_nvmmh_max_tactics: int = 5
 
 
 @dataclass

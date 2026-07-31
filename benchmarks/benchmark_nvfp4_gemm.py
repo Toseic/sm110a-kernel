@@ -135,6 +135,30 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
                 "not thread-safe)"
             ),
         )
+        parser.add_argument(
+            "--cutedsl-sweep-scheduler",
+            action="store_true",
+            help=(
+                "expand each CuTE DSL NVFP4 tactic over swizzle sizes "
+                "1,2,4,8 and both CTA raster orders"
+            ),
+        )
+        parser.add_argument(
+            "--cutedsl-nvmmh",
+            action="store_true",
+            help="rank/prune CuTE DSL NVFP4 tactics with nvMatmulHeuristics",
+        )
+        parser.add_argument(
+            "--cutedsl-nvmmh-fields",
+            default="tile,cluster",
+            help="comma-separated nvMatmulHeuristics knobs: tile,cluster,swizzle,cta_order",
+        )
+        parser.add_argument(
+            "--cutedsl-nvmmh-max-tactics",
+            type=int,
+            default=5,
+            help="maximum ranked tile/cluster/swap tactics to retain",
+        )
         self.add_cache_args(parser)
         self.add_pre_parallel_jit_arg(parser)
         parser.add_argument(
@@ -184,6 +208,10 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
                     # Keep this separate from the local kernel's JIT option:
                     # CuTE DSL compilation has process-global session state.
                     pre_parallel_jit=args.cutedsl_pre_parallel_jit,
+                    cutedsl_sweep_scheduler=args.cutedsl_sweep_scheduler,
+                    cutedsl_nvmmh=args.cutedsl_nvmmh,
+                    cutedsl_nvmmh_fields=args.cutedsl_nvmmh_fields,
+                    cutedsl_nvmmh_max_tactics=args.cutedsl_nvmmh_max_tactics,
                 ))
                 baseline_fn = cute_dsl_runner.run
             else:
