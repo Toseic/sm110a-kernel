@@ -22,6 +22,7 @@ from common import (
     tflops_from_ms,
 )
 from sm110a_kernel import (
+    CuteDslNvfp4GroupedMGemmRunner,
     Nvfp4GroupedMConfig,
     compile_nvfp4_grouped_m_gemm,
     nvfp4_grouped_m_gemm_out,
@@ -170,6 +171,10 @@ class Nvfp4GroupedMGemmBenchmark(BenchmarkBase):
         self.add_timing_args(parser, warmup=2, iters=5, samples=3)
         self.add_cache_args(parser)
         self.add_pre_parallel_jit_arg(parser)
+        parser.add_argument(
+            "--baseline", choices=("torch", "cutedsl"), default="torch",
+            help="baseline implementation",
+        )
         self.add_sol_arg(parser)
         parser.add_argument("--debug", action="store_true")
         parser.add_argument("--no-accuracy", action="store_true")
@@ -190,12 +195,17 @@ class Nvfp4GroupedMGemmBenchmark(BenchmarkBase):
 
     def run_with_args(self, args):
         torch.manual_seed(args.seed)
-        print("[baseline] per-expert torch._scaled_mm NVFP4")
+        if args.baseline == "cutedsl":
+            print("[baseline] TRT-LLM CuTE DSL persistent NVFP4 grouped-M GEMM (autotuned)")
+            baseline_label = "CuTE DSL"
+        else:
+            print("[baseline] per-expert torch._scaled_mm NVFP4")
+            baseline_label = "Torch"
         print("[runner] config selection cached by experts/N/K/tokens-per-expert")
         table = TablePrinter((
             ("Tok/E", 8), ("M", 10), ("E", 6), ("N", 8), ("K", 8),
             ("Kernel(ms)", 14), ("Kernel TF/s", 15),
-            ("Torch(ms)", 14), ("Torch TF/s", 15),
+            (f"{baseline_label}(ms)", 14), (f"{baseline_label} TF/s", 15),
             ("Speedup", 10), ("MaxDiff", 12), ("BestConfig", 34),
         ))
         table.print_header()
@@ -203,7 +213,16 @@ class Nvfp4GroupedMGemmBenchmark(BenchmarkBase):
             aq, bq, sfa, sfb, layout, out, ref = make_workload(
                 tokens, args.experts, args.n, args.k
             )
-            baseline = lambda: run_baseline(aq, bq, sfa, sfb, tokens, ref)
+            if args.baseline == "cutedsl":
+                baseline_runner = CuteDslNvfp4GroupedMGemmRunner(
+                    aq, bq, sfa, sfb, ref, tokens
+                )
+                baseline_runner.autotune(self.make_tune_options(
+                    args, role="baseline", pre_parallel_jit=args.pre_parallel_jit,
+                ))
+                baseline = baseline_runner.run
+            else:
+                baseline = lambda: run_baseline(aq, bq, sfa, sfb, tokens, ref)
             baseline_stats = benchmark_with_stats(
                 baseline, args.warmup, args.iters, args.samples,
                 cold_l2_flush=args._cold_l2_flush,

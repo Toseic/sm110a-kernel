@@ -21,6 +21,11 @@ from .nvfp4_gemm import (
     CuteDslNvfp4GemmRunner,
     cute_dsl_nvfp4_gemm_out,
 )
+from .nvfp4_grouped_m_gemm import (
+    CuteDslNvfp4GroupedMGemmConfig,
+    CuteDslNvfp4GroupedMGemmRunner,
+    cute_dsl_nvfp4_grouped_m_gemm_out,
+)
 
 __all__ = [
     "CuteDslBf16GemmConfig",
@@ -32,4 +37,7 @@ __all__ = [
     "CuteDslNvfp4GemmConfig",
     "CuteDslNvfp4GemmRunner",
     "cute_dsl_nvfp4_gemm_out",
+    "CuteDslNvfp4GroupedMGemmConfig",
+    "CuteDslNvfp4GroupedMGemmRunner",
+    "cute_dsl_nvfp4_grouped_m_gemm_out",
 ]

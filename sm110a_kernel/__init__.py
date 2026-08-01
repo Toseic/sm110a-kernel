@@ -83,6 +83,9 @@ _CUTEDSL_EXPORTS = {
     "CuteDslNvfp4GemmConfig",
     "CuteDslNvfp4GemmRunner",
     "cute_dsl_nvfp4_gemm_out",
+    "CuteDslNvfp4GroupedMGemmConfig",
+    "CuteDslNvfp4GroupedMGemmRunner",
+    "cute_dsl_nvfp4_grouped_m_gemm_out",
 }
 
 
