@@ -49,17 +49,24 @@ namespace {
 constexpr int kMmaK = 64;
 constexpr int kWarpSize = 32;
 constexpr int kEpilogueWarpCount = 4;
-// BF16 only gathers A, so four producer warps are sufficient. NVFP4 also
-// gathers SFA; on cta_group::2, dedicate four warps to each operand so the
-// two independent random-access streams can overlap.
-constexpr bool kSplitGatherWarps = SM110A_NVFP4_FC1_CLUSTER_M == 2;
+// Keep the A/SFA gather group independent from the B/SFB TMA issuer.  This
+// matches the producer decomposition used by the CuTE baseline: four gather
+// warps, one TMA warp, one MMA warp, and four epilogue warps.  In particular,
+// cta_group::2 no longer doubles the gather group merely to overlap A/SFA.
 constexpr int kAProducerWarpCount = 4;
 constexpr int kSfaProducerWarpCount = kAProducerWarpCount;
-constexpr int kProducerWarpCount =
-    kSplitGatherWarps ? kAProducerWarpCount + kSfaProducerWarpCount : kAProducerWarpCount;
+constexpr int kProducerWarpCount = kAProducerWarpCount;
+constexpr bool kSplitGatherWarps = false;
 constexpr int kProducerWarpBase = kEpilogueWarpCount;
 constexpr int kMmaWarp = kProducerWarpBase + kProducerWarpCount;
-constexpr int kWarpCount = kMmaWarp + 1;
+constexpr int kTmaWarp = kMmaWarp + 1;
+// A dedicated scheduler warp owns persistent work acquisition and publishes
+// task records into a small CTA-local ring.  Keeping it out of the producer
+// group lets gather/TMA/MMA/epilogue advance independently across tasks.
+constexpr int kSchedulerWarp = kTmaWarp + 1;
+constexpr int kWarpCount = kSchedulerWarp + 1;
+constexpr bool kEnableTaskPipeline = true;
+constexpr int kTaskPipelineStageCount = 2;
 constexpr int kBlockThreads = kWarpSize * kWarpCount;
 constexpr int kProducerThreadCount = kProducerWarpCount * kWarpSize;
 constexpr int kPersistentTileCount = 2;
@@ -69,7 +76,14 @@ constexpr int kClcWorkerTileCount = 2;
 constexpr int kInterleaveBlock = 64;
 
 __device__ inline float silu(float x) {
-    return x / (1.0f + expf(-x));
+    constexpr float kLog2E = 1.4426950408889634f;
+    float exp2_value;
+    float reciprocal;
+    const float exp2_arg = -kLog2E * x;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(exp2_value) : "f"(exp2_arg));
+    const float denominator = 1.0f + exp2_value;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(reciprocal) : "f"(denominator));
+    return x * reciprocal;
 }
 
 template <int kTileM, int kTileN, int kTileK, int kEpilogueTileN, int kClusterM,
@@ -281,6 +295,21 @@ __device__ inline void mbarrier_wait_tma_ready(int mbar_addr, int phase) {
         "r"(phase), "r"(kSuspendTicks) : "memory");
 }
 
+__device__ inline void mbarrier_wait_tma_issue(int mbar_addr, int phase) {
+    constexpr uint32_t kSuspendTicks = 0x989680;
+    asm volatile(
+        "{ .reg .pred done; WAIT_TMA_ISSUE: "
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 done, [%0], %1, %2; "
+        "@done bra.uni COMPLETE_TMA_ISSUE; bra.uni WAIT_TMA_ISSUE; "
+        "COMPLETE_TMA_ISSUE: }" ::"r"(mbar_addr),
+        "r"(phase), "r"(kSuspendTicks) : "memory");
+}
+
+__device__ inline void mbarrier_arrive_tma_issue(int mbar_addr) {
+    asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];" ::
+        "r"(mbar_addr) : "memory");
+}
+
 __device__ inline void mbarrier_wait_mainloop_output(int mbar_addr, int phase) {
     constexpr uint32_t kSuspendTicks = 0x989680;
     asm volatile(
@@ -299,7 +328,7 @@ __device__ __forceinline__ void cp_async_a_16b(
     asm volatile("{\n\t"
                  ".reg .pred p_ignore_src;\n\t"
                  "setp.ne.u32 p_ignore_src, %2, 0;\n\t"
-                 "cp.async.ca.shared::cta.global [%0], [%1], 16, p_ignore_src;\n\t"
+                 "cp.async.cg.shared::cta.global [%0], [%1], 16, p_ignore_src;\n\t"
                  "}\n"
         :
         : "r"(dst_smem), "l"(src_gmem), "r"(ignore_src)
@@ -333,6 +362,8 @@ __device__ __forceinline__ void load_gather_a_and_sfa(
     const uint8_t *__restrict__ a,
     const uint8_t *__restrict__ sfa,
     const int *__restrict__ source_rows,
+    const int *__restrict__ a_source_rows,
+    int sfa_source_row,
     int valid_rows,
     int tile_k,
     int k,
@@ -353,16 +384,25 @@ __device__ __forceinline__ void load_gather_a_and_sfa(
     const int lane = threadIdx.x & 31;
 
     if constexpr (!kSplitGatherWarps) {
-        constexpr int kRowsPerProducerWarp = kTileM / kProducerWarpCount;
-        const int row = producer_rank * kRowsPerProducerWarp + lane;
+        constexpr int kRowsPerIssue = kProducerThreadCount / kVectorsPerRow;
+        const int producer_thread = producer_rank * kWarpSize + lane;
+        const int vec = producer_thread % kVectorsPerRow;
+        const int sfa_row = producer_thread;
 
-        static_assert(kTileM % kProducerWarpCount == 0);
-        static_assert(kRowsPerProducerWarp == kWarpSize);
+        static_assert(kTileM == kProducerThreadCount);
+        static_assert(kProducerThreadCount % kVectorsPerRow == 0);
+        static_assert(kTileM % kRowsPerIssue == 0);
 
-        // Match the 128B-swizzled TMA layout consumed by
-        // make_k_major_128b_desc.
+        // CuTE-style cooperative gather: the lanes in each V-lane group
+        // jointly load one logical row, where V = TileK / 32.  For TileK=256,
+        // eight lanes issue adjacent 16B copies and cover the row's full
+        // 128B. A warp therefore touches four random source rows per issue,
+        // rather than 32 random rows in the old one-lane-per-row mapping.
         if (!a_is_tma)
-            for (int vec = 0; vec < kVectorsPerRow; ++vec) {
+            #pragma unroll
+            for (int issue = 0; issue < kVectorsPerRow; ++issue) {
+                const int row = producer_thread / kVectorsPerRow + issue * kRowsPerIssue;
+                const bool valid = row < valid_rows;
                 constexpr int kSmemVectorsPerRow = 128 / kVectorBytes;
                 const int physical_linear =
                     row * kSmemVectorsPerRow + vec;
@@ -370,10 +410,8 @@ __device__ __forceinline__ void load_gather_a_and_sfa(
                     (physical_linear & ~7) +
                     ((physical_linear & 7) ^
                         ((physical_linear >> 3) & 7));
-                const bool valid = row < valid_rows;
-                const int source_row = valid ? source_rows[row] : 0;
                 const size_t offset =
-                    static_cast<size_t>(source_row) * (k / 2) +
+                    static_cast<size_t>(a_source_rows[issue]) * (k / 2) +
                     static_cast<size_t>(tile_k) * (kTileK / 2) +
                     vec * kVectorBytes;
                 const int dst_smem =
@@ -384,24 +422,22 @@ __device__ __forceinline__ void load_gather_a_and_sfa(
 
         if (!sfa_is_tma)
             for (int mma_k = 0; mma_k < kMmaSteps; ++mma_k) {
-                const bool valid = row < valid_rows;
-                const int source_row = valid ? source_rows[row] : 0;
                 const int source_in_tile =
-                    (source_row & 31) * 16 +
-                    ((source_row >> 5) & 3) * 4;
+                    (sfa_source_row & 31) * 16 +
+                    ((sfa_source_row >> 5) & 3) * 4;
                 const size_t source_tile =
-                    static_cast<size_t>(source_row >> 7);
+                    static_cast<size_t>(sfa_source_row >> 7);
                 const size_t global_mma_k =
                     static_cast<size_t>(tile_k) * kMmaSteps + mma_k;
                 const int dst_in_tile =
-                    (row & 31) * 16 + ((row >> 5) & 3) * 4;
+                    (sfa_row & 31) * 16 + ((sfa_row >> 5) & 3) * 4;
                 const int dst_smem =
                     static_cast<int>(__cvta_generic_to_shared(
                         sfa_smem + mma_k * 512 + dst_in_tile));
                 cp_async_sfa_4b(dst_smem,
                     sfa + (source_tile * (k / 64) + global_mma_k) * 512 +
                         source_in_tile,
-                    valid);
+                    sfa_row < valid_rows);
             }
 
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -500,6 +536,44 @@ __device__ inline void clc_mbarrier_wait(
         "r"(phase),
         "r"(kSuspendTicks)
         : "memory");
+}
+
+__device__ inline void clc_issue_request(
+    int response_addr,
+    int mbar_addr) {
+    asm volatile("mbarrier.arrive.expect_tx.relaxed.cluster."
+                 "shared::cta.b64 _, [%0], 16;" :: "r"(mbar_addr)
+        : "memory");
+    asm volatile("clusterlaunchcontrol.try_cancel.async.shared::cta."
+                 "mbarrier::complete_tx::bytes.multicast::cluster::all."
+                 "b128 [%0], [%1];" :: "r"(response_addr), "r"(mbar_addr)
+        : "memory");
+}
+
+__device__ inline bool clc_wait_and_query(
+    const uint4 *response,
+    int mbar_addr,
+    int phase,
+    int *canceled_cta_x) {
+    clc_mbarrier_wait(mbar_addr, phase);
+    const uint4 value = response[0];
+    int canceled;
+    int first_cta_x = 0;
+    asm volatile("{\n\t"
+                 ".reg .pred was_canceled;\n\t"
+                 ".reg .b128 response;\n\t"
+                 "mov.b128 response, {%2, %3, %4, %5};\n\t"
+                 "clusterlaunchcontrol.query_cancel.is_canceled.pred."
+                 "b128 was_canceled, response;\n\t"
+                 "selp.u32 %0, 1, 0, was_canceled;\n\t"
+                 "@was_canceled clusterlaunchcontrol.query_cancel."
+                 "get_first_ctaid::x.b32.b128 %1, response;\n\t"
+                 "}"
+        : "=r"(canceled), "=r"(first_cta_x)
+        : "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w)
+        : "memory");
+    *canceled_cta_x = first_cta_x;
+    return canceled != 0;
 }
 
 // Map a shared-memory object to the address at which it is hosted by another
@@ -820,6 +894,8 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
     constexpr int kMmaStepsPerStage = kTileK / kMmaK;
     constexpr int kTmemStageCount = Config::kTmemStageCount;
     constexpr int kTmemAllocationColumns = Config::kTmemAllocationColumns;
+    constexpr bool kUseTaskPipeline = kEnableTaskPipeline && kClusterM == 1 &&
+        kClusterN == 1 && (kPersistent || kDynamicClc);
     const int tid = threadIdx.x;
     const int warp_id = tid / kWarpSize;
     int cta_rank;
@@ -839,11 +915,17 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
 
     __shared__ int tmem_base[1];
     __shared__ int next_work_smem[2];
+    // Persistent c1 task pipeline.  `task_ready` is published by the
+    // scheduler and observed independently by every role; `task_free` is
+    // returned by the epilogue once no role needs the metadata slot.
+    __shared__ int scheduled_cluster_bids[kTaskPipelineStageCount];
+    __shared__ uint64_t task_ready_mbars[kTaskPipelineStageCount];
+    __shared__ uint64_t task_free_mbars[kTaskPipelineStageCount];
     __shared__ __align__(16) uint4 clc_response[1];
     __shared__ __align__(8) uint64_t clc_mbar[1];
     __shared__ int task_source_rows[kTileM];
-    __shared__ int task_gather_tma[2];
     __shared__ uint64_t tma_mbars[kStageCount];
+    __shared__ uint64_t tma_issue_mbars[kStageCount];
     __shared__ uint64_t a_mbars[kStageCount];
     // In the cluster-N path, SFA uses a second transaction barrier. A single
     // mbarrier cannot have two outstanding expect_tx transactions at once.
@@ -860,6 +942,12 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
     const int mainloop_smem = static_cast<int>(__cvta_generic_to_shared(dynamic_smem));
     const int epilogue_smem = mainloop_smem + kMainloopSmemBytes;
     const int base_tma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(tma_mbars));
+    const int base_task_ready_mbar_addr =
+        static_cast<int>(__cvta_generic_to_shared(task_ready_mbars));
+    const int base_task_free_mbar_addr =
+        static_cast<int>(__cvta_generic_to_shared(task_free_mbars));
+    const int base_tma_issue_mbar_addr =
+        static_cast<int>(__cvta_generic_to_shared(tma_issue_mbars));
     const int base_a_mbar_addr = static_cast<int>(__cvta_generic_to_shared(a_mbars));
     const int base_sfa_mbar_addr = static_cast<int>(__cvta_generic_to_shared(sfa_mbars));
     const int base_a_cluster_mbar_addr =
@@ -871,6 +959,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
     if (tid == 0) {
         for (int stage = 0; stage < kStageCount; ++stage) {
             mbarrier_init(base_tma_mbar_addr + stage * sizeof(uint64_t), kClusterM);
+            mbarrier_init(base_tma_issue_mbar_addr + stage * sizeof(uint64_t), 1);
             // In an N cluster, only rank 0 gathers A/SFA. Each peer receives
             // A via its local A barrier and SFA via the separate barrier below.
             const int a_arrival_count =
@@ -890,6 +979,13 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
             mbarrier_init(base_mainloop_mbar_addr + stage * sizeof(uint64_t), 1);
             if constexpr (kPersistent || kDynamicClc) {
                 mbarrier_init(base_epilogue_mbar_addr + stage * sizeof(uint64_t), 4 * kClusterM);
+            }
+        }
+        if constexpr (kUseTaskPipeline) {
+            for (int stage = 0; stage < kTaskPipelineStageCount; ++stage) {
+                mbarrier_init(base_task_ready_mbar_addr + stage * sizeof(uint64_t), 1);
+                mbarrier_init(base_task_free_mbar_addr + stage * sizeof(uint64_t),
+                    kEpilogueWarpCount);
             }
         }
         if constexpr (kDynamicClc) {
@@ -1044,6 +1140,8 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
 
     int producer_stage = 0;
     int producer_mma_phase = 1;
+    int tma_stage = 0;
+    int tma_issue_phase = 0;
     int consumer_stage = 0;
     int consumer_a_phase = 0;
     int consumer_tma_phase = 0;
@@ -1054,11 +1152,100 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
     int cached_source_row_start = -1;
     int clc_phase = 0;
     int dynamic_first_cluster_bid = static_first_cluster_bid;
+    // Each role tracks the task-ring parity independently.  It is intentionally
+    // separate from the mainloop SMEM/TMEM stage state: a task spans all K
+    // stages, while its metadata must remain stable until the epilogue ends.
+    int task_pipe_stage = 0;
+    int task_ready_phase = 0;
+    int scheduler_free_phase = 1;
+    int scheduler_packet_next = static_first_cluster_bid;
+    int scheduler_packet_end =
+        static_first_cluster_bid + kWorkerTileCount < cluster_tiles
+            ? static_first_cluster_bid + kWorkerTileCount
+            : cluster_tiles;
+    bool scheduler_clc_pending = false;
+    bool scheduler_clc_done = false;
 
     while (true) {
         int first_cluster_bid;
         int clc_mbar_addr = 0;
-        if constexpr (kDynamicClc) {
+        if constexpr (kUseTaskPipeline) {
+            if (warp_id == kSchedulerWarp) {
+                // The scheduler is the sole task-source producer.  Persistent
+                // mode pulls one atomic task; CLC mode publishes its initial
+                // static packet and overlaps an asynchronous steal request.
+                mbarrier_wait(base_task_free_mbar_addr +
+                                  task_pipe_stage * sizeof(uint64_t),
+                              scheduler_free_phase);
+                if (elect_sync()) {
+                    int scheduled_bid;
+                    if constexpr (kDynamicClc) {
+                        const int clc_response_addr =
+                            static_cast<int>(__cvta_generic_to_shared(clc_response));
+                        const int scheduler_clc_mbar_addr =
+                            static_cast<int>(__cvta_generic_to_shared(clc_mbar));
+
+                        // Invalid/finished packets are skipped inside the
+                        // scheduler warp.  Data-path roles only see real tasks
+                        // followed by one terminal sentinel.
+                        while (scheduler_packet_next >= scheduler_packet_end &&
+                               !scheduler_clc_done) {
+                            if (!scheduler_clc_pending) {
+                                clc_issue_request(clc_response_addr, scheduler_clc_mbar_addr);
+                                scheduler_clc_pending = true;
+                            }
+                            int canceled_cta_x = 0;
+                            const bool canceled = clc_wait_and_query(clc_response,
+                                scheduler_clc_mbar_addr, clc_phase, &canceled_cta_x);
+                            scheduler_clc_pending = false;
+                            clc_phase ^= 1;
+                            if (!canceled) {
+                                scheduler_clc_done = true;
+                                break;
+                            }
+
+                            scheduler_packet_next =
+                                canceled_cta_x / kClusterM * kWorkerTileCount;
+                            scheduler_packet_end =
+                                scheduler_packet_next + kWorkerTileCount < cluster_tiles
+                                    ? scheduler_packet_next + kWorkerTileCount
+                                    : cluster_tiles;
+                        }
+
+                        scheduled_bid = scheduler_packet_next < scheduler_packet_end
+                            ? scheduler_packet_next++ : cluster_tiles;
+                    } else {
+                        scheduled_bid = atomicAdd(next_cluster_tile, 1);
+                    }
+
+                    const int task_ready_mbar_addr = base_task_ready_mbar_addr +
+                        task_pipe_stage * static_cast<int>(sizeof(uint64_t));
+                    scheduled_cluster_bids[task_pipe_stage] = scheduled_bid;
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];" ::
+                        "r"(task_ready_mbar_addr) : "memory");
+                }
+                __syncwarp();
+                const bool scheduler_done =
+                    scheduled_cluster_bids[task_pipe_stage] >= cluster_tiles;
+                task_pipe_stage = (task_pipe_stage + 1) % kTaskPipelineStageCount;
+                if (task_pipe_stage == 0) {
+                    scheduler_free_phase ^= 1;
+                }
+                if (scheduler_done) {
+                    break;
+                }
+                continue;
+            }
+
+            mbarrier_wait(base_task_ready_mbar_addr +
+                              task_pipe_stage * sizeof(uint64_t),
+                          task_ready_phase);
+            first_cluster_bid = scheduled_cluster_bids[task_pipe_stage];
+            if (first_cluster_bid >= cluster_tiles) {
+                break;
+            }
+        } else if constexpr (kDynamicClc) {
             first_cluster_bid = dynamic_first_cluster_bid;
 
             // One request per cluster.  CLC multicasts the cancellation response
@@ -1104,9 +1291,10 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
             }
         }
         const bool has_work = first_cluster_bid < cluster_tiles;
+        constexpr int kTasksPerPipelineIteration = kUseTaskPipeline ? 1 : kWorkerTileCount;
         const int last_cluster_bid = has_work
-                                         ? (first_cluster_bid + kWorkerTileCount < cluster_tiles
-                                                   ? first_cluster_bid + kWorkerTileCount
+                                         ? (first_cluster_bid + kTasksPerPipelineIteration < cluster_tiles
+                                                   ? first_cluster_bid + kTasksPerPipelineIteration
                                                    : cluster_tiles)
                                          : first_cluster_bid;
 
@@ -1132,54 +1320,88 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                             row < valid_rows ? __ldg(source_rows + cta_row + row) : 0;
                     __syncwarp();
                     cached_source_row_start = cta_row;
-                    // Cache this classification for all adjacent N tiles of
-                    // the same routed-row run.  This keeps the normal gather
-                    // path from repeatedly scanning the 128-entry map.
-                    asm volatile("bar.sync 2, %0;" :: "n"(kProducerThreadCount) : "memory");
-                    if (producer_rank == 0 && (tid & (kWarpSize - 1)) == 0) {
-                        const int base = task_source_rows[0];
-                        bool contiguous = valid_rows == kTileM;
-                        for (int row = 1; row < kTileM && contiguous; ++row)
-                            contiguous = task_source_rows[row] == base + row;
-                        task_gather_tma[0] = contiguous;
-                        task_gather_tma[1] = contiguous && !(base & (kTileM - 1));
-                    }
                     asm volatile("bar.sync 2, %0;" :: "n"(kProducerThreadCount) : "memory");
                 }
-                // The N-cluster path needs one owner-visible gathered stage
-                // that can be copied to peers. Keep it in the vectorized
-                // layout for both contiguous and sparse routes.
-                const bool gather_a_tma = kClusterN == 1 ? task_gather_tma[0] : false;
-                const bool gather_sfa_tma = kClusterN == 1 ? task_gather_tma[1] : false;
 
+                constexpr int kAVectorsPerRow = kTileK / 32;
+                constexpr int kARowsPerIssue = kProducerThreadCount / kAVectorsPerRow;
+                const int producer_thread = producer_rank * kWarpSize + (tid & (kWarpSize - 1));
+                int a_source_row_cache[kAVectorsPerRow];
+                int sfa_source_row_cache = 0;
+                if (kClusterN == 1 || n_rank == 0) {
+                    #pragma unroll
+                    for (int issue = 0; issue < kAVectorsPerRow; ++issue) {
+                        const int row = producer_thread / kAVectorsPerRow +
+                            issue * kARowsPerIssue;
+                        a_source_row_cache[issue] = row < valid_rows ? task_source_rows[row] : 0;
+                    }
+                    sfa_source_row_cache =
+                        producer_thread < valid_rows ? task_source_rows[producer_thread] : 0;
+                }
                 for (int tile_k = 0; tile_k < k_tiles; ++tile_k) {
                     const int mma_mbar_addr =
                         base_mma_mbar_addr + producer_stage * sizeof(uint64_t);
                     const int a_mbar_addr =
                         base_a_mbar_addr + producer_stage * sizeof(uint64_t);
+
+                    mbarrier_wait_mma_reuse(mma_mbar_addr, producer_mma_phase);
+                    if (producer_rank == 0 && elect_sync()) {
+                        mbarrier_arrive_tma_issue(
+                            base_tma_issue_mbar_addr + producer_stage * sizeof(uint64_t));
+                    }
+                    if constexpr (kClusterN == 1) {
+                        load_gather_a_and_sfa<kTileM, kTileK>(a, sfa, task_source_rows,
+                            a_source_row_cache, sfa_source_row_cache,
+                            valid_rows, tile_k, k,
+                            dynamic_smem + producer_stage * kStageSmemBytes,
+                            dynamic_smem + producer_stage * kStageSmemBytes +
+                                kASmemBytes + kBSmemBytes,
+                            a_mbar_addr, false, false);
+                    } else if (n_rank == 0) {
+                        load_gather_a_and_sfa<kTileM, kTileK>(a, sfa, task_source_rows,
+                            a_source_row_cache, sfa_source_row_cache,
+                            valid_rows, tile_k, k,
+                            dynamic_smem + producer_stage * kStageSmemBytes,
+                            dynamic_smem + producer_stage * kStageSmemBytes +
+                                kASmemBytes + kBSmemBytes,
+                            a_mbar_addr, false, false);
+                    }
+
+                    producer_stage = (producer_stage + 1) % kStageCount;
+                    if (producer_stage == 0) {
+                        producer_mma_phase ^= 1;
+                    }
+                }
+            }
+        }
+
+        // The gather producer owns stage acquisition.  Once it has observed
+        // the MMA-reuse barrier it hands the same stage to this dedicated
+        // B/SFB TMA warp through tma_issue_mbars.
+        if (warp_id == kTmaWarp) {
+            for (int cluster_bid = first_cluster_bid; cluster_bid < last_cluster_bid;
+                ++cluster_bid) {
+                const ExpertTileTask task = tasks[cluster_bid];
+                const int tile_n = task.tile_n * kClusterN + n_rank;
+                const int tile_col = tile_n * kTileN;
+                for (int tile_k = 0; tile_k < k_tiles; ++tile_k) {
+                    const int issue_mbar_addr =
+                        base_tma_issue_mbar_addr + tma_stage * sizeof(uint64_t);
                     const int tma_mbar_addr =
-                        base_tma_mbar_addr + producer_stage * sizeof(uint64_t);
-                    const int a_smem = mainloop_smem + producer_stage * kStageSmemBytes;
+                        base_tma_mbar_addr + tma_stage * sizeof(uint64_t);
+                    const int a_smem = mainloop_smem + tma_stage * kStageSmemBytes;
                     const int b_smem = a_smem + kASmemBytes;
                     const int sfa_smem = b_smem + kBSmemBytes;
                     const int sfb_smem = sfa_smem + kSFASmemBytes;
 
-                    mbarrier_wait_mma_reuse(mma_mbar_addr, producer_mma_phase);
-                    // SFB uses a multicast TMA whose completion is delivered
-                    // to each destination CTA's local transaction barrier.
-                    // Keep this barrier local; unlike BF16's independent B
-                    // loads, aggregating it at rank 0 breaks multicast byte
-                    // accounting.
-                    const int tma_transaction_mbar_addr = tma_mbar_addr & 0xFEFFFFFF;
-                    const int off_k = tile_k * kTileK;
-                    const int off_k64 = tile_k * Config::kMmaStepsPerStage;
-                    if (producer_rank == 0 && elect_sync()) {
+                    mbarrier_wait_tma_issue(issue_mbar_addr, tma_issue_phase);
+                    if (elect_sync()) {
+                        const int tma_transaction_mbar_addr = tma_mbar_addr & 0xFEFFFFFF;
+                        const int off_k = tile_k * kTileK;
+                        const int off_k64 = tile_k * Config::kMmaStepsPerStage;
                         asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 "
                                      "_, [%0], %1;" ::"r"(tma_transaction_mbar_addr),
-                            "r"(Config::kBTmaBytes + kSFBSmemBytes +
-                                (gather_a_tma ? Config::kATmaBytes : 0) +
-                                (gather_sfa_tma ? kSFASmemBytes : 0))
-                            : "memory");
+                            "r"(Config::kBTmaBytes + kSFBSmemBytes) : "memory");
                         tma_load_4d<kClusterM>(b_smem, &b_tensor_map, off_k,
                             tile_col + m_rank * (kTileN / kClusterM), 0, task.expert,
                             tma_transaction_mbar_addr);
@@ -1197,36 +1419,11 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                                     static_cast<int16_t>(3 << (n_rank * kClusterM)));
                             }
                         }
-                        if (gather_a_tma) {
-                            tma_load_4d<kClusterM>(a_smem, &a_tensor_map, off_k,
-                                task_source_rows[0], 0, 0, tma_transaction_mbar_addr);
-                        }
-                        if (gather_sfa_tma) {
-                            tma_load_4d<kClusterM>(sfa_smem, &sfa_tensor_map, 0, 0,
-                                off_k64, task_source_rows[0] / kTileM,
-                                tma_transaction_mbar_addr);
-                        }
                     }
 
-                    if constexpr (kClusterN == 1) {
-                        load_gather_a_and_sfa<kTileM, kTileK>(a, sfa, task_source_rows,
-                            valid_rows, tile_k, k,
-                            dynamic_smem + producer_stage * kStageSmemBytes,
-                            dynamic_smem + producer_stage * kStageSmemBytes +
-                                kASmemBytes + kBSmemBytes,
-                            a_mbar_addr, gather_a_tma, gather_sfa_tma);
-                    } else if (n_rank == 0) {
-                        load_gather_a_and_sfa<kTileM, kTileK>(a, sfa, task_source_rows,
-                            valid_rows, tile_k, k,
-                            dynamic_smem + producer_stage * kStageSmemBytes,
-                            dynamic_smem + producer_stage * kStageSmemBytes +
-                                kASmemBytes + kBSmemBytes,
-                            a_mbar_addr, false, false);
-                    }
-
-                    producer_stage = (producer_stage + 1) % kStageCount;
-                    if (producer_stage == 0) {
-                        producer_mma_phase ^= 1;
+                    tma_stage = (tma_stage + 1) % kStageCount;
+                    if (tma_stage == 0) {
+                        tma_issue_phase ^= 1;
                     }
                 }
             }
@@ -1562,7 +1759,26 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
             }
         }
 
-        if constexpr (kDynamicClc) {
+        if constexpr (kUseTaskPipeline) {
+            // The epilogue is the final user of a task record.  Returning the
+            // ring slot here lets the scheduler acquire the next task without
+            // waiting for the other roles to reconverge at a CTA barrier.  All
+            // four epilogue warps must arrive: direct-gmem has no warp-group
+            // barrier, so warp 0 alone may otherwise lap a slower epilogue warp
+            // and make it miss a task_ready phase transition.
+            if (warp_id < kEpilogueWarpCount && elect_sync()) {
+                const int task_free_mbar_addr = base_task_free_mbar_addr +
+                    task_pipe_stage * static_cast<int>(sizeof(uint64_t));
+                asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];" ::
+                    "r"(task_free_mbar_addr) : "memory");
+            }
+            task_pipe_stage = (task_pipe_stage + 1) % kTaskPipelineStageCount;
+            if (task_pipe_stage == 0) {
+                task_ready_phase ^= 1;
+            }
+        }
+
+        if constexpr (kDynamicClc && !kUseTaskPipeline) {
             if (tid == 0) {
                 clc_mbarrier_wait(clc_mbar_addr, clc_phase);
 
@@ -1599,13 +1815,19 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
             asm volatile("barrier.cluster.wait.aligned;");
             asm volatile("fence.proxy.async::generic.acquire."
                          "sync_restrict::shared::cluster.cluster;" ::: "memory");
-        } else if constexpr (!kPersistent) {
+        } else if constexpr (!kPersistent && !kDynamicClc) {
             break;
         }
     }
 
-    asm volatile("barrier.cluster.arrive.release.aligned;");
-    asm volatile("barrier.cluster.wait.acquire.aligned;");
+    if constexpr (!kUseTaskPipeline) {
+        asm volatile("barrier.cluster.arrive.release.aligned;");
+        asm volatile("barrier.cluster.wait.acquire.aligned;");
+    } else {
+        // Scheduler reaches the tail before the data-path warps after it
+        // publishes the sentinel.  Re-converge locally before TMEM dealloc.
+        __syncthreads();
+    }
     if (warp_id == 0) {
         if constexpr (kClusterM == 1) {
             asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 "

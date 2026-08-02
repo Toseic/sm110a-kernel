@@ -363,7 +363,7 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
         selection = AutotuneRunner(options).resolve(
             candidates,
             namespace="nvfp4_fc1",
-            key=("v8", aq.size(0), args.experts, args.topk, args.n, args.k),
+            key=("v9", aq.size(0), args.experts, args.topk, args.n, args.k),
             prepare=prepare_for_runner,
             benchmark=lambda prepared: benchmark_with_stats(
                 prepared.run,
