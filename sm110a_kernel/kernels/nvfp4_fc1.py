@@ -23,8 +23,6 @@ class Nvfp4Fc1Config:
     cluster_n: int = 1
     mode: int = 0
     direct_gmem: bool = False
-    output_evict_first: bool = True
-    operand_cache_policy: bool = True
     macro_swizzle_n_major: bool = True
 
     def validate(self) -> None:
@@ -36,26 +34,10 @@ class Nvfp4Fc1Config:
             raise ValueError("invalid epilogue_tile_n")
         if self.cluster_m not in (1, 2):
             raise ValueError("cluster_m must be 1 or 2")
-        if self.cluster_n not in (1, 2, 4):
-            raise ValueError("cluster_n must be 1, 2, or 4")
-        if self.cluster_n > 1 and self.cluster_m != 2:
-            raise ValueError("cluster_n > 1 requires cluster_m=2")
-        if self.cluster_n == 2 and self.tile_n > 128:
-            raise ValueError("cluster_n=2 requires tile_n <= 128")
-        if self.cluster_n == 4 and self.tile_n != 64:
-            raise ValueError("cluster_n=4 requires tile_n=64")
-        if self.cluster_n == 4 and self.tile_k != 256:
-            raise ValueError("cluster_n=4 currently requires tile_k=256")
-        if self.cluster_n > 1 and self.mode != 0:
-            raise ValueError("cluster_n > 1 currently requires mode=0")
-        if self.tile_n % self.cluster_n:
-            raise ValueError("tile_n must be divisible by cluster_n")
+        if self.cluster_n != 1:
+            raise ValueError("cluster_n must be 1")
         if self.mode not in (0, 1, 2):
             raise ValueError("mode must be 0, 1, or 2")
-        if not isinstance(self.output_evict_first, bool):
-            raise ValueError("output_evict_first must be bool")
-        if not isinstance(self.operand_cache_policy, bool):
-            raise ValueError("operand_cache_policy must be bool")
         if not isinstance(self.macro_swizzle_n_major, bool):
             raise ValueError("macro_swizzle_n_major must be bool")
 
@@ -116,8 +98,6 @@ def _flags(config: Nvfp4Fc1Config, variant):
         ("CLUSTER_M", config.cluster_m), ("CLUSTER_N", config.cluster_n),
         ("MODE", config.mode),
         ("DIRECT_GMEM", int(config.direct_gmem)),
-        ("OUTPUT_EVICT_FIRST", int(config.output_evict_first)),
-        ("OPERAND_CACHE_POLICY", int(config.operand_cache_policy)),
         ("MACRO_SWIZZLE_N_MAJOR", int(config.macro_swizzle_n_major))))
 
 

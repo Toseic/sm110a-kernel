@@ -17,20 +17,14 @@ out = nvfp4_fc1(aq, bq, sfa, sfb, metadata, config)
 ```
 
 The fused gather path supports `cluster_m=1` and `cluster_m=2` (with B/SFB
-cluster multicast), plus `cluster_n=2` for TileN 64/128 and `cluster_n=4`
-for TileN 64 with TileK 256. Cluster-N reuses each gathered TileM A/SFA pair
-across adjacent N tiles and currently uses the non-persistent scheduler.
+cluster multicast). Only `cluster_n=1` is supported.
 Tile K may be 64, 128, or 256. Tasks support configurable N-major or
 M-major macro traversal without serpentine ordering. When all 128 routed
 rows in a task are consecutive, FC1 switches A to a swizzled TMA load; sparse
 or fragmented routing continues to use the vectorized `cp.async` gather.
 
 Routing metadata is produced entirely on GPU with a cooperative stable top-k,
-stable expert compaction, and a parallel per-expert task builder.  The mainloop
-automatically uses the maximum stage count that fits in shared memory.  Output
-cache policy, scheduler traversal, and direct/TMA epilogue are available to the
-benchmark autotuner. SiLU always uses the precise implementation.
-The main kernel marks repeatedly consumed A/SFA loads as L2 evict-last and
-streaming B/SFB loads as evict-first. Operand cache policy on/off is included
-in the regular autotune candidate set; use `--no-operand-cache-policy` to
-restrict a benchmark run to the no-hint candidates.
+stable expert compaction, and a parallel per-expert task builder. The mainloop
+automatically uses the maximum stage count that fits in shared memory. Scheduler
+traversal and direct/TMA epilogue are available to the benchmark autotuner.
+SiLU always uses the precise implementation.

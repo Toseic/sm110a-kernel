@@ -44,13 +44,6 @@
 #ifndef SM110A_NVFP4_FC1_DIRECT_GMEM
 #define SM110A_NVFP4_FC1_DIRECT_GMEM 0
 #endif
-#ifndef SM110A_NVFP4_FC1_OUTPUT_EVICT_FIRST
-#define SM110A_NVFP4_FC1_OUTPUT_EVICT_FIRST 1
-#endif
-#ifndef SM110A_NVFP4_FC1_OPERAND_CACHE_POLICY
-#define SM110A_NVFP4_FC1_OPERAND_CACHE_POLICY 1
-#endif
-
 namespace {
 
 constexpr int kMmaK = 64;
@@ -83,15 +76,7 @@ template <int kTileM, int kTileN, int kTileK, int kEpilogueTileN, int kClusterM,
           int kClusterN = 1>
 struct KernelConfig {
     static_assert(kClusterM == 1 || kClusterM == 2);
-    static_assert(kClusterN == 1 || kClusterN == 2 || kClusterN == 4);
-    static_assert(kClusterN == 1 || kClusterM == 2,
-        "cluster_n reuses a cta_group::2 M pair");
-    static_assert(kClusterN != 4 || kTileN == 64,
-        "cluster_n=4 requires tile_n=64 to fit per-CTA TMEM");
-    static_assert(kClusterN != 4 || kTileK == 256,
-        "cluster_n=4 currently requires tile_k=256");
-    static_assert(kClusterN != 2 || kTileN <= 128,
-        "cluster_n=2 supports tile_n up to 128");
+    static_assert(kClusterN == 1, "NVFP4 FC1 only supports cluster_n=1");
     static_assert(kTileM == 4 * kWarpSize);
     // tcgen05.mma.kind::f16 supports N in steps of 8 for cta_group::1
     // and steps of 16 for cta_group::2, up to N=256. The instruction
@@ -190,11 +175,7 @@ __device__ inline uint32_t elect_sync() {
 template <int kClusterM, int kClusterN>
 struct ClusterShape {
     static_assert(kClusterM == 1 || kClusterM == 2);
-    static_assert(kClusterN == 1 || kClusterN == 2 || kClusterN == 4);
-    static_assert(kClusterN == 1 || kClusterM == 2,
-        "NVFP4 FC1 cluster_n requires cluster_m=2");
-    static_assert(kClusterN == 1 || SM110A_NVFP4_FC1_MODE == 0,
-        "cluster_n currently supports the non-persistent scheduler only");
+    static_assert(kClusterN == 1, "NVFP4 FC1 only supports cluster_n=1");
 };
 
 __device__ inline constexpr uint64_t matrix_desc_encode(
@@ -313,20 +294,8 @@ __device__ inline void mbarrier_wait_mainloop_output(int mbar_addr, int phase) {
 __device__ __forceinline__ void cp_async_a_16b(
     int dst_smem,
     const void *src_gmem,
-    bool valid,
-    uint64_t cache_policy) {
+    bool valid) {
     const uint32_t ignore_src = valid ? 0u : 1u;
-#if SM110A_NVFP4_FC1_OPERAND_CACHE_POLICY
-    asm volatile("{\n\t"
-                 ".reg .pred p_ignore_src;\n\t"
-                 "setp.ne.u32 p_ignore_src, %2, 0;\n\t"
-                 "cp.async.ca.shared::cta.global.L2::cache_hint "
-                 "[%0], [%1], 16, p_ignore_src, %3;\n\t"
-                 "}\n"
-        :
-        : "r"(dst_smem), "l"(src_gmem), "r"(ignore_src), "l"(cache_policy)
-        : "memory");
-#else
     asm volatile("{\n\t"
                  ".reg .pred p_ignore_src;\n\t"
                  "setp.ne.u32 p_ignore_src, %2, 0;\n\t"
@@ -335,26 +304,13 @@ __device__ __forceinline__ void cp_async_a_16b(
         :
         : "r"(dst_smem), "l"(src_gmem), "r"(ignore_src)
         : "memory");
-#endif
 }
 
 __device__ __forceinline__ void cp_async_sfa_4b(
     int dst_smem,
     const void *src_gmem,
-    bool valid,
-    uint64_t cache_policy) {
+    bool valid) {
     const uint32_t ignore_src = valid ? 0u : 1u;
-#if SM110A_NVFP4_FC1_OPERAND_CACHE_POLICY
-    asm volatile("{\n\t"
-                 ".reg .pred p_ignore_src;\n\t"
-                 "setp.ne.u32 p_ignore_src, %2, 0;\n\t"
-                 "cp.async.ca.shared::cta.global.L2::cache_hint "
-                 "[%0], [%1], 4, p_ignore_src, %3;\n\t"
-                 "}\n"
-        :
-        : "r"(dst_smem), "l"(src_gmem), "r"(ignore_src), "l"(cache_policy)
-        : "memory");
-#else
     asm volatile("{\n\t"
                  ".reg .pred p_ignore_src;\n\t"
                  "setp.ne.u32 p_ignore_src, %2, 0;\n\t"
@@ -363,7 +319,6 @@ __device__ __forceinline__ void cp_async_sfa_4b(
         :
         : "r"(dst_smem), "l"(src_gmem), "r"(ignore_src)
         : "memory");
-#endif
 }
 
 __device__ __forceinline__ void cp_async_a_mbarrier_arrive_noinc(int mbar_addr) {
@@ -385,8 +340,7 @@ __device__ __forceinline__ void load_gather_a_and_sfa(
     char *__restrict__ sfa_smem,
     int a_mbar_addr,
     bool a_is_tma,
-    bool sfa_is_tma,
-    uint64_t cache_policy) {
+    bool sfa_is_tma) {
     constexpr int kVectorBytes = 16;
     constexpr int kVectorsPerRow = kTileK / 32;
     constexpr int kMmaSteps = kTileK / 64;
@@ -425,8 +379,7 @@ __device__ __forceinline__ void load_gather_a_and_sfa(
                 const int dst_smem =
                     static_cast<int>(__cvta_generic_to_shared(
                         reinterpret_cast<uint4 *>(a_smem) + swizzled));
-                cp_async_a_16b(
-                    dst_smem, a + offset, valid, cache_policy);
+                cp_async_a_16b(dst_smem, a + offset, valid);
             }
 
         if (!sfa_is_tma)
@@ -448,7 +401,7 @@ __device__ __forceinline__ void load_gather_a_and_sfa(
                 cp_async_sfa_4b(dst_smem,
                     sfa + (source_tile * (k / 64) + global_mma_k) * 512 +
                         source_in_tile,
-                    valid, cache_policy);
+                    valid);
             }
 
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -497,7 +450,7 @@ __device__ __forceinline__ void load_gather_a_and_sfa(
                 cp_async_sfa_4b(dst_smem,
                     sfa + (source_tile * (k / 64) + global_mma_k) * 512 +
                         source_in_tile,
-                    valid, cache_policy);
+                    valid);
             }
         }
 
@@ -524,7 +477,7 @@ __device__ __forceinline__ void load_gather_a_and_sfa(
                                   vec * kVectorBytes;
             const int dst_smem = static_cast<int>(__cvta_generic_to_shared(
                 reinterpret_cast<uint4 *>(a_smem) + swizzled));
-            cp_async_a_16b(dst_smem, a + offset, valid, cache_policy);
+            cp_async_a_16b(dst_smem, a + offset, valid);
         }
     }
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -600,16 +553,8 @@ __device__ inline void tma_load_4d(
     int y,
     int z,
     int w,
-    int mbar_addr,
-    uint64_t cache_policy) {
+    int mbar_addr) {
     if constexpr (kClusterM == 1) {
-#if SM110A_NVFP4_FC1_OPERAND_CACHE_POLICY
-        asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global."
-                     "mbarrier::complete_tx::bytes.cta_group::1.L2::cache_hint "
-                     "[%0], [%1, {%2, %3, %4, %5}], [%6], %7;" ::"r"(dst_smem),
-            "l"(tensor_map), "r"(x), "r"(y), "r"(z), "r"(w), "r"(mbar_addr),
-            "l"(cache_policy) : "memory");
-#else
         asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global."
                      "mbarrier::complete_tx::bytes.cta_group::1 "
                      "[%0], [%1, {%2, %3, %4, %5}], [%6];" ::"r"(dst_smem),
@@ -620,15 +565,7 @@ __device__ inline void tma_load_4d(
             "r"(w),
             "r"(mbar_addr)
             : "memory");
-#endif
     } else {
-#if SM110A_NVFP4_FC1_OPERAND_CACHE_POLICY
-        asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global."
-                     "mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint "
-                     "[%0], [%1, {%2, %3, %4, %5}], [%6], %7;" ::"r"(dst_smem),
-            "l"(tensor_map), "r"(x), "r"(y), "r"(z), "r"(w), "r"(mbar_addr),
-            "l"(cache_policy) : "memory");
-#else
         asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global."
                      "mbarrier::complete_tx::bytes.cta_group::2 "
                      "[%0], [%1, {%2, %3, %4, %5}], [%6];" ::"r"(dst_smem),
@@ -639,7 +576,6 @@ __device__ inline void tma_load_4d(
             "r"(w),
             "r"(mbar_addr)
             : "memory");
-#endif
     }
 }
 
@@ -652,79 +588,29 @@ __device__ inline void tma_load_4d_multicast(
     int z,
     int w,
     int mbar_addr,
-    int16_t cta_mask,
-    uint64_t cache_policy) {
+    int16_t cta_mask) {
     static_assert(kClusterM == 2);
-#if SM110A_NVFP4_FC1_OPERAND_CACHE_POLICY
-    asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global."
-                 "mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2."
-                 "L2::cache_hint "
-                 "[%0], [%1, {%2, %3, %4, %5}], [%6], %7, %8;" ::
-            "r"(dst_smem), "l"(tensor_map), "r"(x), "r"(y), "r"(z), "r"(w),
-            "r"(mbar_addr), "h"(cta_mask), "l"(cache_policy) : "memory");
-#else
     asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global."
                  "mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2 "
                  "[%0], [%1, {%2, %3, %4, %5}], [%6], %7;" ::
             "r"(dst_smem), "l"(tensor_map), "r"(x), "r"(y), "r"(z), "r"(w),
             "r"(mbar_addr), "h"(cta_mask) : "memory");
-#endif
 }
 
-__device__ inline uint64_t make_reuse_cache_policy() {
-    uint64_t policy;
-    asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;"
-        : "=l"(policy));
-    return policy;
-}
-
-__device__ inline uint64_t make_streaming_cache_policy() {
-    uint64_t policy;
-    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;"
-        : "=l"(policy));
-    return policy;
-}
-
-__device__ inline uint64_t make_epilogue_cache_policy() {
-    uint64_t policy;
-    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;"
-        : "=l"(policy));
-    return policy;
-}
-
-template <bool kEvictFirst>
 __device__ inline void store_output_16b(int4 *ptr, int4 value) {
-    if constexpr (kEvictFirst) {
-        // PTX only accepts an L2 eviction priority on stores of at least
-        // 32 bytes.  This path emits 16-byte row fragments, so bypass L1 and
-        // leave the L2 policy to the cache replacement hardware.
-        asm volatile("st.global.L1::no_allocate.v4.b32 "
-                     "[%0], {%1, %2, %3, %4};" ::
-            "l"(ptr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w)
-            : "memory");
-    } else {
-        ptr[0] = value;
-    }
+    ptr[0] = value;
 }
 
-template <bool kEvictFirst>
 __device__ inline void tma_store_3d(
     int src_smem,
     const void *tensor_map,
     int x,
     int y,
-    int z,
-    uint64_t cache_policy) {
+    int z) {
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-    if constexpr (kEvictFirst) {
-        asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.bulk_group.L2::cache_hint "
-                     "[%0, {%1, %2, %3}], [%4], %5;" ::"l"(tensor_map),
-            "r"(x), "r"(y), "r"(z), "r"(src_smem), "l"(cache_policy) : "memory");
-    } else {
-        asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.bulk_group "
-                     "[%0, {%1, %2, %3}], [%4];" ::"l"(tensor_map),
-            "r"(x), "r"(y), "r"(z), "r"(src_smem) : "memory");
-    }
+    asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.bulk_group "
+                 "[%0, {%1, %2, %3}], [%4];" ::"l"(tensor_map),
+        "r"(x), "r"(y), "r"(z), "r"(src_smem) : "memory");
 }
 
 __device__ inline void tma_store_commit_group() {
@@ -1036,16 +922,6 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
     asm volatile("barrier.cluster.wait.acquire.aligned;");
 
     const int tmem_addr = tmem_base[0];
-    uint64_t reuse_cache_policy = 0;
-    uint64_t streaming_cache_policy = 0;
-#if SM110A_NVFP4_FC1_OPERAND_CACHE_POLICY
-    reuse_cache_policy = make_reuse_cache_policy();
-    streaming_cache_policy = make_streaming_cache_policy();
-#endif
-    uint64_t epilogue_cache_policy = 0;
-    if constexpr (!kDirectGmem && SM110A_NVFP4_FC1_OUTPUT_EVICT_FIRST != 0) {
-        if (tid == 0) epilogue_cache_policy = make_epilogue_cache_policy();
-    }
     constexpr uint32_t instruction_desc = (1U << 7U) | (1U << 10U) |
                                           (static_cast<uint32_t>(kTileN) >> 3U << 17U) |
                                           (static_cast<uint32_t>(kClusterTileM) >> 7U << 27U);
@@ -1105,7 +981,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                     if (tid < valid_rows) {
                         const int gmem_row = cta_row + tid;
                         const int gmem_col = tile_col / 2 + logical_col;
-                        store_output_16b<(SM110A_NVFP4_FC1_OUTPUT_EVICT_FIRST != 0)>(
+                        store_output_16b(
                             reinterpret_cast<int4 *>(c + gmem_row * (n / 2) + gmem_col),
                             reinterpret_cast<int4 *>(packed)[0]);
                     }
@@ -1306,7 +1182,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                             : "memory");
                         tma_load_4d<kClusterM>(b_smem, &b_tensor_map, off_k,
                             tile_col + m_rank * (kTileN / kClusterM), 0, task.expert,
-                            tma_transaction_mbar_addr, streaming_cache_policy);
+                            tma_transaction_mbar_addr);
                         for (int scale_tile = 0; scale_tile < kSFBScaleTileCount; ++scale_tile) {
                             const int sfb_tile_smem =
                                 sfb_smem + scale_tile * Config::kMmaStepsPerStage * 512;
@@ -1314,24 +1190,21 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                                 task.expert * (n / 128) + tile_col / 128 + scale_tile;
                             if constexpr (kClusterM == 1) {
                                 tma_load_4d<1>(sfb_tile_smem, &sfb_tensor_map, 0, 0, off_k64,
-                                    sfb_tile_index, tma_transaction_mbar_addr,
-                                    streaming_cache_policy);
+                                    sfb_tile_index, tma_transaction_mbar_addr);
                             } else if (m_rank == 0) {
                                 tma_load_4d_multicast<2>(sfb_tile_smem, &sfb_tensor_map,
                                     0, 0, off_k64, sfb_tile_index, tma_transaction_mbar_addr,
-                                    static_cast<int16_t>(3 << (n_rank * kClusterM)),
-                                    streaming_cache_policy);
+                                    static_cast<int16_t>(3 << (n_rank * kClusterM)));
                             }
                         }
                         if (gather_a_tma) {
                             tma_load_4d<kClusterM>(a_smem, &a_tensor_map, off_k,
-                                task_source_rows[0], 0, 0, tma_transaction_mbar_addr,
-                                reuse_cache_policy);
+                                task_source_rows[0], 0, 0, tma_transaction_mbar_addr);
                         }
                         if (gather_sfa_tma) {
                             tma_load_4d<kClusterM>(sfa_smem, &sfa_tensor_map, 0, 0,
                                 off_k64, task_source_rows[0] / kTileM,
-                                tma_transaction_mbar_addr, reuse_cache_policy);
+                                tma_transaction_mbar_addr);
                         }
                     }
 
@@ -1341,15 +1214,14 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                             dynamic_smem + producer_stage * kStageSmemBytes,
                             dynamic_smem + producer_stage * kStageSmemBytes +
                                 kASmemBytes + kBSmemBytes,
-                            a_mbar_addr, gather_a_tma, gather_sfa_tma,
-                            reuse_cache_policy);
+                            a_mbar_addr, gather_a_tma, gather_sfa_tma);
                     } else if (n_rank == 0) {
                         load_gather_a_and_sfa<kTileM, kTileK>(a, sfa, task_source_rows,
                             valid_rows, tile_k, k,
                             dynamic_smem + producer_stage * kStageSmemBytes,
                             dynamic_smem + producer_stage * kStageSmemBytes +
                                 kASmemBytes + kBSmemBytes,
-                            a_mbar_addr, false, false, reuse_cache_policy);
+                            a_mbar_addr, false, false);
                     }
 
                     producer_stage = (producer_stage + 1) % kStageCount;
@@ -1568,13 +1440,12 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                                 if (tid == 0) {
                                     for (int store_tile = 0; store_tile < kEpilogueStoreTiles;
                                         ++store_tile) {
-                                        tma_store_3d<(SM110A_NVFP4_FC1_OUTPUT_EVICT_FIRST != 0)>(
+                                        tma_store_3d(
                                             stage_smem + store_tile * kStoreTileBytes,
                                             &c_tensor_map,
                                             block_col + store_tile * kEpilogueStoreTileN,
                                             cta_row,
-                                            0,
-                                            epilogue_cache_policy);
+                                            0);
                                     }
                                     tma_store_commit_group();
                                 }
@@ -1594,8 +1465,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                                         store_tile * kStoreTileBytes)[swizzled_chunk];
                                     const int output_offset =
                                         (cta_row + tid) * (n / 2) + block_col + n_group * 8;
-                                    store_output_16b<
-                                        (SM110A_NVFP4_FC1_OUTPUT_EVICT_FIRST != 0)>(
+                                    store_output_16b(
                                         reinterpret_cast<int4 *>(c + output_offset), value);
                                 }
                             }
@@ -1617,13 +1487,12 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                                 constexpr int kSwappedStoreBytes =
                                     kEpilogueTileN * kSwappedStoreColumns * sizeof(nv_bfloat16);
                                 for (int atom = 0; atom < 2; ++atom) {
-                                    tma_store_3d<(SM110A_NVFP4_FC1_OUTPUT_EVICT_FIRST != 0)>(
+                                    tma_store_3d(
                                         stage_smem + atom * kSwappedStoreBytes,
                                         &c_tensor_map,
                                         0,
                                         block_col / kSwappedStoreColumns + atom,
-                                        block_row,
-                                        epilogue_cache_policy);
+                                        block_row);
                                 }
                                 tma_store_commit_group();
                             }
