@@ -562,7 +562,7 @@ class CuteDslNvfp4Fc1Runner:
             cutlass.Int32, num_non_exiting.data_ptr(),
             cutlass.cute.AddressSpace.gmem)
 
-        def run():
+        def run_kernel():
             # Keep metadata tensors alive for the lifetime of this closure:
             # ``compiled`` only receives their raw device pointers.
             _ = tile_expert_idx, tile_mn_limits, num_non_exiting
@@ -572,15 +572,18 @@ class CuteDslNvfp4Fc1Runner:
                 self.tokens, self.m, self.n, self.k, self.experts,
                 stream=self.stream,
             )
-            self.out_target.index_copy_(
-                0,
-                self._valid_output_rows,
-                self.out_storage.index_select(0, self._valid_padded_rows),
-            )
 
-        run()
+        run_kernel()
         torch.cuda.synchronize()
-        return PreparedKernel(config, run)
+        return PreparedKernel(config, run_kernel)
+
+    def _scatter_output(self):
+        """Materialize the logical output after an untimed CuTE launch."""
+        self.out_target.index_copy_(
+            0,
+            self._valid_output_rows,
+            self.out_storage.index_select(0, self._valid_padded_rows),
+        )
 
     def autotune(self, options: TuneOptions | None = None):
         options = options or TuneOptions()
@@ -594,22 +597,31 @@ class CuteDslNvfp4Fc1Runner:
         self.selection = AutotuneRunner(options).resolve(
             configs,
             namespace="cute_dsl_nvfp4_fc1",
-            key=("v5-gather64", self.tokens, self.experts, self.m, self.n // 2, self.k),
+            # v6 measures the CuTE launch alone.  The output scatter is an
+            # independent PyTorch kernel and must not influence tactic choice.
+            key=("v6-gather64-pure", self.tokens, self.experts, self.m, self.n // 2, self.k),
             prepare=self._prepare,
             benchmark=lambda prepared: _stats(prepared.run, options),
             probe=lambda prepared: _quick_probe(prepared.run, options),
             format_candidate=format_config,
             metric_formatter=lambda _c, stats: (
-                f"{2.0 * self.m * (self.n // 2) * self.k / (stats['median_ms'] * 1e9):.1f} TF/s"
+                # FC1 computes both gate and up projections: 4MNK FLOPs.
+                f"{4.0 * self.m * (self.n // 2) * self.k / (stats['median_ms'] * 1e9):.1f} TF/s"
             ),
             pre_jit=self._compile,
         )
         return self.selection
 
-    def run(self):
+    def run_kernel(self):
+        """Launch only the fused CuTE DSL gather/GEMM/SwiGLU kernel."""
         if self.selection is None:
             self.autotune()
         self.selection.prepared.run()
+
+    def run(self):
+        """Launch the kernel, then restore its padded output to logical order."""
+        self.run_kernel()
+        self._scatter_output()
 
 
 def cute_dsl_nvfp4_fc1_out(

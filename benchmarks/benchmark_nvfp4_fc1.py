@@ -52,23 +52,15 @@ NVFP4_FC1_CONFIGS = tuple(
         cluster_n=cluster_n,
         mode=mode,
         direct_gmem=direct_gmem,
-        output_evict_first=True,
-        operand_cache_policy=operand_cache_policy,
     )
-    for tile_n in (64, 128, 256)
+    for tile_n in (128, 256)
     for tile_k in (256,)
-    for epilogue_tile_n in (64, 128)
+    for epilogue_tile_n in (128,)
     for cluster_m in (1, 2)
-    for cluster_n in (1, 2, 4)
     for mode in (0, 1, 2)
     for direct_gmem in (False, True)
-    for operand_cache_policy in (False, True)
+    for cluster_n in (1,)
     if tile_n % epilogue_tile_n == 0
-    if cluster_n == 1 or cluster_m == 2
-    if cluster_n != 2 or tile_n <= 128
-    if cluster_n != 4 or tile_n == 64
-    if cluster_n != 4 or tile_k == 256
-    if cluster_n == 1 or mode == 0
 )
 
 
@@ -82,9 +74,6 @@ def format_candidate(config):
         epilogue,
         "nmaj" if config.macro_swizzle_n_major else "mmaj",
     ]
-    if not config.output_evict_first:
-        fields.append("keep")
-    fields.append("cache" if config.operand_cache_policy else "nocache")
     return "/".join(fields)
 
 
@@ -101,22 +90,10 @@ def selected_candidates(n, k, args):
         candidates = tuple(
             replace(
                 config,
-                output_evict_first=output_evict_first,
                 macro_swizzle_n_major=n_major,
             )
             for config in candidates
-            for output_evict_first in (False, True)
             for n_major in (False, True)
-        )
-    else:
-        updates = {}
-        if args.output_cache is not None:
-            updates["output_evict_first"] = args.output_cache == "evict-first"
-        if updates:
-            candidates = tuple(replace(config, **updates) for config in candidates)
-    if args.no_operand_cache_policy:
-        candidates = tuple(
-            config for config in candidates if not config.operand_cache_policy
         )
     if args.tile_n is not None:
         candidates = tuple(c for c in candidates if c.tile_n == args.tile_n)
@@ -136,9 +113,6 @@ def selected_candidates(n, k, args):
         candidates = tuple(c for c in candidates if c.direct_gmem)
     if args.tma_epilogue:
         candidates = tuple(c for c in candidates if not c.direct_gmem)
-    if args.output_cache is not None:
-        evict_first = args.output_cache == "evict-first"
-        candidates = tuple(c for c in candidates if c.output_evict_first == evict_first)
     return candidates
 
 
@@ -311,17 +285,11 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
         parser.add_argument("--tile-k", type=int, choices=(64, 128, 256))
         parser.add_argument("--epilogue-tile-n", type=int, choices=(64, 128))
         parser.add_argument("--cluster-m", type=int, choices=(1, 2))
-        parser.add_argument("--cluster-n", type=int, choices=(1, 2, 4))
+        parser.add_argument("--cluster-n", type=int, choices=(1,))
         parser.add_argument("--mode", type=int, choices=(0, 1, 2))
-        parser.add_argument("--output-cache", choices=("evict-first", "keep"))
-        parser.add_argument(
-            "--no-operand-cache-policy",
-            action="store_true",
-            help="disable A/SFA retention and B/SFB streaming cache hints",
-        )
         parser.add_argument(
             "--extended-tuning", action="store_true",
-            help="also tune output cache and macro traversal",
+            help="also tune macro traversal",
         )
         parser.add_argument(
             "--direct-gmem",
@@ -415,6 +383,20 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
         )
         return selection, prepared_metadata[selection.candidate]
 
+    def prepare_baseline_metadata(self, router, args):
+        """Build routing metadata before the native-kernel sweep.
+
+        CuTE consumes only the expert row ranges derived from native metadata.
+        Those ranges and ``source_rows`` depend on routing, not on the native
+        tile configuration, so any compatible native configuration supplies a
+        valid view for the baseline.  This lets the baseline sweep appear
+        first, consistent with the NVFP4 GEMM benchmark.
+        """
+        config = selected_candidates(2 * args.n, args.k, args)[0]
+        return prepare_nvfp4_fc1_metadata(
+            router, args.topk, 2 * args.n, config=config
+        )
+
     def run_with_args(self, args):
         torch.manual_seed(args.seed)
         # Retain weights only in NVFP4 form.  Quantizing a single expert at a
@@ -450,22 +432,28 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
             out = torch.empty(
                 (tokens * args.topk, args.n), device="cuda", dtype=torch.bfloat16
             )
-            selection, metadata = self.resolve_kernel(
-                aq, bq, sfa, sfb, router, out, args
-            )
 
-            # Build baseline
+            # Sweep the CuTE baseline before the native FC1 candidates, as in
+            # benchmark_nvfp4_gemm.py.  The native sweep prints many more
+            # configurations, so running it first obscures baseline results.
             if args.baseline == "cutedsl":
                 baseline_out = torch.empty_like(out)
+                baseline_metadata = self.prepare_baseline_metadata(router, args)
                 baseline_runner = CuteDslNvfp4Fc1Runner(
                     aq, bq, sfa, sfb, baseline_out,
-                    metadata.source_rows, metadata.tasks, metadata.state,
+                    baseline_metadata.source_rows,
+                    baseline_metadata.tasks,
+                    baseline_metadata.state,
                 )
                 baseline_runner.autotune(self.make_tune_options(
                     args, role="baseline",
                     pre_parallel_jit=args.cutedsl_pre_parallel_jit,
                 ))
-                baseline_fn = baseline_runner.run
+                # Time only the CuTE fused gather/GEMM/SwiGLU launch.  The
+                # runner's normal ``run`` additionally launches PyTorch
+                # index_select/index_copy_ to restore padded rows, which is
+                # intentionally outside the kernel measurement.
+                baseline_fn = baseline_runner.run_kernel
             else:
                 baseline_out = torch.empty_like(out)
                 baseline_runner = TorchNvfp4Fc1Runner(
@@ -480,10 +468,19 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
                 cold_l2_flush=args._cold_l2_flush,
             )
 
+            selection, metadata = self.resolve_kernel(
+                aq, bq, sfa, sfb, router, out, args
+            )
+
             max_diff = 0.0
             if not args.no_accuracy:
                 selection.prepared.run()
-                baseline_fn()
+                if args.baseline == "cutedsl":
+                    # Accuracy needs the logical, unpadded result, so perform
+                    # the untimed output scatter after the pure-kernel timer.
+                    baseline_runner.run()
+                else:
+                    baseline_fn()
                 torch.cuda.synchronize()
                 max_diff = (out.float() - baseline_out.float()).abs().max().item()
                 if not torch.allclose(
