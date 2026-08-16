@@ -16,6 +16,11 @@ from .nvfp4_fc1 import (
     CuteDslNvfp4Fc1Runner,
     cute_dsl_nvfp4_fc1_out,
 )
+from .nvfp4_fc2 import (
+    CuteDslNvfp4Fc2Config,
+    CuteDslNvfp4Fc2Runner,
+    cute_dsl_nvfp4_fc2_out,
+)
 from .nvfp4_gemm import (
     CuteDslNvfp4GemmConfig,
     CuteDslNvfp4GemmRunner,
@@ -34,6 +39,9 @@ __all__ = [
     "CuteDslNvfp4Fc1Config",
     "CuteDslNvfp4Fc1Runner",
     "cute_dsl_nvfp4_fc1_out",
+    "CuteDslNvfp4Fc2Config",
+    "CuteDslNvfp4Fc2Runner",
+    "cute_dsl_nvfp4_fc2_out",
     "CuteDslNvfp4GemmConfig",
     "CuteDslNvfp4GemmRunner",
     "cute_dsl_nvfp4_gemm_out",

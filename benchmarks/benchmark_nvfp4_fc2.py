@@ -15,12 +15,14 @@ if str(ROOT) not in sys.path:
 
 from common import (  # noqa: E402
     BenchmarkBase,
+    TablePrinter,
     benchmark_with_stats,
     print_sol_report,
     quick_probe,
     sol_bounds,
 )
 from sm110a_kernel import (  # noqa: E402
+    CuteDslNvfp4Fc2Runner,
     Nvfp4Fc2Config,
     compile_nvfp4_fc2,
     from_blocked_nvfp4_scales,
@@ -234,6 +236,10 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
         parser.add_argument("--rtol", type=float, default=2e-2)
         parser.add_argument("--check", action="store_true")
         parser.add_argument("--no-accuracy", action="store_true")
+        parser.add_argument(
+            "--baseline", choices=("cutedsl",), default="cutedsl",
+            help="baseline implementation to benchmark against (default: cutedsl)",
+        )
         parser.add_argument("--debug", action="store_true")
         parser.add_argument("--tile-n", type=int, choices=(64, 128, 256))
         parser.add_argument("--tile-k", type=int, choices=(64, 128, 256))
@@ -268,10 +274,11 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
         return args
 
     def make_result_table(self):
-        return self.make_table_printer((
+        return TablePrinter((
             ("Tokens", 9), ("M", 10), ("TopK", 7), ("E", 6),
-            ("N", 8), ("K", 8), ("KernelMed(ms)", 16),
-            ("TF/s", 14), ("MaxDiff", 12), ("Cache", 8),
+            ("N", 8), ("K", 8), ("Kernel(ms)", 14), ("Kernel TF/s", 15),
+            ("CuTE DSL(ms)", 14), ("CuTE DSL TF/s", 15),
+            ("Speedup", 10), ("MaxDiff", 12), ("Cache", 8),
             ("BestConfig", 42),
         ))
 
@@ -282,6 +289,7 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
             f"[config] experts={args.experts} n={args.n} k={args.k} "
             f"topk={args.topk} tokens={args.token_values}"
         )
+        print("[baseline] TRT-LLM CuTE DSL fused-finalize NVFP4 FC2 (autotuned)")
         print("[runner] resolving and caching the best compatible config")
         table = self.make_result_table()
         table.print_header()
@@ -290,7 +298,24 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
             case = make_case(tokens, args.experts, args.topk, args.n, args.k)
             aq, bq, sfa, sfb, routing, grouped_layout, routing_weights, router_scores = case
             out = torch.empty((tokens, args.n), device="cuda", dtype=torch.bfloat16)
+            baseline_out = torch.empty_like(out)
             prepared_metadata = {}
+
+            # Sweep the CuTE DSL baseline before the native FC2 candidates, as
+            # in benchmark_nvfp4_fc1.py.  The native sweep prints many more
+            # configurations, so running it first obscures baseline results.
+            baseline_runner = CuteDslNvfp4Fc2Runner(
+                aq, bq, sfa, sfb, routing, routing_weights,
+                baseline_out, args.topk,
+            )
+            baseline_runner.autotune(self.make_tune_options(
+                args, role="baseline", pre_parallel_jit=args.pre_parallel_jit,
+            ))
+            baseline_fn = baseline_runner.run
+            baseline_stats = benchmark_with_stats(
+                baseline_fn, args.warmup, args.iters, args.samples,
+                cold_l2_flush=args._cold_l2_flush,
+            )
 
             def prepare(config):
                 metadata = prepare_nvfp4_fc2_metadata(
@@ -300,6 +325,9 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
                     aq, bq, sfa, sfb, routing, routing_weights,
                     metadata, args.topk, out, config=config,
                 )
+                # The fused epilogue scatter-adds into ``out``.  Start each
+                # tactic from zero without putting the memset in the timed path.
+                out.zero_()
                 run()
                 torch.cuda.synchronize()
                 prepared_metadata[config] = metadata
@@ -331,25 +359,60 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
 
             max_abs_diff = 0.0
             if args.check and not args.no_accuracy:
+                # Both finalize kernels accumulate.  Zero both destinations
+                # immediately before the validation launches so the comparison
+                # sees a single-kernel result, not the timed accumulation.
+                # BF16 scatter-add reduction order differs between the two
+                # kernels, so this comparison is opt-in via --check.
+                out.zero_()
+                selection.prepared.run()
+                baseline_out.zero_()
+                baseline_fn()
+                torch.cuda.synchronize()
+                max_abs_diff = (out.float() - baseline_out.float()).abs().max().item()
+                if not torch.allclose(
+                    out.float(), baseline_out.float(), atol=args.atol, rtol=args.rtol
+                ):
+                    raise SystemExit(
+                        f"[check] FAIL tokens={tokens} "
+                        f"max_abs_diff={max_abs_diff:.6f}"
+                    )
+                print(
+                    f"[check tokens={tokens}] PASS vs CuTE DSL "
+                    f"max_abs_diff={max_abs_diff:.6f}"
+                )
+
+            if args.check and not args.no_accuracy:
+                # Optional independent validation against the torch reference.
+                out.zero_()
                 selection.prepared.run()
                 ref = reference(
                     case, tokens, args.experts, args.topk, args.n, args.k
                 )
                 torch.cuda.synchronize()
-                max_abs_diff = (out.float() - ref.float()).abs().max().item()
+                ref_diff = (out.float() - ref.float()).abs().max().item()
                 if not torch.allclose(
                     out.float(), ref.float(), atol=args.atol, rtol=args.rtol
                 ):
                     raise SystemExit(
-                        f"[check] FAIL tokens={tokens} max_abs_diff={max_abs_diff:.6f}"
+                        f"[check] FAIL vs reference tokens={tokens} "
+                        f"max_abs_diff={ref_diff:.6f}"
                     )
-                print(f"[check tokens={tokens}] PASS max_abs_diff={max_abs_diff:.6f}")
+                print(
+                    f"[check tokens={tokens}] PASS vs reference "
+                    f"max_abs_diff={ref_diff:.6f}"
+                )
 
             stats = selection.stats
+            kernel_ms = stats["median_ms"]
+            baseline_ms = baseline_stats["median_ms"]
             table.print_row(
                 tokens, tokens * args.topk, args.topk, args.experts,
-                args.n, args.k, f"{stats['median_ms']:.4f}",
-                f"{fc2_tflops(tokens, args.topk, args.n, args.k, stats['median_ms']):.3f}",
+                args.n, args.k, f"{kernel_ms:.4f}",
+                f"{fc2_tflops(tokens, args.topk, args.n, args.k, kernel_ms):.2f}",
+                f"{baseline_ms:.4f}",
+                f"{fc2_tflops(tokens, args.topk, args.n, args.k, baseline_ms):.2f}",
+                f"{baseline_ms / kernel_ms:.2f}x" if kernel_ms > 0 else "N/A",
                 f"{max_abs_diff:.6f}",
                 "hit" if selection.cache_hit else "miss",
                 format_candidate(selection.candidate),
@@ -359,7 +422,7 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
                     nvfp4_fc2_sol_bounds(
                         router_scores, args.topk, args.n, args.k, selection.candidate
                     ),
-                    stats["median_ms"],
+                    kernel_ms,
                     label="NVFP4 FC2 grouped GEMM + reduction",
                 )
 
