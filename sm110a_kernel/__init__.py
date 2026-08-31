@@ -16,6 +16,11 @@ from .kernels.bf16_gemm import (
     compile_bf16_gemm_configs,
     get_bf16_gemm_module,
 )
+from .kernels.bf16_fa4_mha import (
+    bf16_fa4_mha,
+    bf16_fa4_mha_out,
+    get_bf16_fa4_mha_module,
+)
 from .kernels.nvfp4_gemm import (
     Nvfp4GemmConfig,
     compile_nvfp4_gemm,
