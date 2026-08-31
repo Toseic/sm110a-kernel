@@ -23,7 +23,13 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from common import BenchmarkBase, TablePrinter, benchmark_with_stats
+from common import (
+    BenchmarkBase,
+    TablePrinter,
+    benchmark_with_stats,
+    print_sol_report,
+    sol_bounds,
+)
 from sm110a_kernel import bf16_fa4_mha_out
 
 
@@ -54,6 +60,40 @@ def output_tokens_per_second(case, elapsed_ms):
     return case.batch * case.q_len * 1e3 / elapsed_ms
 
 
+def attention_sol_bounds(case, *, tile_q=128, tile_kv=128):
+    """Return a traffic-aware SOL model for this kernel's tiled dataflow.
+
+    The compulsory model reads Q/K/V and writes O once.  The tiled model adds
+    the K/V reloads caused by assigning one K/V mainloop to every pair of Q
+    tiles.  For causal prefill it counts only the prefix visible to each pair.
+    """
+    element_bytes = 2  # BF16 Q, K, V, and O
+    bh = case.batch * case.heads
+    q_bytes = element_bytes * bh * case.q_len * case.head_dim
+    kv_input_bytes = 2 * element_bytes * bh * case.kv_len * case.head_dim
+    output_bytes = element_bytes * bh * case.q_len * case.head_dim
+    q_pair_count = math.ceil(case.q_len / (2 * tile_q))
+    kv_tile_count = math.ceil(case.kv_len / tile_kv)
+    kv_tiles_per_head = 0
+    for q_pair_idx in range(q_pair_count):
+        if case.causal:
+            q_pair_end = min((q_pair_idx + 1) * 2 * tile_q, case.q_len)
+            kv_tiles_per_head += min(math.ceil(q_pair_end / tile_kv), kv_tile_count)
+        else:
+            kv_tiles_per_head += kv_tile_count
+
+    # K and V are each TMA-loaded for every visited KV tile. Q is loaded once
+    # per task, so it has no inter-Q-pair reload in this dual-Q-tile design.
+    kv_tile_bytes = 2 * element_bytes * tile_kv * case.head_dim
+    tile_read_bytes = q_bytes + bh * kv_tiles_per_head * kv_tile_bytes
+    return sol_bounds(
+        4 * bh * case.q_len * case.kv_len * case.head_dim,
+        q_bytes + kv_input_bytes + output_bytes,
+        q_bytes + kv_input_bytes,
+        tile_read_bytes,
+    )
+
+
 def reference_attention(q, k, v, *, causal, scale):
     scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale
     if causal:
@@ -78,6 +118,7 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
         parser.add_argument("--causal", action="store_true")
         parser.add_argument("--scale", type=float, default=None)
         self.add_timing_args(parser, warmup=5, iters=20, samples=7)
+        self.add_sol_arg(parser)
         parser.add_argument(
             "--no-accuracy",
             action="store_true",
@@ -175,6 +216,15 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
                 f"{attention_tflops(case, stats['median_ms']):.3f}",
                 f"{output_tokens_per_second(case, stats['median_ms']):.0f}",
             )
+            if args.sol:
+                print_sol_report(
+                    attention_sol_bounds(case),
+                    stats["median_ms"],
+                    label=(
+                        f"FA4 {case.name}: B={case.batch}, H={case.heads}, "
+                        f"Q={case.q_len}, KV={case.kv_len}, D={case.head_dim}"
+                    ),
+                )
 
 
 if __name__ == "__main__":
