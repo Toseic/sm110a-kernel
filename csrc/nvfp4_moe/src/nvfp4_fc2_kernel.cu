@@ -104,14 +104,20 @@ struct Nvfp4Fc2Config {
     static constexpr int kMainloopSmemBytes = kStageCount * kPerStageSmemBytes;
     static constexpr int kDynamicSmemBytes = kMainloopSmemBytes + kFinalizeSmemBytes;
     static constexpr int kScaleColsPerMma = 4 + 4 * kSFBScaleTileCount;
-    // A pair of accumulator banks fits for narrow-N.  At N=256 reserve one
-    // accumulator bank and reuse one scale slot, matching the standalone
-    // GEMM's capacity-constrained TMEM layout.
-    static constexpr int kTmemStageCount = kTileN == 256 ? 1 : 2;
+    // Keep two accumulator stages even at N=256 by overlapping the last 16
+    // columns of stage 0 with the first 16 columns of stage 1.  The epilogue
+    // drains these columns before releasing a stage, so the next MMA can
+    // overwrite the overlap while finalize continues through the remaining
+    // columns.  This matches the standalone GEMM TMEM pipeline.
+    static constexpr int kAccumulatorOverlapCols = kTileN == 256 ? 16 : 0;
+    static constexpr int kTmemStageCount = 2;
+    static constexpr int kAccumulatorStageStride =
+        kTileN - kAccumulatorOverlapCols;
     static constexpr int kScaleTmemSlotCount =
         kTileN < 256 ? kStageCount * kMmaStepsPerStage : 1;
     static constexpr int kScaleTmemCols = kScaleTmemSlotCount * kScaleColsPerMma;
-    static constexpr int kAccumulatorTmemCols = kTileN * kTmemStageCount;
+    static constexpr int kAccumulatorTmemCols =
+        kTileN * kTmemStageCount - kAccumulatorOverlapCols;
     static constexpr int kTmemColumnsNeeded = 512;
     static_assert(kAccumulatorTmemCols + kScaleTmemCols <= kTmemColumnsNeeded);
     // tcgen05.alloc requires a power-of-two column count. In particular,
@@ -469,6 +475,8 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc2_fused_kernel(
     constexpr int kMmaStepsPerStage = kTileK / kMmaK;
     constexpr int kTmemStageCount = Config::kTmemStageCount;
     constexpr int kTmemAllocationColumns = Config::kTmemAllocationColumns;
+    constexpr int kAccumulatorOverlapCols = Config::kAccumulatorOverlapCols;
+    constexpr int kAccumulatorStageStride = Config::kAccumulatorStageStride;
     constexpr bool kUseTaskPipeline = kClusterM == 1 && kPersistent;
     const int tid = threadIdx.x;
     const int warp_id = tid / kWarpSize;
@@ -498,6 +506,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc2_fused_kernel(
     __shared__ uint64_t mma_mbars[kStageCount];
     __shared__ uint64_t mainloop_mbars[kTmemStageCount];
     __shared__ uint64_t epilogue_mbars[kTmemStageCount];
+    __shared__ uint64_t overlap_mbars[kTmemStageCount];
 
     extern __shared__ __align__(1024) char dynamic_smem[];
     const int mainloop_smem = static_cast<int>(__cvta_generic_to_shared(dynamic_smem));
@@ -512,6 +521,8 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc2_fused_kernel(
     const int base_mma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(mma_mbars));
     const int base_mainloop_mbar_addr = static_cast<int>(__cvta_generic_to_shared(mainloop_mbars));
     const int base_epilogue_mbar_addr = static_cast<int>(__cvta_generic_to_shared(epilogue_mbars));
+    const int base_overlap_mbar_addr =
+        static_cast<int>(__cvta_generic_to_shared(overlap_mbars));
 
     if (tid == 0) {
         for (int stage = 0; stage < kStageCount; ++stage) {
@@ -526,6 +537,10 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc2_fused_kernel(
             mbarrier_init(base_mainloop_mbar_addr + stage * sizeof(uint64_t), 1);
             if constexpr (kPersistent || kDynamicClc) {
                 mbarrier_init(base_epilogue_mbar_addr + stage * sizeof(uint64_t), 4 * kClusterM);
+                if constexpr (kAccumulatorOverlapCols != 0) {
+                    mbarrier_init(base_overlap_mbar_addr + stage * sizeof(uint64_t),
+                        4 * kClusterM);
+                }
             }
         }
         if constexpr (kUseTaskPipeline) {
@@ -570,33 +585,6 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc2_fused_kernel(
 
     const int k_tiles = k / kTileK;
 
-    // FC2 fusion staging is deliberately physical row-major shared memory:
-    // one epilogue thread owns one row and cp.reduce.async.bulk consumes a
-    // contiguous reduce_tile_n BF16 source range for that row.
-    auto tmem_to_finalize_smem = [&](int mainloop_stage, int reduce_n, float scale) {
-        auto *stage_smem = reinterpret_cast<nv_bfloat16 *>(
-            dynamic_smem + kMainloopSmemBytes);
-        for (int n_group = 0; n_group < SM110A_NVFP4_FC2_REDUCE_TILE_N / 8; ++n_group) {
-            float values[8];
-            const int tmem_row = cta_rank * kTileM + warp_id * kWarpSize;
-            const int tmem_col = mainloop_stage * kTileN + reduce_n + n_group * 8;
-            const int load_addr = tmem_addr + (tmem_row << 16) + tmem_col;
-            asm volatile("tcgen05.ld.sync.aligned.32x32b.x8.b32 "
-                         "{%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                : "=f"(values[0]), "=f"(values[1]), "=f"(values[2]), "=f"(values[3]),
-                  "=f"(values[4]), "=f"(values[5]), "=f"(values[6]), "=f"(values[7])
-                : "r"(load_addr));
-            asm volatile("tcgen05.wait::ld.sync.aligned;");
-            if (tid < kTileM) {
-#pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    stage_smem[tid * SM110A_NVFP4_FC2_REDUCE_TILE_N + n_group * 8 + j] =
-                        __float2bfloat16_rn(values[j] * scale);
-                }
-            }
-        }
-    };
-
     int producer_stage = 0;
     int producer_mma_phase = 1;
     int sfa_stage = 0;
@@ -605,6 +593,8 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc2_fused_kernel(
     int consumer_tma_phase = 0;
     int consumer_mainloop_stage = 0;
     int consumer_epilogue_phase = 1;
+    int consumer_overlap_phase = 0;
+    bool consumer_has_previous_overlap = false;
     int epilogue_mainloop_stage = 0;
     int epilogue_mainloop_phase = 0;
     int clc_phase = 0;
@@ -660,7 +650,6 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc2_fused_kernel(
                         scheduled_bid = atomicAdd(next_cluster_tile, 1);
                     }
                     scheduled_cluster_bids[task_pipe_stage] = scheduled_bid;
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     const int ready_addr = base_task_ready_mbar_addr +
                         task_pipe_stage * sizeof(uint64_t);
                     asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];" ::
@@ -938,11 +927,30 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc2_fused_kernel(
                     mbarrier_wait(
                         base_epilogue_mbar_addr + consumer_mainloop_stage * sizeof(uint64_t),
                         consumer_epilogue_phase);
+                    if constexpr (kAccumulatorOverlapCols != 0) {
+                        if (consumer_has_previous_overlap) {
+                            // The adjacent accumulator stage aliases these 16
+                            // columns.  Wait only until the previous epilogue
+                            // has copied that overlap into shared memory; its
+                            // disjoint columns may continue finalizing.
+                            const int previous_stage =
+                                (consumer_mainloop_stage + kTmemStageCount - 1) %
+                                kTmemStageCount;
+                            mbarrier_wait(base_overlap_mbar_addr +
+                                              previous_stage * sizeof(uint64_t),
+                                          consumer_overlap_phase);
+                            if (previous_stage == kTmemStageCount - 1) {
+                                consumer_overlap_phase ^= 1;
+                            }
+                        }
+                        consumer_has_previous_overlap = true;
+                    }
                 }
 
                 const ExpertTileTask task = tasks[cluster_bid];
                 const int tile_col = task.tile_n * kTileN;
-                const int stage_tmem_addr = tmem_addr + consumer_mainloop_stage * kTileN;
+                const int stage_tmem_addr =
+                    tmem_addr + consumer_mainloop_stage * kAccumulatorStageStride;
                 for (int tile_k = 0; tile_k < k_tiles; ++tile_k) {
                     const int tma_mbar_addr =
                         base_tma_mbar_addr + consumer_stage * sizeof(uint64_t);
@@ -1023,12 +1031,26 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc2_fused_kernel(
                 auto release_tmem = [&]() {
                     if constexpr (kPersistent || kDynamicClc) {
                         if (elect_sync()) {
-                            const int mbar_addr = (base_epilogue_mbar_addr +
-                                                      epilogue_mainloop_stage * sizeof(uint64_t)) &
-                                                  0xFEFFFFFF;
-                            asm volatile("mbarrier.arrive.release.cta.shared::cluster.b64 "
-                                         "_, [%0];" ::"r"(mbar_addr)
-                                : "memory");
+                            // The MMA warp lives on cluster rank 0.  Aggregate
+                            // all epilogue-warp releases from both CTAs onto
+                            // rank 0's barrier so cta_group::2 cannot reuse an
+                            // overlapping accumulator stage early.
+                            mbarrier_arrive_on_cluster_cta(
+                                base_epilogue_mbar_addr +
+                                    epilogue_mainloop_stage * sizeof(uint64_t),
+                                0);
+                        }
+                    }
+                };
+
+                auto release_overlap = [&]() {
+                    if constexpr ((kPersistent || kDynamicClc) &&
+                                  kAccumulatorOverlapCols != 0) {
+                        if (elect_sync()) {
+                            mbarrier_arrive_on_cluster_cta(
+                                base_overlap_mbar_addr +
+                                    epilogue_mainloop_stage * sizeof(uint64_t),
+                                0);
                         }
                     }
                 };
@@ -1044,26 +1066,111 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc2_fused_kernel(
                     token_idx = expanded_id / topk;
                     router_scale = __bfloat162float(routing_weights[expanded_id]);
                 }
-                for (int reduce_n = 0; reduce_n < kTileN;
-                    reduce_n += SM110A_NVFP4_FC2_REDUCE_TILE_N) {
-                    tmem_to_finalize_smem(epilogue_mainloop_stage, reduce_n, router_scale);
-                    asm volatile("bar.sync 1, 128;" ::: "memory");
-                    fence_smem_for_async_proxy();
-                    if (valid_row) {
-                        auto *source = reinterpret_cast<nv_bfloat16 *>(
-                            dynamic_smem + kMainloopSmemBytes) +
-                            tid * SM110A_NVFP4_FC2_REDUCE_TILE_N;
-                        bulk_reduce_add_bf16(final_output +
-                                                 static_cast<size_t>(token_idx) * n +
-                                                 tile_col + reduce_n,
-                                             source,
-                                             SM110A_NVFP4_FC2_REDUCE_TILE_N * sizeof(nv_bfloat16));
+                if (valid_rows == 0) {
+                    // A 2-CTA M=256 tile frequently has no rows in rank 1 for
+                    // sparse expert buckets.  Its accumulator values are
+                    // unobservable, so release both handshakes without doing
+                    // four slabs of TMEM loads and shared/global reduction.
+                    release_overlap();
+                    release_tmem();
+                } else {
+                    auto *stage_smem = reinterpret_cast<nv_bfloat16 *>(
+                        dynamic_smem + kMainloopSmemBytes);
+                    auto stage_tmem_groups = [&](int reduce_n, int group_begin,
+                                                 int group_end) {
+                        for (int n_group = group_begin; n_group < group_end; ++n_group) {
+                            float values[8];
+                            const int tmem_row = cta_rank * kTileM + warp_id * kWarpSize;
+                            const int tmem_col =
+                                epilogue_mainloop_stage * kAccumulatorStageStride +
+                                reduce_n + n_group * 8;
+                            const int load_addr = tmem_addr + (tmem_row << 16) + tmem_col;
+                            asm volatile("tcgen05.ld.sync.aligned.32x32b.x8.b32 "
+                                         "{%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                                : "=f"(values[0]), "=f"(values[1]), "=f"(values[2]),
+                                  "=f"(values[3]), "=f"(values[4]), "=f"(values[5]),
+                                  "=f"(values[6]), "=f"(values[7])
+                                : "r"(load_addr));
+                            asm volatile("tcgen05.wait::ld.sync.aligned;");
+                            if (tid < kTileM) {
+#pragma unroll
+                                for (int j = 0; j < 8; ++j) {
+                                    stage_smem[tid * SM110A_NVFP4_FC2_REDUCE_TILE_N +
+                                               n_group * 8 + j] =
+                                        __float2bfloat16_rn(values[j] * router_scale);
+                                }
+                            }
+                        }
+                        asm volatile("bar.sync 1, 128;" ::: "memory");
+                    };
+                    auto reduce_smem_groups = [&](int reduce_n, int group_begin,
+                                                  int group_end) {
+                        fence_smem_for_async_proxy();
+                        if (valid_row) {
+                            auto *source = stage_smem +
+                                tid * SM110A_NVFP4_FC2_REDUCE_TILE_N + group_begin * 8;
+                            bulk_reduce_add_bf16(final_output +
+                                                     static_cast<size_t>(token_idx) * n +
+                                                     tile_col + reduce_n + group_begin * 8,
+                                                 source,
+                                                 (group_end - group_begin) * 8 *
+                                                     sizeof(nv_bfloat16));
+                        }
+                        bulk_commit_group();
+                        bulk_wait_group_read_0();
+                        asm volatile("bar.sync 1, 128;" ::: "memory");
+                    };
+                    auto stage_and_reduce = [&](int reduce_n) {
+                        stage_tmem_groups(reduce_n, 0,
+                            SM110A_NVFP4_FC2_REDUCE_TILE_N / 8);
+                        reduce_smem_groups(reduce_n, 0,
+                            SM110A_NVFP4_FC2_REDUCE_TILE_N / 8);
+                    };
+
+                    constexpr int kGroupsPerReduce =
+                        SM110A_NVFP4_FC2_REDUCE_TILE_N / 8;
+                    if constexpr (kAccumulatorOverlapCols != 0) {
+                        static_assert(kAccumulatorOverlapCols == 16);
+                        const int overlap_reduce_n = epilogue_mainloop_stage == 0
+                            ? kTileN - SM110A_NVFP4_FC2_REDUCE_TILE_N
+                            : 0;
+                        const int overlap_group_begin = epilogue_mainloop_stage == 0
+                            ? kGroupsPerReduce - kAccumulatorOverlapCols / 8
+                            : 0;
+                        const int overlap_group_end =
+                            overlap_group_begin + kAccumulatorOverlapCols / 8;
+                        stage_tmem_groups(overlap_reduce_n, overlap_group_begin,
+                                          overlap_group_end);
+                        release_overlap();
+
+                        // Complete the same reduce slab after releasing the
+                        // aliased TMEM columns, then issue one full-width global
+                        // reduction instead of splitting it into 16+48 columns.
+                        if (overlap_group_begin != 0) {
+                            stage_tmem_groups(overlap_reduce_n, 0,
+                                              overlap_group_begin);
+                        }
+                        if (overlap_group_end != kGroupsPerReduce) {
+                            stage_tmem_groups(overlap_reduce_n, overlap_group_end,
+                                              kGroupsPerReduce);
+                        }
+                        reduce_smem_groups(overlap_reduce_n, 0, kGroupsPerReduce);
+
+                        for (int reduce_n = 0; reduce_n < kTileN;
+                             reduce_n += SM110A_NVFP4_FC2_REDUCE_TILE_N) {
+                            if (reduce_n != overlap_reduce_n) {
+                                stage_and_reduce(reduce_n);
+                            }
+                        }
+                        release_tmem();
+                    } else {
+                        for (int reduce_n = 0; reduce_n < kTileN;
+                             reduce_n += SM110A_NVFP4_FC2_REDUCE_TILE_N) {
+                            stage_and_reduce(reduce_n);
+                        }
+                        release_tmem();
                     }
-                    bulk_commit_group();
-                    bulk_wait_group_read_0();
-                    asm volatile("bar.sync 1, 128;" ::: "memory");
                 }
-                release_tmem();
                 bulk_wait_group_0();
                 asm volatile("bar.sync 1, 128;" ::: "memory");
 
