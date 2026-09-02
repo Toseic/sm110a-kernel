@@ -175,11 +175,12 @@ __device__ __attribute__((noinline)) SoftmaxUpdate load_s_and_store_p_ptx(
     int valid_q_row,
     float scale,
     float tilem,
-    float tilel) {
+    float tilel,
+    float conditional_rescale_threshold) {
     SoftmaxUpdate update;
     asm volatile(
         "{\n\t"
-        ".reg .pred p, pvalid;\n\t"
+        ".reg .pred p, pvalid, prescale;\n\t"
         ".reg .s32 key, addr;\n\t"
         ".reg .f32 score<128>, rmax, v, sum;\n\t"
         ".reg .b32 packed<4>;\n\t"
@@ -842,6 +843,14 @@ __device__ __attribute__((noinline)) SoftmaxUpdate load_s_and_store_p_ptx(
         "@p max.f32 rmax, rmax, v;\n\t"
         "max.f32 %0, %9, rmax;\n\t"
         "@!pvalid mov.f32 %0, %9;\n\t"
+        // Scores and m are in the natural-log domain.  The threshold is
+        // ln(256), not 8: 8 is log2(256), used only after conversion for ex2.
+        "sub.f32 v, %0, %9;\n\t"
+        "setp.gt.and.f32 prescale, v, %11, pvalid;\n\t"
+        // Match FA4's warp-uniform conditional rescale: if no row in this
+        // warp needs it, retain the old normalization base for every row.
+        "vote.sync.any.pred prescale, prescale, 0xffffffff;\n\t"
+        "@!prescale mov.f32 %0, %9;\n\t"
         "setp.ne.and.f32 p, %10, 0f00000000, pvalid;\n\t"
         "sub.f32 v, %9, %0;\n\t"
         "mul.f32 v, v, 0f3fb8aa3b;\n\t"
@@ -2098,6 +2107,10 @@ __device__ __attribute__((noinline)) SoftmaxUpdate load_s_and_store_p_ptx(
         "tcgen05.st.sync.aligned.32x32b.x4.b32 [addr], {packed0, packed1, packed2, packed3};\n\t"
         "fma.rn.f32 %1, %2, %10, sum;\n\t"
         "@!pvalid mov.f32 %1, %10;\n\t"
+        // `prescale` is warp-uniform after vote.sync.any.  l has already
+        // consumed the positive alpha, so use its sign only as the return
+        // flag that lets the correction warp skip its O read-modify-write.
+        "@!prescale neg.f32 %2, %2;\n\t"
         "}\n"
         : "=f"(update.m), "=f"(update.l), "=f"(update.alpha)
         : "r"(s_tmem_row_addr),
@@ -2107,7 +2120,8 @@ __device__ __attribute__((noinline)) SoftmaxUpdate load_s_and_store_p_ptx(
         "r"(valid_q_row),
         "f"(scale),
         "f"(tilem),
-        "f"(tilel)
+        "f"(tilel),
+        "f"(conditional_rescale_threshold)
         : "memory");
     return update;
 }
@@ -2232,7 +2246,7 @@ __global__ __launch_bounds__(256, 1) void fa_mha_kernel(
     auto *kv_smem = reinterpret_cast<__nv_bfloat16 *>(smem + smem_layout.kv_offset);
 
     // Producer/consumer graph for each (Q slot, KV stage):
-    //   K TMA -> QK MMA -> MUFU -> PV MMA -> recycle K/V stage.
+    //   K TMA -> QK MMA -> rescale -> PV MMA -> recycle K/V stage.
     // Each resident Q tile has an independent prologue mbarrier; all remaining
     // edges need one independent barrier per two-stage-ring entry.
     __shared__ __align__(8) uint64_t q_prologue_mbars[QSlots];
@@ -2240,24 +2254,24 @@ __global__ __launch_bounds__(256, 1) void fa_mha_kernel(
     __shared__ __align__(8) uint64_t tma2_mbars[KvStages];
     __shared__ __align__(8) uint64_t mma1_mbars[QSlots][KvStages];
     __shared__ __align__(8) uint64_t mma2_mbars[QSlots][KvStages];
-    __shared__ __align__(8) uint64_t mufu_mbars[QSlots][KvStages];
+    __shared__ __align__(8) uint64_t rescale_mbars[QSlots][KvStages];
     __shared__ __align__(8) uint64_t epilogue_mbar[1];
     __shared__ __align__(4) int mma_tmem_addr[1];
 
     constexpr int kWarpSize = 32;
-    // CTA role assignment (8 warps = 256 threads). One MUFU warpgroup
+    // CTA role assignment (8 warps = 256 threads). One rescale warpgroup
     // alternates between S0 and S1 so an x128 score row fits in registers.
     constexpr int kKTmaWarp = 0;       // K shared-memory producer
     constexpr int kVTmaWarp = 1;       // V shared-memory producer
     constexpr int kMmaWarp = 2;        // QK and PV tcgen05 issuer
     constexpr int kQPrologueWarp = 3;  // loads the two resident Q tiles
-    constexpr int kMufu0WarpBegin = 4; // Q0/Q1: warp 4-7
-    constexpr int kMufu0WarpEnd = 8;
+    constexpr int kRescaleWarpBegin = 4; // Q0/Q1: warps 4-7
+    constexpr int kRescaleWarpEnd = 8;
     constexpr int kTmaMbarArrivalCount = 1;
     constexpr int kMmaMbarArrivalCount = 1;
-    // A 128-row TMEM tile is partitioned into four 32-row regions. MUFU
+    // A 128-row TMEM tile is partitioned into four 32-row regions. Rescale
     // warps 4-7 collectively own one stage and each arrives once.
-    constexpr int kMufuMbarArrivalCount = kMufu0WarpEnd - kMufu0WarpBegin;
+    constexpr int kRescaleMbarArrivalCount = kRescaleWarpEnd - kRescaleWarpBegin;
     constexpr int kQPrologueMbarArrivalCount = 1;
 
     const int tid = threadIdx.x;
@@ -2269,7 +2283,7 @@ __global__ __launch_bounds__(256, 1) void fa_mha_kernel(
     const int tma2_mbar_base = static_cast<int>(__cvta_generic_to_shared(tma2_mbars));
     const int mma1_mbar_base = static_cast<int>(__cvta_generic_to_shared(mma1_mbars));
     const int mma2_mbar_base = static_cast<int>(__cvta_generic_to_shared(mma2_mbars));
-    const int mufu_mbar_base = static_cast<int>(__cvta_generic_to_shared(mufu_mbars));
+    const int rescale_mbar_base = static_cast<int>(__cvta_generic_to_shared(rescale_mbars));
     const int epilogue_mbar_addr = static_cast<int>(__cvta_generic_to_shared(epilogue_mbar));
 
     // Follow the BF16 GEMM setup pattern: one thread initializes every
@@ -2288,7 +2302,7 @@ __global__ __launch_bounds__(256, 1) void fa_mha_kernel(
                 const int q_offset = (q_slot * KvStages + stage) * sizeof(uint64_t);
                 mbarrier_init(mma1_mbar_base + q_offset, kMmaMbarArrivalCount);
                 mbarrier_init(mma2_mbar_base + q_offset, kMmaMbarArrivalCount);
-                mbarrier_init(mufu_mbar_base + q_offset, kMufuMbarArrivalCount);
+                mbarrier_init(rescale_mbar_base + q_offset, kRescaleMbarArrivalCount);
             }
         }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
@@ -2340,10 +2354,10 @@ __global__ __launch_bounds__(256, 1) void fa_mha_kernel(
     int k_recycle_phase[QSlots][KvStages] = {};
     int v_mma1_phase[QSlots][KvStages] = {};
     int v_recycle_phase[QSlots][KvStages] = {};
-    int mufu_mma1_phase[QSlots][KvStages] = {};
+    int rescale_mma1_phase[QSlots][KvStages] = {};
     int qk_tma1_phase[KvStages] = {};
     int pv_tma2_phase[KvStages] = {};
-    int pv_mufu_phase[QSlots][KvStages] = {};
+    int pv_rescale_phase[QSlots][KvStages] = {};
     int epilogue_phase = 0;
     bool k_slot_initialized[KvStages] = {};
     bool v_slot_initialized[KvStages] = {};
@@ -2364,8 +2378,8 @@ __global__ __launch_bounds__(256, 1) void fa_mha_kernel(
                                                         : kv_tile_count)
                                               : kv_tile_count;
 
-        const int mufu_warp = warp_idx >= kMufu0WarpBegin && warp_idx < kMufu0WarpEnd
-                                  ? warp_idx - kMufu0WarpBegin
+        const int rescale_warp = warp_idx >= kRescaleWarpBegin && warp_idx < kRescaleWarpEnd
+                                     ? warp_idx - kRescaleWarpBegin
                                   : -1;
         // Load both resident Q tiles through independent prologue barriers.
         if (warp_idx == kQPrologueWarp && lane_idx == 0) {
@@ -2461,11 +2475,11 @@ __global__ __launch_bounds__(256, 1) void fa_mha_kernel(
             }
         }
 
-        if (mufu_warp >= 0) {
+        if (rescale_warp >= 0) {
             // Four warps cover 4 x 32 rows and alternate between the two Q
             // slots at each KV tile. This keeps only one 128-value S row live
             // per lane while preserving the Q0/P1/Q1/P0 tensor-core schedule.
-            const int row_base = mufu_warp * kWarpSize;
+            const int row_base = rescale_warp * kWarpSize;
             const int row = row_base + lane_idx;
             const int q_rows[QSlots] = {
                 q_tile_start[0] + row,
@@ -2476,6 +2490,10 @@ __global__ __launch_bounds__(256, 1) void fa_mha_kernel(
                 -__int_as_float(0x7F800000),
                 -__int_as_float(0x7F800000),
             };
+            // The paper's threshold is log2(256) = 8.  This kernel stores
+            // scores in the natural-log domain and converts only the exp
+            // argument to base 2, so use ln(256) = 8 * ln(2) here.
+            constexpr float kConditionalRescaleThresholdLn = 5.5451774444795623f;
             for (int kv_tile = 0; kv_tile < task_kv_tile_count; ++kv_tile) {
                 const int stage = kv_tile % KvStages;
 #pragma unroll
@@ -2491,8 +2509,8 @@ __global__ __launch_bounds__(256, 1) void fa_mha_kernel(
                     }
                     const int mma1_addr =
                         mma1_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t);
-                    mbarrier_wait(mma1_addr, mufu_mma1_phase[q_slot][stage]);
-                    mufu_mma1_phase[q_slot][stage] ^= 1;
+                    mbarrier_wait(mma1_addr, rescale_mma1_phase[q_slot][stage]);
+                    rescale_mma1_phase[q_slot][stage] ^= 1;
 
                     const int q_row = q_rows[q_slot];
                     const bool valid_q_row = q_row < query_len;
@@ -2507,11 +2525,15 @@ __global__ __launch_bounds__(256, 1) void fa_mha_kernel(
                             valid_q_row,
                             scale,
                             tilem[q_slot],
-                            tilel[q_slot]);
+                            tilel[q_slot],
+                            kConditionalRescaleThresholdLn);
                     tilem[q_slot] = softmax.m;
                     tilel[q_slot] = softmax.l;
 
-                    if (kv_tile != 0) {
+                    // `alpha < 0` denotes the warp-uniform conditional-skip
+                    // path.  Do not merely multiply O by one: omit the whole
+                    // TMEM read/modify/write, which is the intended FA4 win.
+                    if (kv_tile != 0 && softmax.alpha > 0.0f) {
                         const int o_tmem_addr =
                             tmem_addr + kOBankBase + q_slot * mma_tmem_columns_per_stage;
                         for (int d8 = 0; d8 < HeadDim / 8; ++d8) {
@@ -2529,7 +2551,7 @@ __global__ __launch_bounds__(256, 1) void fa_mha_kernel(
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     if (lane_idx == 0) {
                         mbarrier_arrive(
-                            mufu_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t));
+                            rescale_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t));
                     }
                 }
             }
@@ -2559,7 +2581,7 @@ __global__ __launch_bounds__(256, 1) void fa_mha_kernel(
         }
 
         // A single elected thread issues tcgen05 operations.  The asynchronous
-        // engines perform the actual matrix work while producer/MUFU warps run.
+        // engines perform the actual matrix work while producer/rescale warps run.
         if (warp_idx == kMmaWarp && elect_sync()) {
             constexpr uint32_t kQkInstrDesc = (1U << 4U) | (1U << 7U) | (1U << 10U) |
                                               ((uint32_t)TileKV >> 3U << 17U) |
@@ -2570,7 +2592,7 @@ __global__ __launch_bounds__(256, 1) void fa_mha_kernel(
             // Keep the two Q tiles staggered around the PV work.  At iteration
             // i the tensor-core issue order is Q0(i), P1(i - 1), Q1(i), P0(i).
             // P1(0) has no predecessor and is deliberately omitted.  This
-            // gives the Q0 MUFU/rescale work the intervening P1 issue window
+            // gives the Q0 rescale work the intervening P1 issue window
             // before its PV is consumed, while P1(i) is flushed at i + 1.
             for (int kv_tile = 0; kv_tile < task_kv_tile_count; ++kv_tile) {
                 const int stage = kv_tile % KvStages;
@@ -2605,10 +2627,10 @@ __global__ __launch_bounds__(256, 1) void fa_mha_kernel(
                     // P0(pv_tile) already waited for this tile's V TMA.  Do
                     // not consume its phase again here: V cannot be recycled
                     // until this P1 commits mma2 below.
-                    const int mufu_addr =
-                        mufu_mbar_base + (q_slot * KvStages + pv_stage) * sizeof(uint64_t);
-                    mbarrier_wait(mufu_addr, pv_mufu_phase[q_slot][pv_stage]);
-                    pv_mufu_phase[q_slot][pv_stage] ^= 1;
+                    const int rescale_addr =
+                        rescale_mbar_base + (q_slot * KvStages + pv_stage) * sizeof(uint64_t);
+                    mbarrier_wait(rescale_addr, pv_rescale_phase[q_slot][pv_stage]);
+                    pv_rescale_phase[q_slot][pv_stage] ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
                     const int o_addr = tmem_addr + kOBankBase + q_slot * mma_tmem_columns_per_stage;
                     const int p_addr = tmem_addr + kSBankBase + q_slot * mma_tmem_columns_per_stage;
@@ -2648,10 +2670,10 @@ __global__ __launch_bounds__(256, 1) void fa_mha_kernel(
                     constexpr int q_slot = 0;
                     mbarrier_wait(tma2_mbar_base + stage * sizeof(uint64_t), pv_tma2_phase[stage]);
                     pv_tma2_phase[stage] ^= 1;
-                    const int mufu_addr =
-                        mufu_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t);
-                    mbarrier_wait(mufu_addr, pv_mufu_phase[q_slot][stage]);
-                    pv_mufu_phase[q_slot][stage] ^= 1;
+                    const int rescale_addr =
+                        rescale_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t);
+                    mbarrier_wait(rescale_addr, pv_rescale_phase[q_slot][stage]);
+                    pv_rescale_phase[q_slot][stage] ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
                     const int o_addr = tmem_addr + kOBankBase + q_slot * mma_tmem_columns_per_stage;
                     const int p_addr = tmem_addr + kSBankBase + q_slot * mma_tmem_columns_per_stage;
@@ -2676,10 +2698,10 @@ __global__ __launch_bounds__(256, 1) void fa_mha_kernel(
                 const int pv_stage = pv_tile % KvStages;
                 constexpr int q_slot = 1;
                 // As above, P0(pv_tile) owns the one TMA-phase wait.
-                const int mufu_addr =
-                    mufu_mbar_base + (q_slot * KvStages + pv_stage) * sizeof(uint64_t);
-                mbarrier_wait(mufu_addr, pv_mufu_phase[q_slot][pv_stage]);
-                pv_mufu_phase[q_slot][pv_stage] ^= 1;
+                const int rescale_addr =
+                    rescale_mbar_base + (q_slot * KvStages + pv_stage) * sizeof(uint64_t);
+                mbarrier_wait(rescale_addr, pv_rescale_phase[q_slot][pv_stage]);
+                pv_rescale_phase[q_slot][pv_stage] ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
                 const int o_addr = tmem_addr + kOBankBase + q_slot * mma_tmem_columns_per_stage;
                 const int p_addr = tmem_addr + kSBankBase + q_slot * mma_tmem_columns_per_stage;
