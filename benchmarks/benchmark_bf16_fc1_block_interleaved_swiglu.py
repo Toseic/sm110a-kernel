@@ -473,6 +473,7 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
                     ),
                     kernel_stats["median_ms"],
                     label="FC1 main kernel (routing excluded)",
+                    debug=args.debug,
                 )
 
 

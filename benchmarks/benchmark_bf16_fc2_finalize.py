@@ -272,7 +272,8 @@ class Fc2FinalizeBenchmark(BenchmarkBase):
                             f"{max_abs_diff:.6f}", format_candidate(best_config))
             if args.sol:
                 print_sol_report(fc2_sol_bounds(router_scores, args.topk, args.h, args.i, best_config),
-                                 stats["median_ms"], label="FC2 grouped GEMM + finalize")
+                                 stats["median_ms"], label="FC2 grouped GEMM + finalize",
+                                 debug=args.debug)
 
 
 if __name__ == "__main__":

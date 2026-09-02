@@ -354,6 +354,7 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
                     ),
                     kernel_stats["median_ms"],
                     label="grouped-M GEMM",
+                    debug=args.debug,
                 )
 
     def resolve_grouped_kernel(self, a, b, layout, out, args):

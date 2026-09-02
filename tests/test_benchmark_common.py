@@ -1,7 +1,9 @@
 import argparse
+import io
 import unittest
+from contextlib import redirect_stdout
 
-from benchmarks.common import BenchmarkBase
+from benchmarks.common import BenchmarkBase, TablePrinter, print_sol_report
 
 
 class TuneOptionsTest(unittest.TestCase):
@@ -39,6 +41,34 @@ class TuneOptionsTest(unittest.TestCase):
         args = parser.parse_args(["--force-sweep-ours"])
         self.assertTrue(args.force_sweep_ours)
         self.assertFalse(args.force_sweep_baseline)
+
+
+class OutputFormatTest(unittest.TestCase):
+    def test_table_printer_uses_one_record_per_line_in_debug_mode(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            table = TablePrinter((("M", 4), ("Time", 8)), debug=True)
+            table.print_header()
+            table.print_row(128, "1.25")
+        self.assertEqual(output.getvalue(), "M=128 Time=1.25\n")
+
+    def test_sol_report_is_a_table_and_debug_is_line_oriented(self):
+        bounds = {
+            "mma_ms": 1.0, "hbm_ms": 2.0, "gmem_ms": 3.0,
+            "pure_l2_ms": 4.0, "best_l2_ms": 5.0, "sol_ms": 4.0,
+            "tile_read_bytes": 6 * 1000 ** 2,
+        }
+        normal = io.StringIO()
+        with redirect_stdout(normal):
+            print_sol_report(bounds, 8.0, label="GEMM")
+        self.assertIn("SOL", normal.getvalue().splitlines()[0])
+        self.assertEqual(len(normal.getvalue().splitlines()), 2)
+
+        debug = io.StringIO()
+        with redirect_stdout(debug):
+            print_sol_report(bounds, 8.0, label="GEMM", debug=True)
+        self.assertEqual(len(debug.getvalue().splitlines()), 1)
+        self.assertIn("SOL=GEMM", debug.getvalue())
 
 
 if __name__ == "__main__":

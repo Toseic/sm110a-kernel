@@ -280,7 +280,7 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
             ("CuTE DSL(ms)", 14), ("CuTE DSL TF/s", 15),
             ("Speedup", 10), ("MaxDiff", 12), ("Cache", 8),
             ("BestConfig", 42),
-        ))
+        ), debug=getattr(self, "_debug_enabled", False))
 
     def run_with_args(self, args):
         torch.manual_seed(args.seed)
@@ -424,6 +424,7 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
                     ),
                     kernel_ms,
                     label="NVFP4 FC2 grouped GEMM + reduction",
+                    debug=args.debug,
                 )
 
 

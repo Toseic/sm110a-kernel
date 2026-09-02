@@ -203,7 +203,7 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
             ("Kernel(ms)", 14), ("Kernel TF/s", 15),
             ("Baseline(ms)", 14), ("Baseline TF/s", 15),
             ("Speedup", 10), ("MaxDiff", 12), ("BestConfig", 24),
-        ))
+        ), debug=args.debug)
         if args.baseline == "cutedsl":
             print("[baseline] CuTE DSL persistent NVFP4 GEMM (autotuned)")
         else:
@@ -264,6 +264,7 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
                     nvfp4_gemm_sol_bounds(m, n, k, selection.candidate),
                     kernel_stats["median_ms"],
                     label="NVFP4 GEMM",
+                    debug=args.debug,
                 )
 
     def resolve_kernel(self, aq, bq, sfa, sfb, out, m, n, k, args):

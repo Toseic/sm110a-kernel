@@ -207,7 +207,7 @@ class Nvfp4GroupedMGemmBenchmark(BenchmarkBase):
             ("Kernel(ms)", 14), ("Kernel TF/s", 15),
             (f"{baseline_label}(ms)", 14), (f"{baseline_label} TF/s", 15),
             ("Speedup", 10), ("MaxDiff", 12), ("BestConfig", 34),
-        ))
+        ), debug=args.debug)
         table.print_header()
         for tokens in args.tokens_per_expert_values:
             aq, bq, sfa, sfb, layout, out, ref = make_workload(
@@ -253,6 +253,7 @@ class Nvfp4GroupedMGemmBenchmark(BenchmarkBase):
                     ),
                     kms,
                     label="NVFP4 grouped-M GEMM",
+                    debug=args.debug,
                 )
 
     def resolve_kernel(self, aq, bq, sfa, sfb, layout, out, tokens, args):

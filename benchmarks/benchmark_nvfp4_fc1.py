@@ -419,7 +419,7 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
             ("N", 8), ("K", 8), ("Kernel(ms)", 14), ("Kernel TF/s", 15),
             ("Baseline(ms)", 14), ("Baseline TF/s", 15),
             ("Speedup", 10), ("MaxDiff", 12), ("Cache", 8), ("BestConfig", 34),
-        ))
+        ), debug=args.debug)
         table.print_header()
 
         for tokens in args.token_values:
@@ -509,6 +509,7 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
                     ),
                     kernel_ms,
                     label="NVFP4 FC1 main kernel (routing excluded)",
+                    debug=args.debug,
                 )
 
 

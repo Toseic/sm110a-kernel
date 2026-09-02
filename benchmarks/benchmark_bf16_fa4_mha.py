@@ -27,8 +27,9 @@ from common import (
     BenchmarkBase,
     TablePrinter,
     benchmark_with_stats,
-    print_sol_report,
     sol_bounds,
+    sol_table_columns,
+    sol_table_values,
 )
 from sm110a_kernel import bf16_fa4_mha_out
 
@@ -119,6 +120,7 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
         parser.add_argument("--scale", type=float, default=None)
         self.add_timing_args(parser, warmup=5, iters=20, samples=7)
         self.add_sol_arg(parser)
+        parser.add_argument("--debug", action="store_true", help="print benchmark records line by line")
         parser.add_argument(
             "--no-accuracy",
             action="store_true",
@@ -196,15 +198,16 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
                 "prefill 1K-8K and decode KV=8K"
             )
 
-        table = TablePrinter((
+        columns = (
             ("mode", 10), ("B", 6), ("H", 6), ("Q", 8), ("KV", 8),
             ("D", 6), ("causal", 9), ("median ms", 13), ("TF/s", 12),
             ("out tok/s", 16),
-        ))
+        ) + (sol_table_columns()[1:] if args.sol else ())
+        table = TablePrinter(columns, debug=args.debug)
         table.print_header()
         for case in self.cases(args):
             stats = self.run_case(case, args)
-            table.print_row(
+            values = (
                 case.name,
                 case.batch,
                 case.heads,
@@ -217,14 +220,11 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
                 f"{output_tokens_per_second(case, stats['median_ms']):.0f}",
             )
             if args.sol:
-                print_sol_report(
+                values += sol_table_values(
                     attention_sol_bounds(case),
                     stats["median_ms"],
-                    label=(
-                        f"FA4 {case.name}: B={case.batch}, H={case.heads}, "
-                        f"Q={case.q_len}, KV={case.kv_len}, D={case.head_dim}"
-                    ),
-                )
+                )[1:]
+            table.print_row(*values)
 
 
 if __name__ == "__main__":

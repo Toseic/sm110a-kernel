@@ -16,12 +16,15 @@ _DECIMAL_MB = 1000 ** 2
 _DECIMAL_GFLOP = 1000 ** 3
 
 class TablePrinter:
-    """Simple fixed-width table printer shared by benchmark scripts."""
+    """Print benchmark records as tables, or as lines in debug mode."""
 
-    def __init__(self, columns):
+    def __init__(self, columns, *, debug=False):
         self.columns = tuple(columns)
+        self.debug = debug
 
     def print_header(self):
+        if self.debug:
+            return
         print("".join(f"{title:<{width}}" for title, width in self.columns))
 
     def print_row(self, *values):
@@ -29,12 +32,16 @@ class TablePrinter:
             raise ValueError(
                 f"expected {len(self.columns)} values, got {len(values)}"
             )
-        print(
-            "".join(
+        if self.debug:
+            print(" ".join(
+                f"{title}={value}"
+                for value, (title, _) in zip(values, self.columns)
+            ))
+        else:
+            print("".join(
                 f"{value:<{width}}"
                 for value, (_, width) in zip(values, self.columns)
-            )
-        )
+            ))
 
 
 class BenchmarkBase:
@@ -215,6 +222,7 @@ class BenchmarkBase:
 
     def run(self):
         args = self.parse_args()
+        self._debug_enabled = getattr(args, "debug", False)
         self.initialize()
         self.configure_cold_l2(args)
         self.run_with_args(args)
@@ -222,8 +230,8 @@ class BenchmarkBase:
     def run_with_args(self, args):
         raise NotImplementedError
 
-    def make_table_printer(self, columns):
-        return TablePrinter(columns)
+    def make_table_printer(self, columns, *, debug=False):
+        return TablePrinter(columns, debug=debug or getattr(self, "_debug_enabled", False))
 
 
 class GemmBenchmarkBase(BenchmarkBase):
@@ -348,18 +356,30 @@ def sol_bounds(
     }
 
 
-def print_sol_report(bounds, measured_ms, *, label="SOL"):
-    """Print a readable, multi-line bound breakdown below a benchmark result."""
+def sol_table_columns():
+    return (
+        ("SOL", 22), ("SOL mma(ms)", 12), ("SOL hbm(ms)", 12),
+        ("SOL gmem(ms)", 14), ("SOL pure-l2(ms)", 16),
+        ("SOL mixed(ms)", 14), ("SOL selected(ms)", 16),
+        ("SOL attainment", 16), ("SOL tile-read(MB)", 18),
+    )
+
+
+def sol_table_values(bounds, measured_ms, *, label="SOL"):
     attainment = 100.0 * bounds["sol_ms"] / measured_ms
-    print(f"[sol] {label}")
-    print(f"      mma:          {bounds['mma_ms']:.4f} ms")
-    print(f"      hbm:          {bounds['hbm_ms']:.4f} ms")
-    print(f"      gmem:         {bounds['gmem_ms']:.4f} ms")
-    print(f"      pure-l2:      {bounds['pure_l2_ms']:.4f} ms")
-    print(f"      mixed-serial:  {bounds['best_l2_ms']:.4f} ms")
-    print(f"      selected:     {bounds['sol_ms']:.4f} ms")
-    print(f"      attainment:   {attainment:.1f}%")
-    print(f"      tile-read:    {bounds['tile_read_bytes'] / _DECIMAL_MB:.1f} MB")
+    return (
+        label, f"{bounds['mma_ms']:.4f}", f"{bounds['hbm_ms']:.4f}",
+        f"{bounds['gmem_ms']:.4f}", f"{bounds['pure_l2_ms']:.4f}",
+        f"{bounds['best_l2_ms']:.4f}", f"{bounds['sol_ms']:.4f}",
+        f"{attainment:.1f}%", f"{bounds['tile_read_bytes'] / _DECIMAL_MB:.1f}",
+    )
+
+
+def print_sol_report(bounds, measured_ms, *, label="SOL", debug=False):
+    """Print SOL metrics using the benchmark output format."""
+    table = TablePrinter(sol_table_columns(), debug=debug)
+    table.print_header()
+    table.print_row(*sol_table_values(bounds, measured_ms, label=label))
 
 
 def summarize_samples(samples, measured_iters):

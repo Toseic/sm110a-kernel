@@ -139,6 +139,7 @@ def run_accuracy_check(args):
     )
     accuracy_args = argparse.Namespace(**accuracy_options)
     bench = Bf16GemmBenchmark()
+    bench._debug_enabled = getattr(args, "debug", False)
     kernel_stats, baseline_stats, max_abs_diff, baseline_name, best_candidate = bench.run_case(
         *ACCURACY_SHAPE, args=accuracy_args
     )
@@ -158,6 +159,7 @@ def run_accuracy_check(args):
             gemm_sol_bounds(*ACCURACY_SHAPE, config, swap_ab),
             kernel_stats["median_ms"],
             label="GEMM",
+            debug=getattr(args, "debug", False),
         )
     print()
 
@@ -392,6 +394,7 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
                 gemm_sol_bounds(m, n, k, config, swap_ab),
                 kernel_stats["median_ms"],
                 label="GEMM",
+                debug=self._debug_enabled,
             )
 
 
