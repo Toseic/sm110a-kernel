@@ -51,10 +51,25 @@ class AttentionCase:
     causal: bool
 
 
+def attention_valid_score_count(case):
+    """Return the number of logical QK scores visible after masking."""
+    if not case.causal:
+        return case.q_len * case.kv_len
+
+    # The kernel uses the upper-left causal convention: query i sees keys
+    # 0..min(i, KV - 1). This also handles Q and KV lengths that differ.
+    ramp_rows = min(case.q_len, case.kv_len)
+    return ramp_rows * (ramp_rows + 1) // 2 + (case.q_len - ramp_rows) * case.kv_len
+
+
+def attention_flops(case):
+    # QK^T and PV each cost 2 FLOPs per multiply-accumulate. Count only
+    # score/value pairs visible through the requested attention mask.
+    return 4 * case.batch * case.heads * attention_valid_score_count(case) * case.head_dim
+
+
 def attention_tflops(case, elapsed_ms):
-    # QK^T and PV each cost 2 FLOPs per multiply-accumulate.
-    flops = 4 * case.batch * case.heads * case.q_len * case.kv_len * case.head_dim
-    return flops / (elapsed_ms * 1e9)
+    return attention_flops(case) / (elapsed_ms * 1e9)
 
 
 def output_tokens_per_second(case, elapsed_ms):
@@ -88,7 +103,7 @@ def attention_sol_bounds(case, *, tile_q=128, tile_kv=128):
     kv_tile_bytes = 2 * element_bytes * tile_kv * case.head_dim
     tile_read_bytes = q_bytes + bh * kv_tiles_per_head * kv_tile_bytes
     return sol_bounds(
-        4 * bh * case.q_len * case.kv_len * case.head_dim,
+        attention_flops(case),
         q_bytes + kv_input_bytes + output_bytes,
         q_bytes + kv_input_bytes,
         tile_read_bytes,
@@ -200,7 +215,7 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
 
         columns = (
             ("mode", 10), ("B", 6), ("H", 6), ("Q", 8), ("KV", 8),
-            ("D", 6), ("causal", 9), ("median ms", 13), ("TF/s", 12),
+            ("D", 6), ("causal", 9), ("median ms", 13), ("TF/s mask", 12),
             ("out tok/s", 16),
         ) + (sol_table_columns()[1:] if args.sol else ())
         table = TablePrinter(columns, debug=args.debug)
