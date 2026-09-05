@@ -223,6 +223,79 @@ __device__ inline void tcgen05_ld_f32_x64(
         : "r"(tmem_addr));
 }
 
+__device__ inline float tcgen05_ld_max_f32_x64(float *values, int tmem_addr) {
+    float maximum;
+    asm volatile(
+        "tcgen05.ld.red.sync.aligned.32x32b.x64.max.f32 "
+        "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, %64, [%65];"
+        : "=f"(values[0]),
+        "=f"(values[1]),
+        "=f"(values[2]),
+        "=f"(values[3]),
+        "=f"(values[4]),
+        "=f"(values[5]),
+        "=f"(values[6]),
+        "=f"(values[7]),
+        "=f"(values[8]),
+        "=f"(values[9]),
+        "=f"(values[10]),
+        "=f"(values[11]),
+        "=f"(values[12]),
+        "=f"(values[13]),
+        "=f"(values[14]),
+        "=f"(values[15]),
+        "=f"(values[16]),
+        "=f"(values[17]),
+        "=f"(values[18]),
+        "=f"(values[19]),
+        "=f"(values[20]),
+        "=f"(values[21]),
+        "=f"(values[22]),
+        "=f"(values[23]),
+        "=f"(values[24]),
+        "=f"(values[25]),
+        "=f"(values[26]),
+        "=f"(values[27]),
+        "=f"(values[28]),
+        "=f"(values[29]),
+        "=f"(values[30]),
+        "=f"(values[31]),
+        "=f"(values[32]),
+        "=f"(values[33]),
+        "=f"(values[34]),
+        "=f"(values[35]),
+        "=f"(values[36]),
+        "=f"(values[37]),
+        "=f"(values[38]),
+        "=f"(values[39]),
+        "=f"(values[40]),
+        "=f"(values[41]),
+        "=f"(values[42]),
+        "=f"(values[43]),
+        "=f"(values[44]),
+        "=f"(values[45]),
+        "=f"(values[46]),
+        "=f"(values[47]),
+        "=f"(values[48]),
+        "=f"(values[49]),
+        "=f"(values[50]),
+        "=f"(values[51]),
+        "=f"(values[52]),
+        "=f"(values[53]),
+        "=f"(values[54]),
+        "=f"(values[55]),
+        "=f"(values[56]),
+        "=f"(values[57]),
+        "=f"(values[58]),
+        "=f"(values[59]),
+        "=f"(values[60]),
+        "=f"(values[61]),
+        "=f"(values[62]),
+        "=f"(values[63]), "=f"(maximum)
+        : "r"(tmem_addr));
+    return maximum;
+}
+
 __device__ inline uint32_t pack_bf16x2(
     float lo,
     float hi) {
@@ -2349,6 +2422,7 @@ __device__ __attribute__((noinline, unused)) SoftmaxUpdate load_s_and_store_p_pt
 // setmaxnreg redistribution.  Split the load into x64 passes so ptxas can
 // compile the entry function at that initial limit; the softmax WG still
 // raises its runtime allocation before entering this routine.
+template <bool AllScoresValid>
 __device__ __attribute__((noinline)) SoftmaxUpdate load_s_and_store_p_chunked(
     int s_tmem_row_addr,
     int tile_key_begin,
@@ -2367,13 +2441,20 @@ __device__ __attribute__((noinline)) SoftmaxUpdate load_s_and_store_p_chunked(
 #pragma unroll
     for (int chunk = 0; chunk < kChunkCount; ++chunk) {
         float scores[kScoresPerChunk];
-        tcgen05_ld_f32_x64(scores, s_tmem_row_addr + chunk * kScoresPerChunk);
-        asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+        if constexpr (AllScoresValid) {
+            const float chunk_max = tcgen05_ld_max_f32_x64(
+                scores, s_tmem_row_addr + chunk * kScoresPerChunk);
+            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+            rmax = fmaxf(rmax, chunk_max);
+        } else {
+            tcgen05_ld_f32_x64(scores, s_tmem_row_addr + chunk * kScoresPerChunk);
+            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
 #pragma unroll
-        for (int i = 0; i < kScoresPerChunk; ++i) {
-            const int key = tile_key_begin + chunk * kScoresPerChunk + i;
-            if (valid_q_row && key < key_len && key <= mask_q_row) {
-                rmax = fmaxf(rmax, scores[i]);
+            for (int i = 0; i < kScoresPerChunk; ++i) {
+                const int key = tile_key_begin + chunk * kScoresPerChunk + i;
+                if (valid_q_row && key < key_len && key <= mask_q_row) {
+                    rmax = fmaxf(rmax, scores[i]);
+                }
             }
         }
     }
@@ -2387,7 +2468,7 @@ __device__ __attribute__((noinline)) SoftmaxUpdate load_s_and_store_p_chunked(
     }
     float alpha =
         valid_q_row && tilel != 0.0f ? exp2_approx((tilem - new_m) * scale_log2e) : 0.0f;
-    float sum = 0.0f;
+    float partial_sum[4] = {};
 
 #pragma unroll
     for (int chunk = 0; chunk < kChunkCount; ++chunk) {
@@ -2397,9 +2478,10 @@ __device__ __attribute__((noinline)) SoftmaxUpdate load_s_and_store_p_chunked(
 #pragma unroll
         for (int i = 0; i < kScoresPerChunk; ++i) {
             const int key = tile_key_begin + chunk * kScoresPerChunk + i;
-            const bool score_valid = valid_q_row && key < key_len && key <= mask_q_row;
+            const bool score_valid = AllScoresValid ||
+                (valid_q_row && key < key_len && key <= mask_q_row);
             scores[i] = score_valid ? exp2_approx((scores[i] - new_m) * scale_log2e) : 0.0f;
-            sum += scores[i];
+            partial_sum[i % 4] += scores[i];
         }
 #pragma unroll
         for (int group = 0; group < kScoresPerChunk / 8; ++group) {
@@ -2417,6 +2499,7 @@ __device__ __attribute__((noinline)) SoftmaxUpdate load_s_and_store_p_chunked(
 
     SoftmaxUpdate update;
     update.m = new_m;
+    const float sum = (partial_sum[0] + partial_sum[1]) + (partial_sum[2] + partial_sum[3]);
     update.l = valid_q_row ? alpha * tilel + sum : tilel;
     update.alpha = warp_rescale ? alpha : -alpha;
     return update;
@@ -2736,7 +2819,18 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel(const __grid_constant__ 
             const bool valid_q_row = q_row < query_len;
             const int s_tmem_addr = tmem_addr + kSBankBase + q_slot * mma_tmem_columns_per_stage;
             const int mask_q_row = causal ? q_row : key_len - 1;
-            const SoftmaxUpdate softmax = load_s_and_store_p_chunked(
+            // Select uniformly across the warp: the earliest row must see
+            // the entire KV tile and all 32 query rows must be in bounds.
+            const bool all_scores_valid =
+                q_tile_start[q_slot] + row_base + kWarpSize <= query_len &&
+                (kv_tile + 1) * TileKV <= key_len &&
+                (!causal || (kv_tile + 1) * TileKV - 1 <= q_tile_start[q_slot] + row_base);
+            const SoftmaxUpdate softmax = all_scores_valid
+                ? load_s_and_store_p_chunked<true>(
+                    s_tmem_addr + (row_base << 16), kv_tile * TileKV, key_len,
+                    mask_q_row, valid_q_row, scale, tilem, tilel,
+                    kConditionalRescaleThresholdLn, scale_log2e)
+                : load_s_and_store_p_chunked<false>(
                 s_tmem_addr + (row_base << 16),
                 kv_tile * TileKV,
                 key_len,
@@ -2781,9 +2875,14 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel(const __grid_constant__ 
 
                 const float alpha = softmax_alpha[q_slot][row];
                 final_l[q_slot] = softmax_l[q_slot][row];
-                // `alpha < 0` denotes the warp-uniform conditional-skip path.
+                // The sign bit (including -0) denotes the conditional-skip path.
                 // Omit the whole TMEM RMW when no row in this warp needs it.
-                if (kv_tile != 0 && alpha > 0.0f) {
+                // Invalid rows (and underflowed alpha) can be zero even
+                // when another lane requests correction. TMEM operations
+                // must still be executed uniformly by the entire warp.
+                const bool warp_needs_rescale = __any_sync(
+                    0xFFFFFFFFU, (__float_as_uint(alpha) & 0x80000000U) == 0);
+                if (kv_tile != 0 && warp_needs_rescale) {
                     const int o_tmem_addr =
                         tmem_addr + kOBankBase + q_slot * mma_tmem_columns_per_stage;
                     for (int d8 = 0; d8 < HeadDim / 8; ++d8) {
@@ -2818,20 +2917,24 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel(const __grid_constant__ 
                 tcgen05_ld_f32_x8(o_fragment, o_tmem_addr + (row_base << 16) + d8 * 8);
                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                 if (valid_q_row) {
-#pragma unroll
-                    for (int e = 0; e < 8; ++e) {
-                        const int d = d8 * 8 + e;
-                        // Match the SW128 tensor-map layout: [D/64, Q, 64].
-                        // TMA XORs row bits [9:7] into byte-address bits
-                        // [6:4] inside each 1 KiB swizzle atom.
-                        const int logical_byte = ((d / 64) * TileQ * 64 + row * 64 + d % 64) *
-                                                 sizeof(__nv_bfloat16);
-                        const int swizzled_byte = logical_byte ^ ((logical_byte >> 3) & 0x70);
-                        auto *out_tile_bytes = reinterpret_cast<char *>(out_smem) +
-                                               q_slot * TileQ * HeadDim * sizeof(__nv_bfloat16);
-                        *reinterpret_cast<__nv_bfloat16 *>(out_tile_bytes + swizzled_byte) =
-                            __float2bfloat16_rn(o_fragment[e] * inv_l);
-                    }
+                    const int d = d8 * 8;
+                    // Match the SW128 tensor-map layout: [D/64, Q, 64].
+                    // TMA XORs row bits [9:7] into byte-address bits
+                    // [6:4] inside each 1 KiB swizzle atom.
+                    const int logical_byte = ((d / 64) * TileQ * 64 + row * 64 + d % 64) *
+                                             sizeof(__nv_bfloat16);
+                    const int swizzled_byte = logical_byte ^ ((logical_byte >> 3) & 0x70);
+                    auto *out_tile_bytes = reinterpret_cast<char *>(out_smem) +
+                                           q_slot * TileQ * HeadDim * sizeof(__nv_bfloat16);
+                    // Eight adjacent BF16 values fill one aligned SW128
+                    // 16-byte atom. Store it together instead of eight
+                    // conflicting scalar halfword instructions.
+                    const uint4 packed = make_uint4(
+                        pack_bf16x2(o_fragment[0] * inv_l, o_fragment[1] * inv_l),
+                        pack_bf16x2(o_fragment[2] * inv_l, o_fragment[3] * inv_l),
+                        pack_bf16x2(o_fragment[4] * inv_l, o_fragment[5] * inv_l),
+                        pack_bf16x2(o_fragment[6] * inv_l, o_fragment[7] * inv_l));
+                    *reinterpret_cast<uint4 *>(out_tile_bytes + swizzled_byte) = packed;
                 }
             }
             // Let the store warp drain Q0 while this WG stages Q1.
