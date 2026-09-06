@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark the BF16 FA4 MHA kernel against the official FlashAttention-4.
+"""Benchmark the BF16 FA4 MHA kernel against external attention kernels.
 
 The default suite uses 32 attention heads and head dimension 128:
 
@@ -10,9 +10,14 @@ Decode is deliberately non-causal. The kernel's causal mask is upper-left,
 so a one-token query would otherwise only attend KV position zero; non-causal
 Q=1 models the final token attending its complete KV cache.
 
-The baseline requires the official ``flash-attn-4`` package::
+The official FlashAttention-4 baseline requires ``flash-attn-4``::
 
     pip install "flash-attn-4[cu13]"
+
+The TRTLLM-Gen baseline uses FlashInfer's standalone binding to the official
+TRTLLM-Gen FMHA cubins and requires ``flashinfer-python>=0.6.18``::
+
+    pip install "flashinfer-python[cu13]>=0.6.18"
 """
 
 import argparse
@@ -40,10 +45,11 @@ from common import (
 from sm110a_kernel import bf16_fa4_mha_out
 
 
-PREFILL_LENGTHS = (1024, 2048, 4096, 8192)
+PREFILL_LENGTHS = (1024, 2048, 4096, 8192, 16384)
 DECODE_BATCH_SIZES = (32, 64, 128)
 DEFAULT_HEADS = 32
 DEFAULT_HEAD_DIM = 128
+TRTLLM_GEN_SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 
 
 def load_official_fa4():
@@ -69,6 +75,33 @@ def load_official_fa4():
         category=UserWarning,
     )
     return _flash_attn_fwd, package_version
+
+
+def load_trtllm_gen():
+    """Load FlashInfer's standalone TRTLLM-Gen context entry point."""
+    capability = torch.cuda.get_device_capability()
+    if capability not in TRTLLM_GEN_SUPPORTED_CAPABILITIES:
+        supported = ", ".join(f"SM{major}{minor}" for major, minor in TRTLLM_GEN_SUPPORTED_CAPABILITIES)
+        actual = f"SM{capability[0]}{capability[1]}"
+        raise SystemExit(
+            f"the TRTLLM-Gen FMHA cubins do not support {actual}; the current "
+            f"standalone distribution supports {supported}. On Thor/SM110 use "
+            "--baseline fa4 until an SM110 TRTLLM-Gen cubin is published"
+        )
+
+    try:
+        from flashinfer.prefill import trtllm_ragged_attention_deepseek
+    except ImportError as exc:
+        raise SystemExit(
+            "the TRTLLM-Gen baseline is not installed; run "
+            f"'{sys.executable} -m pip install \"flashinfer-python[cu13]>=0.6.18\"'"
+        ) from exc
+
+    try:
+        package_version = version("flashinfer-python")
+    except PackageNotFoundError:
+        package_version = "unknown"
+    return trtllm_ragged_attention_deepseek, package_version
 
 
 @dataclass(frozen=True)
@@ -166,9 +199,12 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
         parser.add_argument("--scale", type=float, default=None)
         parser.add_argument(
             "--baseline",
-            choices=("fa4",),
+            choices=("fa4", "trtllm-gen"),
             default="fa4",
-            help="attention baseline (fa4 is the official CuTe DSL implementation)",
+            help=(
+                "attention baseline: official FlashAttention-4 CuTe DSL or "
+                "TRTLLM-Gen FMHA via FlashInfer (default: fa4)"
+            ),
         )
         self.add_timing_args(parser, warmup=5, iters=20, samples=7)
         self.add_sol_arg(parser)
@@ -238,18 +274,70 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
         def run_kernel():
             bf16_fa4_mha_out(q, k, v, out, causal=case.causal, scale=scale)
 
-        def run_baseline():
-            # Use FA4's official forward implementation directly so output is
-            # preallocated and allocation/autograd bookkeeping is not part of
-            # the comparison.
-            self._official_fa4_fwd(
-                q_fa4,
-                k_fa4,
-                v_fa4,
-                softmax_scale=scale,
-                causal=case.causal,
-                out=out_fa4,
+        if args.baseline == "fa4":
+            def run_baseline():
+                # Use FA4's official forward implementation directly so output is
+                # preallocated and allocation/autograd bookkeeping is not part of
+                # the comparison.
+                self._official_fa4_fwd(
+                    q_fa4,
+                    k_fa4,
+                    v_fa4,
+                    softmax_scale=scale,
+                    causal=case.causal,
+                    out=out_fa4,
+                )
+        else:
+            if case.causal and case.q_len != case.kv_len:
+                raise SystemExit(
+                    "TRTLLM-Gen and this kernel use different causal alignment for "
+                    "Q != KV; use equal lengths or a non-causal workload"
+                )
+
+            # TRTLLM-Gen SeparateQkv context consumes packed variable-length
+            # [sum(S), H, D] tensors. The BSHD tensors are already contiguous,
+            # so flattening B/S is a view and is performed outside the timer.
+            q_trtllm = q_fa4.view(-1, case.heads, case.head_dim)
+            k_trtllm = k_fa4.view(-1, case.heads, case.head_dim)
+            v_trtllm = v_fa4.view(-1, case.heads, case.head_dim)
+            out_trtllm = out_fa4.view(-1, case.heads, case.head_dim)
+            seq_lens = torch.full(
+                (case.batch,), case.kv_len, device="cuda", dtype=torch.int32,
             )
+            cum_seq_lens_q = torch.arange(
+                case.batch + 1, device="cuda", dtype=torch.int32,
+            ) * case.q_len
+            cum_seq_lens_kv = torch.arange(
+                case.batch + 1, device="cuda", dtype=torch.int32,
+            ) * case.kv_len
+            workspace = torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8)
+
+            def run_baseline():
+                # All tensors, output, and metadata are preallocated. The
+                # all-rows-active promise avoids a synchronization in the
+                # generic ragged wrapper on every timed invocation.
+                self._trtllm_gen_fwd(
+                    q_trtllm,
+                    k_trtllm,
+                    v_trtllm,
+                    workspace_buffer=workspace,
+                    seq_lens=seq_lens,
+                    max_q_len=case.q_len,
+                    max_kv_len=case.kv_len,
+                    bmm1_scale=scale,
+                    bmm2_scale=1.0,
+                    o_sf_scale=1.0,
+                    batch_size=case.batch,
+                    window_left=-1,
+                    cum_seq_lens_q=cum_seq_lens_q,
+                    cum_seq_lens_kv=cum_seq_lens_kv,
+                    enable_pdl=False,
+                    is_causal=case.causal,
+                    return_lse=False,
+                    out=out_trtllm,
+                    backend="trtllm-gen",
+                    skip_all_rows_active_check=True,
+                )
 
         # Compile both JIT paths and validate their launches before timing.
         run_kernel()
@@ -267,13 +355,14 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
                 out_fa4_bhsd, reference, atol=args.atol, rtol=args.rtol
             )
             kernel_ref_diff = (out.float() - reference.float()).abs().max().item()
-            fa4_ref_diff = (
+            baseline_ref_diff = (
                 out_fa4_bhsd.float() - reference.float()
             ).abs().max().item()
             print(
                 "[accuracy] PASS "
                 f"(kernel_ref={kernel_ref_diff:.6g}, "
-                f"fa4_ref={fa4_ref_diff:.6g}, kernel_fa4={max_diff:.6g})"
+                f"{self._baseline_key}_ref={baseline_ref_diff:.6g}, "
+                f"kernel_{self._baseline_key}={max_diff:.6g})"
             )
 
         kernel_stats = benchmark_with_stats(
@@ -293,8 +382,16 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
         return kernel_stats, baseline_stats, max_diff
 
     def run_with_args(self, args):
-        self._official_fa4_fwd, fa4_version = load_official_fa4()
-        print(f"[baseline] official FlashAttention-4 CuTe DSL {fa4_version}")
+        if args.baseline == "fa4":
+            self._official_fa4_fwd, baseline_version = load_official_fa4()
+            self._baseline_key = "fa4"
+            baseline_label = "FA4"
+            print(f"[baseline] official FlashAttention-4 CuTe DSL {baseline_version}")
+        else:
+            self._trtllm_gen_fwd, baseline_version = load_trtllm_gen()
+            self._baseline_key = "trtllm_gen"
+            baseline_label = "TRTLLM-Gen"
+            print(f"[baseline] official TRTLLM-Gen FMHA via FlashInfer {baseline_version}")
         if args.single:
             print("[mode] single shape (use no arguments for the default workload suite)")
         else:
@@ -306,7 +403,8 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
         columns = (
             ("mode", 10), ("B", 6), ("H", 6), ("Q", 8), ("KV", 8),
             ("D", 6), ("causal", 9), ("Kernel ms", 13), ("Kernel TF/s", 14),
-            ("FA4 ms", 11), ("FA4 TF/s", 12), ("vs FA4", 11), ("Diff", 12),
+            (f"{baseline_label} ms", 16), (f"{baseline_label} TF/s", 19),
+            (f"vs {baseline_label}", 16), ("Diff", 12),
             ("out tok/s", 16),
         ) + (sol_table_columns()[1:] if args.sol else ())
         table = TablePrinter(columns, debug=args.debug)
