@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark the BF16 FA4 MHA kernel on prefill and decode workloads.
+"""Benchmark the BF16 FA4 MHA kernel against the official FlashAttention-4.
 
 The default suite uses 32 attention heads and head dimension 128:
 
@@ -9,12 +9,18 @@ The default suite uses 32 attention heads and head dimension 128:
 Decode is deliberately non-causal. The kernel's causal mask is upper-left,
 so a one-token query would otherwise only attend KV position zero; non-causal
 Q=1 models the final token attending its complete KV cache.
+
+The baseline requires the official ``flash-attn-4`` package::
+
+    pip install "flash-attn-4[cu13]"
 """
 
 import argparse
 import math
 import sys
+import warnings
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import torch
@@ -38,6 +44,31 @@ PREFILL_LENGTHS = (1024, 2048, 4096, 8192)
 DECODE_BATCH_SIZES = (32, 64, 128)
 DEFAULT_HEADS = 32
 DEFAULT_HEAD_DIM = 128
+
+
+def load_official_fa4():
+    """Load the official CuTe DSL forward entry point only when requested."""
+    try:
+        from flash_attn.cute.interface import _flash_attn_fwd
+    except ImportError as exc:
+        raise SystemExit(
+            "the official FA4 baseline is not installed; run "
+            f"'{sys.executable} -m pip install \"flash-attn-4[cu13]\"'"
+        ) from exc
+
+    try:
+        package_version = version("flash-attn-4")
+    except PackageNotFoundError:
+        package_version = "unknown"
+
+    # FA4 4.0.0 beta 29 emits this CuTe adapter warning while compiling even
+    # though AuxData is registered and the resulting kernel launches correctly.
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Argument aux_data .*cannot be converted to a JitArgument.*",
+        category=UserWarning,
+    )
+    return _flash_attn_fwd, package_version
 
 
 @dataclass(frozen=True)
@@ -133,6 +164,12 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
         parser.add_argument("--head-dim", type=int, default=DEFAULT_HEAD_DIM)
         parser.add_argument("--causal", action="store_true")
         parser.add_argument("--scale", type=float, default=None)
+        parser.add_argument(
+            "--baseline",
+            choices=("fa4",),
+            default="fa4",
+            help="attention baseline (fa4 is the official CuTe DSL implementation)",
+        )
         self.add_timing_args(parser, warmup=5, iters=20, samples=7)
         self.add_sol_arg(parser)
         parser.add_argument("--debug", action="store_true", help="print benchmark records line by line")
@@ -174,6 +211,9 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
 
     @staticmethod
     def make_tensors(case):
+        # Our binding consumes BHSD while official FA4 consumes BSHD. Build the
+        # baseline inputs once, outside the timed region, with identical values
+        # and the contiguous layout expected by each implementation.
         q = torch.empty(
             (case.batch, case.heads, case.q_len, case.head_dim),
             device="cuda", dtype=torch.bfloat16,
@@ -183,28 +223,78 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
             device="cuda", dtype=torch.bfloat16,
         ).uniform_(-1, 1)
         v = torch.empty_like(k).uniform_(-1, 1)
-        return q, k, v, torch.empty_like(q)
+        q_fa4 = q.permute(0, 2, 1, 3).contiguous()
+        k_fa4 = k.permute(0, 2, 1, 3).contiguous()
+        v_fa4 = v.permute(0, 2, 1, 3).contiguous()
+        return (
+            q, k, v, torch.empty_like(q),
+            q_fa4, k_fa4, v_fa4, torch.empty_like(q_fa4),
+        )
 
     def run_case(self, case, args):
-        q, k, v, out = self.make_tensors(case)
+        q, k, v, out, q_fa4, k_fa4, v_fa4, out_fa4 = self.make_tensors(case)
         scale = args.scale if args.scale is not None else 1.0 / math.sqrt(case.head_dim)
 
-        def run():
+        def run_kernel():
             bf16_fa4_mha_out(q, k, v, out, causal=case.causal, scale=scale)
 
-        run()  # Compile and validate the launch before timing.
+        def run_baseline():
+            # Use FA4's official forward implementation directly so output is
+            # preallocated and allocation/autograd bookkeeping is not part of
+            # the comparison.
+            self._official_fa4_fwd(
+                q_fa4,
+                k_fa4,
+                v_fa4,
+                softmax_scale=scale,
+                causal=case.causal,
+                out=out_fa4,
+            )
+
+        # Compile both JIT paths and validate their launches before timing.
+        run_kernel()
+        run_baseline()
         torch.cuda.synchronize()
+
+        out_fa4_bhsd = out_fa4.permute(0, 2, 1, 3)
+        torch.testing.assert_close(out, out_fa4_bhsd, atol=args.atol, rtol=args.rtol)
+        max_diff = (out.float() - out_fa4_bhsd.float()).abs().max().item()
+
         if args.single and not args.no_accuracy:
             reference = reference_attention(q, k, v, causal=case.causal, scale=scale)
             torch.testing.assert_close(out, reference, atol=args.atol, rtol=args.rtol)
-            max_diff = (out.float() - reference.float()).abs().max().item()
-            print(f"[accuracy] PASS (max_abs_diff={max_diff:.6g})")
+            torch.testing.assert_close(
+                out_fa4_bhsd, reference, atol=args.atol, rtol=args.rtol
+            )
+            kernel_ref_diff = (out.float() - reference.float()).abs().max().item()
+            fa4_ref_diff = (
+                out_fa4_bhsd.float() - reference.float()
+            ).abs().max().item()
+            print(
+                "[accuracy] PASS "
+                f"(kernel_ref={kernel_ref_diff:.6g}, "
+                f"fa4_ref={fa4_ref_diff:.6g}, kernel_fa4={max_diff:.6g})"
+            )
 
-        return benchmark_with_stats(
-            run, args.warmup, args.iters, args.samples, cold_l2_flush=args._cold_l2_flush
+        kernel_stats = benchmark_with_stats(
+            run_kernel,
+            args.warmup,
+            args.iters,
+            args.samples,
+            cold_l2_flush=args._cold_l2_flush,
         )
+        baseline_stats = benchmark_with_stats(
+            run_baseline,
+            args.warmup,
+            args.iters,
+            args.samples,
+            cold_l2_flush=args._cold_l2_flush,
+        )
+        return kernel_stats, baseline_stats, max_diff
 
     def run_with_args(self, args):
+        self._official_fa4_fwd, fa4_version = load_official_fa4()
+        print(f"[baseline] official FlashAttention-4 CuTe DSL {fa4_version}")
         if args.single:
             print("[mode] single shape (use no arguments for the default workload suite)")
         else:
@@ -215,13 +305,16 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
 
         columns = (
             ("mode", 10), ("B", 6), ("H", 6), ("Q", 8), ("KV", 8),
-            ("D", 6), ("causal", 9), ("median ms", 13), ("TF/s mask", 12),
+            ("D", 6), ("causal", 9), ("Kernel ms", 13), ("Kernel TF/s", 14),
+            ("FA4 ms", 11), ("FA4 TF/s", 12), ("vs FA4", 11), ("Diff", 12),
             ("out tok/s", 16),
         ) + (sol_table_columns()[1:] if args.sol else ())
         table = TablePrinter(columns, debug=args.debug)
         table.print_header()
         for case in self.cases(args):
-            stats = self.run_case(case, args)
+            kernel_stats, baseline_stats, max_diff = self.run_case(case, args)
+            kernel_ms = kernel_stats["median_ms"]
+            baseline_ms = baseline_stats["median_ms"]
             values = (
                 case.name,
                 case.batch,
@@ -230,14 +323,18 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
                 case.kv_len,
                 case.head_dim,
                 str(case.causal),
-                f"{stats['median_ms']:.4f}",
-                f"{attention_tflops(case, stats['median_ms']):.3f}",
-                f"{output_tokens_per_second(case, stats['median_ms']):.0f}",
+                f"{kernel_ms:.4f}",
+                f"{attention_tflops(case, kernel_ms):.3f}",
+                f"{baseline_ms:.4f}",
+                f"{attention_tflops(case, baseline_ms):.3f}",
+                f"{baseline_ms / kernel_ms:.3f}x",
+                f"{max_diff:.6g}",
+                f"{output_tokens_per_second(case, kernel_ms):.0f}",
             )
             if args.sol:
                 values += sol_table_values(
                     attention_sol_bounds(case),
-                    stats["median_ms"],
+                    kernel_ms,
                 )[1:]
             table.print_row(*values)
 
