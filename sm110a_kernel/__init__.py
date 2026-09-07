@@ -27,6 +27,15 @@ from .kernels.bf16_fa4_mha import (
     compile_bf16_fa4_mha_configs,
     get_bf16_fa4_mha_module,
 )
+from .kernels.bf16_fa4_gqa import (
+    Bf16Fa4GqaConfig,
+    Bf16Fa4GqaTactic,
+    bf16_fa4_gqa,
+    bf16_fa4_gqa_out,
+    compile_bf16_fa4_gqa,
+    compile_bf16_fa4_gqa_configs,
+    get_bf16_fa4_gqa_module,
+)
 from .kernels.nvfp4_gemm import (
     Nvfp4GemmConfig,
     compile_nvfp4_gemm,
