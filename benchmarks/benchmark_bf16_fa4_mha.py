@@ -39,10 +39,8 @@ from common import (
     TablePrinter,
     benchmark_with_stats,
     sol_bounds,
-    sol_table_columns,
-    sol_table_values,
 )
-from sm110a_kernel import bf16_fa4_mha_out
+from sm110a_kernel import Bf16Fa4MhaTactic, bf16_fa4_mha_out
 
 
 PREFILL_LENGTHS = (1024, 2048, 4096, 8192, 16384)
@@ -136,10 +134,6 @@ def attention_tflops(case, elapsed_ms):
     return attention_flops(case) / (elapsed_ms * 1e9)
 
 
-def output_tokens_per_second(case, elapsed_ms):
-    return case.batch * case.q_len * 1e3 / elapsed_ms
-
-
 def attention_sol_bounds(case, *, tile_q=128, tile_kv=128):
     """Return a traffic-aware SOL model for this kernel's tiled dataflow.
 
@@ -206,6 +200,15 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
                 "TRTLLM-Gen FMHA via FlashInfer (default: fa4)"
             ),
         )
+        parser.add_argument(
+            "--tactic",
+            choices=("16warp", "12warp"),
+            default="16warp",
+            help=(
+                "kernel CTA schedule: 16-warp split softmax/rescale/TMA-store "
+                "warpgroups or 12-warp fused per-Q-slot warpgroups (default: 16warp)"
+            ),
+        )
         self.add_timing_args(parser, warmup=5, iters=20, samples=7)
         self.add_sol_arg(parser)
         parser.add_argument("--debug", action="store_true", help="print benchmark records line by line")
@@ -270,9 +273,14 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
     def run_case(self, case, args):
         q, k, v, out, q_fa4, k_fa4, v_fa4, out_fa4 = self.make_tensors(case)
         scale = args.scale if args.scale is not None else 1.0 / math.sqrt(case.head_dim)
+        tactic = (
+            Bf16Fa4MhaTactic.WARP_12
+            if args.tactic == "12warp"
+            else Bf16Fa4MhaTactic.WARP_16
+        )
 
         def run_kernel():
-            bf16_fa4_mha_out(q, k, v, out, causal=case.causal, scale=scale)
+            bf16_fa4_mha_out(q, k, v, out, causal=case.causal, scale=scale, tactic=tactic)
 
         if args.baseline == "fa4":
             def run_baseline():
@@ -399,14 +407,19 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
                 "[mode] default suite: 32 heads, head_dim=128; "
                 "prefill 1K-8K and decode KV=8K"
             )
+        print(f"[tactic] {args.tactic}")
 
         columns = (
-            ("mode", 10), ("B", 6), ("H", 6), ("Q", 8), ("KV", 8),
-            ("D", 6), ("causal", 9), ("Kernel ms", 13), ("Kernel TF/s", 14),
-            (f"{baseline_label} ms", 16), (f"{baseline_label} TF/s", 19),
-            (f"vs {baseline_label}", 16), ("Diff", 12),
-            ("out tok/s", 16),
-        ) + (sol_table_columns()[1:] if args.sol else ())
+            ("mode", 9),
+            ("shape [B,H,Q,KV,D]", 24),
+            ("mask", 7),
+            ("tactic", 10),
+            ("Kernel ms", 13),
+            ("Kernel TF/s", 14),
+            (f"{baseline_label} ms", 15),
+            (f"vs {baseline_label}", 12),
+            ("Diff", 12),
+        ) + ((("SOL selected(ms)", 17), ("SOL attainment", 15)) if args.sol else ())
         table = TablePrinter(columns, debug=args.debug)
         table.print_header()
         for case in self.cases(args):
@@ -415,25 +428,21 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
             baseline_ms = baseline_stats["median_ms"]
             values = (
                 case.name,
-                case.batch,
-                case.heads,
-                case.q_len,
-                case.kv_len,
-                case.head_dim,
-                str(case.causal),
+                f"{case.batch}x{case.heads}x{case.q_len}x{case.kv_len}x{case.head_dim}",
+                "causal" if case.causal else "noncausal",
+                args.tactic,
                 f"{kernel_ms:.4f}",
                 f"{attention_tflops(case, kernel_ms):.3f}",
                 f"{baseline_ms:.4f}",
-                f"{attention_tflops(case, baseline_ms):.3f}",
                 f"{baseline_ms / kernel_ms:.3f}x",
                 f"{max_diff:.6g}",
-                f"{output_tokens_per_second(case, kernel_ms):.0f}",
             )
             if args.sol:
-                values += sol_table_values(
-                    attention_sol_bounds(case),
-                    kernel_ms,
-                )[1:]
+                bounds = attention_sol_bounds(case)
+                values += (
+                    f"{bounds['sol_ms']:.4f}",
+                    f"{100.0 * bounds['sol_ms'] / kernel_ms:.1f}%",
+                )
             table.print_row(*values)
 
 

@@ -17,8 +17,14 @@ from .kernels.bf16_gemm import (
     get_bf16_gemm_module,
 )
 from .kernels.bf16_fa4_mha import (
+    Bf16Fa4MhaConfig,
+    Bf16Fa4MhaTactic,
+    TACTIC_12WARP,
+    TACTIC_16WARP,
     bf16_fa4_mha,
     bf16_fa4_mha_out,
+    compile_bf16_fa4_mha,
+    compile_bf16_fa4_mha_configs,
     get_bf16_fa4_mha_module,
 )
 from .kernels.nvfp4_gemm import (

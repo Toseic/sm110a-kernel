@@ -1,41 +1,100 @@
-"""Correctness-first BF16 MHA scaffold for future FA4 development."""
+"""Configuration-specialized BF16 FA4 MHA kernel.
+
+The tactic selects the CTA schedule and is baked in at JIT compile time via
+``-DSM110A_FA4_MHA_TACTIC``:
+
+* ``TACTIC_16WARP`` — 16 warps with dedicated softmax, O-rescale, and
+  TMA-store warpgroups.
+* ``TACTIC_12WARP`` — 12 warps with one fused softmax/rescale/epilogue
+  warpgroup per Q slot.
+"""
 
 from __future__ import annotations
 
 import math
-import os
+from dataclasses import dataclass
+from enum import IntEnum
 from pathlib import Path
+from typing import Iterable, Optional
+
+from ..jit_runtime import SplitCudaJit
 
 _ROOT = Path(__file__).resolve().parents[2]
+_SOURCE_DIR = _ROOT / "csrc/bf16_fa4/src"
+
+class Bf16Fa4MhaTactic(IntEnum):
+    """CTA schedules supported by the BF16 FA4 MHA kernel."""
+
+    WARP_16 = 0
+    WARP_12 = 1
 
 
-def _load_extension():
-    from torch.utils.cpp_extension import load
-
-    cuda_arch = os.environ.get("CUDA_ARCH", "sm_110a")
-    compute_arch = os.environ.get("COMPUTE_CUDA_ARCH", "compute_110a")
-    return load(
-        name=f"sm110a_bf16_fa4_mha_{cuda_arch}",
-        sources=[
-            str(_ROOT / "csrc/bf16_fa4/src/bf16_fa4_mha_torch_binding.cpp"),
-            str(_ROOT / "csrc/bf16_fa4/src/bf16_fa4_mha_kernel.cu"),
-        ],
-        extra_cuda_cflags=["-O3", "-lineinfo", f"-gencode=arch={compute_arch},code={cuda_arch}"],
-        extra_cflags=["-O3", "-std=c++17"],
-        extra_ldflags=["-lcuda"],
-        verbose=os.environ.get("SM110A_JIT_VERBOSE") == "1",
-    )
+# Short aliases keep the launch API convenient and preserve the initial
+# tactic-facing public API.
+TACTIC_16WARP = Bf16Fa4MhaTactic.WARP_16
+TACTIC_12WARP = Bf16Fa4MhaTactic.WARP_12
 
 
-_EXT = None
+@dataclass(frozen=True)
+class Bf16Fa4MhaConfig:
+    tactic: Bf16Fa4MhaTactic = TACTIC_16WARP
+
+    def __post_init__(self) -> None:
+        try:
+            tactic = Bf16Fa4MhaTactic(self.tactic)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("tactic must be 0 (16-warp) or 1 (12-warp)") from exc
+        object.__setattr__(self, "tactic", tactic)
+
+    def validate(self) -> None:
+        if not isinstance(self.tactic, Bf16Fa4MhaTactic):
+            raise TypeError("tactic must be a Bf16Fa4MhaTactic")
 
 
-def get_bf16_fa4_mha_module():
-    """Load the FA MHA CUDA extension on demand."""
-    global _EXT
-    if _EXT is None:
-        _EXT = _load_extension()
-    return _EXT
+class Bf16Fa4MhaModule:
+    def __init__(self, binding, library, config: Bf16Fa4MhaConfig):
+        self._binding, self._launcher, self._config = binding, library.entry_address, config
+
+    def fa_mha(self, q, k, v, causal=False, scale=1.0):
+        return self._binding.fa_mha(q, k, v, self._launcher, bool(causal), scale)
+
+    def fa_mha_out(self, q, k, v, out, causal=False, scale=1.0):
+        return self._binding.fa_mha_out(q, k, v, out, self._launcher, bool(causal), scale)
+
+
+def _kernel_cflags(config: Bf16Fa4MhaConfig, _variant) -> tuple[str, ...]:
+    return (f"-DSM110A_FA4_MHA_TACTIC={int(config.tactic)}",)
+
+
+_JIT = SplitCudaJit(
+    name="sm110a_bf16_fa4_mha", root=_ROOT,
+    binding_sources=(_SOURCE_DIR / "bf16_fa4_mha_torch_binding.cpp",),
+    kernel_sources=(_SOURCE_DIR / "bf16_fa4_mha_kernel.cu",),
+    kernel_dependencies=(),
+    kernel_symbol="sm110a_bf16_fa4_mha_launch", config_key=lambda config: config,
+    kernel_cflags=_kernel_cflags, make_facade=Bf16Fa4MhaModule,
+)
+
+
+def compile_bf16_fa4_mha(config: Optional[Bf16Fa4MhaConfig] = None) -> Bf16Fa4MhaModule:
+    config = config or Bf16Fa4MhaConfig()
+    if not isinstance(config, Bf16Fa4MhaConfig):
+        raise TypeError("config must be a Bf16Fa4MhaConfig")
+    config.validate()
+    return _JIT.compile(config)
+
+
+def compile_bf16_fa4_mha_configs(configs: Iterable[Bf16Fa4MhaConfig], max_workers=None):
+    configs = tuple(configs)
+    for config in configs:
+        if not isinstance(config, Bf16Fa4MhaConfig):
+            raise TypeError("configs must contain Bf16Fa4MhaConfig instances")
+        config.validate()
+    return _JIT.compile_many(configs, max_workers)
+
+
+def get_bf16_fa4_mha_module(config: Optional[Bf16Fa4MhaConfig] = None):
+    return compile_bf16_fa4_mha(config)
 
 
 def _resolve_scale(q, scale):
@@ -47,15 +106,23 @@ def _resolve_scale(q, scale):
     return scale
 
 
-def bf16_fa4_mha(q, k, v, *, causal=False, scale=None):
+def _config_for(
+    tactic: int | Bf16Fa4MhaTactic | Bf16Fa4MhaConfig,
+) -> Bf16Fa4MhaConfig:
+    if isinstance(tactic, Bf16Fa4MhaConfig):
+        return tactic
+    return Bf16Fa4MhaConfig(tactic=tactic)
+
+
+def bf16_fa4_mha(q, k, v, *, causal=False, scale=None, tactic=TACTIC_16WARP):
     """Compute BF16 MHA for contiguous `[B, H, S, D]` CUDA tensors."""
-    return get_bf16_fa4_mha_module().fa_mha(
+    return compile_bf16_fa4_mha(_config_for(tactic)).fa_mha(
         q, k, v, bool(causal), _resolve_scale(q, scale)
     )
 
 
-def bf16_fa4_mha_out(q, k, v, out, *, causal=False, scale=None):
+def bf16_fa4_mha_out(q, k, v, out, *, causal=False, scale=None, tactic=TACTIC_16WARP):
     """Write BF16 FA MHA to a caller-provided contiguous output."""
-    return get_bf16_fa4_mha_module().fa_mha_out(
+    return compile_bf16_fa4_mha(_config_for(tactic)).fa_mha_out(
         q, k, v, out, bool(causal), _resolve_scale(q, scale)
     )

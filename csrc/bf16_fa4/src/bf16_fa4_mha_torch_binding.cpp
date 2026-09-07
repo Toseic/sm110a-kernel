@@ -1,17 +1,19 @@
+#include <cmath>
+#include <cstdint>
+
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
+#include <cuda_runtime.h>
 #include <torch/extension.h>
 
-#include <cmath>
-
-cudaError_t bf16_fa4_mha_cuda(
-    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
-    __nv_bfloat16* out, int batch, int heads, int query_len, int key_len,
-    int head_dim, float scale, bool causal, cudaStream_t stream);
-
 namespace {
+
+using FaMhaLauncher = cudaError_t (*)(const __nv_bfloat16*, const __nv_bfloat16*,
+                                      const __nv_bfloat16*, __nv_bfloat16*, int,
+                                      int, int, int, int, float, bool,
+                                      cudaStream_t);
 
 void check_qkv(const torch::Tensor& q, const torch::Tensor& k,
                const torch::Tensor& v) {
@@ -43,40 +45,44 @@ void check_out(const torch::Tensor& out, const torch::Tensor& q) {
               "out must have the same device and shape as Q");
 }
 
-torch::Tensor fa_mha_out(torch::Tensor q, torch::Tensor k,
-                                  torch::Tensor v, torch::Tensor out,
-                                  bool causal, double scale) {
+torch::Tensor run_out(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+                      torch::Tensor out, uint64_t launcher_address, bool causal,
+                      double scale) {
+  TORCH_CHECK(launcher_address != 0, "FA MHA launcher is null");
   check_qkv(q, k, v);
   check_out(out, q);
   TORCH_CHECK(std::isfinite(scale) && scale > 0.0,
               "scale must be finite and positive");
   c10::cuda::CUDAGuard device_guard(q.device());
   const auto stream = c10::cuda::getCurrentCUDAStream(q.device().index());
-  C10_CUDA_CHECK(bf16_fa4_mha_cuda(
+  const auto launcher =
+      reinterpret_cast<FaMhaLauncher>(static_cast<uintptr_t>(launcher_address));
+  C10_CUDA_CHECK(launcher(
       reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
       reinterpret_cast<const __nv_bfloat16*>(k.data_ptr<at::BFloat16>()),
       reinterpret_cast<const __nv_bfloat16*>(v.data_ptr<at::BFloat16>()),
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
-      q.size(0), q.size(1), q.size(2), k.size(2), q.size(3),
-      static_cast<float>(scale), causal, stream));
+      static_cast<int>(q.size(0)), static_cast<int>(q.size(1)),
+      static_cast<int>(q.size(2)), static_cast<int>(k.size(2)),
+      static_cast<int>(q.size(3)), static_cast<float>(scale), causal, stream));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
 
 torch::Tensor fa_mha(torch::Tensor q, torch::Tensor k, torch::Tensor v,
-                              bool causal, double scale) {
-  auto out = torch::empty_like(q);
-  return fa_mha_out(q, k, v, out, causal, scale);
+                     uint64_t launcher, bool causal, double scale) {
+  return run_out(q, k, v, torch::empty_like(q), launcher, causal, scale);
+}
+
+torch::Tensor fa_mha_out(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+                         torch::Tensor out, uint64_t launcher, bool causal,
+                         double scale) {
+  return run_out(q, k, v, out, launcher, causal, scale);
 }
 
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("fa_mha", &fa_mha, "BF16 FA MHA (CUDA)",
-        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false,
-        py::arg("scale") = 1.0);
-  m.def("fa_mha_out", &fa_mha_out,
-        "BF16 FA MHA out (CUDA)", py::arg("q"), py::arg("k"),
-        py::arg("v"), py::arg("out"), py::arg("causal") = false,
-        py::arg("scale") = 1.0);
+  m.def("fa_mha", &fa_mha);
+  m.def("fa_mha_out", &fa_mha_out);
 }
