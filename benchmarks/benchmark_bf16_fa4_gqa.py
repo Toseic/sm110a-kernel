@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Benchmark the BF16 FA4-style GQA kernel against official FlashAttention-4.
 
-The kernel uses BHSD tensors: Q is ``[B, Hq, Q, D]`` and K/V are
-``[B, Hkv, KV, D]``.  ``Hq`` must be divisible by ``Hkv``.  This first GQA
-implementation deliberately launches one CTA per query head and therefore
-reloads the corresponding K/V head for every member of a GQA group.
+The prefill kernel uses BHSD tensors: Q is ``[B, Hq, Q, D]`` and K/V are
+``[B, Hkv, KV, D]``. It is specialized for ``Hq / Hkv == 4`` and multicasts
+each K/V tile across the four query-head CTAs in a cluster.
 """
 
 import argparse
@@ -50,12 +49,11 @@ def attention_flops(case):
 
 
 def attention_sol_bounds(case, *, tile_q=128, tile_kv=128):
-    """Traffic-aware SOL for the deliberately unoptimized GQA schedule.
+    """Traffic-aware SOL for the cluster-multicast GQA schedule.
 
     Compulsory traffic counts the physical GQA inputs once: there are Hq Q
-    heads but only Hkv K/V heads.  The tiled traffic describes this kernel as
-    implemented: every Q-head CTA independently TMA-loads K and V for every
-    KV tile it visits, including duplicate loads by heads in one GQA group.
+    heads but only Hkv K/V heads. Each cluster loads a visited K/V tile once
+    and TMA multicasts it to the four query-head CTAs.
     """
     element_bytes = 2  # BF16 Q, K, V, O
     q_bytes = element_bytes * case.batch * case.q_heads * case.q_len * case.head_dim
@@ -72,13 +70,11 @@ def attention_sol_bounds(case, *, tile_q=128, tile_kv=128):
         else:
             kv_tiles_per_query_head += kv_tile_count
 
-    # Both K and V are loaded for each visited tile. Hq, rather than Hkv, is
-    # intentional: this is the repeated-load baseline, not a shared-K/V GQA
-    # optimization model.
+    # Both K and V are loaded once per KV-head cluster for each visited tile.
     kv_tile_bytes = 2 * element_bytes * tile_kv * case.head_dim
     tile_read_bytes = (
         q_bytes
-        + case.batch * case.q_heads * kv_tiles_per_query_head * kv_tile_bytes
+        + case.batch * case.kv_heads * kv_tiles_per_query_head * kv_tile_bytes
     )
     return sol_bounds(
         attention_flops(case),
@@ -142,8 +138,10 @@ class Bf16Fa4GqaBenchmark(BenchmarkBase):
     def validate_args(self, args):
         if min(args.batch, args.q_heads, args.kv_heads, args.q_len, args.kv_len, args.head_dim) <= 0:
             raise SystemExit("all dimensions must be positive")
-        if args.q_heads % args.kv_heads:
-            raise SystemExit("--q-heads must be divisible by --kv-heads")
+        if args.q_heads != 4 * args.kv_heads:
+            raise SystemExit("this kernel requires --q-heads == 4 * --kv-heads")
+        if args.q_len < 128:
+            raise SystemExit("this prefill kernel requires --q-len >= 128")
         if args.scale is not None and (not math.isfinite(args.scale) or args.scale <= 0):
             raise SystemExit("--scale must be finite and positive")
         self.validate_timing_args(args, allow_zero_warmup=True)
@@ -154,12 +152,9 @@ class Bf16Fa4GqaBenchmark(BenchmarkBase):
             yield GqaCase("single", args.batch, args.q_heads, args.kv_heads, args.q_len,
                           args.kv_len, args.head_dim, args.causal)
             return
-        # Keep the exact sequence-length suite used by benchmark_bf16_fa4_mha:
-        # causal prefill at 1K..16K and full-cache non-causal decode at 8K.
+        # Decode is intentionally excluded until it gets a dedicated schedule.
         for seq_len in (1024, 2048, 4096, 8192, 16384):
             yield GqaCase("prefill", 1, 32, 8, seq_len, seq_len, 128, True)
-        for batch in (32, 64, 128):
-            yield GqaCase("decode", batch, 32, 8, 1, 8192, 128, False)
 
     def run_with_args(self, args):
         tactic = Bf16Fa4GqaTactic.WARP_12 if args.tactic == "12warp" else Bf16Fa4GqaTactic.WARP_16

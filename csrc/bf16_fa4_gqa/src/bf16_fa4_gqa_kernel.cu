@@ -18,6 +18,9 @@ namespace {
 
 constexpr int kFaMhaTactic16Warp = 0;
 constexpr int kFaMhaTactic12Warp = 1;
+// This kernel is intentionally specialized for the common 4:1 GQA layout.
+// One cluster contains the four Q heads which consume the same K/V head.
+constexpr int kGqaGroupSize = 4;
 static_assert(SM110A_FA4_MHA_TACTIC == kFaMhaTactic16Warp ||
                   SM110A_FA4_MHA_TACTIC == kFaMhaTactic12Warp,
     "SM110A_FA4_MHA_TACTIC must be 0 (16-warp) or 1 (12-warp)");
@@ -85,6 +88,80 @@ __device__ inline void tma_4d_gmem2smem(
         "r"(w),
         "r"(mbar_addr)
         : "memory");
+}
+
+template <int ClusterSize>
+__device__ inline void tma_4d_gmem2smem_multicast(
+    int dst,
+    const void *tmap_ptr,
+    int x,
+    int y,
+    int z,
+    int w,
+    int mbar_addr,
+    int16_t cta_mask) {
+    static_assert(ClusterSize == 4, "this GQA multicast path is specialized for G=4");
+    asm volatile(
+        "cp.async.bulk.tensor.4d.shared::cluster.global."
+        // cta_group describes the consuming tcgen05 MMA group, not the
+        // multicast width.  The attention MMAs are CTA-group 1; the four
+        // destinations are selected solely by cta_mask.
+        "mbarrier::complete_tx::bytes.multicast::cluster.cta_group::1 "
+        "[%0], [%1, {%2, %3, %4, %5}], [%6], %7;" ::
+            "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(w),
+            "r"(mbar_addr), "h"(cta_mask)
+        : "memory");
+}
+
+__device__ inline int cluster_cta_rank() {
+    int rank;
+    asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(rank));
+    return rank;
+}
+
+__device__ inline int map_shared_to_cluster_cta(int local_addr, int cta_rank) {
+    int remote_addr;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;"
+                 : "=r"(remote_addr)
+                 : "r"(local_addr), "r"(cta_rank));
+    return remote_addr;
+}
+
+__device__ inline void mbarrier_expect_tx_on_cluster_cta(
+    int local_mbar_addr,
+    int cta_rank,
+    int transaction_bytes) {
+    const int target_mbar_addr = cluster_cta_rank() == cta_rank
+        ? local_mbar_addr
+        : map_shared_to_cluster_cta(local_mbar_addr, cta_rank);
+    asm volatile(
+        "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;" : :
+            "r"(target_mbar_addr), "r"(transaction_bytes)
+        : "memory");
+}
+
+template <int ClusterSize>
+__device__ inline void mbarrier_expect_tx_cluster(
+    int local_mbar_addr,
+    int transaction_bytes) {
+#pragma unroll
+    for (int cta_rank = 0; cta_rank < ClusterSize; ++cta_rank) {
+        mbarrier_expect_tx_on_cluster_cta(local_mbar_addr, cta_rank, transaction_bytes);
+    }
+}
+
+__device__ inline void mbarrier_expect_tx(
+    int mbar_addr,
+    int transaction_bytes) {
+    asm volatile(
+        "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;" : :
+            "r"(mbar_addr), "r"(transaction_bytes)
+        : "memory");
+}
+
+__device__ inline void cluster_sync() {
+    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 }
 
 __device__ inline void tma_4d_smem2gmem(
@@ -439,6 +516,23 @@ __device__ inline void tcgen05_commit_mbarrier(
         : "memory");
 }
 
+__device__ inline void tcgen05_commit_mbarrier_multicast(
+    int mbar_addr,
+    int16_t cta_mask) {
+    asm volatile(
+        "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.multicast:"
+        ":cluster.b64 [%0], %1;" : : "r"(mbar_addr), "h"(cta_mask)
+        : "memory");
+}
+
+__device__ inline void tcgen05_commit_stage_reuse(
+    int local_mbar_addr,
+    int leader_mbar_addr) {
+    constexpr int16_t kLeaderCtaMask = 1;
+    tcgen05_commit_mbarrier(local_mbar_addr);
+    tcgen05_commit_mbarrier_multicast(leader_mbar_addr, kLeaderCtaMask);
+}
+
 __device__ inline void mbarrier_arrive(
     int mbar_addr) {
     asm volatile("mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];" ::"r"(mbar_addr)
@@ -554,8 +648,8 @@ inline cudaError_t init_qkv_tmaps(
 
 // A CTA owns two independent Q tiles for one head.  K/V are shared between
 // those slots; S is transient, while each slot's unnormalized O stays in TMEM.
-template <int TileQ, int TileKV, int QSlots, int KvStages, int HeadDim>
-__global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
+template <int TileQ, int TileKV, int QSlots, int KvStages, int HeadDim, int GqaGroupSize>
+__global__ __cluster_dims__(GqaGroupSize, 1, 1) __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
     const __grid_constant__ CUtensorMap q_tmap,
     const __grid_constant__ CUtensorMap k_tmap,
     const __grid_constant__ CUtensorMap v_tmap,
@@ -593,6 +687,11 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
     __shared__ __align__(8) uint64_t q_prologue_mbars[QSlots];
     __shared__ __align__(8) uint64_t tma1_mbars[KvStages];
     __shared__ __align__(8) uint64_t tma2_mbars[KvStages];
+    // Every QK/PV completion contributes directly to rank 0's stage-reuse
+    // barrier. The leader may overwrite K/V only after all cluster CTAs and
+    // both resident Q slots have completed their corresponding MMA.
+    __shared__ __align__(8) uint64_t cluster_k_ready_mbars[KvStages];
+    __shared__ __align__(8) uint64_t cluster_v_ready_mbars[KvStages];
     __shared__ __align__(8) uint64_t mma1_mbars[QSlots][KvStages];
     __shared__ __align__(8) uint64_t mma2_mbars[QSlots][KvStages];
     __shared__ __align__(8) uint64_t softmax_mbars[QSlots][KvStages];
@@ -634,10 +733,15 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
     const int tid = threadIdx.x;
     const int warp_idx = threadIdx.x / kWarpSize;
     const int lane_idx = threadIdx.x % kWarpSize;
+    const int cta_rank = cluster_cta_rank();
 
     const int q_prologue_mbar_base = static_cast<int>(__cvta_generic_to_shared(q_prologue_mbars));
     const int tma1_mbar_base = static_cast<int>(__cvta_generic_to_shared(tma1_mbars));
     const int tma2_mbar_base = static_cast<int>(__cvta_generic_to_shared(tma2_mbars));
+    const int cluster_k_ready_mbar_base =
+        static_cast<int>(__cvta_generic_to_shared(cluster_k_ready_mbars));
+    const int cluster_v_ready_mbar_base =
+        static_cast<int>(__cvta_generic_to_shared(cluster_v_ready_mbars));
     const int mma1_mbar_base = static_cast<int>(__cvta_generic_to_shared(mma1_mbars));
     const int mma2_mbar_base = static_cast<int>(__cvta_generic_to_shared(mma2_mbars));
     const int softmax_mbar_base = static_cast<int>(__cvta_generic_to_shared(softmax_mbars));
@@ -673,6 +777,14 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
                 mbarrier_init(rescale_mbar_base + q_offset, kRescaleMbarArrivalCount);
             }
         }
+        if (cta_rank == 0) {
+            for (int stage = 0; stage < KvStages; ++stage) {
+                mbarrier_init(cluster_k_ready_mbar_base + stage * sizeof(uint64_t),
+                    GqaGroupSize * QSlots);
+                mbarrier_init(cluster_v_ready_mbar_base + stage * sizeof(uint64_t),
+                    GqaGroupSize * QSlots);
+            }
+        }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     if (warp_idx == kTmaLoadWarp && lane_idx == 0) {
@@ -684,6 +796,9 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
         prefetch_tensormap(&out_tmap);
     }
     __syncthreads();
+    // Make every peer's same-offset mbarriers visible before any remote
+    // arrive or multicast can target them.
+    cluster_sync();
 
     // S0/S1 are temporary score/probability tiles. O0/O1 are the two long-lived
     // unnormalized accumulators, one per resident Q slot.
@@ -704,7 +819,7 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
         // the allocation itself remains live until tcgen05.dealloc below.
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
     }
-    __syncthreads();
+    cluster_sync();
 
     // K/V share one stage ring; Q slots have fixed shared-memory and TMEM banks.
     const int q_smem_addr = static_cast<int>(__cvta_generic_to_shared(q_smem));
@@ -715,17 +830,19 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
     // Launch assigns exactly one adjacent Q-tile pair to each CTA.
     const int q_tile_count = (query_len + TileQ - 1) / TileQ;
     const int q_pair_count = (q_tile_count + QSlots - 1) / QSlots;
-    const int total_task_count = q_pair_count * batch * heads;
-    const int task_id = blockIdx.x;
+    const int total_task_count = q_pair_count * batch * kv_heads;
+    const int task_id = blockIdx.x / GqaGroupSize;
     if (task_id >= total_task_count) {
         return;
     }
     const int kv_tile_count = (key_len + TileKV - 1) / TileKV;
-    const int bh = task_id / q_pair_count;
-    const int batch_idx = bh / heads;
-    const int query_head = bh - batch_idx * heads;
-    const int kv_bh = batch_idx * kv_heads + query_head / (heads / kv_heads);
-    const int q_pair_idx = task_id - bh * q_pair_count;
+    const int cluster_bh = task_id / q_pair_count;
+    const int batch_idx = cluster_bh / kv_heads;
+    const int kv_head = cluster_bh - batch_idx * kv_heads;
+    const int query_head = kv_head * GqaGroupSize + cta_rank;
+    const int bh = batch_idx * heads + query_head;
+    const int kv_bh = batch_idx * kv_heads + kv_head;
+    const int q_pair_idx = task_id - cluster_bh * q_pair_count;
     const int q_tile_start[QSlots] = {
         (q_pair_idx * QSlots + 0) * TileQ,
         (q_pair_idx * QSlots + 1) * TileQ,
@@ -915,101 +1032,71 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
         return;
     }
 
-    // The sole load warp owns Q, K, and V TMA traffic. For each KV tile it
-    // loads K, waits until both QK operations release the aliased stage, then
-    // overwrites that stage with V. Before ring reuse, both prior PV users
-    // must have completed.
+    // Every CTA loads private Q. Rank 0 owns multicast K/V traffic and rearms
+    // all destination barriers after the cluster's MMA completion token.
     if (warp_idx == kTmaLoadWarp) {
         if (lane_idx == 0) {
+            constexpr int16_t kGqaClusterMask = (1 << GqaGroupSize) - 1;
+            int cluster_k_ready_phase[KvStages] = {};
+            int cluster_v_ready_phase[KvStages] = {};
             const int q_transaction_bytes = TileQ * HeadDim * sizeof(__nv_bfloat16);
             for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
                 const int q_mbar_addr = q_prologue_mbar_base + q_slot * sizeof(uint64_t);
-                const int q_transaction_mbar_addr = q_mbar_addr & 0xFEFFFFFF;
-                asm volatile(
-                    "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;" ::"r"(
-                        q_transaction_mbar_addr),
-                    "r"(q_transaction_bytes)
-                    : "memory");
+                mbarrier_expect_tx(q_mbar_addr, q_transaction_bytes);
                 tma_4d_gmem2smem(q_smem_addr + q_slot * TileQ * HeadDim * sizeof(__nv_bfloat16),
                     &q_tmap,
                     0,
                     q_tile_start[q_slot],
                     0,
                     bh,
-                    q_transaction_mbar_addr);
+                    q_mbar_addr);
             }
-            const int transaction_bytes = TileKV * HeadDim * sizeof(__nv_bfloat16);
             // Fill both K stages before waiting for QK. This lets K(i + 1)
             // transfer while the tensor core and softmax pipeline consume i.
             const int k_prologue_tiles =
                 task_kv_tile_count < KvStages ? task_kv_tile_count : KvStages;
+            const int transaction_bytes = TileKV * HeadDim * sizeof(__nv_bfloat16);
             for (int kv_tile = 0; kv_tile < k_prologue_tiles; ++kv_tile) {
                 const int stage = kv_tile;
-                const int k_addr = tma1_mbar_base + stage * sizeof(uint64_t);
-                const int k_tx_addr = k_addr & 0xFEFFFFFF;
-                asm volatile(
-                    "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;" ::"r"(
-                        k_tx_addr),
-                    "r"(transaction_bytes)
-                    : "memory");
-                tma_4d_gmem2smem(kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16),
-                    &k_tmap,
-                    0,
-                    kv_tile * TileKV,
-                    0,
-                    kv_bh,
-                    k_tx_addr);
+                const int k_tx_addr = tma1_mbar_base + stage * sizeof(uint64_t);
+                if (cta_rank == 0) {
+                    mbarrier_expect_tx_cluster<GqaGroupSize>(k_tx_addr, transaction_bytes);
+                    tma_4d_gmem2smem_multicast<GqaGroupSize>(
+                        kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16),
+                        &k_tmap, 0, kv_tile * TileKV, 0, kv_bh, k_tx_addr, kGqaClusterMask);
+                }
             }
 
             for (int kv_tile = 0; kv_tile < task_kv_tile_count; ++kv_tile) {
                 const int stage = kv_tile % KvStages;
-                const int mma1_phase = (kv_tile / KvStages) & 1;
-                for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
-                    const int addr =
-                        mma1_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t);
-                    mbarrier_wait(addr, mma1_phase);
+                const int v_tx_addr = tma2_mbar_base + stage * sizeof(uint64_t);
+                if (cta_rank == 0) {
+                    mbarrier_wait(cluster_k_ready_mbar_base + stage * sizeof(uint64_t),
+                        cluster_k_ready_phase[stage]);
+                    cluster_k_ready_phase[stage] ^= 1;
+                    mbarrier_expect_tx_cluster<GqaGroupSize>(v_tx_addr, transaction_bytes);
+                    tma_4d_gmem2smem_multicast<GqaGroupSize>(
+                        kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16),
+                        &v_tmap, 0, kv_tile * TileKV, 0, kv_bh, v_tx_addr, kGqaClusterMask);
                 }
-                const int v_addr = tma2_mbar_base + stage * sizeof(uint64_t);
-                const int v_tx_addr = v_addr & 0xFEFFFFFF;
-                asm volatile(
-                    "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;" ::"r"(
-                        v_tx_addr),
-                    "r"(transaction_bytes)
-                    : "memory");
-                tma_4d_gmem2smem(kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16),
-                    &v_tmap,
-                    0,
-                    kv_tile * TileKV,
-                    0,
-                    kv_bh,
-                    v_tx_addr);
 
                 // Once both PV consumers release V(i), immediately refill
                 // that stage with K(i + 2). The other K stage was prefetched
                 // already, so the MMA issuer need not wait on this recycle.
                 const int next_k_tile = kv_tile + KvStages;
                 if (next_k_tile < task_kv_tile_count) {
-                    const int recycle_phase = (kv_tile / KvStages) & 1;
-                    for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
-                        const int addr =
-                            mma2_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t);
-                        mbarrier_wait(addr, recycle_phase);
+                    const int next_k_tx_addr = tma1_mbar_base + stage * sizeof(uint64_t);
+                    if (cta_rank == 0) {
+                        mbarrier_wait(cluster_v_ready_mbar_base + stage * sizeof(uint64_t),
+                            cluster_v_ready_phase[stage]);
+                        cluster_v_ready_phase[stage] ^= 1;
+                        mbarrier_expect_tx_cluster<GqaGroupSize>(
+                            next_k_tx_addr, transaction_bytes);
+                        tma_4d_gmem2smem_multicast<GqaGroupSize>(
+                            kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16),
+                            &k_tmap, 0, next_k_tile * TileKV, 0, kv_bh, next_k_tx_addr,
+                            kGqaClusterMask);
                     }
-                    const int next_k_addr = tma1_mbar_base + stage * sizeof(uint64_t);
-                    const int next_k_tx_addr = next_k_addr & 0xFEFFFFFF;
-                    asm volatile(
-                        "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;" ::
-                            "r"(next_k_tx_addr),
-                            "r"(transaction_bytes)
-                        : "memory");
-                    tma_4d_gmem2smem(
-                        kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16),
-                        &k_tmap,
-                        0,
-                        next_k_tile * TileKV,
-                        0,
-                        kv_bh,
-                        next_k_tx_addr);
                 }
             }
         }
@@ -1077,8 +1164,9 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
                                 kQkInstrDesc,
                                 d64 != 0 || d16 != 0);
                         }
-                    tcgen05_commit_mbarrier(
-                        mma1_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t));
+                    tcgen05_commit_stage_reuse(
+                        mma1_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t),
+                        cluster_k_ready_mbar_base + stage * sizeof(uint64_t));
                 }
 
                 // P1(i - 1).  There is intentionally no P1 in the prologue.
@@ -1105,8 +1193,9 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
                             pv_instr_desc,
                             pv_tile != 0 || k16 != 0);
                     }
-                    tcgen05_commit_mbarrier(
-                        mma2_mbar_base + (q_slot * KvStages + pv_stage) * sizeof(uint64_t));
+                    tcgen05_commit_stage_reuse(
+                        mma2_mbar_base + (q_slot * KvStages + pv_stage) * sizeof(uint64_t),
+                        cluster_v_ready_mbar_base + pv_stage * sizeof(uint64_t));
                 }
 
                 // Q1(i).
@@ -1120,11 +1209,12 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
                             tcgen05_mma_bf16(s_addr,
                                 make_128b_swizzle_desc(q_addr + d64 * TileQ * 128 + d16 * 32),
                                 make_128b_swizzle_desc(k_addr + d64 * TileKV * 128 + d16 * 32),
-                                kQkInstrDesc,
-                                d64 != 0 || d16 != 0);
+                            kQkInstrDesc,
+                            d64 != 0 || d16 != 0);
                         }
-                    tcgen05_commit_mbarrier(
-                        mma1_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t));
+                    tcgen05_commit_stage_reuse(
+                        mma1_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t),
+                        cluster_k_ready_mbar_base + stage * sizeof(uint64_t));
                 }
 
                 // P0(i).
@@ -1148,8 +1238,9 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
                             pv_instr_desc,
                             kv_tile != 0 || k16 != 0);
                     }
-                    tcgen05_commit_mbarrier(
-                        mma2_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t));
+                    tcgen05_commit_stage_reuse(
+                        mma2_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t),
+                        cluster_v_ready_mbar_base + stage * sizeof(uint64_t));
                 }
             }
 
@@ -1176,8 +1267,9 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
                         pv_instr_desc,
                         pv_tile != 0 || k16 != 0);
                 }
-                tcgen05_commit_mbarrier(
-                    mma2_mbar_base + (q_slot * KvStages + pv_stage) * sizeof(uint64_t));
+                tcgen05_commit_stage_reuse(
+                    mma2_mbar_base + (q_slot * KvStages + pv_stage) * sizeof(uint64_t),
+                    cluster_v_ready_mbar_base + pv_stage * sizeof(uint64_t));
             }
             // A fresh, non-ring completion point protects the final O from
             // parity wraparound on the recycled mma2 barriers.
@@ -3304,8 +3396,10 @@ template <int TileQ, int TileKV, int QSlots, int KvStages> struct FaMhaSmemLayou
 
 // A CTA owns two independent Q tiles for one head.  K/V are shared between
 // those slots; S is transient, while each slot's unnormalized O stays in TMEM.
-template <int TileQ, int TileKV, int QSlots, int KvStages, int HeadDim>
-__global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_constant__ CUtensorMap q_tmap,
+template <int TileQ, int TileKV, int QSlots, int KvStages, int HeadDim, int GqaGroupSize>
+__global__ __cluster_dims__(GqaGroupSize, 1, 1)
+__launch_bounds__(384, 1) void fa_mha_kernel_wg12(
+    const __grid_constant__ CUtensorMap q_tmap,
     const __grid_constant__ CUtensorMap k_tmap,
     const __grid_constant__ CUtensorMap v_tmap,
     __nv_bfloat16 *__restrict__ out,
@@ -3341,6 +3435,8 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
     __shared__ __align__(8) uint64_t q_prologue_mbars[QSlots];
     __shared__ __align__(8) uint64_t tma1_mbars[KvStages];
     __shared__ __align__(8) uint64_t tma2_mbars[KvStages];
+    __shared__ __align__(8) uint64_t cluster_k_ready_mbars[KvStages];
+    __shared__ __align__(8) uint64_t cluster_v_ready_mbars[KvStages];
     __shared__ __align__(8) uint64_t mma1_mbars[QSlots][KvStages];
     __shared__ __align__(8) uint64_t mma2_mbars[QSlots][KvStages];
     __shared__ __align__(8) uint64_t rescale_mbars[QSlots][KvStages];
@@ -3371,10 +3467,15 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
     const int tid = threadIdx.x;
     const int warp_idx = threadIdx.x / kWarpSize;
     const int lane_idx = threadIdx.x % kWarpSize;
+    const int cta_rank = cluster_cta_rank();
 
     const int q_prologue_mbar_base = static_cast<int>(__cvta_generic_to_shared(q_prologue_mbars));
     const int tma1_mbar_base = static_cast<int>(__cvta_generic_to_shared(tma1_mbars));
     const int tma2_mbar_base = static_cast<int>(__cvta_generic_to_shared(tma2_mbars));
+    const int cluster_k_ready_mbar_base =
+        static_cast<int>(__cvta_generic_to_shared(cluster_k_ready_mbars));
+    const int cluster_v_ready_mbar_base =
+        static_cast<int>(__cvta_generic_to_shared(cluster_v_ready_mbars));
     const int mma1_mbar_base = static_cast<int>(__cvta_generic_to_shared(mma1_mbars));
     const int mma2_mbar_base = static_cast<int>(__cvta_generic_to_shared(mma2_mbars));
     const int rescale_mbar_base = static_cast<int>(__cvta_generic_to_shared(rescale_mbars));
@@ -3402,6 +3503,14 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
                 mbarrier_init(rescale_mbar_base + q_offset, kRescaleMbarArrivalCount);
             }
         }
+        if (cta_rank == 0) {
+            for (int stage = 0; stage < KvStages; ++stage) {
+                mbarrier_init(cluster_k_ready_mbar_base + stage * sizeof(uint64_t),
+                    GqaGroupSize * QSlots);
+                mbarrier_init(cluster_v_ready_mbar_base + stage * sizeof(uint64_t),
+                    GqaGroupSize * QSlots);
+            }
+        }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     if (warp_idx == kQPrologueWarp && lane_idx == 0) {
@@ -3414,6 +3523,7 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
         prefetch_tensormap(&v_tmap);
     }
     __syncthreads();
+    cluster_sync();
 
     // Q has independent completion barriers, so launch its cold transfers
     // before TMEM allocation.  The MMA warp still waits on those barriers
@@ -3421,17 +3531,19 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
     const int q_smem_addr = static_cast<int>(__cvta_generic_to_shared(q_smem));
     const int q_tile_count = (query_len + TileQ - 1) / TileQ;
     const int q_pair_count = (q_tile_count + QSlots - 1) / QSlots;
-    const int total_task_count = q_pair_count * batch * heads;
-    const int task_id = blockIdx.x;
+    const int total_task_count = q_pair_count * batch * kv_heads;
+    const int task_id = blockIdx.x / GqaGroupSize;
     if (task_id >= total_task_count) {
         return;
     }
     const int kv_tile_count = (key_len + TileKV - 1) / TileKV;
-    const int bh = task_id / q_pair_count;
-    const int batch_idx = bh / heads;
-    const int query_head = bh - batch_idx * heads;
-    const int kv_bh = batch_idx * kv_heads + query_head / (heads / kv_heads);
-    const int q_pair_idx = task_id - bh * q_pair_count;
+    const int cluster_bh = task_id / q_pair_count;
+    const int batch_idx = cluster_bh / kv_heads;
+    const int kv_head = cluster_bh - batch_idx * kv_heads;
+    const int query_head = kv_head * GqaGroupSize + cta_rank;
+    const int bh = batch_idx * heads + query_head;
+    const int kv_bh = batch_idx * kv_heads + kv_head;
+    const int q_pair_idx = task_id - cluster_bh * q_pair_count;
     const int q_tile_start[QSlots] = {
         (q_pair_idx * QSlots + 0) * TileQ,
         (q_pair_idx * QSlots + 1) * TileQ,
@@ -3446,7 +3558,7 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
         const int q_transaction_bytes = TileQ * HeadDim * sizeof(__nv_bfloat16);
         for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
             const int q_mbar_addr = q_prologue_mbar_base + q_slot * sizeof(uint64_t);
-            const int q_transaction_mbar_addr = q_mbar_addr & 0xFEFFFFFF;
+            const int q_transaction_mbar_addr = q_mbar_addr;
             asm volatile(
                 "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;" : :
                     "r"(q_transaction_mbar_addr),
@@ -3481,7 +3593,7 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
         // the allocation itself remains live until tcgen05.dealloc below.
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
     }
-    __syncthreads();
+    cluster_sync();
 
     // K/V share one stage ring; Q slots have fixed shared-memory and TMEM banks.
     const int kv_smem_addr = static_cast<int>(__cvta_generic_to_shared(kv_smem));
@@ -3605,82 +3717,46 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
         return;
     }
 
-    // K producer: stage may be overwritten only after PV has consumed it
-    // for *both* Q slots, hence the two mma2 waits on ring reuse.
+    // Rank 0 owns K multicast traffic and rearms all destinations after the
+    // cluster-wide PV completion token releases a recycled stage.
     if (warp_idx == kKTmaWarp) {
-        int k_recycle_phase[QSlots][KvStages] = {};
-        bool k_slot_initialized[KvStages] = {};
-        if (lane_idx == 0) {
+        if (lane_idx == 0 && cta_rank == 0) {
+            constexpr int16_t kGqaClusterMask = (1 << GqaGroupSize) - 1;
+            int cluster_v_ready_phase[KvStages] = {};
+            const int transaction_bytes = TileKV * HeadDim * sizeof(__nv_bfloat16);
             for (int kv_tile = 0; kv_tile < task_kv_tile_count; ++kv_tile) {
                 const int stage = kv_tile % KvStages;
-                if (k_slot_initialized[stage]) {
-                    for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
-                        const int addr =
-                            mma2_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t);
-                        mbarrier_wait(addr, k_recycle_phase[q_slot][stage]);
-                        k_recycle_phase[q_slot][stage] ^= 1;
-                    }
+                if (kv_tile >= KvStages) {
+                    mbarrier_wait(cluster_v_ready_mbar_base + stage * sizeof(uint64_t),
+                        cluster_v_ready_phase[stage]);
+                    cluster_v_ready_phase[stage] ^= 1;
                 }
-                const int addr = tma1_mbar_base + stage * sizeof(uint64_t);
-                const int tx_addr = addr & 0xFEFFFFFF;
-                const int transaction_bytes = TileKV * HeadDim * sizeof(__nv_bfloat16);
-                asm volatile(
-                    "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;" ::"r"(
-                        tx_addr),
-                    "r"(transaction_bytes)
-                    : "memory");
-                tma_4d_gmem2smem(kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16),
-                    &k_tmap,
-                    0,
-                    kv_tile * TileKV,
-                    0,
-                    kv_bh,
-                    tx_addr);
-                k_slot_initialized[stage] = true;
+                const int tx_addr = tma1_mbar_base + stage * sizeof(uint64_t);
+                mbarrier_expect_tx_cluster<GqaGroupSize>(tx_addr, transaction_bytes);
+                tma_4d_gmem2smem_multicast<GqaGroupSize>(
+                    kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16),
+                    &k_tmap, 0, kv_tile * TileKV, 0, kv_bh, tx_addr, kGqaClusterMask);
             }
         }
         return;
     }
 
-    // V producer: QK must finish before V overwrites the stage (mma1), and
-    // the prior PV must finish before a reused V stage is overwritten.
+    // Rank 0 similarly owns V traffic after all local QK consumers release K.
     if (warp_idx == kVTmaWarp) {
-        int v_mma1_phase[QSlots][KvStages] = {};
-        int v_recycle_phase[QSlots][KvStages] = {};
-        bool v_slot_initialized[KvStages] = {};
-        if (lane_idx == 0) {
+        if (lane_idx == 0 && cta_rank == 0) {
+            constexpr int16_t kGqaClusterMask = (1 << GqaGroupSize) - 1;
+            int cluster_k_ready_phase[KvStages] = {};
+            const int transaction_bytes = TileKV * HeadDim * sizeof(__nv_bfloat16);
             for (int kv_tile = 0; kv_tile < task_kv_tile_count; ++kv_tile) {
                 const int stage = kv_tile % KvStages;
-                for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
-                    const int addr =
-                        mma1_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t);
-                    mbarrier_wait(addr, v_mma1_phase[q_slot][stage]);
-                    v_mma1_phase[q_slot][stage] ^= 1;
-                }
-                if (v_slot_initialized[stage]) {
-                    for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
-                        const int addr =
-                            mma2_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t);
-                        mbarrier_wait(addr, v_recycle_phase[q_slot][stage]);
-                        v_recycle_phase[q_slot][stage] ^= 1;
-                    }
-                }
-                const int addr = tma2_mbar_base + stage * sizeof(uint64_t);
-                const int tx_addr = addr & 0xFEFFFFFF;
-                const int transaction_bytes = TileKV * HeadDim * sizeof(__nv_bfloat16);
-                asm volatile(
-                    "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;" ::"r"(
-                        tx_addr),
-                    "r"(transaction_bytes)
-                    : "memory");
-                tma_4d_gmem2smem(kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16),
-                    &v_tmap,
-                    0,
-                    kv_tile * TileKV,
-                    0,
-                    kv_bh,
-                    tx_addr);
-                v_slot_initialized[stage] = true;
+                const int tx_addr = tma2_mbar_base + stage * sizeof(uint64_t);
+                mbarrier_wait(cluster_k_ready_mbar_base + stage * sizeof(uint64_t),
+                    cluster_k_ready_phase[stage]);
+                cluster_k_ready_phase[stage] ^= 1;
+                mbarrier_expect_tx_cluster<GqaGroupSize>(tx_addr, transaction_bytes);
+                tma_4d_gmem2smem_multicast<GqaGroupSize>(
+                    kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16),
+                    &v_tmap, 0, kv_tile * TileKV, 0, kv_bh, tx_addr, kGqaClusterMask);
             }
         }
         return;
@@ -3729,8 +3805,9 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
                                 kQkInstrDesc,
                                 d64 != 0 || d16 != 0);
                         }
-                    tcgen05_commit_mbarrier(
-                        mma1_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t));
+                    tcgen05_commit_stage_reuse(
+                        mma1_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t),
+                        cluster_k_ready_mbar_base + stage * sizeof(uint64_t));
                 }
 
                 // P1(i - 1).  There is intentionally no P1 in the prologue.
@@ -3757,8 +3834,9 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
                             pv_instr_desc,
                             pv_tile != 0 || k16 != 0);
                     }
-                    tcgen05_commit_mbarrier(
-                        mma2_mbar_base + (q_slot * KvStages + pv_stage) * sizeof(uint64_t));
+                    tcgen05_commit_stage_reuse(
+                        mma2_mbar_base + (q_slot * KvStages + pv_stage) * sizeof(uint64_t),
+                        cluster_v_ready_mbar_base + pv_stage * sizeof(uint64_t));
                 }
 
                 // Q1(i).
@@ -3772,11 +3850,12 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
                             tcgen05_mma_bf16(s_addr,
                                 make_128b_swizzle_desc(q_addr + d64 * TileQ * 128 + d16 * 32),
                                 make_128b_swizzle_desc(k_addr + d64 * TileKV * 128 + d16 * 32),
-                                kQkInstrDesc,
-                                d64 != 0 || d16 != 0);
+                            kQkInstrDesc,
+                            d64 != 0 || d16 != 0);
                         }
-                    tcgen05_commit_mbarrier(
-                        mma1_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t));
+                    tcgen05_commit_stage_reuse(
+                        mma1_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t),
+                        cluster_k_ready_mbar_base + stage * sizeof(uint64_t));
                 }
 
                 // P0(i).
@@ -3800,8 +3879,9 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
                             pv_instr_desc,
                             kv_tile != 0 || k16 != 0);
                     }
-                    tcgen05_commit_mbarrier(
-                        mma2_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t));
+                    tcgen05_commit_stage_reuse(
+                        mma2_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t),
+                        cluster_v_ready_mbar_base + stage * sizeof(uint64_t));
                 }
             }
 
@@ -3828,8 +3908,9 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
                         pv_instr_desc,
                         pv_tile != 0 || k16 != 0);
                 }
-                tcgen05_commit_mbarrier(
-                    mma2_mbar_base + (q_slot * KvStages + pv_stage) * sizeof(uint64_t));
+                tcgen05_commit_stage_reuse(
+                    mma2_mbar_base + (q_slot * KvStages + pv_stage) * sizeof(uint64_t),
+                    cluster_v_ready_mbar_base + pv_stage * sizeof(uint64_t));
             }
             // A fresh, non-ring completion point protects the final O from
             // parity wraparound on the recycled mma2 barriers.
@@ -3846,7 +3927,7 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
 
 // One launcher instantiation emits exactly one CTA schedule; the discarded
 // if-constexpr branch never instantiates its kernel.
-template <int kTactic>
+template <int kTactic, int GqaGroupSize>
 cudaError_t bf16_fa4_mha_launch_impl(
     const __nv_bfloat16 *q,
     const __nv_bfloat16 *k,
@@ -3861,13 +3942,14 @@ cudaError_t bf16_fa4_mha_launch_impl(
     float scale,
     bool causal,
     cudaStream_t stream) {
+    static_assert(GqaGroupSize == 4, "bf16 FA4 GQA currently supports only G=4");
     constexpr int kTileQ = 128;
     constexpr int kTileKV = 128;
     constexpr int kQSlots = 2;
     constexpr int kKvStages = 2;
     constexpr int kHeadDim = 128;
     // S0/S1 plus long-lived O0/O1 consume all 512 available TMEM columns.
-    if (head_dim != kHeadDim) {
+    if (head_dim != kHeadDim || heads != kv_heads * GqaGroupSize || query_len < kTileQ) {
         return cudaErrorInvalidValue;
     }
 
@@ -3893,9 +3975,9 @@ cudaError_t bf16_fa4_mha_launch_impl(
 
     const int q_tile_count = (query_len + kTileQ - 1) / kTileQ;
     const int q_pair_count = (q_tile_count + kQSlots - 1) / kQSlots;
-    const int total_task_count = q_pair_count * batch * heads;
-    // Barrier parity is task-local. Give every (head, Q-pair) task a fresh
-    // CTA rather than carrying the two-stage ring state across tasks.
+    const int total_task_count = q_pair_count * batch * kv_heads;
+    // Every cluster owns one (KV head, Q-pair) task and its four CTA ranks
+    // own the four query heads in that GQA group.
 
     if constexpr (kTactic == kFaMhaTactic12Warp) {
         using SmemLayout = FaMhaSmemLayoutWg12<kTileQ, kTileKV, kQSlots, kKvStages>;
@@ -3906,28 +3988,34 @@ cudaError_t bf16_fa4_mha_launch_impl(
         }
 
         status = cudaFuncSetAttribute(
-            fa_mha_kernel_wg12<kTileQ, kTileKV, kQSlots, kKvStages, kHeadDim>,
+            fa_mha_kernel_wg12<kTileQ, kTileKV, kQSlots, kKvStages, kHeadDim, GqaGroupSize>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             static_cast<int>(smem_layout.dynamic_bytes));
         if (status != cudaSuccess) {
             return status;
         }
+        status = cudaFuncSetAttribute(
+            fa_mha_kernel_wg12<kTileQ, kTileKV, kQSlots, kKvStages, kHeadDim, GqaGroupSize>,
+            cudaFuncAttributeNonPortableClusterSizeAllowed,
+            1);
+        if (status != cudaSuccess) {
+            return status;
+        }
 
         const dim3 block(12 * 32);
-        const dim3 grid(total_task_count);
-        fa_mha_kernel_wg12<kTileQ, kTileKV, kQSlots, kKvStages, kHeadDim>
-            <<<grid, block, smem_layout.dynamic_bytes, stream>>>(q_tmap,
-                k_tmap,
-                v_tmap,
-                out,
-                batch,
-                heads,
-                kv_heads,
-                query_len,
-                key_len,
-                scale,
-                causal);
-        return cudaGetLastError();
+        cudaLaunchAttribute attr{};
+        attr.id = cudaLaunchAttributeSharedMemoryMode;
+        attr.val.sharedMemoryMode = cudaSharedMemoryModeAllowNonPortable;
+        cudaLaunchConfig_t launch_config{};
+        launch_config.gridDim = dim3(GqaGroupSize * total_task_count);
+        launch_config.blockDim = block;
+        launch_config.dynamicSmemBytes = smem_layout.dynamic_bytes;
+        launch_config.stream = stream;
+        launch_config.attrs = &attr;
+        launch_config.numAttrs = 1;
+        return cudaLaunchKernelEx(&launch_config,
+            fa_mha_kernel_wg12<kTileQ, kTileKV, kQSlots, kKvStages, kHeadDim, GqaGroupSize>, q_tmap, k_tmap,
+            v_tmap, out, batch, heads, kv_heads, query_len, key_len, scale, causal);
     } else {
         CUtensorMap out_tmap{};
         status = init_qkv_tmap(&out_tmap, out, batch * heads, query_len, head_dim, kTileQ);
@@ -3944,28 +4032,34 @@ cudaError_t bf16_fa4_mha_launch_impl(
         }
 
         status = cudaFuncSetAttribute(
-            fa_mha_kernel_wg16<kTileQ, kTileKV, kQSlots, kKvStages, kHeadDim>,
+            fa_mha_kernel_wg16<kTileQ, kTileKV, kQSlots, kKvStages, kHeadDim, GqaGroupSize>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             static_cast<int>(smem_layout.dynamic_bytes));
         if (status != cudaSuccess) {
             return status;
         }
+        status = cudaFuncSetAttribute(
+            fa_mha_kernel_wg16<kTileQ, kTileKV, kQSlots, kKvStages, kHeadDim, GqaGroupSize>,
+            cudaFuncAttributeNonPortableClusterSizeAllowed,
+            1);
+        if (status != cudaSuccess) {
+            return status;
+        }
 
         const dim3 block(16 * 32);
-        const dim3 grid(total_task_count);
-        fa_mha_kernel_wg16<kTileQ, kTileKV, kQSlots, kKvStages, kHeadDim>
-            <<<grid, block, smem_layout.dynamic_bytes, stream>>>(q_tmap,
-                k_tmap,
-                v_tmap,
-                out_tmap,
-                batch,
-                heads,
-                kv_heads,
-                query_len,
-                key_len,
-                scale,
-                causal);
-        return cudaGetLastError();
+        cudaLaunchAttribute attr{};
+        attr.id = cudaLaunchAttributeSharedMemoryMode;
+        attr.val.sharedMemoryMode = cudaSharedMemoryModeAllowNonPortable;
+        cudaLaunchConfig_t launch_config{};
+        launch_config.gridDim = dim3(GqaGroupSize * total_task_count);
+        launch_config.blockDim = block;
+        launch_config.dynamicSmemBytes = smem_layout.dynamic_bytes;
+        launch_config.stream = stream;
+        launch_config.attrs = &attr;
+        launch_config.numAttrs = 1;
+        return cudaLaunchKernelEx(&launch_config,
+            fa_mha_kernel_wg16<kTileQ, kTileKV, kQSlots, kKvStages, kHeadDim, GqaGroupSize>, q_tmap, k_tmap,
+            v_tmap, out_tmap, batch, heads, kv_heads, query_len, key_len, scale, causal);
     }
 }
 
@@ -3983,7 +4077,7 @@ cudaError_t bf16_fa4_mha_cuda(
     float scale,
     bool causal,
     cudaStream_t stream) {
-    return bf16_fa4_mha_launch_impl<SM110A_FA4_MHA_TACTIC>(
+    return bf16_fa4_mha_launch_impl<SM110A_FA4_MHA_TACTIC, kGqaGroupSize>(
         q, k, v, out, batch, heads, kv_heads, query_len, key_len, head_dim, scale, causal, stream);
 }
 

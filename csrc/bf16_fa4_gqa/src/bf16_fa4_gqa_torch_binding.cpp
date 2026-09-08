@@ -32,6 +32,10 @@ void check_qkv(const torch::Tensor& q, const torch::Tensor& k,
   TORCH_CHECK(k.size(1) == v.size(1), "K and V head dimensions must match");
   TORCH_CHECK(q.size(1) >= k.size(1) && q.size(1) % k.size(1) == 0,
               "Q head count must be a positive multiple of the K/V head count");
+  TORCH_CHECK(q.size(1) == 4 * k.size(1),
+              "this GQA kernel is specialized for exactly four Q heads per K/V head");
+  TORCH_CHECK(q.size(2) >= 128,
+              "this prefill GQA kernel requires query length >= 128");
   TORCH_CHECK(k.size(2) == v.size(2), "K and V sequence lengths must match");
   TORCH_CHECK(q.size(3) == k.size(3) && q.size(3) == v.size(3),
               "Q, K, and V head dimensions must match");
