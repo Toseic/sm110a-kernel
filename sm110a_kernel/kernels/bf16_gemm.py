@@ -52,18 +52,25 @@ class Bf16GemmModule:
     def __init__(self, binding, library, config: Bf16GemmConfig):
         self._binding, self._launcher, self._config = binding, library.entry_address, config
 
-    def _args(self):
+    def _args(self, device, max_active_clusters=None):
         c = self._config
-        return (self._launcher, c.tile_m, c.tile_n, c.tile_k, c.cluster_m)
+        if max_active_clusters is None:
+            import torch
+            sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+            max_active_clusters = sm_count // c.cluster_m
+        if max_active_clusters <= 0:
+            raise ValueError("max_active_clusters must be positive")
+        return (self._launcher, c.tile_m, c.tile_n, c.tile_k, c.cluster_m,
+                int(max_active_clusters))
 
-    def bf16_gemm(self, a, b, swap_ab=False):
-        return self._binding.bf16_gemm(a, b, *self._args(), swap_ab)
-    def bf16_gemm_out(self, a, b, out, swap_ab=False):
-        return self._binding.bf16_gemm_out(a, b, out, *self._args(), swap_ab)
-    def bf16_gemm_nt(self, a, b_nt, swap_ab=False):
-        return self._binding.bf16_gemm_nt(a, b_nt, *self._args(), swap_ab)
-    def bf16_gemm_nt_out(self, a, b_nt, out, swap_ab=False):
-        return self._binding.bf16_gemm_nt_out(a, b_nt, out, *self._args(), swap_ab)
+    def bf16_gemm(self, a, b, swap_ab=False, max_active_clusters=None):
+        return self._binding.bf16_gemm(a, b, *self._args(a.device, max_active_clusters), swap_ab)
+    def bf16_gemm_out(self, a, b, out, swap_ab=False, max_active_clusters=None):
+        return self._binding.bf16_gemm_out(a, b, out, *self._args(a.device, max_active_clusters), swap_ab)
+    def bf16_gemm_nt(self, a, b_nt, swap_ab=False, max_active_clusters=None):
+        return self._binding.bf16_gemm_nt(a, b_nt, *self._args(a.device, max_active_clusters), swap_ab)
+    def bf16_gemm_nt_out(self, a, b_nt, out, swap_ab=False, max_active_clusters=None):
+        return self._binding.bf16_gemm_nt_out(a, b_nt, out, *self._args(a.device, max_active_clusters), swap_ab)
 
 
 def _kernel_cflags(config, _variant):
@@ -103,14 +110,15 @@ def get_bf16_gemm_module(a, b, config=None):
     return compile_bf16_gemm(config or _default_config(a, b))
 
 
-def bf16_gemm(a, b, config=None, swap_ab=False):
-    return get_bf16_gemm_module(a, b, config).bf16_gemm(a, b, swap_ab)
+def bf16_gemm(a, b, config=None, swap_ab=False, max_active_clusters=None):
+    return get_bf16_gemm_module(a, b, config).bf16_gemm(a, b, swap_ab, max_active_clusters)
 
 
-def bf16_gemm_out(a, b, out, config=None, swap_ab=False):
-    return get_bf16_gemm_module(a, b, config).bf16_gemm_out(a, b, out, swap_ab)
+def bf16_gemm_out(a, b, out, config=None, swap_ab=False, max_active_clusters=None):
+    return get_bf16_gemm_module(a, b, config).bf16_gemm_out(a, b, out, swap_ab, max_active_clusters)
 
 
-def bf16_gemm_nt_out(a, b_nt, out, config=None, swap_ab=False):
+def bf16_gemm_nt_out(a, b_nt, out, config=None, swap_ab=False, max_active_clusters=None):
     """Compute ``a @ b_nt.T`` for a contiguous, pretransposed ``b_nt(N, K)``."""
-    return compile_bf16_gemm(config).bf16_gemm_nt_out(a, b_nt, out, swap_ab)
+    return compile_bf16_gemm(config).bf16_gemm_nt_out(
+        a, b_nt, out, swap_ab, max_active_clusters)

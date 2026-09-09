@@ -56,7 +56,9 @@
 
 // Functional summary
 // ------------------
-//   * Persistent tiled kernel: launches one CTA per SM (grid == kSmCount == 20)
+//   * Persistent tiled kernel: launches a caller-selected number of clusters
+//     (one CTA per SM in each cluster) and walks the output-tile grid in
+//     round-robin.
 //     and walks the (grid_m * grid_n) output-tile grid in round-robin so each
 //     CTA accumulates multiple output tiles per launch.
 //   * Each CTA executes a 6-warp pipeline (192 threads):
@@ -195,7 +197,7 @@
 //      inner loop walks M, which empirically keeps the K-resident operand
 //      hot in L2. The triple-nested loop in the launch
 //          for bid = _bid; bid < grid_size; bid += grid_x
-//      turns the grid persistent: kSmCount CTAs share the tile grid evenly.
+//      turns the grid persistent: all launched CTAs share the tile grid evenly.
 //
 //   5. Teardown
 //      ------------------------------------------------
@@ -251,8 +253,6 @@ constexpr int kWarpCount = 6;
 constexpr int kBlockThreads = kWarpSize * kWarpCount;
 constexpr int kEpilogueStageCount = 2;
 constexpr bool kPrefetchTmaDesc = true;
-constexpr int kSmCount = 20;
-
 constexpr int kMacroSwizzleM = 8;
 constexpr int kMacroSwizzleN = 8;
 constexpr bool kMacroSwizzleMFast = true;
@@ -1078,6 +1078,7 @@ void launch_bf16_gemm_impl(
     int K,
     int64_t *profiler_ptr,
     int num_entries,
+    int max_active_clusters,
     cudaStream_t stream) {
 
     using Config = KernelConfig<kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN>;
@@ -1130,7 +1131,10 @@ void launch_bf16_gemm_impl(
     constexpr int mbarrier_smem = 256;
     const int smem_size = kDynamicSmemBytes + mbarrier_smem;
 
-    int grid = kSmCount;
+    // The kernel has a fixed compile-time cluster size.  A grid with this many
+    // clusters therefore contains max_active_clusters * kClusterM CTAs.
+    assert(max_active_clusters > 0);
+    const int grid = max_active_clusters * kClusterM;
 
     auto kernel =
         bf16_gemm_kernel<kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN, DO_PROFILE, SWAP_AB>;
@@ -1158,7 +1162,17 @@ void launch_bf16_gemm(
     int N,
     int K,
     bool swap_ab,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    int max_active_clusters) {
+    if (max_active_clusters <= 0) {
+        int device = 0;
+        int sm_count = 0;
+        assert(cudaGetDevice(&device) == cudaSuccess);
+        assert(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount,
+                                      device) == cudaSuccess);
+        max_active_clusters = sm_count / SM110A_BF16_CLUSTER_M;
+    }
+    assert(max_active_clusters > 0);
     if (swap_ab) {
         launch_bf16_gemm_impl<SM110A_BF16_TILE_M,
             SM110A_BF16_TILE_N,
@@ -1166,7 +1180,8 @@ void launch_bf16_gemm(
             SM110A_BF16_CLUSTER_M,
             SM110A_BF16_EPILOGUE_BLOCK_N,
             false,
-            true>(A_ptr, B_ptr, C_ptr, M, N, K, nullptr, 0, stream);
+            true>(A_ptr, B_ptr, C_ptr, M, N, K, nullptr, 0,
+                  max_active_clusters, stream);
     } else {
         launch_bf16_gemm_impl<SM110A_BF16_TILE_M,
             SM110A_BF16_TILE_N,
@@ -1174,15 +1189,17 @@ void launch_bf16_gemm(
             SM110A_BF16_CLUSTER_M,
             SM110A_BF16_EPILOGUE_BLOCK_N,
             false,
-            false>(A_ptr, B_ptr, C_ptr, M, N, K, nullptr, 0, stream);
+            false>(A_ptr, B_ptr, C_ptr, M, N, K, nullptr, 0,
+                   max_active_clusters, stream);
     }
 }
 
 extern "C" void sm110a_bf16_gemm_launch(
     const __nv_bfloat16* d_a, const __nv_bfloat16* d_b,
     __nv_bfloat16* d_c, int m, int n, int k, bool swap_ab,
-    cudaStream_t stream) {
-  launch_bf16_gemm(d_a, d_b, d_c, m, n, k, swap_ab, stream);
+    int max_active_clusters, cudaStream_t stream) {
+  launch_bf16_gemm(d_a, d_b, d_c, m, n, k, swap_ab, stream,
+                   max_active_clusters);
 }
 
 void launch_bf16_gemm_profile(
@@ -1195,7 +1212,17 @@ void launch_bf16_gemm_profile(
     int64_t *profiler_ptr,
     int num_entries,
     bool swap_ab,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    int max_active_clusters) {
+    if (max_active_clusters <= 0) {
+        int device = 0;
+        int sm_count = 0;
+        assert(cudaGetDevice(&device) == cudaSuccess);
+        assert(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount,
+                                      device) == cudaSuccess);
+        max_active_clusters = sm_count / SM110A_BF16_CLUSTER_M;
+    }
+    assert(max_active_clusters > 0);
     if (swap_ab) {
         launch_bf16_gemm_impl<SM110A_BF16_TILE_M,
             SM110A_BF16_TILE_N,
@@ -1203,7 +1230,8 @@ void launch_bf16_gemm_profile(
             SM110A_BF16_CLUSTER_M,
             SM110A_BF16_EPILOGUE_BLOCK_N,
             true,
-            true>(A_ptr, B_ptr, C_ptr, M, N, K, profiler_ptr, num_entries, stream);
+            true>(A_ptr, B_ptr, C_ptr, M, N, K, profiler_ptr, num_entries,
+                  max_active_clusters, stream);
     } else {
         launch_bf16_gemm_impl<SM110A_BF16_TILE_M,
             SM110A_BF16_TILE_N,
@@ -1211,6 +1239,7 @@ void launch_bf16_gemm_profile(
             SM110A_BF16_CLUSTER_M,
             SM110A_BF16_EPILOGUE_BLOCK_N,
             true,
-            false>(A_ptr, B_ptr, C_ptr, M, N, K, profiler_ptr, num_entries, stream);
+            false>(A_ptr, B_ptr, C_ptr, M, N, K, profiler_ptr, num_entries,
+                   max_active_clusters, stream);
     }
 }

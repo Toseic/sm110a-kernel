@@ -50,6 +50,9 @@ Single shape:
 
 ```bash
 /home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_bf16_gemm.py --m 4096 --n 4096 --k 4096 --warmup 5 --iters 20
+
+# Launch only four persistent clusters (instead of all available SMs)
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_bf16_gemm.py --m 4096 --n 4096 --k 4096 --max-active-clusters 4
 ```
 
 Skip correctness check:
@@ -119,6 +122,20 @@ Each aligned 128-row tile must contain one valid expert.
 The current grouped benchmark keeps `M` aligned to `128` rows per tile and
 uses the same `N`/`K` alignment constraints as the existing BF16 GEMM
 baseline.
+
+## Persistent-cluster limit
+
+The BF16 GEMM entry points accept `max_active_clusters`. They launch
+`max_active_clusters * config.cluster_m` CTAs. Leaving it as `None` uses the
+tensor device's SM count divided by `config.cluster_m`, preserving the former
+one-CTA-per-SM launch size.
+
+```python
+bf16_gemm_nt_out(a, b_nt, out, config=config, max_active_clusters=4)
+```
+
+The benchmark exposes the same control as `--max-active-clusters`; `0` selects
+the device-derived default.
 
 ## Contents
 

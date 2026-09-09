@@ -172,6 +172,15 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
 
     def add_arguments(self, parser):
         parser.add_argument(
+            "--max-active-clusters",
+            type=int,
+            default=0,
+            help=(
+                "persistent clusters to launch (default: device SM count / "
+                "the selected cluster size)"
+            ),
+        )
+        parser.add_argument(
             "--debug",
             action="store_true",
             help="Print per-config sweep details",
@@ -196,6 +205,11 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
             self.validate_extra_args(args)
             return args
         return super().validate_args(args)
+
+    def validate_extra_args(self, args):
+        if args.max_active_clusters < 0:
+            raise SystemExit("--max-active-clusters must be non-negative")
+        return args
 
     def iter_shapes(self, args):
         if args.single_shape:
@@ -348,7 +362,8 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
         def prepare(candidate):
             config, swap_ab = candidate
             run = lambda: bf16_gemm_nt_out(
-                a, b_kernel, out, config=config, swap_ab=swap_ab
+                a, b_kernel, out, config=config, swap_ab=swap_ab,
+                max_active_clusters=args.max_active_clusters or None,
             )
             run()
             torch.cuda.synchronize()
@@ -363,7 +378,8 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
             candidates,
             # B is now prepacked as (N, K), so prior selections measured the
             # incorrect B interpretation and must not be reused.
-            namespace="bf16_gemm_nt_v2", key=(m, n, k), prepare=prepare,
+            namespace="bf16_gemm_nt_v3",
+            key=(m, n, k, args.max_active_clusters), prepare=prepare,
             benchmark=lambda prepared: benchmark_with_stats(
                 prepared.run, args.warmup, args.iters, args.samples,
                 cold_l2_flush=getattr(args, "_cold_l2_flush", None),
