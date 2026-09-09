@@ -80,18 +80,30 @@ class Nvfp4Fc2Module:
         )
         return Nvfp4Fc2Metadata(*values)
 
-    def nvfp4_fc2(self, a, b, sfa, sfb, routing, routing_weights, metadata, topk):
+    def _max_active_clusters(self, device, value):
+        if value is None:
+            import torch
+            value = torch.cuda.get_device_properties(device).multi_processor_count // self.config.cluster_m
+        if value <= 0:
+            raise ValueError("max_active_clusters must be positive")
+        return int(value)
+
+    def nvfp4_fc2(self, a, b, sfa, sfb, routing, routing_weights, metadata, topk,
+                  max_active_clusters=None):
         return self._binding.nvfp4_fc2(
             a, b, sfa, sfb, routing, routing_weights, metadata.tasks,
             metadata.state, topk, self._address,
+            self._max_active_clusters(a.device, max_active_clusters),
         )
 
     def nvfp4_fc2_out(
-        self, a, b, sfa, sfb, routing, routing_weights, metadata, topk, out
+        self, a, b, sfa, sfb, routing, routing_weights, metadata, topk, out,
+        max_active_clusters=None
     ):
         return self._binding.nvfp4_fc2_out(
             a, b, sfa, sfb, routing, routing_weights, metadata.tasks,
             metadata.state, topk, out, self._address,
+            self._max_active_clusters(a.device, max_active_clusters),
         )
 
 
@@ -146,15 +158,17 @@ def prepare_nvfp4_fc2_metadata(grouped_layout, experts, n, config=None):
     return compile_nvfp4_fc2(config).prepare_metadata(grouped_layout, experts, n)
 
 
-def nvfp4_fc2(a, b, sfa, sfb, routing, routing_weights, metadata, topk, config=None):
+def nvfp4_fc2(a, b, sfa, sfb, routing, routing_weights, metadata, topk, config=None,
+              max_active_clusters=None):
     return compile_nvfp4_fc2(config).nvfp4_fc2(
-        a, b, sfa, sfb, routing, routing_weights, metadata, topk,
+        a, b, sfa, sfb, routing, routing_weights, metadata, topk, max_active_clusters,
     )
 
 
 def nvfp4_fc2_out(
-    a, b, sfa, sfb, routing, routing_weights, metadata, topk, out, config=None
+    a, b, sfa, sfb, routing, routing_weights, metadata, topk, out, config=None,
+    max_active_clusters=None
 ):
     return compile_nvfp4_fc2(config).nvfp4_fc2_out(
-        a, b, sfa, sfb, routing, routing_weights, metadata, topk, out,
+        a, b, sfa, sfb, routing, routing_weights, metadata, topk, out, max_active_clusters,
     )

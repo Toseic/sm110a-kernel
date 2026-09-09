@@ -16,5 +16,5 @@ void launch_nvfp4_fc2_main(
     const uint8_t* sfb, const int32_t* grouped_assignments,
     const int32_t* tasks, int32_t* state, __nv_bfloat16* c,
     const __nv_bfloat16* routing_weights, int tokens,
-    int m, int experts, int n, int k, int topk, int max_tasks,
+    int m, int experts, int n, int k, int topk, int max_tasks, int max_active_clusters,
     cudaStream_t stream);

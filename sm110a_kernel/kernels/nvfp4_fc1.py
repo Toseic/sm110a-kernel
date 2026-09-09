@@ -78,17 +78,27 @@ class Nvfp4Fc1Module:
             self.config.cluster_m, self._routing_address)
         return Nvfp4Fc1Metadata(routing, source_rows, tasks, state)
 
-    def nvfp4_fc1_out(self, a, b, sfa, sfb, metadata: Nvfp4Fc1Metadata, out):
+    def _max_active_clusters(self, device, value):
+        if value is None:
+            import torch
+            value = torch.cuda.get_device_properties(device).multi_processor_count // (
+                self.config.cluster_m * self.config.cluster_n)
+        if value <= 0:
+            raise ValueError("max_active_clusters must be positive")
+        return int(value)
+
+    def nvfp4_fc1_out(self, a, b, sfa, sfb, metadata: Nvfp4Fc1Metadata, out,
+                      max_active_clusters=None):
         return self._binding.nvfp4_fc1_out(
             a, b, sfa, sfb, metadata.source_rows, metadata.tasks, metadata.state,
-            out, self._address)
+            out, self._address, self._max_active_clusters(a.device, max_active_clusters))
 
-    def nvfp4_fc1(self, a, b, sfa, sfb, metadata: Nvfp4Fc1Metadata):
+    def nvfp4_fc1(self, a, b, sfa, sfb, metadata: Nvfp4Fc1Metadata, max_active_clusters=None):
         import torch
         out = torch.empty(
             (metadata.source_rows.numel(), b.size(1) // 2),
             device=a.device, dtype=torch.bfloat16)
-        return self.nvfp4_fc1_out(a, b, sfa, sfb, metadata, out)
+        return self.nvfp4_fc1_out(a, b, sfa, sfb, metadata, out, max_active_clusters)
 
 
 def _flags(config: Nvfp4Fc1Config, variant):
@@ -132,9 +142,9 @@ def prepare_nvfp4_fc1_metadata(router_scores, topk, n, config=None):
     return compile_nvfp4_fc1(config).prepare_metadata(router_scores, topk, n)
 
 
-def nvfp4_fc1(a, b, sfa, sfb, metadata, config=None):
-    return compile_nvfp4_fc1(config).nvfp4_fc1(a, b, sfa, sfb, metadata)
+def nvfp4_fc1(a, b, sfa, sfb, metadata, config=None, max_active_clusters=None):
+    return compile_nvfp4_fc1(config).nvfp4_fc1(a, b, sfa, sfb, metadata, max_active_clusters)
 
 
-def nvfp4_fc1_out(a, b, sfa, sfb, metadata, out, config=None):
-    return compile_nvfp4_fc1(config).nvfp4_fc1_out(a, b, sfa, sfb, metadata, out)
+def nvfp4_fc1_out(a, b, sfa, sfb, metadata, out, config=None, max_active_clusters=None):
+    return compile_nvfp4_fc1(config).nvfp4_fc1_out(a, b, sfa, sfb, metadata, out, max_active_clusters)

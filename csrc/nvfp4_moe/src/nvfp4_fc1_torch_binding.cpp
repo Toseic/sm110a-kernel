@@ -8,7 +8,7 @@
 namespace {
 using Launcher = void (*)(const uint8_t*, const uint8_t*, const uint8_t*, const uint8_t*,
     const int32_t*, const int32_t*, int32_t*, __nv_bfloat16*, int, int, int, int,
-    int, int, cudaStream_t);
+    int, int, int, cudaStream_t);
 using MetadataLauncher = void (*)(const int32_t*, int32_t*, int32_t*, int32_t*, int32_t*,
     int, int, int, int, int, int, bool, cudaStream_t);
 using RoutingLauncher = void (*)(const __nv_bfloat16*, int, int, int, int32_t*, int32_t*,
@@ -76,11 +76,11 @@ std::vector<torch::Tensor> prepare_routing(
 
 torch::Tensor run_out(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb,
     torch::Tensor source_rows, torch::Tensor tasks, torch::Tensor state,
-    torch::Tensor out, uint64_t address) {
+    torch::Tensor out, uint64_t address, int64_t max_active_clusters) {
   check_fp4(a, "A", 2); check_fp4(b, "B", 3);
   const int64_t tokens = a.size(0), m = out.size(0);
   const int64_t e = b.size(0), n = b.size(1), k = a.size(1) * 2;
-  TORCH_CHECK(address != 0 && tokens % 128 == 0 && n % 128 == 0 && k % 64 == 0,
+  TORCH_CHECK(address != 0 && max_active_clusters >= 0 && tokens % 128 == 0 && n % 128 == 0 && k % 64 == 0,
       "NVFP4 FC1 requires tokens/physical-N/K divisible by 128/128/64");
   TORCH_CHECK(b.size(2) * 2 == k && a.device() == b.device(), "incompatible A/B");
   check_scale(sfa, tokens * (k / 16), "SFA");
@@ -106,14 +106,14 @@ torch::Tensor run_out(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch
       reinterpret_cast<uint8_t*>(sfb.data_ptr()), source_rows.data_ptr<int32_t>(),
       tasks.data_ptr<int32_t>(), state.data_ptr<int32_t>(),
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()), tokens, m, e, n, k,
-      tasks.size(0), stream);
+      tasks.size(0), static_cast<int>(max_active_clusters), stream);
   C10_CUDA_KERNEL_LAUNCH_CHECK(); return out;
 }
 torch::Tensor run(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb,
-    torch::Tensor source_rows, torch::Tensor tasks, torch::Tensor state, uint64_t address) {
+    torch::Tensor source_rows, torch::Tensor tasks, torch::Tensor state, uint64_t address, int64_t max_active_clusters) {
   auto out = torch::empty({source_rows.numel(), b.size(1) / 2},
       a.options().dtype(torch::kBFloat16));
-  return run_out(a,b,sfa,sfb,source_rows,tasks,state,out,address);
+  return run_out(a,b,sfa,sfb,source_rows,tasks,state,out,address,max_active_clusters);
 }
 }
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

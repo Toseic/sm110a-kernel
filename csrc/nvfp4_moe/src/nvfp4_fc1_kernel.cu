@@ -1857,7 +1857,7 @@ void launch_nvfp4_fc1_impl(
     int experts,
     int n,
     int k,
-    int max_tasks,
+    int max_tasks, int max_active_clusters,
     cudaStream_t stream) {
     using Config = KernelConfig<kTileM, kTileN, kTileK, kEpilogueTileN, kClusterM, kClusterN>;
     using Shape = ClusterShape<kClusterM, kClusterN>;
@@ -1972,8 +1972,9 @@ void launch_nvfp4_fc1_impl(
             constexpr int kClusterCtas = kClusterM * kClusterN;
             resident_clusters = sm_count / kClusterCtas > 0 ? sm_count / kClusterCtas : 1;
         }
-        const int launched_clusters =
-            resident_clusters < persistent_clusters ? resident_clusters : persistent_clusters;
+        const int cluster_limit = max_active_clusters > 0 ? max_active_clusters : resident_clusters;
+        const int launched_clusters = cluster_limit < persistent_clusters
+            ? cluster_limit : persistent_clusters;
         kernel<<<dim3(kClusterM * launched_clusters, kClusterN, 1), kBlockThreads,
             kDynamicSmemBytes, stream>>>(
             d_a, a_tensor_map, b_tensor_map, d_sfa, sfa_tensor_map, sfb_tensor_map, c_tensor_map, d_source_rows, tasks, task_count,
@@ -2004,7 +2005,7 @@ void launch_nvfp4_fc1_impl(
 void launch_nvfp4_fc1_entry(
     const uint8_t *a, const uint8_t *b, const uint8_t *sfa, const uint8_t *sfb,
     const int32_t *source_rows, const int32_t *tasks, int32_t *state, nv_bfloat16 *c,
-    int tokens, int m, int experts, int n, int k, int max_tasks, cudaStream_t stream) {
+    int tokens, int m, int experts, int n, int k, int max_tasks, int max_active_clusters, cudaStream_t stream) {
     if (!a || !b || !sfa || !sfb || !source_rows || !tasks || !state || !c ||
         tokens <= 0 || m <= 0 || experts <= 0 || n <= 0 || k <= 0 || max_tasks <= 0)
         return;
@@ -2013,7 +2014,7 @@ void launch_nvfp4_fc1_entry(
         SM110A_NVFP4_FC1_EPILOGUE_TILE_N, SM110A_NVFP4_FC1_CLUSTER_M,
         SM110A_NVFP4_FC1_CLUSTER_N,
         false>(a, b, sfa, sfb, source_rows, tasks, state, c, tokens, m, experts,
-            n, k, max_tasks, stream);
+            n, k, max_tasks, max_active_clusters, stream);
 }
 
 } // namespace
@@ -2021,17 +2022,17 @@ void launch_nvfp4_fc1_entry(
 void launch_nvfp4_fc1_main(
     const uint8_t *a, const uint8_t *b, const uint8_t *sfa, const uint8_t *sfb,
     const int32_t *source_rows, const int32_t *tasks, int32_t *state, nv_bfloat16 *c,
-    int tokens, int m, int experts, int n, int k, int max_tasks, cudaStream_t stream) {
+    int tokens, int m, int experts, int n, int k, int max_tasks, int max_active_clusters, cudaStream_t stream) {
     launch_nvfp4_fc1_entry(
         a, b, sfa, sfb, source_rows, tasks, state, c, tokens, m, experts, n, k,
-        max_tasks, stream);
+        max_tasks, max_active_clusters, stream);
 }
 
 extern "C" void sm110a_nvfp4_fc1_launch(
     const uint8_t *a, const uint8_t *b, const uint8_t *sfa, const uint8_t *sfb,
     const int32_t *source_rows, const int32_t *tasks, int32_t *state, nv_bfloat16 *c,
-    int tokens, int m, int experts, int n, int k, int max_tasks, cudaStream_t stream) {
+    int tokens, int m, int experts, int n, int k, int max_tasks, int max_active_clusters, cudaStream_t stream) {
     launch_nvfp4_fc1_main(
         a, b, sfa, sfb, source_rows, tasks, state, c, tokens, m, experts, n, k,
-        max_tasks, stream);
+        max_tasks, max_active_clusters, stream);
 }

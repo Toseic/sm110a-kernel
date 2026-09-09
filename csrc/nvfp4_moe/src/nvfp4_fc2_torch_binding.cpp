@@ -12,7 +12,7 @@ namespace {
 using Launcher = void (*)(
     const uint8_t*, const uint8_t*, const uint8_t*, const uint8_t*,
     const int32_t*, const int32_t*, int32_t*, __nv_bfloat16*,
-    const __nv_bfloat16*, int, int, int, int, int, int, int, cudaStream_t);
+    const __nv_bfloat16*, int, int, int, int, int, int, int, int, cudaStream_t);
 using MetadataLauncher = void (*)(
     const int32_t*, int32_t*, int32_t*, int32_t*, int32_t*, int, int, int,
     int, int, int, bool, cudaStream_t);
@@ -63,7 +63,7 @@ torch::Tensor run_out(
     torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb,
     torch::Tensor routing, torch::Tensor routing_weights,
     torch::Tensor tasks, torch::Tensor state, int64_t topk,
-    torch::Tensor out, uint64_t address) {
+    torch::Tensor out, uint64_t address, int64_t max_active_clusters) {
   check_fp4(a, "A", 2);
   check_fp4(b, "B", 3);
   TORCH_CHECK(routing.is_cuda() && routing.scalar_type() == torch::kInt32 &&
@@ -87,7 +87,7 @@ torch::Tensor run_out(
   const int64_t experts = b.size(0);
   const int64_t n = b.size(1);
   const int64_t k = a.size(1) * 2;
-  TORCH_CHECK(address != 0 && m % 128 == 0 && n % 128 == 0 && k % 64 == 0,
+  TORCH_CHECK(address != 0 && max_active_clusters >= 0 && m % 128 == 0 && n % 128 == 0 && k % 64 == 0,
               "NVFP4 FC2 requires M/N/K divisible by 128/128/64");
   TORCH_CHECK(b.size(2) * 2 == k && a.device() == b.device(),
               "incompatible NVFP4 A/B shapes");
@@ -128,7 +128,7 @@ torch::Tensor run_out(
            reinterpret_cast<const __nv_bfloat16*>(routing_weights.data_ptr<at::BFloat16>()),
            static_cast<int>(tokens), static_cast<int>(m), static_cast<int>(experts),
            static_cast<int>(n), static_cast<int>(k), static_cast<int>(topk),
-           static_cast<int>(tasks.size(0)), stream);
+           static_cast<int>(tasks.size(0)), static_cast<int>(max_active_clusters), stream);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
@@ -137,12 +137,12 @@ torch::Tensor run(
     torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb,
     torch::Tensor routing, torch::Tensor routing_weights,
     torch::Tensor tasks, torch::Tensor state, int64_t topk,
-    uint64_t address) {
+    uint64_t address, int64_t max_active_clusters) {
   TORCH_CHECK(topk > 0, "topk must be positive");
   auto out = torch::empty({a.size(0) / topk, b.size(1)},
                           a.options().dtype(torch::kBFloat16));
   return run_out(a, b, sfa, sfb, routing, routing_weights, tasks, state,
-                 topk, out, address);
+                 topk, out, address, max_active_clusters);
 }
 
 }  // namespace
