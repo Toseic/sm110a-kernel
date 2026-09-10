@@ -23,6 +23,15 @@ from .kernels.bf16_gemm import (
     compile_bf16_gemm_configs,
     get_bf16_gemm_module,
 )
+from .kernels.bf16_gemm_serving import (
+    Bf16GemmServingConfig,
+    bf16_gemm_serving,
+    bf16_gemm_serving_out,
+    bf16_gemm_serving_nt_out,
+    compile_bf16_gemm_serving,
+    compile_bf16_gemm_serving_configs,
+    get_bf16_gemm_serving_module,
+)
 from .kernels.bf16_fa4_mha import (
     Bf16Fa4MhaConfig,
     Bf16Fa4MhaTactic,
