@@ -22,3 +22,13 @@ Pass benchmark arguments directly to the benchmark script:
 ```
 
 Add new benchmarks as `benchmarks/benchmark_<name>.py`.
+
+# Exclusive GPU Launch Handling
+
+When GPU 0 is configured with `EXCLUSIVE_PROCESS`, a launch may fail with
+`CUDA-capable device(s) is/are busy or unavailable` while another process is
+using the device. Treat this as a transient condition: poll the GPU state at a
+reasonable interval (for example, every 2 seconds) and retry the launch after
+the active compute process exits. Do not start competing retries in a tight
+loop; preserve the original command and report a timeout if a bounded wait is
+required.
