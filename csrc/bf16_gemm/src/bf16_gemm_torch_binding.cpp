@@ -123,18 +123,12 @@ void run_cublaslt(torch::Tensor a, torch::Tensor b, torch::Tensor out,
       cublasLtMatmulDescCreate(&operation_desc, CUBLAS_COMPUTE_32F_FAST_16BF,
                                CUDA_R_32F),
       "cublasLtMatmulDescCreate");
-  const cublasOperation_t trans_a = CUBLAS_OP_T;
-  const cublasOperation_t trans_b = CUBLAS_OP_N;
-  check_cublas_status(cublasLtMatmulDescSetAttribute(
-                          operation_desc, CUBLASLT_MATMUL_DESC_TRANSA, &trans_a,
-                          sizeof(trans_a)),
-                      "cublasLtMatmulDescSetAttribute(TRANSA)");
-  check_cublas_status(cublasLtMatmulDescSetAttribute(
-                          operation_desc, CUBLASLT_MATMUL_DESC_TRANSB, &trans_b,
-                          sizeof(trans_b)),
-                      "cublasLtMatmulDescSetAttribute(TRANSB)");
-
-  check_cublas_status(cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_16BF, k, n, k),
+  // cuBLASLt uses column-major layouts.  The row-major B(K, N) buffer is
+  // therefore the column-major view B^T(N, K), while the row-major A(M, K)
+  // buffer is the column-major view A^T(K, M).  Passing B as operand A and A
+  // as operand B computes C^T = B^T * A^T, which is stored in the row-major
+  // C(M, N) buffer through the column-major C(N, M) layout.
+  check_cublas_status(cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_16BF, n, k, n),
                       "cublasLtMatrixLayoutCreate(a_desc)");
   check_cublas_status(cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_16BF, k, m, k),
                       "cublasLtMatrixLayoutCreate(b_desc)");
