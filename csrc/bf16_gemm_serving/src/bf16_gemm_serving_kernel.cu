@@ -61,9 +61,10 @@
 //     round-robin.
 //     and walks the (grid_m * grid_n) output-tile grid in round-robin so each
 //     CTA accumulates multiple output tiles per launch.
-//   * Each CTA executes a 6-warp pipeline (192 threads):
+//   * Each CTA executes a 7-warp pipeline (224 threads):
 //       warp 4              – load warp (TMA gmem→smem)
 //       warp 5 (cta_rank 0) – MMA warp   (tcgen05.mma on TMEM)
+//       warp 6 (cta_rank 0) – scheduler warp (cluster tile-task producer)
 //       warps 0..3          – epilogue warps (tmem→smem→gmem via TMA)
 //   * Clusters of size kClusterM along M cooperate via DSMEM and multicast:
 //     every cluster CTA loads its own A row, and rank `cta_rank` loads its
@@ -91,13 +92,15 @@
 //        each bank is gated by an `epilogue_mbar` that the epilogue trips
 //        only after its TMA store has committed, hiding the TMEM lifetime
 //        from the mainloop.
-//   4. Producer/consumer decoupling with two mbarrier rings:
+//   4. Producer/consumer decoupling with task and data mbarrier rings:
+//          scheduler_mbars[2]      – rank-0 scheduler -> every TMA warp.
+//          scheduler_free_mbars[2] – all epilogues    -> rank-0 reuse.
 //          tma_mbars[kStageCount]  – TMA completion -> MMA consumer.
 //          mma_mbars[kStageCount]  – MMA commit     -> TMA producer.
 //        A separate `mainlooop_mbars[2]` array — note the misspelling kept
 //        on purpose — signals mainloop-stage completion to the epilogue.
 //        Phase parity bits per ring track the 2-cycle wrap.
-//   5. L2-friendly tile schedule (`compute_bid`).
+//   5. L2-friendly tile schedule (`compute_bid`, scheduler warp only).
 //        The output grid is mapped through an 8x8 macro-swizzle. With
 //        `kMacroSwizzleMFast=true`, M is iterated fastest inside a macro
 //        band so consecutive CTAs read overlapping K-resident operands
@@ -120,13 +123,16 @@
 // Detailed pipeline
 // -----------------
 //   Legend
+//     S – scheduler warp (warp_id == 6 on cta_rank == 0)
 //     L – load warp (warp_id == 4)
 //     M – MMA  warp (warp_id == 5 on cta_rank == 0)
 //     E – epilogue warps (warp_id in {0,1,2,3})
 //
 //   0. Setup (all warps, once per CTA)
 //      ------------------------------------------------
-//      tid==0   : mbarrier.init for tma_mbars[kStageCount] (count=kClusterM),
+//      tid==0   : mbarrier.init for scheduler_mbars[2] (count=1),
+//                 scheduler_free_mbars[2] (count=4*kClusterM),
+//                 tma_mbars[kStageCount] (count=kClusterM),
 //                 mma_mbars[kStageCount] (count=1), mainlooop_mbars[2] (1),
 //                 epilogue_mbars[2] (4*kClusterM); then
 //                 `fence.mbarrier_init.release.cluster`.
@@ -135,10 +141,19 @@
 //      warp 0*  : `prefetch.tensormap` for A_tmap / B_tmap / C_tmap.
 //      barrier.cluster.arrive+wait (or __syncthreads when kClusterM==1).
 //
-//   1. Main loop — repeated `K / kTileK` iterations
+//   1. Scheduler task ring — once per output tile
+//      Rank-0 S waits for scheduler_free_mbar[task_stage], writes the swizzled
+//      cluster-base coordinate to output_tasks[task_stage], then remotely
+//      arrives on every CTA's scheduler_mbar[task_stage].  Each TMA warp loads
+//      the rank-0 task through DSMEM and derives its local M coordinate.
+//
+//   2. Main loop — repeated `K / kTileK` iterations
 //      ------------------------------------------------
 //      ┌─── L (load warp) ──────────────────────────────────────────────┐
+//      │  wait(scheduler_mbar[task_stage], task_phase) // task ready?  │
+//      │  read output_tasks[task_stage]                                 │
 //      │  wait(mma_mbar[mma_stage], mma_phase)        // slot free?     │
+//      │  write mainloop_tasks[mma_stage]                               │
 //      │  mbar.arrive.expect_tx(tma_mbar[tma_stage], cp_size)           │
 //      │  cp.async.bulk.tensor.3d A: smem[stage]<-A_tmap(m_off,k_off)   │
 //      │  cp.async.bulk.tensor.3d B: smem[stage]+A_sz <-                │
@@ -149,6 +164,8 @@
 //
 //      ┌─── M (MMA warp, one issued per cluster) ───────────────────────┐
 //      │  wait(tma_mbar[tma_stage], tma_phase)        // data ready?    │
+//      │  read mainloop_tasks[tma_stage]                               │
+//      │  first K task waits for the TMEM/epilogue slot                │
 //      │  tcgen05.fence::after_thread_sync                              │
 //      │  taddr_use = taddr + mainloop_stage * kTileN                   │
 //      │  for k1 in [0, kTileK/64):                                     │
@@ -160,17 +177,18 @@
 //      │      mma_mbar[mma_stage]   -> tells L the slot is empty        │
 //      └─── (consumes tma_mbar; produces mma_mbar) ─────────────────────┘
 //
-//   2. End-of-K – hand control to the epilogue
+//   3. End-of-K – hand control to the epilogue
 //      ------------------------------------------------
 //      M issues one extra `tcgen05.commit.cta_group::kClusterM
 //      .mbarrier.arrive::one.shared::cluster.multicast` on
 //      mainlooop_mbar[mainloop_stage], then toggles mainloop_stage and the
 //      epilogue_phase parity bit.
 //
-//   3. Epilogue (warps 0..3; double-buffered on TMEM)
+//   4. Epilogue (warps 0..3; double-buffered on TMEM)
 //      ------------------------------------------------
 //      ┌─── E ──────────────────────────────────────────────────────────┐
 //      │  wait(mainloop_mbar[mainloop_stage], mainloop_phase)           │
+//      │  read output_tasks[mainloop_stage]; signal scheduler_free     │
 //      │  tcgen05.fence::after_thread_sync                              │
 //      │  For n_block in [0, kTileN/kEpilogueBlockN):                   │
 //      │     smem_slot = n_block % kEpilogueStageCount                  │
@@ -190,7 +208,7 @@
 //      │  (loop) advance mainloop_stage, flip mainloop_phase            │
 //      └─── (consumes mainloop_mbar; produces epilogue_mbar) ───────────┘
 //
-//   4. Tile cycling (`compute_bid`)
+//   5. Tile cycling (`compute_bid`, scheduler warp only)
 //      ------------------------------------------------
 //      Linear `bid` is decomposed through the 8x8 macro-swizzle into an
 //      (off_m, off_n) tile coordinate. With `kMacroSwizzleMFast = true` the
@@ -199,7 +217,7 @@
 //          for bid = _bid; bid < grid_size; bid += grid_x
 //      turns the grid persistent: all launched CTAs share the tile grid evenly.
 //
-//   5. Teardown
+//   6. Teardown
 //      ------------------------------------------------
 //      cluster barrier -> warp 0 `tcgen05.dealloc.cta_group::kClusterM`
 //      returns kTileN*2 TMEM columns. If DO_PROFILE, the elected leader
@@ -249,7 +267,7 @@ namespace {
 
 constexpr int kMmaK = 16;
 constexpr int kWarpSize = 32;
-constexpr int kWarpCount = 6;
+constexpr int kWarpCount = 7;
 constexpr int kBlockThreads = kWarpSize * kWarpCount;
 constexpr int kEpilogueStageCount = 2;
 constexpr bool kPrefetchTmaDesc = true;
@@ -260,6 +278,7 @@ constexpr bool kMacroSwizzleMFast = true;
 template <int kTileM, int kTileN, int kTileK, int kClusterM, int kEpilogueBlockN>
 struct KernelConfig {
     static_assert(kClusterM == 1 || kClusterM == 2);
+    static_assert(kMacroSwizzleM % kClusterM == 0);
     static_assert(kTileM == 4 * kWarpSize);
     static_assert(kEpilogueBlockN == 32 || kEpilogueBlockN == 64 || kEpilogueBlockN == 128);
     static_assert(kTileN % kEpilogueBlockN == 0);
@@ -281,6 +300,57 @@ struct KernelConfig {
     static constexpr int kMainloopSmemBytes = kStageCount * kPerStageSmemBytes;
     static constexpr int kDynamicSmemBytes = kMainloopSmemBytes + kEpilogueSmemBytes;
 };
+
+struct OutputTileTask {
+    int off_m;
+    int off_n;
+};
+
+struct MainloopTask {
+    int off_m;
+    int off_n;
+    int iter_k;
+    int mainloop_stage;
+};
+
+__device__ inline int map_shared_to_cluster_cta(
+    int local_smem_addr,
+    int target_cta_rank) {
+    int remote_addr;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;"
+        : "=r"(remote_addr)
+        : "r"(local_smem_addr), "r"(target_cta_rank));
+    return remote_addr;
+}
+
+__device__ inline void mbarrier_arrive_on_cluster_cta(
+    int local_mbar_addr,
+    int target_cta_rank) {
+    const int remote_mbar_addr =
+        map_shared_to_cluster_cta(local_mbar_addr, target_cta_rank);
+    asm volatile("mbarrier.arrive.release.cluster.shared::cluster.b64 _, [%0];" ::
+            "r"(remote_mbar_addr)
+        : "memory");
+}
+
+__device__ inline OutputTileTask load_output_task_from_cluster_cta(
+    const OutputTileTask *tasks,
+    int stage,
+    int target_cta_rank) {
+    const int local_addr =
+        static_cast<int>(__cvta_generic_to_shared(tasks + stage));
+    const int remote_addr = map_shared_to_cluster_cta(local_addr, target_cta_rank);
+    OutputTileTask task;
+    asm volatile("ld.shared::cluster.u32 %0, [%1];"
+        : "=r"(task.off_m)
+        : "r"(remote_addr)
+        : "memory");
+    asm volatile("ld.shared::cluster.u32 %0, [%1];"
+        : "=r"(task.off_n)
+        : "r"(remote_addr + static_cast<int>(sizeof(int)))
+        : "memory");
+    return task;
+}
 
 template <int CTA_GROUP = 1>
 __device__ inline void tma_3d_gmem2smem(
@@ -360,6 +430,40 @@ __device__ inline void wait_mma_slot(
                  "bra.uni LAB_WAIT;\n\t"
                  "DONE:\n\t"
                  "}" ::"r"(mbar_addr),
+        "r"(phase),
+        "r"(ticks)
+        : "memory");
+}
+
+__device__ inline void wait_scheduler_task(
+    int mbar_addr,
+    int phase) {
+    uint32_t ticks = 0x989680;
+    asm volatile("{\n\t"
+                 ".reg .pred P1;\n\t"
+                 "LAB_WAIT:\n\t"
+                 "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 P1, [%0], %1, %2;\n\t"
+                 "@P1 bra.uni DONE;\n\t"
+                 "bra.uni LAB_WAIT;\n\t"
+                 "DONE:\n\t"
+                 "}" :: "r"(mbar_addr),
+        "r"(phase),
+        "r"(ticks)
+        : "memory");
+}
+
+__device__ inline void wait_scheduler_slot(
+    int mbar_addr,
+    int phase) {
+    uint32_t ticks = 0x989680;
+    asm volatile("{\n\t"
+                 ".reg .pred P1;\n\t"
+                 "LAB_WAIT:\n\t"
+                 "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 P1, [%0], %1, %2;\n\t"
+                 "@P1 bra.uni DONE;\n\t"
+                 "bra.uni LAB_WAIT;\n\t"
+                 "DONE:\n\t"
+                 "}" :: "r"(mbar_addr),
         "r"(phase),
         "r"(ticks)
         : "memory");
@@ -623,10 +727,18 @@ void bf16_gemm_serving_kernel(
     __shared__ int tmem_addr[1];
     __shared__ uint64_t tma_mbars[kStageCount];
     __shared__ uint64_t mma_mbars[kStageCount];
+    __shared__ uint64_t scheduler_mbars[2];
+    __shared__ uint64_t scheduler_free_mbars[2];
     __shared__ uint64_t mainlooop_mbars[2];
     __shared__ uint64_t epilogue_mbars[2];
+    __shared__ OutputTileTask output_tasks[2];
+    __shared__ MainloopTask mainloop_tasks[kStageCount];
     const int _base_tma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(tma_mbars));
     const int _base_mma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(mma_mbars));
+    const int _base_scheduler_mbar_addr =
+        static_cast<int>(__cvta_generic_to_shared(scheduler_mbars));
+    const int _base_scheduler_free_mbar_addr =
+        static_cast<int>(__cvta_generic_to_shared(scheduler_free_mbars));
     const int _base_mainloop_mbar_addr =
         static_cast<int>(__cvta_generic_to_shared(mainlooop_mbars));
     const int _base_epilogue_mbar_addr = static_cast<int>(__cvta_generic_to_shared(epilogue_mbars));
@@ -638,6 +750,8 @@ void bf16_gemm_serving_kernel(
             mbarrier_init(_base_mma_mbar_addr + 8 * s, 1);
         }
         for (int s = 0; s < 2; ++s) {
+            mbarrier_init(_base_scheduler_mbar_addr + 8 * s, 1);
+            mbarrier_init(_base_scheduler_free_mbar_addr + 8 * s, 4 * kClusterM);
             mbarrier_init(_base_mainloop_mbar_addr + 8 * s, 1);
             mbarrier_init(_base_epilogue_mbar_addr + 8 * s, 4 * kClusterM);
         }
@@ -677,7 +791,7 @@ void bf16_gemm_serving_kernel(
     const int taddr = tmem_addr[0];
 
     // tma load
-    auto load = [&](int iter_k, int mma_phase, int stage_id, int off_m, int off_n) {
+    auto load = [&](const MainloopTask &task, int mma_phase, int stage_id) {
         const int mma_mbar_addr = _base_mma_mbar_addr + 8 * stage_id;
         if constexpr (DO_PROFILE) {
             profiler.start(ProfilerTag::WaitMMA);
@@ -697,16 +811,19 @@ void bf16_gemm_serving_kernel(
         if constexpr (DO_PROFILE) {
             profiler.start(ProfilerTag::IssueTMA);
         }
+        // The TMA completion barrier publishes both the task metadata and
+        // the asynchronously copied A/B payload to the MMA consumer.
+        mainloop_tasks[stage_id] = task;
         asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;" ::"r"(
                          tma_mbar_addr),
             "r"(cp_size)
             : "memory");
-        const int off_k_64 = iter_k * (kTileK / 64);
-        tma_3d_gmem2smem<kClusterM>(A_smem, &A_tmap, 0, off_m, off_k_64, tma_mbar_addr);
+        const int off_k_64 = task.iter_k * (kTileK / 64);
+        tma_3d_gmem2smem<kClusterM>(A_smem, &A_tmap, 0, task.off_m, off_k_64, tma_mbar_addr);
         tma_3d_gmem2smem<kClusterM>(B_smem,
             &B_tmap,
             0,
-            off_n + cta_rank * (kTileN / kClusterM),
+            task.off_n + cta_rank * (kTileN / kClusterM),
             off_k_64,
             tma_mbar_addr);
         if constexpr (DO_PROFILE) {
@@ -715,7 +832,8 @@ void bf16_gemm_serving_kernel(
     };
 
     // mma compute
-    auto compute = [&](int iter_k, int mainloop_stage, int tma_phase, int stage_id) {
+    auto compute =
+        [&](int tma_phase, int stage_id, bool first_k, int epilogue_phase) -> MainloopTask {
         const int tma_mbar_addr = _base_tma_mbar_addr + 8 * stage_id;
         if constexpr (DO_PROFILE) {
             profiler.start(ProfilerTag::WaitTMA);
@@ -725,6 +843,17 @@ void bf16_gemm_serving_kernel(
             profiler.stop();
         }
 
+        const MainloopTask task = mainloop_tasks[stage_id];
+        if (first_k) {
+            if constexpr (DO_PROFILE) {
+                profiler.start(ProfilerTag::WaitEpilogue);
+            }
+            wait_epilogue(
+                _base_epilogue_mbar_addr + task.mainloop_stage * 8, epilogue_phase);
+            if constexpr (DO_PROFILE) {
+                profiler.stop();
+            }
+        }
         const int A_smem = smem + stage_id * kPerStageSmemBytes;
         const int B_smem = A_smem + kASmemBytes;
         const int mma_mbar_addr = _base_mma_mbar_addr + 8 * stage_id;
@@ -736,7 +865,7 @@ void bf16_gemm_serving_kernel(
         };
 
         asm volatile("tcgen05.fence::after_thread_sync;");
-        const int this_taddr = taddr + mainloop_stage * kTileN;
+        const int this_taddr = taddr + task.mainloop_stage * kTileN;
 
         if constexpr (DO_PROFILE) {
             profiler.start(ProfilerTag::IssueMMA);
@@ -745,7 +874,7 @@ void bf16_gemm_serving_kernel(
             make_desc(A_smem),
             make_desc(B_smem),
             i_desc,
-            iter_k);
+            task.iter_k);
         for (int k2 = 1; k2 < 64 / kMmaK; k2++) {
             uint64_t a_desc = make_desc(A_smem + k2 * 32);
             uint64_t b_desc = make_desc(B_smem + k2 * 32);
@@ -769,6 +898,7 @@ void bf16_gemm_serving_kernel(
         if constexpr (DO_PROFILE) {
             profiler.stop();
         }
+        return task;
     };
 
     auto tmem_to_smem = [&](int mainloop_stage, int n_block, int smem_stage) {
@@ -957,41 +1087,72 @@ void bf16_gemm_serving_kernel(
         }
     };
 
-    // load warp
+    // One scheduler per cluster owns output-tile work.  It publishes the
+    // cluster's rank-0 coordinate and signals each CTA's local ready barrier.
+    // Consumer CTAs derive their M coordinate from the cluster base task.
+    if (cta_rank == 0 && warp_id == 6 && elect_sync()) {
+        int task_stage = 0;
+        int task_free_phase = 1;
+        for (int bid = _bid; bid < grid_size; bid += grid_x) {
+            wait_scheduler_slot(
+                _base_scheduler_free_mbar_addr + task_stage * 8, task_free_phase);
+            auto [off_m, off_n] = compute_bid(bid);
+            output_tasks[task_stage] = {off_m, off_n};
+            for (int target_rank = 0; target_rank < kClusterM; ++target_rank) {
+                mbarrier_arrive_on_cluster_cta(
+                    _base_scheduler_mbar_addr + task_stage * 8, target_rank);
+            }
+
+            task_stage = (task_stage + 1) % 2;
+            if (task_stage == 0) {
+                task_free_phase ^= 1;
+            }
+        }
+    }
+
+    // TMA warp: consume output tasks, expand each one into K-stage tasks, and
+    // pass those tasks to MMA alongside the A/B stage payload.
     if (warp_id == 4 && elect_sync()) {
         int mma_stage = 0;
         int mma_phase = 1;
+        int task_stage = 0;
+        int task_phase = 0;
         for (int bid = _bid; bid < grid_size; bid += grid_x) {
-            auto [off_m, off_n] = compute_bid(bid);
+            wait_scheduler_task(_base_scheduler_mbar_addr + task_stage * 8, task_phase);
+            OutputTileTask output_task = cta_rank == 0
+                ? output_tasks[task_stage]
+                : load_output_task_from_cluster_cta(output_tasks, task_stage, 0);
+            output_task.off_m += cta_rank * kTileM;
+            // Keep a rank-local copy for the epilogue.  It is protected by
+            // the mainloop completion chain before epilogue consumption.
+            output_tasks[task_stage] = output_task;
             for (int iter_k = 0; iter_k < K / kTileK; ++iter_k) {
-                load(iter_k, mma_phase, mma_stage, off_m, off_n);
+                const MainloopTask task{
+                    output_task.off_m, output_task.off_n, iter_k, task_stage};
+                load(task, mma_phase, mma_stage);
                 mma_stage = (mma_stage + 1) % kStageCount;
                 if (mma_stage == 0) {
                     mma_phase ^= 1;
                 }
             }
+            task_stage = (task_stage + 1) % 2;
+            if (task_stage == 0) {
+                task_phase ^= 1;
+            }
         }
     }
 
-    // mma warp
+    // MMA warp: its loop bounds only describe how many tasks will arrive;
+    // task metadata itself comes exclusively from the TMA stage ring.
     if (cta_rank == 0 && warp_id == 5 && elect_sync()) {
         int tma_phase = 0;
         int tma_stage = 0;
-
-        int mainloop_stage = 0;
         int epilogue_phase = 1;
 
         for (int bid = _bid; bid < grid_size; bid += grid_x) {
-            if constexpr (DO_PROFILE) {
-                profiler.start(ProfilerTag::WaitEpilogue);
-            }
-            wait_epilogue(_base_epilogue_mbar_addr + mainloop_stage * 8, epilogue_phase);
-            if constexpr (DO_PROFILE) {
-                profiler.stop();
-            }
-
+            MainloopTask task{};
             for (int iter_k = 0; iter_k < K / kTileK; ++iter_k) {
-                compute(iter_k, mainloop_stage, tma_phase, tma_stage);
+                task = compute(tma_phase, tma_stage, iter_k == 0, epilogue_phase);
                 tma_stage = (tma_stage + 1) % kStageCount;
                 if (tma_stage == 0) {
                     tma_phase ^= 1;
@@ -1001,13 +1162,12 @@ void bf16_gemm_serving_kernel(
             constexpr int16_t cta_mask = (1 << kClusterM) - 1;
             asm volatile(
                 "tcgen05.commit.cta_group::%2.mbarrier::arrive::one.shared::cluster.multicast:"
-                ":cluster.b64 [%0], %1;" ::"r"(_base_mainloop_mbar_addr + 8 * mainloop_stage),
+                ":cluster.b64 [%0], %1;" ::"r"(
+                    _base_mainloop_mbar_addr + 8 * task.mainloop_stage),
                 "h"(cta_mask),
                 "n"(kClusterM)
                 : "memory");
-
-            mainloop_stage = (mainloop_stage + 1) % 2;
-            if (mainloop_stage == 0) {
+            if (task.mainloop_stage == 1) {
                 epilogue_phase ^= 1;
             }
         }
@@ -1027,11 +1187,15 @@ void bf16_gemm_serving_kernel(
             if constexpr (DO_PROFILE)
                 if (elect_sync())
                     profiler.stop();
-            auto [off_m, off_n] = compute_bid(bid);
+            const OutputTileTask task = output_tasks[mainloop_stage];
+            if (elect_sync()) {
+                mbarrier_arrive_on_cluster_cta(
+                    _base_scheduler_free_mbar_addr + mainloop_stage * 8, 0);
+            }
             if constexpr (DO_PROFILE)
                 if (elect_sync())
                     profiler.start(ProfilerTag::Epilogue);
-            epilogue(mainloop_stage, off_m, off_n);
+            epilogue(mainloop_stage, task.off_m, task.off_n);
             if constexpr (DO_PROFILE)
                 if (elect_sync())
                     profiler.stop();
@@ -1243,4 +1407,3 @@ void launch_bf16_gemm_serving_profile(
                    max_active_clusters, stream);
     }
 }
-
