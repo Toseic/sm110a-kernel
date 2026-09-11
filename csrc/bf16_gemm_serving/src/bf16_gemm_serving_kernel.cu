@@ -1,5 +1,5 @@
 // =============================================================================
-// SM110A BF16 GEMM — Overview
+// SM110A BF16 persistent serving GEMM — design and execution pipeline
 // =============================================================================
 //
 // Target hardware
@@ -8,59 +8,200 @@
 //   Tensor Memory (TMEM), distributed shared memory (DSMEM), thread-block
 //   clusters and the Tensor Memory Accelerator (TMA) bulk-copy engine.
 //
-// Problem
-// -------
-//   C[M,N] = A[M,K] @ B[K,N]   with A, B, C stored as nv_bfloat16.
-//   M, N, K must be multiples of (kTileM, kTileN, kTileK) respectively.
-//   A "SWAP_AB" template variant reuses the kernel for the transposed
-//   product B[N,K] @ A[K,M] by treating (B,A) as the operands on the host
-//   side (see launch_bf16_gemm_serving_impl).
+// Scope and implementation status
+// -------------------------------
+//   The target operation is C[M,N] = A[M,K] @ B[K,N] in BF16.  The online
+//   serving variant keeps N, K and B fixed for one long-lived launch and
+//   receives only M rows at runtime.  Its physical work unit is
+//   kClusterM*kTileM rows by kTileN columns; N and K must be divisible by
+//   kTileN and kTileK.  Padding makes an explicitly flushed M tail physical-
+//   tile aligned even when its logical valid_rows is not.
 //
-// Bottleneck model
-// ----------------
-//   Back-of-the-envelope estimate for the default 128x256x64 tile with
-//   kClusterM == 2 (2 CTAs cooperate along M):
+//   This file contains both the original finite-launch validation entry and
+//   the low-level persistent ring entry.  They share the complete
+//   scheduler->TMA->MMA->epilogue data path; the scheduler selects either a
+//   finite grid or ServingQueueControl as its task source.  Queue allocation,
+//   production/consumption helpers and the public Python lifetime handle are
+//   layered above these low-level CUDA entry points.
 //
-//     Per-tile loads (one K tile = 64 elements):
-//         A: 128 rows * 64 * sizeof(bf16)               = 16 KiB / CTA
-//         B: 128 cols * 64 * sizeof(bf16)               = 16 KiB / CTA
-//         Total per output tile: 2 * (128 + 128) * 64   = 32 KiB of K data
+// Online-serving contract
+// -----------------------
+//   The final kernel is launched once, remains resident, and
+//   consumes M rows published online by a separate GPU producer.  N, K and B
+//   are fixed for the lifetime of a launch; only the amount of available M
+//   work changes.  The producer is responsible for obeying the release/acquire
+//   queue protocol described here.  How it is co-scheduled (for example with
+//   CUDA Green Contexts) is deliberately outside this kernel's contract.
 //
-//     Over the full problem (M = 128 * Mtiles, N = 256 * Ntiles):
-//         Total bytes moved = 2 * (128 + 128) * K * (Mtiles * Ntiles)
-//                            = K * M * N / 64 bytes.
-//         Memory-bound time = total_bytes / peak_L2_or_DRAM_bandwidth.
-//         Compute-bound time = 2 * K * M * N / peak_BF16_MMA_rate.
+//   The first supported serving tactic is fixed rather than autotuned:
 //
-//     For a 4K^3 problem the two limits are roughly:
-//         * L2-hit TMA: K * M * N / 64 / ~1.281 TB/s  ~= 3.12 ms.
-//         * MMA issue : 2 * K * M * N     / ~250 TF/s  ~= 0.55 ms.
-//     (Effective rates depend on the deployed Blackwell part; treat these
-//     numbers as a sanity check, not a contract.)
+//       kTileM              = 128
+//       kTileN              = 256
+//       kTileK              = 128
+//       kClusterM           = 2
+//       kEpilogueBlockN     = 32
+//       SWAP_AB             = false
+//       physical B layout   = B_nt[N,K]
 //
-//     Per-stage latency model (single output tile, kClusterM = 2):
-//         * MMA work        : 2 * 128 * 256 * 64 / 8K  ~= 512 cycles.
-//         * DRAM -> L2 fetch: (2 * 128 * 64 + 2 * 128 * 64) / 8  ~= 4096 cycles.
-//         * L2 hit on fetch : (2 * 128 * 64 + 2 * 128 * 64) / 40 ~= 819 cycles.
+//   This is the winner stored by the existing 4096x4096x4096 autotuning runs.
+//   It gives one 256-row cluster-M group, sixteen independent N tasks when
+//   N=4096, and three A/B shared-memory stages under the 227 KiB budget.  The
+//   protocol is intentionally tactic-independent, so a later launch API can
+//   select another compiled tactic without changing the ring representation.
 //
-//   Reading the three numbers together explains the design pressure points
-//   addressed below:
-//     * The MMA path is only ~2x of an L2-hit fetch, so compute and memory
-//       must overlap tightly -- that is the role of the multi-stage mainloop.
-//     * An L2 miss inflates the fetch by ~5x, so the macro-swizzle and the
-//       L2-friendly tile order are first-order optimizations, not niceties.
-//     * TMA descriptor prefetch matters because every mainloop iteration
-//       consumes a fresh A/B tile, so the very first load cannot afford to
-//       stall on the descriptor fetch.
+//   1. Physical input/output rings
+//      ---------------------------
+//      The launch owns X row slots in each of two fixed-address arenas:
 //
-
-// Functional summary
-// ------------------
-//   * Persistent tiled kernel: launches a caller-selected number of clusters
-//     (one CTA per SM in each cluster) and walks the output-tile grid in
-//     round-robin.
-//     and walks the (grid_m * grid_n) output-tile grid in round-robin so each
-//     CTA accumulates multiple output tiles per launch.
+//          A_ring[X][kTileM][K]
+//          C_ring[X][kTileM][N]
+//
+//      A and C use the same physical slot number.  X must be divisible by
+//      kClusterM.  The externally visible queue is expressed in cluster-M
+//      groups, not individual CTAs:
+//
+//          group_capacity = X / kClusterM
+//          group ticket g -> group_index = g % group_capacity
+//          base_slot       = group_index * kClusterM
+//
+//      Consequently a cluster group never straddles the physical end of the
+//      ring.  CTA rank r reads A_ring[base_slot+r] and writes the matching
+//      C_ring[base_slot+r].  The persistent launch can therefore keep one
+//      immutable A tensor map, one immutable C tensor map, and one immutable B
+//      tensor map; tasks carry coordinates/tickets rather than arbitrary
+//      pointers or dynamically rebuilt tensor maps.
+//
+//      Logical requests may have any positive M.  The producer writes them in
+//      strict arrival order and packs their rows consecutively into physical
+//      slots.  Request-boundary segment metadata is owned by the producer and
+//      downstream output consumer; GEMM sees only packed rows.  A normal
+//      publication contains kClusterM*kTileM valid rows.  To bound latency, the
+//      producer explicitly FLUSHes a partial group: it zero-fills every unused
+//      A row and publishes valid_rows for downstream unpacking.  GEMM still
+//      computes and stores the full padded physical group.
+//
+//   2. Monotonic queue positions
+//      -------------------------
+//      Three cache-line-separated uint64_t counters describe queue progress:
+//
+//          published_tail  number of completely published M groups
+//          dispatch_head   next flattened N-tile work item to claim
+//          recycle_head    number of in-order output groups released for reuse
+//
+//      A published group creates grid_n = N/kTileN independently claimable
+//      work items.  Work items are claimed in N-tile-major epochs so that the
+//      whole cluster fleet shares one B N-tile at a time.  Epoch width
+//      W = min(group_capacity, launched_clusters): W consecutive claims map to
+//      W different groups at the same n_tile, so each 2 MiB B tile is fetched
+//      from DRAM once per epoch instead of once per group (an 8x reduction at
+//      W=8), keeping B L2-resident instead of re-streaming all of B per group.
+//      Capping W at the fleet size also bounds the L2 A/C working set to the
+//      one active epoch; deeper rings only add waiting groups, which stay
+//      untouched in DRAM instead of thrashing L2:
+//
+//          work_tail    = published_tail * grid_n
+//          work_id      = atomic claim in [dispatch_head, work_tail)
+//          epoch        = work_id / W            (one B N-tile per epoch)
+//          n_tile       = epoch % grid_n
+//          group_ticket = (epoch / grid_n) * W + work_id % W
+//          off_m        = (group_ticket % group_capacity)
+//                         * kClusterM * kTileM
+//          off_n        = n_tile * kTileN
+//
+//      A cluster scheduler claims one (group_ticket,n_tile) at a time and feeds
+//      it into that cluster's existing scheduler->TMA->MMA->epilogue pipeline.
+//      group_ticket stays monotonic along claim order, so in-order
+//      OUTPUT_READY, consumption, and slot recycling are unchanged, and
+//      W == 1 degenerates to the old group-major order.  Epochs are a claim
+//      ordering, not a barrier: clusters flow across epoch boundaries.  The
+//      cost of the reuse is completion latency - a group finishes only after
+//      grid_n epochs (~W x the group-major latency at full occupancy) - which
+//      is the intended trade for serving throughput.  Claiming should use a
+//      bounded CAS loop (claim only while the mapped group_ticket is below the
+//      published frontier), never an unconditional atomicAdd that can run past
+//      the published frontier.
+//
+//      The producer may reuse ticket g's physical storage only after the
+//      downstream consumer has released it and advanced recycle_head.  In
+//      particular, GEMM completion does not make the C slot writable by the
+//      producer: C must remain live until the output consumer acknowledges it.
+//
+//   3. Per-group state-word encoding
+//      -----------------------------
+//      Each physical group has one atomically accessed 64-bit state word.  The
+//      v1 encoding keeps publication, completion and ABA protection in
+//      a single naturally atomic value:
+//
+//          bits  0..1   state: 0 FREE, 1 READY, 2 OUTPUT_READY
+//          bit      2   FLUSH (the producer explicitly closed a partial group)
+//          bit      3   reserved (zero in ABI v1)
+//          bits  4..15  valid_rows in [1, kClusterM*kTileM]
+//          bits 16..63  low 48 bits of the monotonic group generation/ticket
+//
+//      The 48-bit generation makes a wrapped physical slot distinguishable
+//      from its previous occupant.  State transitions preserve the generation,
+//      FLUSH and valid_rows fields:
+//
+//          FREE(g) -> READY(g) -> OUTPUT_READY(g) -> FREE(g+capacity)
+//
+//      The producer initializes A data, completion_count=0 and all immutable
+//      metadata before a release-store of READY(g), then release-advances
+//      published_tail after the complete cluster-M group is visible.  A
+//      scheduler acquire-loads published_tail/state before issuing TMA.  The
+//      There is deliberately no ACTIVE state: dispatch_head is the unique work
+//      allocator, and all N tasks for a group must continue to observe READY
+//      concurrently. CUDA atomic accesses use device scope while producer,
+//      GEMM and output consumer are GPU kernels in one context.
+//
+//   4. N-tile completion and output publication
+//      ----------------------------------------
+//      Each group has a uint32_t completion_count reset by the producer before
+//      READY publication.  An epilogue increments it only after its C TMA store
+//      for one n_tile is globally complete.  The thread observing
+//      completion_count == grid_n performs a release-store of OUTPUT_READY.
+//      Therefore an acquire-load of OUTPUT_READY by the downstream consumer
+//      makes the entire C_ring group visible.  N tasks and whole groups may
+//      complete out of order; request order is recovered from group_ticket and
+//      the producer-owned segment metadata.  recycle_head advances only across
+//      the contiguous prefix of groups that the output consumer has released.
+//
+//   5. Empty queue, backpressure and shutdown
+//      --------------------------------------
+//      An empty scheduler first spins briefly, then uses progressively longer
+//      nanosleeps so an idle persistent launch does not continuously saturate
+//      GMEM/atomic fabric.  The input ring is full when
+//      published_tail-recycle_head == group_capacity; the producer must wait
+//      rather than overwrite live A or C.  Ring size X is a runtime launch
+//      property and should initially be at least twice the resident cluster
+//      count times kClusterM slots, then tuned from measured burst depth.
+//
+//      Shutdown is draining, never an independent per-warp branch.  After its
+//      final release-publication, the producer sets DRAIN_AND_STOP.  A cluster
+//      scheduler that can claim no remaining work injects a typed STOP task
+//      into its local shared-memory task ring.  STOP travels through
+//      scheduler->TMA->MMA->epilogue, preserving every mbarrier phase and
+//      allowing outstanding stores to finish before cluster synchronization
+//      and TMEM deallocation.  The final cluster publishes STOPPED.  A future
+//      immediate-cancel mode, if needed, must be a separate protocol.
+//
+//   6. Boundary between the global and local pipelines
+//      ------------------------------------------------
+//      Only the elected scheduler lane on cluster rank 0 reads or atomically
+//      modifies the GMEM queue.  It converts a claimed global work item into an
+//      OutputTileTask stored in the existing two-entry SMEM ring.  From that
+//      point onward metadata follows exactly one ordered path:
+//
+//          GMEM work ring -> cluster scheduler -> DSMEM task multicast
+//                         -> TMA -> MMA -> epilogue -> GMEM completion
+//
+//      Load, MMA and epilogue warps never poll global queue state.  This keeps
+//      queue latency/atomics off the data path and makes STOP/FLUSH ordinary
+//      typed pipeline messages rather than out-of-band synchronization.
+//
+// Shared finite/persistent execution core
+// ---------------------------------------
+//   * The finite entry drains one output grid; the persistent entry claims one
+//     (group_ticket,n_tile) at a time until DRAIN_AND_STOP is drained.
 //   * Each CTA executes a 7-warp pipeline (224 threads):
 //       warp 4              – load warp (TMA gmem→smem)
 //       warp 5 (cta_rank 0) – MMA warp   (tcgen05.mma on TMEM)
@@ -72,12 +213,13 @@
 //   * Output accumulator lives in TMEM (kTileN*2 columns, i.e. 2 banks for
 //     mainloop double-buffering) and is drained to shared memory via
 //     tcgen05.ld, then to global memory via 2-D/3-D TMA bulk stores.
-//   * Two entry points:
+//   * Low-level entry points:
 //       launch_bf16_gemm_serving          – regular, unprofiled path.
 //       launch_bf16_gemm_serving_profile  – same kernel with per-stage profiler.
+//       launch_bf16_gemm_persistent_serving – long-lived ring consumer.
 //
-// Optimizations
-// -------------
+// Implemented execution mechanisms
+// --------------------------------
 //   1. TMA for all bulk data movement.
 //        * Loads  : 3-D tensor maps for A and B, 128 B swizzle.
 //        * Stores : 2-D map for the KEpilogueBlockN==32 fast path, 3-D map
@@ -97,31 +239,25 @@
 //          scheduler_free_mbars[2] – all epilogues    -> rank-0 reuse.
 //          tma_mbars[kStageCount]  – TMA completion -> MMA consumer.
 //          mma_mbars[kStageCount]  – MMA commit     -> TMA producer.
-//        A separate `mainlooop_mbars[2]` array — note the misspelling kept
-//        on purpose — signals mainloop-stage completion to the epilogue.
+//        `mainlooop_mbars[2]` signals mainloop-stage completion to the
+//        epilogue, and `completion_mbars[2]` joins both cluster CTAs after
+//        their C-store completion before the group completion atomic.
 //        Phase parity bits per ring track the 2-cycle wrap.
-//   5. L2-friendly tile schedule (`compute_bid`, scheduler warp only).
-//        The output grid is mapped through an 8x8 macro-swizzle. With
-//        `kMacroSwizzleMFast=true`, M is iterated fastest inside a macro
-//        band so consecutive CTAs read overlapping K-resident operands
-//        and reuse L2 lines.
-//   6. TMA descriptor prefetch (`prefetch.tensormap`) issued once at startup,
+//   5. TMA descriptor prefetch (`prefetch.tensormap`) issued once at startup,
 //        so the first TMA does not stall on the descriptor fetch.
-//   7. Pipelined epilogue:
+//   6. Pipelined epilogue:
 //          * 2 smem slots per mainloop_stage (`kEpilogueStageCount == 2`).
 //          * `cp.async.bulk.wait_group.read 1` + `bar.sync 1, 128` keeps the
 //            TMA store of slot N concurrent with the tcgen05.ld that fills
 //            slot N+1.
-//   8. `SWAP_AB` template variant reuses the same kernel binary for the
-//      transposed product (no second hand-written kernel); only the host-side
-//      launch swaps pointer/dimension arguments and selects the matching
-//      C tensor-map encoder.
-//   9. Per-stage profiler (DO_PROFILE): tag-based timing of Setup,
+//   7. The finite scaffold retains a `SWAP_AB` template variant for its
+//      existing benchmark API.  Online v1 fixes SWAP_AB=false and B_nt[N,K].
+//   8. Per-stage profiler (DO_PROFILE): tag-based timing of Setup,
 //      WaitMMA, IssueTMA, WaitTMA, IssueMMA, WaitMainloop, WaitEpilogue,
 //      Epilogue via elected leaders, no impact on the unprofiled path.
 //
-// Detailed pipeline
-// -----------------
+// Current cluster-local pipeline (retained by the online design)
+// --------------------------------------------------------------
 //   Legend
 //     S – scheduler warp (warp_id == 6 on cta_rank == 0)
 //     L – load warp (warp_id == 4)
@@ -142,10 +278,12 @@
 //      barrier.cluster.arrive+wait (or __syncthreads when kClusterM==1).
 //
 //   1. Scheduler task ring — once per output tile
-//      Rank-0 S waits for scheduler_free_mbar[task_stage], writes the swizzled
-//      cluster-base coordinate to output_tasks[task_stage], then remotely
-//      arrives on every CTA's scheduler_mbar[task_stage].  Each TMA warp loads
-//      the rank-0 task through DSMEM and derives its local M coordinate.
+//      Rank-0 S waits for scheduler_free_mbar[task_stage], writes a cluster-base
+//      task to output_tasks[task_stage], then remotely arrives on every
+//      CTA's scheduler_mbar[task_stage].  Each TMA warp loads the rank-0 task
+//      through DSMEM and derives its local M coordinate.  The finite entry uses
+//      compute_bid(); the persistent entry uses a bounded-CAS claim of
+//      (group_ticket,n_tile), without changing the downstream interface.
 //
 //   2. Main loop — repeated `K / kTileK` iterations
 //      ------------------------------------------------
@@ -208,16 +346,7 @@
 //      │  (loop) advance mainloop_stage, flip mainloop_phase            │
 //      └─── (consumes mainloop_mbar; produces epilogue_mbar) ───────────┘
 //
-//   5. Tile cycling (`compute_bid`, scheduler warp only)
-//      ------------------------------------------------
-//      Linear `bid` is decomposed through the 8x8 macro-swizzle into an
-//      (off_m, off_n) tile coordinate. With `kMacroSwizzleMFast = true` the
-//      inner loop walks M, which empirically keeps the K-resident operand
-//      hot in L2. The triple-nested loop in the launch
-//          for bid = _bid; bid < grid_size; bid += grid_x
-//      turns the grid persistent: all launched CTAs share the tile grid evenly.
-//
-//   6. Teardown
+//   5. Teardown
 //      ------------------------------------------------
 //      cluster barrier -> warp 0 `tcgen05.dealloc.cta_group::kClusterM`
 //      returns kTileN*2 TMEM columns. If DO_PROFILE, the elected leader
@@ -227,8 +356,6 @@
 // -----
 //   * The `__grid_constant__ CUtensorMap` parameters carry the host-built
 //     TMA descriptors; we never rebuild them on the device.
-//   * The `& 0xFEFFFFFF` mask on mbar addresses sets the "CTA-local" bit
-//     expected by the `mbarrier` PTX (state<->phase packing convention).
 //   * All TMEM addresses are 32-bit shared-memory offsets returned by
 //     `tcgen05.alloc` and stored in `tmem_addr[0]`.
 //   * `kClusterM == 1` falls back to `__syncthreads()` for setup/teardown;
@@ -301,9 +428,19 @@ struct KernelConfig {
     static constexpr int kDynamicSmemBytes = kMainloopSmemBytes + kEpilogueSmemBytes;
 };
 
+enum class TaskKind : uint32_t {
+    kCompute = 0,
+    kStop = 1,
+};
+
 struct OutputTileTask {
     int off_m;
     int off_n;
+    uint64_t group_ticket;
+    uint32_t group_index;
+    uint32_t n_tile;
+    uint32_t valid_rows;
+    TaskKind kind;
 };
 
 struct MainloopTask {
@@ -311,7 +448,326 @@ struct MainloopTask {
     int off_n;
     int iter_k;
     int mainloop_stage;
+    uint64_t group_ticket;
+    uint32_t group_index;
+    uint32_t n_tile;
+    uint32_t valid_rows;
+    TaskKind kind;
 };
+
+static_assert(sizeof(OutputTileTask) == 32);
+static_assert(sizeof(MainloopTask) == 40);
+static_assert(std::is_trivially_copyable_v<OutputTileTask>);
+static_assert(std::is_trivially_copyable_v<MainloopTask>);
+
+using sm110a::bf16_gemm_serving::ServingGroupMeta;
+using sm110a::bf16_gemm_serving::ServingGroupState;
+using sm110a::bf16_gemm_serving::ServingLifecycle;
+using sm110a::bf16_gemm_serving::ServingQueueControl;
+using sm110a::bf16_gemm_serving::decode_serving_group_state;
+using sm110a::bf16_gemm_serving::decode_serving_group_ticket;
+using sm110a::bf16_gemm_serving::decode_serving_group_valid_rows;
+using sm110a::bf16_gemm_serving::decode_serving_group_flush;
+using sm110a::bf16_gemm_serving::encode_serving_group_state;
+using sm110a::bf16_gemm_serving::serving_group_meta;
+using sm110a::bf16_gemm_serving::serving_compare_exchange_weak_relaxed;
+using sm110a::bf16_gemm_serving::serving_fetch_add_acq_rel;
+using sm110a::bf16_gemm_serving::serving_load_acquire;
+using sm110a::bf16_gemm_serving::serving_load_relaxed;
+using sm110a::bf16_gemm_serving::serving_store_relaxed;
+using sm110a::bf16_gemm_serving::serving_store_release;
+
+__global__ void initialize_serving_queue_kernel(
+    ServingQueueControl *control,
+    uint32_t slot_count,
+    uint32_t group_capacity,
+    uint32_t n,
+    uint32_t k,
+    uint32_t grid_n,
+    uint32_t launched_clusters) {
+    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < group_capacity) {
+        ServingGroupMeta *meta = serving_group_meta(control) + tid;
+        serving_store_relaxed(
+            &meta->state_word,
+            encode_serving_group_state(ServingGroupState::kFree, tid, 0, false));
+        serving_store_relaxed(&meta->completion_count, uint32_t{0});
+    }
+    if (tid == 0) {
+        control->config.magic = sm110a::bf16_gemm_serving::kServingQueueMagic;
+        control->config.abi_version =
+            sm110a::bf16_gemm_serving::kServingQueueAbiVersion;
+        control->config.header_bytes = sizeof(ServingQueueControl);
+        control->config.group_meta_bytes = sizeof(ServingGroupMeta);
+        control->config.slot_count = slot_count;
+        control->config.group_capacity = group_capacity;
+        control->config.n = n;
+        control->config.k = k;
+        control->config.grid_n = grid_n;
+        control->config.tile_m = SM110A_BF16_TILE_M;
+        control->config.tile_n = SM110A_BF16_TILE_N;
+        control->config.tile_k = SM110A_BF16_TILE_K;
+        control->config.cluster_m = SM110A_BF16_CLUSTER_M;
+        control->config.epilogue_block_n = SM110A_BF16_EPILOGUE_BLOCK_N;
+        serving_store_relaxed(&control->published_tail.value, uint64_t{0});
+        serving_store_relaxed(&control->dispatch_head.value, uint64_t{0});
+        serving_store_relaxed(&control->recycle_head.value, uint64_t{0});
+        serving_store_relaxed(
+            &control->lifecycle.state,
+            static_cast<uint32_t>(ServingLifecycle::kRunning));
+        serving_store_relaxed(&control->lifecycle.stopped_clusters, uint32_t{0});
+        control->lifecycle.launched_clusters = launched_clusters;
+    }
+}
+
+__global__ void request_serving_drain_kernel(ServingQueueControl *control) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        const uint32_t state = serving_load_acquire(&control->lifecycle.state);
+        if (state == static_cast<uint32_t>(ServingLifecycle::kRunning)) {
+            serving_store_release(&control->lifecycle.state,
+                static_cast<uint32_t>(ServingLifecycle::kDrainAndStop));
+        }
+    }
+}
+
+__global__ void serving_test_producer_kernel(
+    const nv_bfloat16 *__restrict__ rows,
+    nv_bfloat16 *__restrict__ a_ring,
+    ServingQueueControl *control,
+    uint64_t group_ticket,
+    uint32_t valid_rows,
+    bool flush,
+    uint64_t delay_cycles,
+    bool bypass_payload) {
+    const uint32_t k = control->config.k;
+    const uint32_t physical_rows =
+        control->config.cluster_m * control->config.tile_m;
+    const uint32_t group_index = static_cast<uint32_t>(
+        group_ticket % control->config.group_capacity);
+    ServingGroupMeta *meta = serving_group_meta(control) + group_index;
+    if (threadIdx.x == 0 && delay_cycles != 0) {
+        const uint64_t start = clock64();
+        while (clock64() - start < delay_cycles) {
+        }
+    }
+    __syncthreads();
+    // Backpressure is resolved before any A-ring write. This is essential at
+    // capacity=1: ticket g+1 must not overwrite the rows still used by g.
+    if (threadIdx.x == 0) {
+        uint32_t backoff_step = 0;
+        while (true) {
+            const uint64_t free_word = serving_load_acquire(&meta->state_word);
+            const uint64_t tail = serving_load_acquire(&control->published_tail.value);
+            if (decode_serving_group_state(free_word) == ServingGroupState::kFree &&
+                decode_serving_group_ticket(free_word) ==
+                    (group_ticket &
+                        sm110a::bf16_gemm_serving::kServingTicketValueMask) &&
+                tail == group_ticket) {
+                break;
+            }
+            const uint32_t shift = min(backoff_step, uint32_t{10});
+            __nanosleep(32u << shift);
+            backoff_step = min(backoff_step + 1, uint32_t{10});
+        }
+    }
+    __syncthreads();
+    if (!bypass_payload) {
+        // Vectorized row-major copy: k % 8 == 0 (queue validates k % 128),
+        // so every row is a whole number of 16-byte vectors. Rows beyond
+        // valid_rows are zero-padded to the physical group height.
+        constexpr int kVecElems = 8;
+        constexpr size_t kUnroll = 8;
+        const uint32_t vec_per_row = k / kVecElems;
+        const size_t copy_vecs = static_cast<size_t>(valid_rows) * vec_per_row;
+        const size_t pad_vecs =
+            static_cast<size_t>(physical_rows) * vec_per_row;
+        const size_t dst_base =
+            static_cast<size_t>(group_index) * physical_rows * k;
+        uint4 *dst = reinterpret_cast<uint4 *>(a_ring + dst_base);
+        const uint4 *src = reinterpret_cast<const uint4 *>(rows);
+        const size_t stride = blockDim.x;
+        size_t v = threadIdx.x;
+        for (; v + (kUnroll - 1) * stride < copy_vecs; v += kUnroll * stride) {
+            uint4 regs[kUnroll];
+#pragma unroll
+            for (size_t u = 0; u < kUnroll; ++u) {
+                regs[u] = src[v + u * stride];
+            }
+#pragma unroll
+            for (size_t u = 0; u < kUnroll; ++u) {
+                dst[v + u * stride] = regs[u];
+            }
+        }
+        for (; v < copy_vecs; v += stride) {
+            dst[v] = src[v];
+        }
+        const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
+        for (size_t p = copy_vecs + threadIdx.x; p < pad_vecs; p += stride) {
+            dst[p] = zero;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        serving_store_relaxed(&meta->completion_count, uint32_t{0});
+        __threadfence();
+        serving_store_release(&meta->state_word,
+            encode_serving_group_state(
+                ServingGroupState::kReady, group_ticket, valid_rows, flush));
+        serving_store_release(&control->published_tail.value, group_ticket + 1);
+    }
+}
+
+__global__ void serving_test_consumer_kernel(
+    const nv_bfloat16 *__restrict__ c_ring,
+    nv_bfloat16 *__restrict__ rows,
+    ServingQueueControl *control,
+    uint64_t group_ticket,
+    uint32_t expected_valid_rows,
+    bool bypass_payload) {
+    const uint32_t group_capacity = control->config.group_capacity;
+    const uint32_t group_index =
+        static_cast<uint32_t>(group_ticket % group_capacity);
+    ServingGroupMeta *meta = serving_group_meta(control) + group_index;
+    uint64_t state_word;
+    uint32_t backoff_step = 0;
+    do {
+        state_word = serving_load_acquire(&meta->state_word);
+        if (decode_serving_group_state(state_word) == ServingGroupState::kOutputReady &&
+            decode_serving_group_ticket(state_word) ==
+                (group_ticket & sm110a::bf16_gemm_serving::kServingTicketValueMask)) {
+            break;
+        }
+        const uint32_t shift = min(backoff_step, uint32_t{10});
+        __nanosleep(32u << shift);
+        backoff_step = min(backoff_step + 1, uint32_t{10});
+    } while (true);
+
+    const uint32_t valid_rows = decode_serving_group_valid_rows(state_word);
+    if (valid_rows != expected_valid_rows) {
+        if (threadIdx.x == 0) {
+            control->lifecycle.reserved0 = 2;
+        }
+        return;
+    }
+    if (!bypass_payload) {
+        const uint32_t n = control->config.n;
+        const uint32_t physical_rows =
+            control->config.cluster_m * control->config.tile_m;
+        constexpr int kVecElems = 8;
+        constexpr size_t kUnroll = 8;
+        const size_t src_base =
+            static_cast<size_t>(group_index) * physical_rows * n;
+        const size_t copy_vecs =
+            static_cast<size_t>(valid_rows) * (n / kVecElems);
+        const uint4 *src = reinterpret_cast<const uint4 *>(c_ring + src_base);
+        uint4 *dst = reinterpret_cast<uint4 *>(rows);
+        const size_t stride = blockDim.x;
+        size_t v = threadIdx.x;
+        for (; v + (kUnroll - 1) * stride < copy_vecs; v += kUnroll * stride) {
+            uint4 regs[kUnroll];
+#pragma unroll
+            for (size_t u = 0; u < kUnroll; ++u) {
+                regs[u] = src[v + u * stride];
+            }
+#pragma unroll
+            for (size_t u = 0; u < kUnroll; ++u) {
+                dst[v + u * stride] = regs[u];
+            }
+        }
+        for (; v < copy_vecs; v += stride) {
+            dst[v] = src[v];
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const uint64_t recycle = serving_load_acquire(&control->recycle_head.value);
+        if (recycle != group_ticket) {
+            control->lifecycle.reserved0 = 3;
+            return;
+        }
+        __threadfence();
+        serving_store_release(&meta->state_word,
+            encode_serving_group_state(ServingGroupState::kFree,
+                group_ticket + group_capacity,
+                0,
+                false));
+        serving_store_release(&control->recycle_head.value, group_ticket + 1);
+    }
+}
+
+enum class ServingClaimStatus : uint32_t {
+    kClaimed,
+    kEmpty,
+    kContended,
+    kStop,
+};
+
+// Called only by the elected rank-0 scheduler lane. A successful CAS advances
+// dispatch_head by exactly one N tile; no claim spans or speculatively skips a
+// task. The producer publishes group state before published_tail, so observing
+// the latter with acquire makes the input payload and state word visible.
+__device__ inline ServingClaimStatus try_claim_serving_work(
+    ServingQueueControl *control,
+    OutputTileTask *task) {
+    constexpr int kMaxCasAttempts = 16;
+    const uint32_t grid_n = control->config.grid_n;
+    const uint32_t group_capacity = control->config.group_capacity;
+    const uint64_t window_width = static_cast<uint64_t>(
+        min(group_capacity, control->lifecycle.launched_clusters));
+
+#pragma unroll 1
+    for (int attempt = 0; attempt < kMaxCasAttempts; ++attempt) {
+        uint64_t head = serving_load_relaxed(&control->dispatch_head.value);
+        const uint64_t published_tail =
+            serving_load_acquire(&control->published_tail.value);
+        const uint64_t epoch = head / window_width;
+        const uint32_t n_tile = static_cast<uint32_t>(epoch % grid_n);
+        const uint64_t group_ticket =
+            (epoch / grid_n) * window_width + head % window_width;
+        if (group_ticket >= published_tail) {
+            const auto lifecycle = static_cast<ServingLifecycle>(
+                serving_load_acquire(&control->lifecycle.state));
+            return lifecycle == ServingLifecycle::kRunning
+                ? ServingClaimStatus::kEmpty
+                : ServingClaimStatus::kStop;
+        }
+
+        const uint32_t group_index =
+            static_cast<uint32_t>(group_ticket % group_capacity);
+        ServingGroupMeta *meta = serving_group_meta(control) + group_index;
+        const uint64_t state_word = serving_load_acquire(&meta->state_word);
+        if (decode_serving_group_state(state_word) != ServingGroupState::kReady ||
+            decode_serving_group_ticket(state_word) !=
+                (group_ticket & sm110a::bf16_gemm_serving::kServingTicketValueMask)) {
+            // published_tail is authoritative. A mismatch means this claimant
+            // raced producer publication visibility or slot recycling; retry
+            // without consuming the flattened task.
+            continue;
+        }
+
+        const uint64_t desired = head + 1;
+        if (serving_compare_exchange_weak_relaxed(
+                &control->dispatch_head.value, head, desired)) {
+            const uint32_t base_slot = group_index * SM110A_BF16_CLUSTER_M;
+            *task = OutputTileTask{
+                static_cast<int>(base_slot * SM110A_BF16_TILE_M),
+                static_cast<int>(n_tile * SM110A_BF16_TILE_N),
+                group_ticket,
+                group_index,
+                n_tile,
+                decode_serving_group_valid_rows(state_word),
+                TaskKind::kCompute};
+            return ServingClaimStatus::kClaimed;
+        }
+    }
+    return ServingClaimStatus::kContended;
+}
+
+__device__ inline void serving_queue_backoff(uint32_t *backoff_step) {
+    const uint32_t shift = min(*backoff_step, uint32_t{10});
+    __nanosleep(32u << shift);
+    *backoff_step = min(*backoff_step + 1, uint32_t{10});
+}
 
 __device__ inline int map_shared_to_cluster_cta(
     int local_smem_addr,
@@ -340,15 +796,15 @@ __device__ inline OutputTileTask load_output_task_from_cluster_cta(
     const int local_addr =
         static_cast<int>(__cvta_generic_to_shared(tasks + stage));
     const int remote_addr = map_shared_to_cluster_cta(local_addr, target_cta_rank);
-    OutputTileTask task;
-    asm volatile("ld.shared::cluster.u32 %0, [%1];"
-        : "=r"(task.off_m)
-        : "r"(remote_addr)
-        : "memory");
-    asm volatile("ld.shared::cluster.u32 %0, [%1];"
-        : "=r"(task.off_n)
-        : "r"(remote_addr + static_cast<int>(sizeof(int)))
-        : "memory");
+    OutputTileTask task{};
+    auto *words = reinterpret_cast<uint32_t *>(&task);
+#pragma unroll
+    for (int i = 0; i < static_cast<int>(sizeof(OutputTileTask) / sizeof(uint32_t)); ++i) {
+        asm volatile("ld.shared::cluster.u32 %0, [%1];"
+            : "=r"(words[i])
+            : "r"(remote_addr + i * static_cast<int>(sizeof(uint32_t)))
+            : "memory");
+    }
     return task;
 }
 
@@ -666,6 +1122,7 @@ template <
     int kTileK,
     int kClusterM,
     int kEpilogueBlockN,
+    bool PERSISTENT,
     bool DO_PROFILE,
     bool SWAP_AB>
 __global__
@@ -679,7 +1136,8 @@ void bf16_gemm_serving_kernel(
     int N,
     int K,
     int64_t *profiler_ptr,
-    int num_entries) {
+    int num_entries,
+    ServingQueueControl *queue_control) {
 
     using Config = KernelConfig<kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN>;
     constexpr int kStageCount = Config::kStageCount;
@@ -731,6 +1189,7 @@ void bf16_gemm_serving_kernel(
     __shared__ uint64_t scheduler_free_mbars[2];
     __shared__ uint64_t mainlooop_mbars[2];
     __shared__ uint64_t epilogue_mbars[2];
+    __shared__ uint64_t completion_mbars[2];
     __shared__ OutputTileTask output_tasks[2];
     __shared__ MainloopTask mainloop_tasks[kStageCount];
     const int _base_tma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(tma_mbars));
@@ -742,6 +1201,8 @@ void bf16_gemm_serving_kernel(
     const int _base_mainloop_mbar_addr =
         static_cast<int>(__cvta_generic_to_shared(mainlooop_mbars));
     const int _base_epilogue_mbar_addr = static_cast<int>(__cvta_generic_to_shared(epilogue_mbars));
+    const int _base_completion_mbar_addr =
+        static_cast<int>(__cvta_generic_to_shared(completion_mbars));
 
     // init mbarrier
     if (tid == 0) {
@@ -754,6 +1215,7 @@ void bf16_gemm_serving_kernel(
             mbarrier_init(_base_scheduler_free_mbar_addr + 8 * s, 4 * kClusterM);
             mbarrier_init(_base_mainloop_mbar_addr + 8 * s, 1);
             mbarrier_init(_base_epilogue_mbar_addr + 8 * s, 4 * kClusterM);
+            mbarrier_init(_base_completion_mbar_addr + 8 * s, kClusterM);
         }
 
         asm volatile("fence.mbarrier_init.release.cluster;");
@@ -833,7 +1295,7 @@ void bf16_gemm_serving_kernel(
 
     // mma compute
     auto compute =
-        [&](int tma_phase, int stage_id, bool first_k, int epilogue_phase) -> MainloopTask {
+        [&](int tma_phase, int stage_id, int epilogue_phase) -> MainloopTask {
         const int tma_mbar_addr = _base_tma_mbar_addr + 8 * stage_id;
         if constexpr (DO_PROFILE) {
             profiler.start(ProfilerTag::WaitTMA);
@@ -844,7 +1306,10 @@ void bf16_gemm_serving_kernel(
         }
 
         const MainloopTask task = mainloop_tasks[stage_id];
-        if (first_k) {
+        if (task.kind == TaskKind::kStop) {
+            return task;
+        }
+        if (task.iter_k == 0) {
             if constexpr (DO_PROFILE) {
                 profiler.start(ProfilerTag::WaitEpilogue);
             }
@@ -1093,11 +1558,10 @@ void bf16_gemm_serving_kernel(
     if (cta_rank == 0 && warp_id == 6 && elect_sync()) {
         int task_stage = 0;
         int task_free_phase = 1;
-        for (int bid = _bid; bid < grid_size; bid += grid_x) {
-            wait_scheduler_slot(
-                _base_scheduler_free_mbar_addr + task_stage * 8, task_free_phase);
-            auto [off_m, off_n] = compute_bid(bid);
-            output_tasks[task_stage] = {off_m, off_n};
+        auto publish_task = [&](const OutputTileTask &task) {
+            wait_scheduler_slot(_base_scheduler_free_mbar_addr + task_stage * 8,
+                task_free_phase);
+            output_tasks[task_stage] = task;
             for (int target_rank = 0; target_rank < kClusterM; ++target_rank) {
                 mbarrier_arrive_on_cluster_cta(
                     _base_scheduler_mbar_addr + task_stage * 8, target_rank);
@@ -1107,6 +1571,33 @@ void bf16_gemm_serving_kernel(
             if (task_stage == 0) {
                 task_free_phase ^= 1;
             }
+        };
+
+        if constexpr (PERSISTENT) {
+            uint32_t backoff_step = 0;
+            while (true) {
+                OutputTileTask task{};
+                const ServingClaimStatus status =
+                    try_claim_serving_work(queue_control, &task);
+                if (status == ServingClaimStatus::kClaimed) {
+                    publish_task(task);
+                    backoff_step = 0;
+                } else if (status == ServingClaimStatus::kStop) {
+                    publish_task(OutputTileTask{
+                        0, 0, 0, 0, 0, 0, TaskKind::kStop});
+                    break;
+                } else {
+                    serving_queue_backoff(&backoff_step);
+                }
+            }
+        } else {
+            for (int bid = _bid; bid < grid_size; bid += grid_x) {
+                auto [off_m, off_n] = compute_bid(bid);
+                publish_task(OutputTileTask{
+                    off_m, off_n, 0, 0, 0, kClusterTileM, TaskKind::kCompute});
+            }
+            publish_task(OutputTileTask{
+                0, 0, 0, 0, 0, 0, TaskKind::kStop});
         }
     }
 
@@ -1117,7 +1608,7 @@ void bf16_gemm_serving_kernel(
         int mma_phase = 1;
         int task_stage = 0;
         int task_phase = 0;
-        for (int bid = _bid; bid < grid_size; bid += grid_x) {
+        while (true) {
             wait_scheduler_task(_base_scheduler_mbar_addr + task_stage * 8, task_phase);
             OutputTileTask output_task = cta_rank == 0
                 ? output_tasks[task_stage]
@@ -1126,9 +1617,36 @@ void bf16_gemm_serving_kernel(
             // Keep a rank-local copy for the epilogue.  It is protected by
             // the mainloop completion chain before epilogue consumption.
             output_tasks[task_stage] = output_task;
+            if (output_task.kind == TaskKind::kStop) {
+                const int mma_mbar_addr = _base_mma_mbar_addr + 8 * mma_stage;
+                wait_mma_slot(mma_mbar_addr, mma_phase);
+                mainloop_tasks[mma_stage] = MainloopTask{
+                    output_task.off_m,
+                    output_task.off_n,
+                    0,
+                    task_stage,
+                    output_task.group_ticket,
+                    output_task.group_index,
+                    output_task.n_tile,
+                    output_task.valid_rows,
+                    TaskKind::kStop};
+                for (int target_rank = 0; target_rank < kClusterM; ++target_rank) {
+                    mbarrier_arrive_on_cluster_cta(
+                        _base_tma_mbar_addr + 8 * mma_stage, target_rank);
+                }
+                break;
+            }
             for (int iter_k = 0; iter_k < K / kTileK; ++iter_k) {
                 const MainloopTask task{
-                    output_task.off_m, output_task.off_n, iter_k, task_stage};
+                    output_task.off_m,
+                    output_task.off_n,
+                    iter_k,
+                    task_stage,
+                    output_task.group_ticket,
+                    output_task.group_index,
+                    output_task.n_tile,
+                    output_task.valid_rows,
+                    output_task.kind};
                 load(task, mma_phase, mma_stage);
                 mma_stage = (mma_stage + 1) % kStageCount;
                 if (mma_stage == 0) {
@@ -1149,26 +1667,34 @@ void bf16_gemm_serving_kernel(
         int tma_stage = 0;
         int epilogue_phase = 1;
 
-        for (int bid = _bid; bid < grid_size; bid += grid_x) {
-            MainloopTask task{};
-            for (int iter_k = 0; iter_k < K / kTileK; ++iter_k) {
-                task = compute(tma_phase, tma_stage, iter_k == 0, epilogue_phase);
-                tma_stage = (tma_stage + 1) % kStageCount;
-                if (tma_stage == 0) {
-                    tma_phase ^= 1;
+        while (true) {
+            const MainloopTask task = compute(tma_phase, tma_stage, epilogue_phase);
+            if (task.kind == TaskKind::kStop) {
+                for (int target_rank = 0; target_rank < kClusterM; ++target_rank) {
+                    mbarrier_arrive_on_cluster_cta(
+                        _base_mma_mbar_addr + 8 * tma_stage, target_rank);
+                    mbarrier_arrive_on_cluster_cta(
+                        _base_mainloop_mbar_addr + 8 * task.mainloop_stage, target_rank);
                 }
+                break;
+            }
+            tma_stage = (tma_stage + 1) % kStageCount;
+            if (tma_stage == 0) {
+                tma_phase ^= 1;
             }
 
-            constexpr int16_t cta_mask = (1 << kClusterM) - 1;
-            asm volatile(
-                "tcgen05.commit.cta_group::%2.mbarrier::arrive::one.shared::cluster.multicast:"
-                ":cluster.b64 [%0], %1;" ::"r"(
-                    _base_mainloop_mbar_addr + 8 * task.mainloop_stage),
-                "h"(cta_mask),
-                "n"(kClusterM)
-                : "memory");
-            if (task.mainloop_stage == 1) {
-                epilogue_phase ^= 1;
+            if (task.iter_k == K / kTileK - 1) {
+                constexpr int16_t cta_mask = (1 << kClusterM) - 1;
+                asm volatile(
+                    "tcgen05.commit.cta_group::%2.mbarrier::arrive::one.shared::cluster.multicast:"
+                    ":cluster.b64 [%0], %1;" ::"r"(
+                        _base_mainloop_mbar_addr + 8 * task.mainloop_stage),
+                    "h"(cta_mask),
+                    "n"(kClusterM)
+                    : "memory");
+                if (task.mainloop_stage == 1) {
+                    epilogue_phase ^= 1;
+                }
             }
         }
     }
@@ -1177,8 +1703,9 @@ void bf16_gemm_serving_kernel(
     if (warp_id < 4) {
         int mainloop_stage = 0;
         int mainloop_phase = 0;
+        int completion_phase = 0;
 
-        for (int bid = _bid; bid < grid_size; bid += grid_x) {
+        while (true) {
             if constexpr (DO_PROFILE)
                 if (elect_sync())
                     profiler.start(ProfilerTag::WaitMainloop);
@@ -1188,6 +1715,9 @@ void bf16_gemm_serving_kernel(
                 if (elect_sync())
                     profiler.stop();
             const OutputTileTask task = output_tasks[mainloop_stage];
+            if (task.kind == TaskKind::kStop) {
+                break;
+            }
             if (elect_sync()) {
                 mbarrier_arrive_on_cluster_cta(
                     _base_scheduler_free_mbar_addr + mainloop_stage * 8, 0);
@@ -1196,12 +1726,38 @@ void bf16_gemm_serving_kernel(
                 if (elect_sync())
                     profiler.start(ProfilerTag::Epilogue);
             epilogue(mainloop_stage, task.off_m, task.off_n);
+            if constexpr (PERSISTENT) {
+                if (tid == 0) {
+                    mbarrier_arrive_on_cluster_cta(
+                        _base_completion_mbar_addr + 8 * mainloop_stage, 0);
+                    if (cta_rank == 0) {
+                        wait_scheduler_task(
+                            _base_completion_mbar_addr + 8 * mainloop_stage,
+                            completion_phase);
+                        ServingGroupMeta *meta =
+                            serving_group_meta(queue_control) + task.group_index;
+                        const uint32_t completed = serving_fetch_add_acq_rel(
+                            &meta->completion_count, uint32_t{1}) + 1;
+                        if (completed == queue_control->config.grid_n) {
+                            const uint64_t ready_word =
+                                serving_load_acquire(&meta->state_word);
+                            serving_store_release(&meta->state_word,
+                                encode_serving_group_state(
+                                    ServingGroupState::kOutputReady,
+                                    task.group_ticket,
+                                    task.valid_rows,
+                                    decode_serving_group_flush(ready_word)));
+                        }
+                    }
+                }
+            }
             if constexpr (DO_PROFILE)
                 if (elect_sync())
                     profiler.stop();
             mainloop_stage = (mainloop_stage + 1) % 2;
             if (mainloop_stage == 0) {
                 mainloop_phase ^= 1;
+                completion_phase ^= 1;
             }
         }
     }
@@ -1217,6 +1773,22 @@ void bf16_gemm_serving_kernel(
             "r"(kTileN * 2),
             "n"(kClusterM));
     }
+    if constexpr (kClusterM > 1) {
+        asm volatile("barrier.cluster.arrive.release.aligned;");
+        asm volatile("barrier.cluster.wait.acquire.aligned;");
+    } else {
+        __syncthreads();
+    }
+    if constexpr (PERSISTENT) {
+        if (cta_rank == 0 && warp_id == 6 && elect_sync()) {
+            const uint32_t stopped = serving_fetch_add_acq_rel(
+                &queue_control->lifecycle.stopped_clusters, uint32_t{1}) + 1;
+            if (stopped == queue_control->lifecycle.launched_clusters) {
+                serving_store_release(&queue_control->lifecycle.state,
+                    static_cast<uint32_t>(ServingLifecycle::kStopped));
+            }
+        }
+    }
     if constexpr (DO_PROFILE) {
         if (elect_sync()) {
             profiler.flush();
@@ -1225,6 +1797,254 @@ void bf16_gemm_serving_kernel(
 }
 
 } // namespace
+
+cudaError_t initialize_bf16_gemm_serving_queue(
+    sm110a::bf16_gemm_serving::ServingQueueControl *control,
+    size_t control_bytes,
+    uint32_t slot_count,
+    uint32_t n,
+    uint32_t k,
+    uint32_t launched_clusters,
+    cudaStream_t stream) {
+    constexpr uint32_t kTileM = SM110A_BF16_TILE_M;
+    constexpr uint32_t kTileN = SM110A_BF16_TILE_N;
+    constexpr uint32_t kTileK = SM110A_BF16_TILE_K;
+    constexpr uint32_t kClusterM = SM110A_BF16_CLUSTER_M;
+    constexpr uint32_t kEpilogueBlockN = SM110A_BF16_EPILOGUE_BLOCK_N;
+
+    if (control == nullptr ||
+        reinterpret_cast<uintptr_t>(control) % alignof(
+            sm110a::bf16_gemm_serving::ServingQueueControl) != 0 ||
+        slot_count == 0 || slot_count % kClusterM != 0 || n == 0 ||
+        n % kTileN != 0 || k == 0 || k % kTileK != 0 ||
+        launched_clusters == 0) {
+        return cudaErrorInvalidValue;
+    }
+    if constexpr (kTileM != 128 || kTileN != 256 || kTileK != 128 ||
+        kClusterM != 2 || kEpilogueBlockN != 32) {
+        return cudaErrorInvalidConfiguration;
+    }
+
+    const uint32_t group_capacity = slot_count / kClusterM;
+    const size_t required_bytes =
+        sm110a::bf16_gemm_serving::serving_queue_control_bytes(group_capacity);
+    if (control_bytes < required_bytes) {
+        return cudaErrorInvalidValue;
+    }
+
+    cudaError_t status = cudaMemsetAsync(control, 0, required_bytes, stream);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    constexpr uint32_t kThreads = 256;
+    const uint32_t blocks = (group_capacity + kThreads - 1) / kThreads;
+    initialize_serving_queue_kernel<<<blocks, kThreads, 0, stream>>>(control,
+        slot_count,
+        group_capacity,
+        n,
+        k,
+        n / kTileN,
+        launched_clusters);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t sm110a_bf16_gemm_serving_queue_initialize(
+    sm110a::bf16_gemm_serving::ServingQueueControl *control,
+    size_t control_bytes,
+    uint32_t slot_count,
+    uint32_t n,
+    uint32_t k,
+    uint32_t launched_clusters,
+    cudaStream_t stream) {
+    return initialize_bf16_gemm_serving_queue(control,
+        control_bytes,
+        slot_count,
+        n,
+        k,
+        launched_clusters,
+        stream);
+}
+
+cudaError_t request_bf16_gemm_serving_drain(
+    sm110a::bf16_gemm_serving::ServingQueueControl *control,
+    cudaStream_t stream) {
+    if (control == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    request_serving_drain_kernel<<<1, 1, 0, stream>>>(control);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t sm110a_bf16_gemm_serving_request_drain(
+    sm110a::bf16_gemm_serving::ServingQueueControl *control,
+    cudaStream_t stream) {
+    return request_bf16_gemm_serving_drain(control, stream);
+}
+
+cudaError_t launch_bf16_gemm_serving_test_producer(
+    const __nv_bfloat16 *rows,
+    __nv_bfloat16 *a_ring,
+    sm110a::bf16_gemm_serving::ServingQueueControl *control,
+    uint64_t group_ticket,
+    uint32_t valid_rows,
+    bool flush,
+    uint64_t delay_cycles,
+    bool bypass_payload,
+    cudaStream_t stream) {
+    constexpr uint32_t kPhysicalRows =
+        SM110A_BF16_CLUSTER_M * SM110A_BF16_TILE_M;
+    if (rows == nullptr || a_ring == nullptr || control == nullptr ||
+        valid_rows == 0 || valid_rows > kPhysicalRows ||
+        (valid_rows != kPhysicalRows && !flush)) {
+        return cudaErrorInvalidValue;
+    }
+    serving_test_producer_kernel<<<1, 256, 0, stream>>>(
+        rows, a_ring, control, group_ticket, valid_rows, flush, delay_cycles,
+        bypass_payload);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t sm110a_bf16_gemm_serving_test_publish(
+    const __nv_bfloat16 *rows,
+    __nv_bfloat16 *a_ring,
+    sm110a::bf16_gemm_serving::ServingQueueControl *control,
+    uint64_t group_ticket,
+    uint32_t valid_rows,
+    bool flush,
+    uint64_t delay_cycles,
+    bool bypass_payload,
+    cudaStream_t stream) {
+    return launch_bf16_gemm_serving_test_producer(
+        rows,
+        a_ring,
+        control,
+        group_ticket,
+        valid_rows,
+        flush,
+        delay_cycles,
+        bypass_payload,
+        stream);
+}
+
+cudaError_t launch_bf16_gemm_serving_test_consumer(
+    const __nv_bfloat16 *c_ring,
+    __nv_bfloat16 *rows,
+    sm110a::bf16_gemm_serving::ServingQueueControl *control,
+    uint64_t group_ticket,
+    uint32_t expected_valid_rows,
+    bool bypass_payload,
+    cudaStream_t stream) {
+    constexpr uint32_t kPhysicalRows =
+        SM110A_BF16_CLUSTER_M * SM110A_BF16_TILE_M;
+    if (c_ring == nullptr || rows == nullptr || control == nullptr ||
+        expected_valid_rows == 0 || expected_valid_rows > kPhysicalRows) {
+        return cudaErrorInvalidValue;
+    }
+    serving_test_consumer_kernel<<<1, 256, 0, stream>>>(
+        c_ring, rows, control, group_ticket, expected_valid_rows,
+        bypass_payload);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t sm110a_bf16_gemm_serving_test_consume(
+    const __nv_bfloat16 *c_ring,
+    __nv_bfloat16 *rows,
+    sm110a::bf16_gemm_serving::ServingQueueControl *control,
+    uint64_t group_ticket,
+    uint32_t expected_valid_rows,
+    bool bypass_payload,
+    cudaStream_t stream) {
+    return launch_bf16_gemm_serving_test_consumer(
+        c_ring, rows, control, group_ticket, expected_valid_rows,
+        bypass_payload, stream);
+}
+
+cudaError_t launch_bf16_gemm_persistent_serving(
+    const __nv_bfloat16 *a_ring,
+    const __nv_bfloat16 *b_nt,
+    __nv_bfloat16 *c_ring,
+    sm110a::bf16_gemm_serving::ServingQueueControl *control,
+    uint32_t slot_count,
+    uint32_t n,
+    uint32_t k,
+    uint32_t launched_clusters,
+    cudaStream_t stream) {
+    constexpr uint32_t kTileM = SM110A_BF16_TILE_M;
+    constexpr uint32_t kTileN = SM110A_BF16_TILE_N;
+    constexpr uint32_t kTileK = SM110A_BF16_TILE_K;
+    constexpr uint32_t kClusterM = SM110A_BF16_CLUSTER_M;
+    constexpr uint32_t kEpilogueBlockN = SM110A_BF16_EPILOGUE_BLOCK_N;
+    if constexpr (kTileM != 128 || kTileN != 256 || kTileK != 128 ||
+        kClusterM != 2 || kEpilogueBlockN != 32) {
+        return cudaErrorInvalidConfiguration;
+    }
+    if (a_ring == nullptr || b_nt == nullptr || c_ring == nullptr ||
+        control == nullptr || slot_count == 0 || slot_count % kClusterM != 0 ||
+        n == 0 || n % kTileN != 0 || k == 0 || k % kTileK != 0 ||
+        launched_clusters == 0) {
+        return cudaErrorInvalidValue;
+    }
+
+    CUtensorMap a_tmap, b_tmap, c_tmap;
+    const uint64_t ring_rows = static_cast<uint64_t>(slot_count) * kTileM;
+    init_3D_tmap(&a_tmap,
+        a_ring,
+        ring_rows,
+        k,
+        kTileM,
+        kTileK,
+        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B);
+    init_3D_tmap(&b_tmap,
+        b_nt,
+        n,
+        k,
+        kTileN / kClusterM,
+        kTileK,
+        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B);
+    init_2D_output_tmap(&c_tmap, c_ring, ring_rows, n, kTileM, kEpilogueBlockN);
+
+    using Config = KernelConfig<kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN>;
+    constexpr int kSmemBytes = Config::kDynamicSmemBytes + 256;
+    auto kernel = bf16_gemm_serving_kernel<
+        kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN, true, false, false>;
+    cudaError_t status = cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    kernel<<<launched_clusters * kClusterM, kBlockThreads, kSmemBytes, stream>>>(
+        a_tmap,
+        b_tmap,
+        c_tmap,
+        static_cast<int>(ring_rows),
+        static_cast<int>(n),
+        static_cast<int>(k),
+        nullptr,
+        0,
+        control);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t sm110a_bf16_gemm_persistent_serving_launch(
+    const __nv_bfloat16 *a_ring,
+    const __nv_bfloat16 *b_nt,
+    __nv_bfloat16 *c_ring,
+    sm110a::bf16_gemm_serving::ServingQueueControl *control,
+    uint32_t slot_count,
+    uint32_t n,
+    uint32_t k,
+    uint32_t launched_clusters,
+    cudaStream_t stream) {
+    return launch_bf16_gemm_persistent_serving(a_ring,
+        b_nt,
+        c_ring,
+        control,
+        slot_count,
+        n,
+        k,
+        launched_clusters,
+        stream);
+}
 
 template <int kTileM,
     int kTileN,
@@ -1301,7 +2121,8 @@ void launch_bf16_gemm_serving_impl(
     const int grid = max_active_clusters * kClusterM;
 
     auto kernel =
-        bf16_gemm_serving_kernel<kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN, DO_PROFILE, SWAP_AB>;
+        bf16_gemm_serving_kernel<
+            kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN, false, DO_PROFILE, SWAP_AB>;
 
     if (smem_size > 48 * 1024) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
@@ -1314,7 +2135,8 @@ void launch_bf16_gemm_serving_impl(
         N,
         K,
         profiler_ptr,
-        num_entries);
+        num_entries,
+        nullptr);
 }
 
 // Non-template wrappers for pre-compiled path — instantiate with the #define defaults.

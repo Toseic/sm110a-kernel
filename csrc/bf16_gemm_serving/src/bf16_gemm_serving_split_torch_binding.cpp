@@ -12,12 +12,36 @@ namespace {
 using Bf16GemmServingLauncher = void (*)(const __nv_bfloat16*, const __nv_bfloat16*,
                                    __nv_bfloat16*, int, int, int, bool,
                                    int, cudaStream_t);
+using ServingQueueInitLauncher = cudaError_t (*)(
+    void*, size_t, uint32_t, uint32_t, uint32_t, uint32_t, cudaStream_t);
+using PersistentServingLauncher = cudaError_t (*)(
+    const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, void*,
+    uint32_t, uint32_t, uint32_t, uint32_t, cudaStream_t);
+using ServingDrainLauncher = cudaError_t (*)(void*, cudaStream_t);
+using ServingTestPublishLauncher = cudaError_t (*)(
+    const __nv_bfloat16*, __nv_bfloat16*, void*, uint64_t, uint32_t, bool, uint64_t,
+    bool, cudaStream_t);
+using ServingTestConsumeLauncher = cudaError_t (*)(
+    const __nv_bfloat16*, __nv_bfloat16*, void*, uint64_t, uint32_t, bool,
+    cudaStream_t);
 
 void check_tensor(const torch::Tensor& tensor, const char* name) {
   TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
   TORCH_CHECK(tensor.scalar_type() == torch::kBFloat16,
               name, " must have dtype torch.bfloat16");
   TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+void check_control(const torch::Tensor& control) {
+  TORCH_CHECK(control.is_cuda(), "Serving queue control must be a CUDA tensor");
+  TORCH_CHECK(control.scalar_type() == torch::kUInt8,
+              "Serving queue control must have dtype torch.uint8");
+  TORCH_CHECK(control.is_contiguous() && control.dim() == 1,
+              "Serving queue control must be a contiguous 1D tensor");
+}
+
+void check_cuda_status(cudaError_t status, const char* operation) {
+  TORCH_CHECK(status == cudaSuccess, operation, ": ", cudaGetErrorString(status));
 }
 
 void check_config(int64_t tile_m, int64_t tile_n, int64_t tile_k,
@@ -123,6 +147,141 @@ torch::Tensor bf16_gemm_serving_nt_out(torch::Tensor a, torch::Tensor b, torch::
   return run_out(a, b, out, launcher, tm, tn, tk, cm, max_active_clusters, swap, true);
 }
 
+void serving_queue_initialize(torch::Tensor control, uint64_t launcher_address,
+                              int64_t slot_count, int64_t n, int64_t k,
+                              int64_t launched_clusters) {
+  check_control(control);
+  TORCH_CHECK(launcher_address != 0, "Serving queue initializer is null");
+  TORCH_CHECK(slot_count > 0 && n > 0 && k > 0 && launched_clusters > 0,
+              "Invalid serving queue dimensions");
+  c10::cuda::CUDAGuard device_guard(control.device());
+  const auto launcher = reinterpret_cast<ServingQueueInitLauncher>(
+      static_cast<uintptr_t>(launcher_address));
+  check_cuda_status(launcher(control.data_ptr(), control.numel(),
+                             static_cast<uint32_t>(slot_count),
+                             static_cast<uint32_t>(n), static_cast<uint32_t>(k),
+                             static_cast<uint32_t>(launched_clusters),
+                             c10::cuda::getCurrentCUDAStream(control.device().index())),
+                    "Serving queue initialization failed");
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void persistent_serving_start(torch::Tensor a_ring, torch::Tensor b_nt,
+                              torch::Tensor c_ring, torch::Tensor control,
+                              uint64_t launcher_address, int64_t slot_count,
+                              int64_t n, int64_t k, int64_t launched_clusters) {
+  check_tensor(a_ring, "A_ring");
+  check_tensor(b_nt, "B_nt");
+  check_tensor(c_ring, "C_ring");
+  check_control(control);
+  TORCH_CHECK(launcher_address != 0, "Persistent serving launcher is null");
+  TORCH_CHECK(a_ring.dim() == 3 && b_nt.dim() == 2 && c_ring.dim() == 3,
+              "A_ring/C_ring must be 3D and B_nt must be 2D");
+  TORCH_CHECK(a_ring.size(0) == slot_count && a_ring.size(1) == 128 &&
+                  a_ring.size(2) == k,
+              "Invalid A_ring shape");
+  TORCH_CHECK(b_nt.size(0) == n && b_nt.size(1) == k,
+              "Invalid B_nt shape");
+  TORCH_CHECK(c_ring.size(0) == slot_count && c_ring.size(1) == 128 &&
+                  c_ring.size(2) == n,
+              "Invalid C_ring shape");
+  TORCH_CHECK(a_ring.device() == b_nt.device() && a_ring.device() == c_ring.device() &&
+                  a_ring.device() == control.device(),
+              "All serving tensors must be on the same device");
+  c10::cuda::CUDAGuard device_guard(a_ring.device());
+  const auto launcher = reinterpret_cast<PersistentServingLauncher>(
+      static_cast<uintptr_t>(launcher_address));
+  check_cuda_status(launcher(
+                        reinterpret_cast<const __nv_bfloat16*>(
+                            a_ring.data_ptr<at::BFloat16>()),
+                        reinterpret_cast<const __nv_bfloat16*>(
+                            b_nt.data_ptr<at::BFloat16>()),
+                        reinterpret_cast<__nv_bfloat16*>(
+                            c_ring.data_ptr<at::BFloat16>()),
+                        control.data_ptr(), static_cast<uint32_t>(slot_count),
+                        static_cast<uint32_t>(n), static_cast<uint32_t>(k),
+                        static_cast<uint32_t>(launched_clusters),
+                        c10::cuda::getCurrentCUDAStream(a_ring.device().index())),
+                    "Persistent serving launch failed");
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void serving_request_drain(torch::Tensor control, uint64_t launcher_address) {
+  check_control(control);
+  TORCH_CHECK(launcher_address != 0, "Serving drain launcher is null");
+  c10::cuda::CUDAGuard device_guard(control.device());
+  const auto launcher = reinterpret_cast<ServingDrainLauncher>(
+      static_cast<uintptr_t>(launcher_address));
+  check_cuda_status(launcher(
+                        control.data_ptr(),
+                        c10::cuda::getCurrentCUDAStream(control.device().index())),
+                    "Serving drain request failed");
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void serving_test_publish(torch::Tensor rows, torch::Tensor a_ring,
+                          torch::Tensor control, uint64_t launcher_address,
+                          int64_t group_ticket, bool flush,
+                          int64_t delay_cycles, bool bypass) {
+  check_tensor(rows, "rows");
+  check_tensor(a_ring, "A_ring");
+  check_control(control);
+  TORCH_CHECK(launcher_address != 0, "Serving test producer is null");
+  TORCH_CHECK(rows.dim() == 2 && a_ring.dim() == 3,
+              "rows must be 2D and A_ring must be 3D");
+  TORCH_CHECK(rows.size(0) > 0 && rows.size(0) <= 256 &&
+                  rows.size(1) == a_ring.size(2),
+              "Invalid producer row shape");
+  TORCH_CHECK(rows.device() == a_ring.device() && rows.device() == control.device(),
+              "Producer tensors must be on the same device");
+  TORCH_CHECK(group_ticket >= 0, "group_ticket must be non-negative");
+  TORCH_CHECK(delay_cycles >= 0, "delay_cycles must be non-negative");
+  c10::cuda::CUDAGuard device_guard(rows.device());
+  const auto launcher = reinterpret_cast<ServingTestPublishLauncher>(
+      static_cast<uintptr_t>(launcher_address));
+  check_cuda_status(launcher(
+                        reinterpret_cast<const __nv_bfloat16*>(
+                            rows.data_ptr<at::BFloat16>()),
+                        reinterpret_cast<__nv_bfloat16*>(
+                            a_ring.data_ptr<at::BFloat16>()),
+                        control.data_ptr(), static_cast<uint64_t>(group_ticket),
+                        static_cast<uint32_t>(rows.size(0)), flush,
+                        static_cast<uint64_t>(delay_cycles), bypass,
+                        c10::cuda::getCurrentCUDAStream(rows.device().index())),
+                    "Serving test publication failed");
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void serving_test_consume(torch::Tensor c_ring, torch::Tensor rows,
+                          torch::Tensor control, uint64_t launcher_address,
+                          int64_t group_ticket, bool bypass) {
+  check_tensor(c_ring, "C_ring");
+  check_tensor(rows, "rows");
+  check_control(control);
+  TORCH_CHECK(launcher_address != 0, "Serving test consumer is null");
+  TORCH_CHECK(c_ring.dim() == 3 && rows.dim() == 2,
+              "C_ring must be 3D and rows must be 2D");
+  TORCH_CHECK(rows.size(0) > 0 && rows.size(0) <= 256 &&
+                  rows.size(1) == c_ring.size(2),
+              "Invalid consumer output shape");
+  TORCH_CHECK(c_ring.device() == rows.device() && rows.device() == control.device(),
+              "Consumer tensors must be on the same device");
+  TORCH_CHECK(group_ticket >= 0, "group_ticket must be non-negative");
+  c10::cuda::CUDAGuard device_guard(rows.device());
+  const auto launcher = reinterpret_cast<ServingTestConsumeLauncher>(
+      static_cast<uintptr_t>(launcher_address));
+  check_cuda_status(launcher(
+                        reinterpret_cast<const __nv_bfloat16*>(
+                            c_ring.data_ptr<at::BFloat16>()),
+                        reinterpret_cast<__nv_bfloat16*>(
+                            rows.data_ptr<at::BFloat16>()),
+                        control.data_ptr(), static_cast<uint64_t>(group_ticket),
+                        static_cast<uint32_t>(rows.size(0)), bypass,
+                        c10::cuda::getCurrentCUDAStream(rows.device().index())),
+                    "Serving test consumption failed");
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -130,5 +289,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("bf16_gemm_serving_out", &bf16_gemm_serving_out);
   m.def("bf16_gemm_serving_nt", &bf16_gemm_serving_nt);
   m.def("bf16_gemm_serving_nt_out", &bf16_gemm_serving_nt_out);
+  m.def("serving_queue_initialize", &serving_queue_initialize);
+  m.def("persistent_serving_start", &persistent_serving_start);
+  m.def("serving_request_drain", &serving_request_drain);
+  m.def("serving_test_publish", &serving_test_publish);
+  m.def("serving_test_consume", &serving_test_consume);
 }
-

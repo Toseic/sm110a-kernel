@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 
+"""Persistent BF16 GEMM serving correctness and latency benchmark."""
+
 import argparse
-import math
+import gc
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -11,411 +14,381 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from common import (
-    GemmBenchmarkBase,
-    benchmark_with_stats,
-    benchmark_with_stats_batched,
-    quick_probe,
-    tflops_from_ms,
-    print_sol_report,
-    sol_bounds,
-)
 from sm110a_kernel import (
     Bf16GemmServingConfig,
     compile_bf16_gemm_serving,
-    bf16_gemm_serving_out,
-    bf16_gemm_serving_nt_out,
-    CuteDslBf16GemmRunner,
-    cublaslt_gemm_out,
-    cublaslt_gemm_out_batched,
-)
-from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
-
-
-DEFAULT_SHAPES = [
-    (256, 256, 256),
-    (512, 512, 512),
-    (1024, 1024, 1024),
-    (2048, 2048, 2048),
-    (2560, 2048, 2048),
-    (4096, 4096, 4096),
-    (4096, 11008, 4096),
-    (11008, 4096, 4096),
-    (256, 32768, 4096),
-]
-ACCURACY_SHAPE = (512, 512, 512)
-CUBLASLT_WORKSPACE_BYTES = 32 * 1024 * 1024
-BF16_GEMM_SERVING_CONFIGS = tuple(
-    Bf16GemmServingConfig(
-        tile_m=128,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        cluster_m=cluster_m,
-        epilogue_block_n=epilogue_block_n,
-    )
-    for tile_n in (128, 256)
-    for tile_k in (64, 128)
-    for cluster_m in (1, 2)
-    for epilogue_block_n in (32, 64, 128)
-    if tile_n % epilogue_block_n == 0
-    and (
-        227 * 1024 - 2 * 128 * epilogue_block_n * 2
-    ) // ((128 + tile_n // cluster_m) * tile_k * 2) >= 2
+    create_green_contexts,
+    sm_resource_info,
 )
 
 
-def compatible_candidates(m, n, k):
-    return tuple(
-        (config, swap_ab)
-        for config in BF16_GEMM_SERVING_CONFIGS
-        for swap_ab in (False, True)
-        if k % config.tile_k == 0
-        and (
-            (
-                not swap_ab
-                and m % (config.tile_m * config.cluster_m) == 0
-                and n % config.tile_n == 0
-            )
-            or (
-                swap_ab
-                and n % (config.tile_m * config.cluster_m) == 0
-                and m % config.tile_n == 0
-            )
+SERVING_SMS = 16
+PRODUCER_SMS = 2
+CONSUMER_SMS = 2
+M = 256
+N = 4096
+K = 4096
+
+
+def create_serving_contexts():
+    partitions = (SERVING_SMS, PRODUCER_SMS, CONSUMER_SMS)
+    info = sm_resource_info()
+    alignment = info["sm_coscheduled_alignment"]
+    if (sum(partitions) > info["sm_count"] or
+            any(count < info["min_sm_partition_size"] or count % alignment
+                for count in partitions)):
+        raise RuntimeError(
+            "benchmark requires valid 16-SM serving, 2-SM producer, and "
+            f"2-SM consumer Green Contexts; device info is {info}"
         )
+    return create_green_contexts(partitions)
+
+
+def release_green_resources(contexts):
+    for context in contexts:
+        context.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
+    for context in contexts:
+        context.close()
+
+
+def run_prepublished_case(module, groups, b_nt, *, slots, clusters, bypass=False):
+    queue = module.create_queue(
+        b_nt, slot_count=slots, max_active_clusters=clusters
     )
+    for rows in groups:
+        queue.test_publish(rows, flush=rows.shape[0] != M, bypass=bypass)
+    queue.request_drain()
+    queue.start()
+    queue.wait_stopped()
+    outputs = [queue.test_consume(bypass=bypass) for _ in groups]
+    torch.cuda.synchronize()
+    return queue, outputs
 
 
-def format_candidate(candidate):
-    config, swap_ab = candidate
-    return (
-        f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
-        f"/c{config.cluster_m}"
-        f"/e{config.epilogue_block_n}"
-        f"/{'swap' if swap_ab else 'noswap'}"
-    )
-
-
-def gemm_sol_bounds(m, n, k, config, swap_ab=False):
-    """SOL model for the selected standard-GEMM mainloop configuration."""
-    if swap_ab:
-        m, n = n, m
-    cluster_tile_m = config.cluster_m * config.tile_m
-    tile_count = math.ceil(m / cluster_tile_m) * math.ceil(n / config.tile_n)
-    flops = 2 * m * n * k
-    a_and_b_bytes = 2 * (m * k + n * k)
-    compulsory_bytes = a_and_b_bytes + 2 * m * n
-    tile_read_bytes = 2 * tile_count * (cluster_tile_m + config.tile_n) * k
-    return sol_bounds(flops, compulsory_bytes, a_and_b_bytes, tile_read_bytes)
-
-
-def print_result(m, n, k, kernel_stats, baseline_stats, max_abs_diff, best_candidate):
-    return (
-        m,
-        n,
-        k,
-        f"{kernel_stats['median_ms']:.4f}",
-        f"{tflops_from_ms(m, n, k, kernel_stats['median_ms']):.3f}",
-        f"{baseline_stats['median_ms']:.4f}",
-        f"{tflops_from_ms(m, n, k, baseline_stats['median_ms']):.3f}",
-        f"{baseline_stats['median_ms'] / kernel_stats['median_ms']:.2f}",
-        f"{max_abs_diff:.6f}",
-        format_candidate(best_candidate),
-    )
-
-
-def run_accuracy_check(args):
-    print("[accuracy] small shape with correctness check")
-    print("[runner] resolving kernel config")
-    # Keep every command-line option (notably the local kernel's
-    # ``pre_parallel_jit`` flag) and override only the short accuracy run's
-    # timing/check settings.  A hand-maintained Namespace easily drifts when
-    # new benchmark options are added.
-    accuracy_options = vars(args).copy()
-    accuracy_options.update(
-        warmup=2,
-        iters=20,
-        samples=7,
-        skip_check=False,
-    )
-    accuracy_args = argparse.Namespace(**accuracy_options)
-    bench = Bf16GemmServingBenchmark()
-    bench._debug_enabled = getattr(args, "debug", False)
-    kernel_stats, baseline_stats, max_abs_diff, baseline_name, best_candidate = bench.run_case(
-        *ACCURACY_SHAPE, args=accuracy_args
-    )
-    bench.make_result_table(baseline_name).print_header()
-    bench.make_result_table(baseline_name).print_row(
-        *print_result(
-            *ACCURACY_SHAPE,
-            kernel_stats,
-            baseline_stats,
+def check_outputs(groups, outputs, b_nt):
+    max_abs_diff = 0.0
+    for rows, output in zip(groups, outputs):
+        reference = rows @ b_nt.T
+        max_abs_diff = max(
             max_abs_diff,
-            best_candidate,
+            (output.float() - reference.float()).abs().max().item(),
         )
+        torch.testing.assert_close(output, reference, rtol=2e-2, atol=1.0)
+    return max_abs_diff
+
+
+def run_persistent_serving_tests():
+    print("[test] persistent serving queue correctness")
+    module = compile_bf16_gemm_serving(Bf16GemmServingConfig())
+    cases = (
+        ("single-full", [M], 256, 2, 1, False),
+        ("single-flush", [173], 256, 2, 1, False),
+        ("multi-group-multi-n", [M, 119], 512, 4, 4, False),
+        ("bypass-state-machine", [M, 137], 256, 4, 2, True),
     )
-    if args.sol:
-        config, swap_ab = best_candidate
-        print_sol_report(
-            gemm_sol_bounds(*ACCURACY_SHAPE, config, swap_ab),
-            kernel_stats["median_ms"],
-            label="GEMM",
-            debug=getattr(args, "debug", False),
+    for case_index, (name, row_counts, n, slots, clusters, bypass) in enumerate(cases):
+        torch.manual_seed(9000 + case_index)
+        b_nt = torch.randn((n, K), device="cuda", dtype=torch.bfloat16)
+        groups = [
+            torch.randn((count, K), device="cuda", dtype=torch.bfloat16)
+            for count in row_counts
+        ]
+        queue, outputs = run_prepublished_case(
+            module, groups, b_nt, slots=slots, clusters=clusters, bypass=bypass
         )
-    print()
-
-
-class Bf16GemmServingBenchmark(GemmBenchmarkBase):
-    default_shapes = DEFAULT_SHAPES
-
-    def baseline_choices(self):
-        return ("torch", "cublaslt", "cutedsl")
-
-    def add_arguments(self, parser):
-        parser.add_argument(
-            "--max-active-clusters",
-            type=int,
-            default=0,
-            help=(
-                "persistent clusters to launch (default: device SM count / "
-                "the selected cluster size)"
-            ),
+        max_abs_diff = (
+            check_outputs(groups, outputs, b_nt)
+            if not bypass
+            else float("nan")
         )
-        parser.add_argument(
-            "--debug",
-            action="store_true",
-            help="Print per-config sweep details",
-        )
-        parser.add_argument(
-            "--cutedsl-pre-parallel-jit",
-            action="store_true",
-            help=(
-                "compile CuTE DSL baseline configurations in parallel before "
-                "benchmarking (disabled by default because CuTE DSL JIT is "
-                "not thread-safe)"
-            ),
-        )
-
-    def validate_args(self, args):
-        # Allow --m alone to filter default shapes by M dimension, instead of
-        # requiring --m, --n, --k together for single-shape mode.
-        if args.m > 0 and args.n == 0 and args.k == 0:
-            args.single_shape = False
-            args.m_filter = args.m
-            self.validate_timing_args(args, allow_zero_warmup=True)
-            self.validate_extra_args(args)
-            return args
-        return super().validate_args(args)
-
-    def validate_extra_args(self, args):
-        if args.max_active_clusters < 0:
-            raise SystemExit("--max-active-clusters must be non-negative")
-        return args
-
-    def iter_shapes(self, args):
-        if args.single_shape:
-            yield (args.m, args.n, args.k)
-            return
-        m_filter = getattr(args, "m_filter", 0)
-        if m_filter:
-            for shape in self.default_shapes:
-                if shape[0] == m_filter:
-                    yield shape
-            return
-        yield from self.default_shapes
-
-    def run_preflight(self, args):
-        if getattr(args, "m_filter", 0):
-            matched = sum(1 for s in self.default_shapes if s[0] == args.m_filter)
-            print(
-                f"[filter] M={args.m_filter}: {matched} matching shape(s) "
-                f"out of {len(self.default_shapes)}"
+        expected_work = len(groups) * (n // 256)
+        dispatch_head = int(queue.control[256:264].view(torch.int64).item())
+        recycle_head = int(queue.control[384:392].view(torch.int64).item())
+        lifecycle = queue.control[512:524].view(torch.int32).cpu().tolist()
+        if dispatch_head != expected_work or recycle_head != len(groups):
+            raise AssertionError(
+                f"{name}: dispatch={dispatch_head}, recycle={recycle_head}"
             )
-            print()
-        if not args.single_shape and not args.no_accuracy:
-            run_accuracy_check(args)
-
-    def emit_runtime_banner(self, args, actual_blas):
-        if args.baseline == "cutedsl":
-            print("[baseline] CuTE DSL persistent BF16 GEMM (autotuned)")
-            return "CuTE DSL"
-        baseline_name = super().emit_runtime_banner(args, actual_blas)
+        if lifecycle != [3, clusters, clusters]:
+            raise AssertionError(f"{name}: invalid lifecycle {lifecycle}")
+        diff_text = (
+            f"max_diff={max_abs_diff:.3f}" if not bypass
+            else "outputs unchecked (bypass)"
+        )
         print(
-            "[runner] config selection is cached per workload and CUDA environment"
-        )
-        print()
-        return baseline_name
-
-    def make_result_table(self, baseline_name):
-        return self.make_table_printer(
-            (
-                ("M", 8),
-                ("N", 8),
-                ("K", 8),
-                ("KernelMed(ms)", 16),
-                ("Kernel TF/s", 16),
-                (f"{baseline_name}Med(ms)", 16),
-                (f"{baseline_name} TF/s", 16),
-                (f"{baseline_name}Speedup", 14),
-                ("Diff", 12),
-                ("BestConfig", 28),
-            )
+            f"  PASS {name}: groups={len(groups)}, N={n}, K={K}, "
+            f"work_items={expected_work}, {diff_text}"
         )
 
-    def print_header(self, baseline_name):
-        self.make_result_table(baseline_name).print_header()
-
-    def run_case(self, m, n, k, args):
-        a = torch.empty((m, k), device="cuda", dtype=torch.bfloat16)
-        b = torch.empty((k, n), device="cuda", dtype=torch.bfloat16)
-        a.uniform_(-1.0, 1.0)
-        b.uniform_(-1.0, 1.0)
-        # Native TMA loads B as contiguous (N, K).  Pack once before all
-        # measurements; the benchmark operation remains a(M,K) @ b(K,N).
-        b_kernel = b.transpose(0, 1).contiguous()
-
-        out_kernel = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
-        out_baseline = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
-        workspace = None
-        cute_dsl_runner = None
-
-        if args.baseline == "torch":
-            baseline_name = "Torch"
-            baseline_fn = lambda: torch.mm(a, b, out=out_baseline)
-            baseline_stats = benchmark_with_stats(
-                baseline_fn,
-                args.warmup,
-                args.iters,
-                args.samples,
-                cold_l2_flush=getattr(args, "_cold_l2_flush", None),
-            )
-        elif args.baseline == "cublaslt":
-            baseline_name = "Lt"
-            workspace = torch.empty(
-                (CUBLASLT_WORKSPACE_BYTES,), device="cuda", dtype=torch.uint8
-            )
-            baseline_fn = lambda iters: cublaslt_gemm_out_batched(
-                a, b, out_baseline, workspace, iters
-            )
-            baseline_stats = benchmark_with_stats_batched(
-                baseline_fn,
-                args.warmup,
-                args.iters,
-                args.samples,
-                cold_l2_flush=getattr(args, "_cold_l2_flush", None),
-            )
-        elif args.baseline == "cutedsl":
-            cute_dsl_runner = CuteDslBf16GemmRunner(a, b, out_baseline)
-            cute_dsl_runner.autotune(
-                self.make_tune_options(
-                    args,
-                    role="baseline",
-                    # CuTE DSL's compiler has process-global session state and
-                    # cannot safely compile configurations concurrently.  Keep
-                    # this separate from the local kernel's parallel JIT flag.
-                    pre_parallel_jit=args.cutedsl_pre_parallel_jit,
-                )
-            )
-            baseline_name = "CuTE DSL"
-            baseline_fn = cute_dsl_runner.run
-            baseline_stats = benchmark_with_stats(
-                baseline_fn,
-                args.warmup,
-                args.iters,
-                args.samples,
-                cold_l2_flush=getattr(args, "_cold_l2_flush", None),
-            )
-        else:
-            raise SystemExit(f"unsupported --baseline value: {args.baseline}")
-
-        selection = self.resolve_kernel(
-            a, b_kernel, out_kernel, m, n, k, args
+    contexts = create_serving_contexts()
+    persistent_stream = contexts[0].torch_stream()
+    producer_stream = contexts[1].torch_stream()
+    consumer_stream = contexts[2].torch_stream()
+    torch.manual_seed(9010)
+    b_nt = torch.randn((N, K), device="cuda", dtype=torch.bfloat16)
+    groups = [
+        torch.randn((M, K), device="cuda", dtype=torch.bfloat16),
+        torch.randn((137, K), device="cuda", dtype=torch.bfloat16),
+        torch.randn((M, K), device="cuda", dtype=torch.bfloat16),
+    ]
+    outputs = [
+        torch.empty((rows.shape[0], N), device="cuda", dtype=torch.bfloat16)
+        for rows in groups
+    ]
+    torch.cuda.synchronize()
+    queue = None
+    try:
+        queue = module.create_queue(
+            b_nt,
+            slot_count=2,
+            max_active_clusters=SERVING_SMS // 2,
+            persistent_stream=persistent_stream,
+            control_stream=producer_stream,
         )
-        best_candidate, kernel_stats = selection.candidate, selection.stats
+        queue.start()
+        with torch.cuda.stream(producer_stream):
+            for rows in groups:
+                queue.test_publish(rows, flush=rows.shape[0] != M)
+            queue.request_drain()
+        with torch.cuda.stream(consumer_stream):
+            for index in range(len(groups)):
+                queue.test_consume(out=outputs[index])
+        queue.wait_stopped()
+        contexts[1].synchronize()
+        contexts[2].synchronize()
 
-        max_abs_diff = 0.0
-        if not args.skip_check:
-            best_config, best_swap_ab = best_candidate
-            selection.prepared.run()
-            if args.baseline == "torch":
-                baseline_fn()
-            elif args.baseline == "cublaslt":
-                cublaslt_gemm_out(a, b, out_baseline, workspace)
+        max_abs_diff = check_outputs(groups, outputs, b_nt)
+        state_word = int(queue.control[640:648].view(torch.int64).item())
+        dispatch_head = int(queue.control[256:264].view(torch.int64).item())
+        recycle_head = int(queue.control[384:392].view(torch.int64).item())
+        expected_work = len(groups) * (N // 256)
+        if (state_word != len(groups) << 16 or dispatch_head != expected_work or
+                recycle_head != len(groups)):
+            raise AssertionError(
+                "online-wrap: invalid final queue state "
+                f"state={state_word}, dispatch={dispatch_head}, recycle={recycle_head}"
+            )
+        print(
+            "  PASS online-empty-wakeup-wrap: serving=16 SM, producer=2 SM, "
+            "consumer=2 SM, N=4096, K=4096, 16 N tiles/group, "
+            f"capacity=1 group, tickets=0,1,2, max_diff={max_abs_diff:.3f}"
+        )
+    finally:
+        queue = None
+        persistent_stream = producer_stream = consumer_stream = None
+        b_nt = groups = outputs = None
+        release_green_resources(contexts)
+
+    print(f"[test] PASS ({len(cases) + 1} cases)")
+
+
+def warm_gpu_clocks(b_nt, iterations=20):
+    """Ramp SM clocks to the loaded state before timing.
+
+    Thor DVFS drops the SM clock to a fraction of the loaded rate when the GPU
+    is lightly loaded, and paced producer phases start from that state. Without
+    this warmup the first ~30ms of a phase run 5x slower and poison 16-group
+    averages (the "500us knee" measurement artifact).
+    """
+    warm = torch.empty((N, N), dtype=torch.bfloat16, device=b_nt.device)
+    for _ in range(iterations):
+        torch.mm(b_nt, b_nt.T, out=warm)
+    torch.cuda.synchronize()
+
+
+def measure_sm_clock_hz():
+    """Calibrate the running SM clock by timing a known cycle-count spin.
+
+    torch's reported clock_rate matches neither the idle nor the loaded clock,
+    so producer delay_cycles computed from it are off by ~1.5x in wall time.
+    """
+    cycles = 8_000_000
+    torch.cuda.synchronize()
+    started = time.perf_counter()
+    torch.cuda._sleep(cycles)
+    torch.cuda.synchronize()
+    return cycles / (time.perf_counter() - started)
+
+
+def run_producer_speed_sweep(args):
+    module = compile_bf16_gemm_serving(Bf16GemmServingConfig())
+    torch.manual_seed(args.seed)
+    b_nt = torch.randn((N, K), device="cuda", dtype=torch.bfloat16)
+    rows = [
+        torch.randn((M, K), device="cuda", dtype=torch.bfloat16)
+        for _ in range(args.groups)
+    ]
+    outputs = [
+        torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
+        for _ in range(args.groups)
+    ]
+    references = (
+        [group @ b_nt.T for group in rows] if not args.bypass_io else []
+    )
+    torch.cuda.synchronize()
+
+    # Force CUDA module/function/TMA setup before all 20 SMs are assigned to
+    # Green Contexts. This prepublished compute is outside measurement.
+    warmup_queue = module.create_queue(
+        b_nt, slot_count=2, max_active_clusters=1
+    )
+    warmup_queue.test_publish(rows[0])
+    warmup_queue.request_drain()
+    warmup_queue.start()
+    warmup_queue.wait_stopped()
+    warmup_queue.test_consume(out=outputs[0])
+    torch.cuda.synchronize()
+    warmup_queue = None
+    gc.collect()
+
+    contexts = create_serving_contexts()
+    persistent_stream = contexts[0].torch_stream()
+    producer_stream = contexts[1].torch_stream()
+    consumer_stream = contexts[2].torch_stream()
+    queue = None
+    queues = [
+        module.create_queue(
+            b_nt,
+            slot_count=2 * args.capacity,
+            max_active_clusters=SERVING_SMS // 2,
+            persistent_stream=persistent_stream,
+            control_stream=producer_stream,
+        )
+        for _ in args.producer_delays_us
+    ]
+    torch.cuda.synchronize()
+    try:
+        warm_gpu_clocks(b_nt)
+        clock_hz = measure_sm_clock_hz()
+        print(f"[clock] calibrated SM clock during pacing: {clock_hz/1.0e6:.0f} MHz")
+        print("[serving] producer arrival-rate sweep")
+        print("[resources] serving=16 SM (8 clusters), producer=2 SM, consumer=2 SM")
+        print(
+            f"[queue] capacity={args.capacity} groups, groups/run={args.groups}, "
+            "M=256, N=4096, K=4096, 16 N tiles/group"
+        )
+        if args.bypass_io:
+            print(
+                "[mode] payload bypass: producer/consumer skip A/C-ring copies; "
+                "outputs are not validated"
+            )
+        print(
+            "Delay(us)     Pace ceiling/s    Total groups/s   Steady groups/s  "
+            "Steady ms/group  Steady TF/s      MaxDiff"
+        )
+        throughputs = []
+        for delay_us, queue in zip(args.producer_delays_us, queues):
+            warm_gpu_clocks(b_nt)
+            queue.start()
+            delay_cycles = round(delay_us * clock_hz / 1.0e6)
+            started = time.perf_counter()
+            completions = [
+                torch.cuda.Event(enable_timing=True)
+                for _ in range(args.groups)
+            ]
+            with torch.cuda.stream(producer_stream):
+                for group in range(args.groups):
+                    queue.test_publish(
+                        rows[group], delay_cycles=delay_cycles,
+                        bypass=args.bypass_io)
+                queue.request_drain()
+            with torch.cuda.stream(consumer_stream):
+                for group in range(args.groups):
+                    queue.test_consume(out=outputs[group], bypass=args.bypass_io)
+                    completions[group].record()
+            queue.wait_stopped()
+            contexts[1].synchronize()
+            contexts[2].synchronize()
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+
+            if args.bypass_io:
+                max_abs_diff = float("nan")
             else:
-                cute_dsl_runner.run()
-            max_abs_diff = (
-                (out_kernel.float() - out_baseline.float()).abs().max().item()
+                max_abs_diff = max(
+                    (output.float() - reference.float()).abs().max().item()
+                    for output, reference in zip(outputs, references)
+                )
+                for output, reference in zip(outputs, references):
+                    torch.testing.assert_close(
+                        output, reference, rtol=2e-2, atol=1.0)
+            groups_per_second = args.groups * 1000.0 / elapsed_ms
+            intervals_ms = [
+                completions[index - 1].elapsed_time(completions[index])
+                for index in range(1, args.groups)
+            ]
+            steady_intervals = intervals_ms[len(intervals_ms) // 4:]
+            steady_groups_per_second = (
+                1000.0 * len(steady_intervals) / sum(steady_intervals)
             )
-
-        return (
-            kernel_stats,
-            baseline_stats,
-            max_abs_diff,
-            baseline_name,
-            best_candidate,
-        )
-
-    def resolve_kernel(self, a, b_kernel, out, m, n, k, args):
-        candidates = compatible_candidates(m, n, k)
-        if not candidates:
-            raise RuntimeError(f"no JIT config supports M={m}, N={n}, K={k}")
-
-        def prepare(candidate):
-            config, swap_ab = candidate
-            run = lambda: bf16_gemm_serving_nt_out(
-                a, b_kernel, out, config=config, swap_ab=swap_ab,
-                max_active_clusters=args.max_active_clusters or None,
+            throughputs.append(steady_groups_per_second)
+            steady_latency_ms = sum(steady_intervals) / len(steady_intervals)
+            steady_tflops = (
+                2.0 * M * N * K * steady_groups_per_second / 1.0e12
             )
-            run()
-            torch.cuda.synchronize()
-            return PreparedKernel(candidate, run)
-
-        options = self.make_tune_options(
-            args,
-            role="ours",
-            pre_parallel_jit=args.pre_parallel_jit,
-        )
-        return AutotuneRunner(options).resolve(
-            candidates,
-            # B is now prepacked as (N, K), so prior selections measured the
-            # incorrect B interpretation and must not be reused.
-            namespace="bf16_gemm_serving_nt_v3",
-            key=(m, n, k, args.max_active_clusters), prepare=prepare,
-            benchmark=lambda prepared: benchmark_with_stats(
-                prepared.run, args.warmup, args.iters, args.samples,
-                cold_l2_flush=getattr(args, "_cold_l2_flush", None),
-            ),
-            probe=lambda prepared: quick_probe(
-                prepared.run,
-                args.iters,
-                cold_l2_flush=getattr(args, "_cold_l2_flush", None),
-            ),
-            format_candidate=format_candidate,
-            metric_formatter=lambda _candidate, stats: (
-                f"{tflops_from_ms(m, n, k, stats['median_ms']):.1f} TF/s"
-            ),
-            pre_jit=lambda candidate: compile_bf16_gemm_serving(candidate[0]),
-        )
-
-    def print_result(self, shape, result):
-        m, n, k = shape
-        kernel_stats, baseline_stats, max_abs_diff, _, best_candidate = result
-        self.make_result_table(result[3]).print_row(
-            *print_result(
-                m, n, k, kernel_stats, baseline_stats, max_abs_diff, best_candidate
+            target = "unlimited" if delay_us == 0 else f"{1.0e6 / delay_us:.1f}"
+            diff_text = (
+                "n/a (bypass)" if args.bypass_io else f"{max_abs_diff:.3f}"
             )
-        )
-        if self._sol_enabled:
-            config, swap_ab = best_candidate
-            print_sol_report(
-                gemm_sol_bounds(m, n, k, config, swap_ab),
-                kernel_stats["median_ms"],
-                label="GEMM",
-                debug=self._debug_enabled,
+            print(
+                f"{delay_us:<14.1f}{target:<18}{groups_per_second:<17.1f}"
+                f"{steady_groups_per_second:<17.1f}{steady_latency_ms:<17.4f}"
+                f"{steady_tflops:<17.3f}{diff_text}"
             )
+        print(
+            f"[compute] peak steady completion rate: {max(throughputs):.1f} "
+            "groups/s across the producer pacing sweep"
+        )
+    finally:
+        queue = None
+        queues = None
+        persistent_stream = producer_stream = consumer_stream = None
+        outputs = references = rows = b_nt = module = None
+        release_green_resources(contexts)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--test", action="store_true",
+        help="run persistent serving correctness tests instead of timing",
+    )
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--groups", type=int, default=64)
+    parser.add_argument("--capacity", type=int, default=32)
+    parser.add_argument(
+        "--producer-delays-us",
+        default="0,500,1000,2000,4000,8000",
+        help="comma-separated producer pacing delays in microseconds",
+    )
+    parser.add_argument(
+        "--bypass-io", action="store_true",
+        help="producer/consumer skip A/C-ring payload copies; measures the "
+             "queue and serving kernel without test I/O overhead",
+    )
+    args = parser.parse_args()
+    if args.groups <= 0 or args.capacity <= 0:
+        raise SystemExit("--groups and --capacity must be positive")
+    try:
+        args.producer_delays_us = tuple(
+            float(value) for value in args.producer_delays_us.split(",")
+        )
+    except ValueError as exc:
+        raise SystemExit("--producer-delays-us must be comma-separated numbers") from exc
+    if not args.producer_delays_us or any(value < 0 for value in args.producer_delays_us):
+        raise SystemExit("producer delays must be non-negative")
+    return args
 
 
 def main():
-    Bf16GemmServingBenchmark().run()
+    args = parse_args()
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA is required")
+    if args.test:
+        run_persistent_serving_tests()
+    else:
+        run_producer_speed_sweep(args)
 
 
 if __name__ == "__main__":

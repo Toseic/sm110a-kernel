@@ -24,6 +24,7 @@ from .kernels.bf16_gemm import (
     get_bf16_gemm_module,
 )
 from .kernels.bf16_gemm_serving import (
+    Bf16GemmPersistentServingQueue,
     Bf16GemmServingConfig,
     bf16_gemm_serving,
     bf16_gemm_serving_out,
