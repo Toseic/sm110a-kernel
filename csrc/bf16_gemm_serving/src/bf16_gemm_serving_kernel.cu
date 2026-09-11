@@ -492,6 +492,7 @@ __global__ void initialize_serving_queue_kernel(
             &meta->state_word,
             encode_serving_group_state(ServingGroupState::kFree, tid, 0, false));
         serving_store_relaxed(&meta->completion_count, uint32_t{0});
+        serving_store_relaxed(&meta->io_arrival_count, uint32_t{0});
     }
     if (tid == 0) {
         control->config.magic = sm110a::bf16_gemm_serving::kServingQueueMagic;
@@ -530,6 +531,43 @@ __global__ void request_serving_drain_kernel(ServingQueueControl *control) {
     }
 }
 
+__device__ inline void copy_uint4_grid_stride(
+    const uint4 *__restrict__ src,
+    uint4 *__restrict__ dst,
+    size_t count) {
+    constexpr size_t kUnroll = 8;
+    const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+    size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    for (; index + (kUnroll - 1) * stride < count;
+         index += kUnroll * stride) {
+        uint4 values[kUnroll];
+#pragma unroll
+        for (size_t item = 0; item < kUnroll; ++item) {
+            values[item] = src[index + item * stride];
+        }
+#pragma unroll
+        for (size_t item = 0; item < kUnroll; ++item) {
+            dst[index + item * stride] = values[item];
+        }
+    }
+    for (; index < count; index += stride) {
+        dst[index] = src[index];
+    }
+}
+
+__device__ inline void zero_uint4_grid_stride(
+    uint4 *__restrict__ dst,
+    size_t begin,
+    size_t end) {
+    const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+    size_t index = begin +
+        static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
+    for (; index < end; index += stride) {
+        dst[index] = zero;
+    }
+}
+
 __global__ void serving_test_producer_kernel(
     const nv_bfloat16 *__restrict__ rows,
     nv_bfloat16 *__restrict__ a_ring,
@@ -545,7 +583,7 @@ __global__ void serving_test_producer_kernel(
     const uint32_t group_index = static_cast<uint32_t>(
         group_ticket % control->config.group_capacity);
     ServingGroupMeta *meta = serving_group_meta(control) + group_index;
-    if (threadIdx.x == 0 && delay_cycles != 0) {
+    if (blockIdx.x == 0 && threadIdx.x == 0 && delay_cycles != 0) {
         const uint64_t start = clock64();
         while (clock64() - start < delay_cycles) {
         }
@@ -576,7 +614,6 @@ __global__ void serving_test_producer_kernel(
         // so every row is a whole number of 16-byte vectors. Rows beyond
         // valid_rows are zero-padded to the physical group height.
         constexpr int kVecElems = 8;
-        constexpr size_t kUnroll = 8;
         const uint32_t vec_per_row = k / kVecElems;
         const size_t copy_vecs = static_cast<size_t>(valid_rows) * vec_per_row;
         const size_t pad_vecs =
@@ -585,35 +622,31 @@ __global__ void serving_test_producer_kernel(
             static_cast<size_t>(group_index) * physical_rows * k;
         uint4 *dst = reinterpret_cast<uint4 *>(a_ring + dst_base);
         const uint4 *src = reinterpret_cast<const uint4 *>(rows);
-        const size_t stride = blockDim.x;
-        size_t v = threadIdx.x;
-        for (; v + (kUnroll - 1) * stride < copy_vecs; v += kUnroll * stride) {
-            uint4 regs[kUnroll];
-#pragma unroll
-            for (size_t u = 0; u < kUnroll; ++u) {
-                regs[u] = src[v + u * stride];
-            }
-#pragma unroll
-            for (size_t u = 0; u < kUnroll; ++u) {
-                dst[v + u * stride] = regs[u];
-            }
-        }
-        for (; v < copy_vecs; v += stride) {
-            dst[v] = src[v];
-        }
-        const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
-        for (size_t p = copy_vecs + threadIdx.x; p < pad_vecs; p += stride) {
-            dst[p] = zero;
-        }
+        copy_uint4_grid_stride(src, dst, copy_vecs);
+        zero_uint4_grid_stride(dst, copy_vecs, pad_vecs);
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        serving_store_relaxed(&meta->completion_count, uint32_t{0});
+        // Copy blocks arrive on io_arrival_count; whoever arrives last
+        // publishes, so the release-store of kReady covers every block's
+        // payload writes and re-zeroes the tally for the consumer phase.
         __threadfence();
-        serving_store_release(&meta->state_word,
-            encode_serving_group_state(
-                ServingGroupState::kReady, group_ticket, valid_rows, flush));
-        serving_store_release(&control->published_tail.value, group_ticket + 1);
+        const uint32_t arrived = serving_fetch_add_acq_rel(
+            &meta->io_arrival_count, uint32_t{1});
+        if (arrived + 1 == gridDim.x) {
+            serving_store_relaxed(&meta->io_arrival_count, uint32_t{0});
+            // completion_count belongs to the GEMM phase of this slot
+            // generation.  Reset it only after every producer block has
+            // finished the A-ring copy, and before READY makes the new
+            // generation claimable.  Without this reset a wrapped slot starts
+            // from the previous generation's grid_n count and can never hit
+            // the exact OUTPUT_READY publication threshold again.
+            serving_store_relaxed(&meta->completion_count, uint32_t{0});
+            serving_store_release(&meta->state_word,
+                encode_serving_group_state(
+                    ServingGroupState::kReady, group_ticket, valid_rows, flush));
+            serving_store_release(&control->published_tail.value, group_ticket + 1);
+        }
     }
 }
 
@@ -654,44 +687,37 @@ __global__ void serving_test_consumer_kernel(
         const uint32_t physical_rows =
             control->config.cluster_m * control->config.tile_m;
         constexpr int kVecElems = 8;
-        constexpr size_t kUnroll = 8;
         const size_t src_base =
             static_cast<size_t>(group_index) * physical_rows * n;
         const size_t copy_vecs =
             static_cast<size_t>(valid_rows) * (n / kVecElems);
         const uint4 *src = reinterpret_cast<const uint4 *>(c_ring + src_base);
         uint4 *dst = reinterpret_cast<uint4 *>(rows);
-        const size_t stride = blockDim.x;
-        size_t v = threadIdx.x;
-        for (; v + (kUnroll - 1) * stride < copy_vecs; v += kUnroll * stride) {
-            uint4 regs[kUnroll];
-#pragma unroll
-            for (size_t u = 0; u < kUnroll; ++u) {
-                regs[u] = src[v + u * stride];
-            }
-#pragma unroll
-            for (size_t u = 0; u < kUnroll; ++u) {
-                dst[v + u * stride] = regs[u];
-            }
-        }
-        for (; v < copy_vecs; v += stride) {
-            dst[v] = src[v];
-        }
+        copy_uint4_grid_stride(src, dst, copy_vecs);
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        const uint64_t recycle = serving_load_acquire(&control->recycle_head.value);
-        if (recycle != group_ticket) {
-            control->lifecycle.reserved0 = 3;
-            return;
-        }
+        // Same last-arriver discipline as the producer: the release-store of
+        // kFree orders every copy block's reads/writes before the recycle and
+        // re-zeroes the arrival tally for the next producer phase.
         __threadfence();
-        serving_store_release(&meta->state_word,
-            encode_serving_group_state(ServingGroupState::kFree,
-                group_ticket + group_capacity,
-                0,
-                false));
-        serving_store_release(&control->recycle_head.value, group_ticket + 1);
+        const uint32_t arrived = serving_fetch_add_acq_rel(
+            &meta->io_arrival_count, uint32_t{1});
+        if (arrived + 1 == gridDim.x) {
+            serving_store_relaxed(&meta->io_arrival_count, uint32_t{0});
+            const uint64_t recycle =
+                serving_load_acquire(&control->recycle_head.value);
+            if (recycle != group_ticket) {
+                control->lifecycle.reserved0 = 3;
+                return;
+            }
+            serving_store_release(&meta->state_word,
+                encode_serving_group_state(ServingGroupState::kFree,
+                    group_ticket + group_capacity,
+                    0,
+                    false));
+            serving_store_release(&control->recycle_head.value, group_ticket + 1);
+        }
     }
 }
 
@@ -1898,7 +1924,7 @@ cudaError_t launch_bf16_gemm_serving_test_producer(
         (valid_rows != kPhysicalRows && !flush)) {
         return cudaErrorInvalidValue;
     }
-    serving_test_producer_kernel<<<1, 256, 0, stream>>>(
+    serving_test_producer_kernel<<<2, 512, 0, stream>>>(
         rows, a_ring, control, group_ticket, valid_rows, flush, delay_cycles,
         bypass_payload);
     return cudaGetLastError();
@@ -1940,7 +1966,7 @@ cudaError_t launch_bf16_gemm_serving_test_consumer(
         expected_valid_rows == 0 || expected_valid_rows > kPhysicalRows) {
         return cudaErrorInvalidValue;
     }
-    serving_test_consumer_kernel<<<1, 256, 0, stream>>>(
+    serving_test_consumer_kernel<<<2, 512, 0, stream>>>(
         c_ring, rows, control, group_ticket, expected_valid_rows,
         bypass_payload);
     return cudaGetLastError();

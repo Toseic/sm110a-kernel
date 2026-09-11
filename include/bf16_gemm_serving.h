@@ -46,6 +46,7 @@ cudaError_t launch_bf16_gemm_serving_test_producer(
     uint32_t valid_rows,
     bool flush,
     uint64_t delay_cycles,
+    bool bypass_payload,
     cudaStream_t stream);
 
 cudaError_t launch_bf16_gemm_serving_test_consumer(
@@ -54,4 +55,5 @@ cudaError_t launch_bf16_gemm_serving_test_consumer(
     sm110a::bf16_gemm_serving::ServingQueueControl* control,
     uint64_t group_ticket,
     uint32_t expected_valid_rows,
+    bool bypass_payload,
     cudaStream_t stream);

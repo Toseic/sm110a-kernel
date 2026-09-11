@@ -122,8 +122,13 @@ struct alignas(128) ServingQueueControl {
 
 struct alignas(32) ServingGroupMeta {
     uint64_t state_word;
+    // N-tile completion tally for GEMM-side OUTPUT_READY publication; reset
+    // to zero by the producer before READY.
     uint32_t completion_count;
-    uint32_t reserved0;
+    // Arrival tally for multi-block test I/O copies (producer publish and
+    // consumer recycle). Reset discipline: whoever publishes the next state
+    // for the slot zeroes it first, so every phase starts from zero.
+    uint32_t io_arrival_count;
     uint64_t reserved1;
     uint64_t reserved2;
 };
