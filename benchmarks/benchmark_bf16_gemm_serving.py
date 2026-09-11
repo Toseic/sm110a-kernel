@@ -258,6 +258,14 @@ def run_producer_speed_sweep(args):
         )
         for _ in args.producer_delays_us
     ]
+    if args.bypass_io:
+        # Bypass skips the producer payload copy, so torch.empty() can leave
+        # the A ring backed by zero-filled, highly compressible fresh pages.
+        # Initialize it outside the timed region to keep the GEMM's logical
+        # work unchanged without giving A loads and the resulting C stores an
+        # unrealistic data-compression advantage.
+        for queue in queues:
+            queue.a_ring.normal_()
     torch.cuda.synchronize()
     try:
         warm_gpu_clocks(b_nt)
@@ -272,7 +280,7 @@ def run_producer_speed_sweep(args):
         if args.bypass_io:
             print(
                 "[mode] payload bypass: producer/consumer skip A/C-ring copies; "
-                "outputs are not validated"
+                "A-ring is prefilled with random data; outputs are not validated"
             )
         print(
             "Delay(us)     Pace ceiling/s    Total groups/s   Steady groups/s  "
