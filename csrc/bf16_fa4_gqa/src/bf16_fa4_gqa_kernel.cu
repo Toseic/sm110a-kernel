@@ -539,6 +539,17 @@ __device__ inline void mbarrier_arrive(
         : "memory");
 }
 
+// Canonical tcgen05 producer/consumer handoff: tcgen05.ld/st run on the
+// generic proxy while tcgen05.mma runs on the asynchronous proxy, so an
+// mbarrier release/acquire alone does not order them.
+__device__ inline void tcgen05_fence_before_thread_sync() {
+    asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+}
+
+__device__ inline void tcgen05_fence_after_thread_sync() {
+    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+}
+
 __host__ __device__ constexpr size_t align_up(
     size_t value,
     size_t alignment) {
@@ -551,8 +562,12 @@ __host__ __device__ constexpr size_t align_up(
 template <int TileQ, int TileKV, int QSlots, int KvStages> struct FaMhaSmemLayout {
     static constexpr size_t kAlignment = 128;
     static constexpr size_t kMaxSmemBytes = 227 * 1024;
+    // Counts the __shared__ mbarrier arrays declared inside
+    // fa_mha_kernel_wg16: q_prologue/out_store/epilogue/tmem_release plus,
+    // per stage, tma1/tma2/cluster_k_ready/cluster_v_ready and the
+    // QSlots-sized mma1/mma2/softmax/rescale rings.
     static constexpr size_t kStaticMbarrierBytes =
-        (2 * QSlots + 2 + (2 + 4 * QSlots) * KvStages) * sizeof(uint64_t);
+        (2 * QSlots + 2 + (4 + 4 * QSlots) * KvStages) * sizeof(uint64_t);
     static constexpr size_t kSoftmaxHandoffBytes =
         2 * QSlots * TileQ * sizeof(float);
 
@@ -849,10 +864,13 @@ __global__ __cluster_dims__(GqaGroupSize, 1, 1) __launch_bounds__(512, 1) void f
     };
     const int q_pair_end =
         q_tile_start[1] + TileQ < query_len ? q_tile_start[1] + TileQ : query_len;
-    const int task_kv_tile_count = causal ? ((q_pair_end + TileKV - 1) / TileKV < kv_tile_count
-                                                    ? (q_pair_end + TileKV - 1) / TileKV
-                                                    : kv_tile_count)
-                                          : kv_tile_count;
+    // Bottom-right causal alignment (the FA convention): query row r
+    // attends keys <= r + (key_len - query_len).
+    const int causal_offset = key_len - query_len;
+    const int causal_kv_tile_end =
+        causal ? (q_pair_end + causal_offset + TileKV - 1) / TileKV : kv_tile_count;
+    const int task_kv_tile_count =
+        causal_kv_tile_end < kv_tile_count ? causal_kv_tile_end : kv_tile_count;
     const int softmax_warp = warp_idx >= kSoftmaxWarpBegin && warp_idx < kSoftmaxWarpEnd
                                  ? warp_idx - kSoftmaxWarpBegin
                                  : -1;
@@ -889,16 +907,17 @@ __global__ __cluster_dims__(GqaGroupSize, 1, 1) __launch_bounds__(512, 1) void f
             const int mma1_addr = mma1_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t);
             mbarrier_wait(mma1_addr, softmax_mma1_phase[stage]);
             softmax_mma1_phase[stage] ^= 1;
+            tcgen05_fence_after_thread_sync();
 
             const bool valid_q_row = q_row < query_len;
             const int s_tmem_addr = tmem_addr + kSBankBase + q_slot * mma_tmem_columns_per_stage;
-            const int mask_q_row = causal ? q_row : key_len - 1;
+            const int mask_q_row = causal ? q_row + causal_offset : key_len - 1;
             // Select uniformly across the warp: the earliest row must see
             // the entire KV tile and all 32 query rows must be in bounds.
             const bool all_scores_valid =
                 q_tile_start[q_slot] + row_base + kWarpSize <= query_len &&
                 (kv_tile + 1) * TileKV <= key_len &&
-                (!causal || (kv_tile + 1) * TileKV - 1 <= q_tile_start[q_slot] + row_base);
+                (!causal || (kv_tile + 1) * TileKV - 1 <= q_tile_start[q_slot] + row_base + causal_offset);
             const SoftmaxUpdate softmax = all_scores_valid
                 ? load_s_and_store_p_chunked<true>(
                     s_tmem_addr + (row_base << 16), kv_tile * TileKV, key_len,
@@ -919,6 +938,7 @@ __global__ __cluster_dims__(GqaGroupSize, 1, 1) __launch_bounds__(512, 1) void f
             tilel = softmax.l;
             // Complete all P stores before publishing the scalar handoff.
             asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+            tcgen05_fence_before_thread_sync();
             softmax_alpha[q_slot][row] = softmax.alpha;
             softmax_l[q_slot][row] = tilel;
             __syncwarp();
@@ -946,6 +966,7 @@ __global__ __cluster_dims__(GqaGroupSize, 1, 1) __launch_bounds__(512, 1) void f
                     softmax_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t);
                 mbarrier_wait(softmax_addr, softmax_phase[q_slot][stage]);
                 softmax_phase[q_slot][stage] ^= 1;
+                tcgen05_fence_after_thread_sync();
 
                 const float alpha = softmax_alpha[q_slot][row];
                 final_l[q_slot] = softmax_l[q_slot][row];
@@ -972,6 +993,7 @@ __global__ __cluster_dims__(GqaGroupSize, 1, 1) __launch_bounds__(512, 1) void f
                     }
                 }
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                tcgen05_fence_before_thread_sync();
                 if (lane_idx == 0) {
                     mbarrier_arrive(
                         rescale_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t));
@@ -980,6 +1002,7 @@ __global__ __cluster_dims__(GqaGroupSize, 1, 1) __launch_bounds__(512, 1) void f
         }
 
         mbarrier_wait(epilogue_mbar_addr, 0);
+        tcgen05_fence_after_thread_sync();
         for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
             const int q_row = q_tile_start[q_slot] + row;
             const bool valid_q_row = q_row < query_len;
@@ -1017,6 +1040,7 @@ __global__ __cluster_dims__(GqaGroupSize, 1, 1) __launch_bounds__(512, 1) void f
             }
         }
         // Protect TMEM deallocation until all epilogue reads finish.
+        tcgen05_fence_before_thread_sync();
         if (lane_idx == 0) {
             mbarrier_arrive(tmem_release_mbar_addr);
         }
@@ -1147,7 +1171,7 @@ __global__ __cluster_dims__(GqaGroupSize, 1, 1) __launch_bounds__(512, 1) void f
                 const int stage = kv_tile % KvStages;
                 mbarrier_wait(tma1_mbar_base + stage * sizeof(uint64_t), qk_tma1_phase[stage]);
                 qk_tma1_phase[stage] ^= 1;
-                asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+                tcgen05_fence_after_thread_sync();
                 const int k_addr = kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16);
 
                 // Q0(i).
@@ -1181,7 +1205,7 @@ __global__ __cluster_dims__(GqaGroupSize, 1, 1) __launch_bounds__(512, 1) void f
                         rescale_mbar_base + (q_slot * KvStages + pv_stage) * sizeof(uint64_t);
                     mbarrier_wait(rescale_addr, pv_rescale_phase[q_slot][pv_stage]);
                     pv_rescale_phase[q_slot][pv_stage] ^= 1;
-                    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+                    tcgen05_fence_after_thread_sync();
                     const int o_addr = tmem_addr + kOBankBase + q_slot * mma_tmem_columns_per_stage;
                     const int p_addr = tmem_addr + kSBankBase + q_slot * mma_tmem_columns_per_stage;
                     const int v_addr =
@@ -1226,7 +1250,7 @@ __global__ __cluster_dims__(GqaGroupSize, 1, 1) __launch_bounds__(512, 1) void f
                         rescale_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t);
                     mbarrier_wait(rescale_addr, pv_rescale_phase[q_slot][stage]);
                     pv_rescale_phase[q_slot][stage] ^= 1;
-                    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+                    tcgen05_fence_after_thread_sync();
                     const int o_addr = tmem_addr + kOBankBase + q_slot * mma_tmem_columns_per_stage;
                     const int p_addr = tmem_addr + kSBankBase + q_slot * mma_tmem_columns_per_stage;
                     const int v_addr =
@@ -1255,7 +1279,7 @@ __global__ __cluster_dims__(GqaGroupSize, 1, 1) __launch_bounds__(512, 1) void f
                     rescale_mbar_base + (q_slot * KvStages + pv_stage) * sizeof(uint64_t);
                 mbarrier_wait(rescale_addr, pv_rescale_phase[q_slot][pv_stage]);
                 pv_rescale_phase[q_slot][pv_stage] ^= 1;
-                asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+                tcgen05_fence_after_thread_sync();
                 const int o_addr = tmem_addr + kOBankBase + q_slot * mma_tmem_columns_per_stage;
                 const int p_addr = tmem_addr + kSBankBase + q_slot * mma_tmem_columns_per_stage;
                 const int v_addr =
@@ -1276,6 +1300,7 @@ __global__ __cluster_dims__(GqaGroupSize, 1, 1) __launch_bounds__(512, 1) void f
             tcgen05_commit_mbarrier(epilogue_mbar_addr);
         }
         mbarrier_wait(tmem_release_mbar_addr, 0);
+        tcgen05_fence_after_thread_sync();
         asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" ::"r"(tmem_addr),
             "r"(mma_tmem_columns));
         return;
@@ -3373,8 +3398,12 @@ __device__ __attribute__((noinline)) SoftmaxUpdate load_s_and_store_p_ptx(
 template <int TileQ, int TileKV, int QSlots, int KvStages> struct FaMhaSmemLayoutWg12 {
     static constexpr size_t kAlignment = 128;
     static constexpr size_t kMaxSmemBytes = 227 * 1024;
+    // Counts the __shared__ mbarrier arrays declared inside
+    // fa_mha_kernel_wg12: q_prologue/epilogue/tmem_release plus, per stage,
+    // tma1/tma2/cluster_k_ready/cluster_v_ready and the QSlots-sized
+    // mma1/mma2/rescale rings.
     static constexpr size_t kStaticMbarrierBytes =
-        (QSlots + 2 + (2 + 3 * QSlots) * KvStages) * sizeof(uint64_t);
+        (QSlots + 2 + (4 + 3 * QSlots) * KvStages) * sizeof(uint64_t);
 
     size_t q_offset;
     size_t kv_offset;
@@ -3550,10 +3579,13 @@ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(
     };
     const int q_pair_end =
         q_tile_start[1] + TileQ < query_len ? q_tile_start[1] + TileQ : query_len;
-    const int task_kv_tile_count = causal ? ((q_pair_end + TileKV - 1) / TileKV < kv_tile_count
-                                                    ? (q_pair_end + TileKV - 1) / TileKV
-                                                    : kv_tile_count)
-                                          : kv_tile_count;
+    // Bottom-right causal alignment (the FA convention): query row r
+    // attends keys <= r + (key_len - query_len).
+    const int causal_offset = key_len - query_len;
+    const int causal_kv_tile_end =
+        causal ? (q_pair_end + causal_offset + TileKV - 1) / TileKV : kv_tile_count;
+    const int task_kv_tile_count =
+        causal_kv_tile_end < kv_tile_count ? causal_kv_tile_end : kv_tile_count;
     if (warp_idx == kQPrologueWarp && lane_idx == 0) {
         const int q_transaction_bytes = TileQ * HeadDim * sizeof(__nv_bfloat16);
         for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
@@ -3633,10 +3665,11 @@ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(
             const int mma1_addr = mma1_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t);
             mbarrier_wait(mma1_addr, rescale_mma1_phase[stage]);
             rescale_mma1_phase[stage] ^= 1;
+            tcgen05_fence_after_thread_sync();
 
             const bool valid_q_row = q_row < query_len;
             const int s_tmem_addr = tmem_addr + kSBankBase + q_slot * mma_tmem_columns_per_stage;
-            const int mask_q_row = causal ? q_row : key_len - 1;
+            const int mask_q_row = causal ? q_row + causal_offset : key_len - 1;
             // The hardware reduction is correct only if all 128 S values
             // belong to this row's attention domain.  The diagonal causal
             // tile and the final KV tail remain on the masked scalar-max path.
@@ -3659,7 +3692,14 @@ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(
             // `alpha < 0` denotes the warp-uniform conditional-skip path.
             // Do not merely multiply O by one: omit the whole TMEM
             // read/modify/write, which is the intended FA4 win.
-            if (kv_tile != 0 && softmax.alpha > 0.0f) {
+            // Test the sign bit rather than `alpha > 0`: a valid row whose
+            // rescale factor underflows to +0 (and any row with tilel == 0,
+            // including every invalid tail row) carries a zero alpha while
+            // another lane requests the correction, and the tcgen05
+            // ld/st below must execute warp-uniformly.
+            const bool warp_needs_rescale = __any_sync(
+                0xFFFFFFFFU, (__float_as_uint(softmax.alpha) & 0x80000000U) == 0);
+            if (kv_tile != 0 && warp_needs_rescale) {
                 const int o_tmem_addr =
                     tmem_addr + kOBankBase + q_slot * mma_tmem_columns_per_stage;
                 for (int d8 = 0; d8 < HeadDim / 8; ++d8) {
@@ -3675,6 +3715,7 @@ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(
                 }
             }
             asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+            tcgen05_fence_before_thread_sync();
             if (lane_idx == 0) {
                 mbarrier_arrive(rescale_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t));
             }
@@ -3682,6 +3723,7 @@ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(
 
         mbarrier_wait(epilogue_mbar_addr, epilogue_phase);
         epilogue_phase ^= 1;
+        tcgen05_fence_after_thread_sync();
         const bool epilogue_valid_q_row = q_row < query_len;
         const float inv_l = epilogue_valid_q_row ? 1.0f / tilel : 0.0f;
         const int out_base = epilogue_valid_q_row ? (bh * query_len + q_row) * HeadDim : 0;
@@ -3703,6 +3745,7 @@ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(
             }
         }
         // Protect TMEM deallocation until all epilogue reads finish.
+        tcgen05_fence_before_thread_sync();
         if (lane_idx == 0) {
             mbarrier_arrive(tmem_release_mbar_addr);
         }
@@ -3788,7 +3831,7 @@ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(
                 const int stage = kv_tile % KvStages;
                 mbarrier_wait(tma1_mbar_base + stage * sizeof(uint64_t), qk_tma1_phase[stage]);
                 qk_tma1_phase[stage] ^= 1;
-                asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+                tcgen05_fence_after_thread_sync();
                 const int k_addr = kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16);
 
                 // Q0(i).
@@ -3822,7 +3865,7 @@ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(
                         rescale_mbar_base + (q_slot * KvStages + pv_stage) * sizeof(uint64_t);
                     mbarrier_wait(rescale_addr, pv_rescale_phase[q_slot][pv_stage]);
                     pv_rescale_phase[q_slot][pv_stage] ^= 1;
-                    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+                    tcgen05_fence_after_thread_sync();
                     const int o_addr = tmem_addr + kOBankBase + q_slot * mma_tmem_columns_per_stage;
                     const int p_addr = tmem_addr + kSBankBase + q_slot * mma_tmem_columns_per_stage;
                     const int v_addr =
@@ -3867,7 +3910,7 @@ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(
                         rescale_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t);
                     mbarrier_wait(rescale_addr, pv_rescale_phase[q_slot][stage]);
                     pv_rescale_phase[q_slot][stage] ^= 1;
-                    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+                    tcgen05_fence_after_thread_sync();
                     const int o_addr = tmem_addr + kOBankBase + q_slot * mma_tmem_columns_per_stage;
                     const int p_addr = tmem_addr + kSBankBase + q_slot * mma_tmem_columns_per_stage;
                     const int v_addr =
@@ -3896,7 +3939,7 @@ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(
                     rescale_mbar_base + (q_slot * KvStages + pv_stage) * sizeof(uint64_t);
                 mbarrier_wait(rescale_addr, pv_rescale_phase[q_slot][pv_stage]);
                 pv_rescale_phase[q_slot][pv_stage] ^= 1;
-                asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+                tcgen05_fence_after_thread_sync();
                 const int o_addr = tmem_addr + kOBankBase + q_slot * mma_tmem_columns_per_stage;
                 const int p_addr = tmem_addr + kSBankBase + q_slot * mma_tmem_columns_per_stage;
                 const int v_addr =
@@ -3917,6 +3960,7 @@ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(
             tcgen05_commit_mbarrier(epilogue_mbar_addr);
         }
         mbarrier_wait(tmem_release_mbar_addr, 0);
+        tcgen05_fence_after_thread_sync();
         asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" ::"r"(tmem_addr),
             "r"(mma_tmem_columns));
         return;
@@ -3949,7 +3993,13 @@ cudaError_t bf16_fa4_mha_launch_impl(
     constexpr int kKvStages = 2;
     constexpr int kHeadDim = 128;
     // S0/S1 plus long-lived O0/O1 consume all 512 available TMEM columns.
-    if (head_dim != kHeadDim || heads != kv_heads * GqaGroupSize || query_len < kTileQ) {
+    // scale must be positive: m is tracked in the raw QK domain, so a
+    // non-positive scale would flip/zero the exponent deltas and overflow.
+    // Bottom-right causal masking requires key_len >= query_len so every
+    // query row keeps a non-empty attention domain.
+    if (head_dim != kHeadDim || heads != kv_heads * GqaGroupSize || query_len < kTileQ ||
+        batch <= 0 || kv_heads <= 0 || key_len <= 0 || !(scale > 0.0f) ||
+        (causal && key_len < query_len)) {
         return cudaErrorInvalidValue;
     }
 
