@@ -1,12 +1,15 @@
 """Configuration-specialized BF16 FA4 GQA kernel.
 
-The tactic selects the CTA schedule and is baked in at JIT compile time via
-``-DSM110A_FA4_MHA_TACTIC``:
+Two orthogonal axes are baked in at JIT compile time:
 
-* ``TACTIC_16WARP`` — 16 warps with dedicated softmax, O-rescale, and
-  TMA-store warpgroups.
-* ``TACTIC_12WARP`` — 12 warps with one fused softmax/rescale/epilogue
-  warpgroup per Q slot.
+* ``tactic`` via ``-DSM110A_FA4_MHA_TACTIC`` selects the CTA schedule:
+  - ``TACTIC_16WARP`` — 16 warps with dedicated softmax, O-rescale, and
+    TMA-store warpgroups.
+  - ``TACTIC_12WARP`` — 12 warps with one fused softmax/rescale/epilogue
+    warpgroup per Q slot.
+* ``pack_gqa`` via ``-DSM110A_FA4_MHA_PACK_GQA`` folds the four query heads
+  of each K/V head into the logical query-row dimension of a single CTA
+  (``True``), or assigns one query head per CTA (``False``).
 """
 
 from __future__ import annotations
@@ -38,17 +41,23 @@ TACTIC_12WARP = Bf16Fa4GqaTactic.WARP_12
 @dataclass(frozen=True)
 class Bf16Fa4GqaConfig:
     tactic: Bf16Fa4GqaTactic = TACTIC_16WARP
+    pack_gqa: bool = False
 
     def __post_init__(self) -> None:
         try:
             tactic = Bf16Fa4GqaTactic(self.tactic)
         except (TypeError, ValueError) as exc:
-            raise ValueError("tactic must be 0 (16-warp) or 1 (12-warp)") from exc
+            raise ValueError(
+                "tactic must be 0 (16-warp) or 1 (12-warp)"
+            ) from exc
         object.__setattr__(self, "tactic", tactic)
+        object.__setattr__(self, "pack_gqa", bool(self.pack_gqa))
 
     def validate(self) -> None:
         if not isinstance(self.tactic, Bf16Fa4GqaTactic):
             raise TypeError("tactic must be a Bf16Fa4GqaTactic")
+        if not isinstance(self.pack_gqa, bool):
+            raise TypeError("pack_gqa must be a bool")
 
 
 class Bf16Fa4GqaModule:
@@ -63,7 +72,10 @@ class Bf16Fa4GqaModule:
 
 
 def _kernel_cflags(config: Bf16Fa4GqaConfig, _variant) -> tuple[str, ...]:
-    return (f"-DSM110A_FA4_MHA_TACTIC={int(config.tactic)}",)
+    return (
+        f"-DSM110A_FA4_MHA_TACTIC={int(config.tactic)}",
+        f"-DSM110A_FA4_MHA_PACK_GQA={int(config.pack_gqa)}",
+    )
 
 
 _JIT = SplitCudaJit(
@@ -108,21 +120,24 @@ def _resolve_scale(q, scale):
 
 def _config_for(
     tactic: int | Bf16Fa4GqaTactic | Bf16Fa4GqaConfig,
+    pack_gqa: bool = False,
 ) -> Bf16Fa4GqaConfig:
     if isinstance(tactic, Bf16Fa4GqaConfig):
         return tactic
-    return Bf16Fa4GqaConfig(tactic=tactic)
+    return Bf16Fa4GqaConfig(tactic=tactic, pack_gqa=pack_gqa)
 
 
-def bf16_fa4_gqa(q, k, v, *, causal=False, scale=None, tactic=TACTIC_16WARP):
+def bf16_fa4_gqa(q, k, v, *, causal=False, scale=None, tactic=TACTIC_16WARP,
+                 pack_gqa=False):
     """Compute BF16 GQA for Q `[B,Hq,S,D]` and K/V `[B,Hkv,S,D]` tensors."""
-    return compile_bf16_fa4_gqa(_config_for(tactic)).fa_gqa(
+    return compile_bf16_fa4_gqa(_config_for(tactic, pack_gqa)).fa_gqa(
         q, k, v, bool(causal), _resolve_scale(q, scale)
     )
 
 
-def bf16_fa4_gqa_out(q, k, v, out, *, causal=False, scale=None, tactic=TACTIC_16WARP):
+def bf16_fa4_gqa_out(q, k, v, out, *, causal=False, scale=None, tactic=TACTIC_16WARP,
+                     pack_gqa=False):
     """Write BF16 FA GQA to a caller-provided contiguous output."""
-    return compile_bf16_fa4_gqa(_config_for(tactic)).fa_gqa_out(
+    return compile_bf16_fa4_gqa(_config_for(tactic, pack_gqa)).fa_gqa_out(
         q, k, v, out, bool(causal), _resolve_scale(q, scale)
     )
