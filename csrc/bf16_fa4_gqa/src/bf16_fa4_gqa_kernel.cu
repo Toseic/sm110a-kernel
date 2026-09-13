@@ -263,6 +263,43 @@ __device__ inline void tcgen05_st_f32_x8(
         "f"(values[7]));
 }
 
+__device__ inline void tcgen05_ld_f32_x32(
+    float *values,
+    int tmem_addr) {
+    asm volatile(
+        "tcgen05.ld.sync.aligned.32x32b.x32.b32 "
+        "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, "
+        "%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, "
+        "%31}, [%32];"
+        : "=f"(values[0]), "=f"(values[1]), "=f"(values[2]), "=f"(values[3]),
+        "=f"(values[4]), "=f"(values[5]), "=f"(values[6]), "=f"(values[7]),
+        "=f"(values[8]), "=f"(values[9]), "=f"(values[10]), "=f"(values[11]),
+        "=f"(values[12]), "=f"(values[13]), "=f"(values[14]), "=f"(values[15]),
+        "=f"(values[16]), "=f"(values[17]), "=f"(values[18]), "=f"(values[19]),
+        "=f"(values[20]), "=f"(values[21]), "=f"(values[22]), "=f"(values[23]),
+        "=f"(values[24]), "=f"(values[25]), "=f"(values[26]), "=f"(values[27]),
+        "=f"(values[28]), "=f"(values[29]), "=f"(values[30]), "=f"(values[31])
+        : "r"(tmem_addr));
+}
+
+__device__ inline void tcgen05_st_f32_x32(
+    const float *values,
+    int tmem_addr) {
+    asm volatile(
+        "tcgen05.st.sync.aligned.32x32b.x32.b32 [%0], "
+        "{%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, "
+        "%17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, "
+        "%32};" ::"r"(tmem_addr),
+        "f"(values[0]), "f"(values[1]), "f"(values[2]), "f"(values[3]),
+        "f"(values[4]), "f"(values[5]), "f"(values[6]), "f"(values[7]),
+        "f"(values[8]), "f"(values[9]), "f"(values[10]), "f"(values[11]),
+        "f"(values[12]), "f"(values[13]), "f"(values[14]), "f"(values[15]),
+        "f"(values[16]), "f"(values[17]), "f"(values[18]), "f"(values[19]),
+        "f"(values[20]), "f"(values[21]), "f"(values[22]), "f"(values[23]),
+        "f"(values[24]), "f"(values[25]), "f"(values[26]), "f"(values[27]),
+        "f"(values[28]), "f"(values[29]), "f"(values[30]), "f"(values[31]));
+}
+
 __device__ inline void tcgen05_ld_f32_x64(
     float *values,
     int tmem_addr) {
@@ -734,6 +771,10 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
     __shared__ __align__(8) uint64_t mma2_mbars[QSlots][KvStages];
     __shared__ __align__(8) uint64_t softmax_mbars[QSlots][KvStages];
     __shared__ __align__(8) uint64_t rescale_mbars[QSlots][KvStages];
+    // P-store completion for one (slot, stage); the stats barrier above is
+    // released before the P stores so the rescale WG overlaps them, so the
+    // MMA warp needs this separate full-P token before issuing PV.
+    __shared__ __align__(8) uint64_t p_full_mbars[QSlots][KvStages];
     __shared__ __align__(8) uint64_t epilogue_mbar[1];
     __shared__ __align__(8) uint64_t out_store_ready_mbars[QSlots];
     __shared__ __align__(8) uint64_t tmem_release_mbar[1];
@@ -783,6 +824,7 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
     const int mma2_mbar_base = static_cast<int>(__cvta_generic_to_shared(mma2_mbars));
     const int softmax_mbar_base = static_cast<int>(__cvta_generic_to_shared(softmax_mbars));
     const int rescale_mbar_base = static_cast<int>(__cvta_generic_to_shared(rescale_mbars));
+    const int p_full_mbar_base = static_cast<int>(__cvta_generic_to_shared(p_full_mbars));
     const int epilogue_mbar_addr = static_cast<int>(__cvta_generic_to_shared(epilogue_mbar));
     const int out_store_ready_mbar_base =
         static_cast<int>(__cvta_generic_to_shared(out_store_ready_mbars));
@@ -814,6 +856,7 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
                 mbarrier_init(mma2_mbar_base + q_offset, kMmaMbarArrivalCount);
                 mbarrier_init(softmax_mbar_base + q_offset, kSoftmaxMbarArrivalCount);
                 mbarrier_init(rescale_mbar_base + q_offset, kRescaleMbarArrivalCount);
+                mbarrier_init(p_full_mbar_base + q_offset, kSoftmaxMbarArrivalCount);
             }
         }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
@@ -955,9 +998,9 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
                 scale_log2e);
             tilem = softmax.m;
             tilel = softmax.l;
-            // Complete all P stores before publishing the scalar handoff.
-            asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
-            tcgen05_fence_before_thread_sync();
+            // Publish the stats immediately: the epilogue WG's O rescale
+            // depends only on alpha/l, so it overlaps this WG's remaining
+            // exp2/P-store work instead of serializing behind it.
             softmax_alpha[q_slot][row] = softmax.alpha;
             softmax_l[q_slot][row] = tilel;
             __syncwarp();
@@ -965,12 +1008,20 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
                 mbarrier_arrive(
                     softmax_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t));
             }
+            // Complete all P stores before releasing the tile's P to the
+            // MMA warp on the separate p-full barrier.
+            asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+            tcgen05_fence_before_thread_sync();
+            if (lane_idx == 0) {
+                mbarrier_arrive(
+                    p_full_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t));
+            }
         }
         return;
     }
 
     if (epilogue_warp >= 0) {
-        // This WG needs only the 8-value O fragment plus scalar loop state.
+        // This WG needs only the 32-value O fragment plus scalar loop state.
         // It donates registers before either softmax WG's increase can finish.
         setmaxnreg_decrease<96>();
         int softmax_phase[QSlots][KvStages] = {};
@@ -999,16 +1050,18 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
                 if (kv_tile != 0 && warp_needs_rescale) {
                     const int o_tmem_addr =
                         tmem_addr + kOBankBase + q_slot * mma_tmem_columns_per_stage;
-                    for (int d8 = 0; d8 < HeadDim / 8; ++d8) {
-                        float o_fragment[8];
-                        const int addr = o_tmem_addr + (row_base << 16) + d8 * 8;
-                        tcgen05_ld_f32_x8(o_fragment, addr);
+                    // Four x32 round trips instead of sixteen x8 ones; the
+                    // trailing wait::st below is the only store fence.
+                    for (int d32 = 0; d32 < HeadDim / 32; ++d32) {
+                        float o_fragment[32];
+                        const int addr = o_tmem_addr + (row_base << 16) + d32 * 32;
+                        tcgen05_ld_f32_x32(o_fragment, addr);
                         asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
 #pragma unroll
-                        for (int e = 0; e < 8; ++e) {
+                        for (int e = 0; e < 32; ++e) {
                             o_fragment[e] *= alpha;
                         }
-                        tcgen05_st_f32_x8(o_fragment, addr);
+                        tcgen05_st_f32_x32(o_fragment, addr);
                     }
                 }
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
@@ -3715,16 +3768,18 @@ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(
             if (kv_tile != 0 && warp_needs_rescale) {
                 const int o_tmem_addr =
                     tmem_addr + kOBankBase + q_slot * mma_tmem_columns_per_stage;
-                for (int d8 = 0; d8 < HeadDim / 8; ++d8) {
-                    float o_fragment[8];
-                    const int addr = o_tmem_addr + (row_base << 16) + d8 * 8;
-                    tcgen05_ld_f32_x8(o_fragment, addr);
+                // Four x32 round trips instead of sixteen x8 ones; the
+                // trailing wait::st below is the only store fence.
+                for (int d32 = 0; d32 < HeadDim / 32; ++d32) {
+                    float o_fragment[32];
+                    const int addr = o_tmem_addr + (row_base << 16) + d32 * 32;
+                    tcgen05_ld_f32_x32(o_fragment, addr);
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
 #pragma unroll
-                    for (int e = 0; e < 8; ++e) {
+                    for (int e = 0; e < 32; ++e) {
                         o_fragment[e] *= softmax.alpha;
                     }
-                    tcgen05_st_f32_x8(o_fragment, addr);
+                    tcgen05_st_f32_x32(o_fragment, addr);
                 }
             }
             asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
