@@ -263,7 +263,7 @@ def main():
     parser = argparse.ArgumentParser(description="SM110A autotune runner")
     parser.add_argument(
         "workload",
-        choices=("bf16-gemm", "bf16-gemm-serving", "nvfp4-gemm", "grouped-m-gemm", "nvfp4-grouped-m-gemm", "fc1-swiglu", "nvfp4-fc1", "fc2-finalize", "nvfp4-fc2"),
+        choices=("bf16-gemm", "bf16-gemm-serving", "nvfp4-gemm", "grouped-m-gemm", "nvfp4-grouped-m-gemm", "fc1-swiglu", "nvfp4-fc1", "fc2-finalize", "nvfp4-fc2", "bf16-fa4-gqa"),
         help="workload to resolve and cache",
     )
     parser.add_argument("args", nargs=argparse.REMAINDER, help="arguments forwarded to the benchmark")
@@ -278,6 +278,7 @@ def main():
         "nvfp4-fc1": "benchmark_nvfp4_fc1.py",
         "fc2-finalize": "benchmark_bf16_fc2_finalize.py",
         "nvfp4-fc2": "benchmark_nvfp4_fc2.py",
+        "bf16-fa4-gqa": "benchmark_bf16_fa4_gqa.py",
     }
     forwarded = parsed.args[1:] if parsed.args[:1] == ["--"] else parsed.args
     raise SystemExit(subprocess.call([sys.executable, str(_ROOT / "benchmarks" / scripts[parsed.workload]), *forwarded]))

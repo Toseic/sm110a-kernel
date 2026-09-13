@@ -5,9 +5,11 @@ The kernel uses BHSD tensors: Q is ``[B, Hq, Q, D]`` and K/V are
 ``[B, Hkv, KV, D]``. It is specialized for ``Hq / Hkv == 4``. Two orthogonal
 axes select the schedule:
 
-* ``--tactic`` — 16-warp or 12-warp CTA schedule.
+* ``--tactic`` — 16-warp or 12-warp CTA schedule, or ``auto`` (default) to
+  autotune over all schedules with a per-workload cache.
 * ``--pack-gqa`` — fold the four query heads into the logical query-row
-  dimension of one CTA instead of assigning one query head per CTA.
+  dimension of one CTA instead of assigning one query head per CTA
+  (requires an explicit ``--tactic``).
 
 The default suite matches the MHA benchmark: causal prefill at B=1 with
 Q=KV in {1K..16K} and non-causal decode at Q=1, KV=8K with B in {32, 64, 128}.
@@ -26,8 +28,14 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from common import BenchmarkBase, TablePrinter, benchmark_with_stats, sol_bounds
-from sm110a_kernel import Bf16Fa4GqaTactic, bf16_fa4_gqa_out
+from common import BenchmarkBase, benchmark_with_stats, quick_probe, sol_bounds
+from sm110a_kernel import (
+    Bf16Fa4GqaConfig,
+    Bf16Fa4GqaTactic,
+    bf16_fa4_gqa_out,
+    compile_bf16_fa4_gqa,
+)
+from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
 
 
 PREFILL_LENGTHS = (1024, 2048, 4096, 8192, 16384)
@@ -35,6 +43,21 @@ DECODE_BATCH_SIZES = (32, 64, 128)
 DEFAULT_Q_HEADS = 32
 DEFAULT_KV_HEADS = 8
 DEFAULT_HEAD_DIM = 128
+
+TACTIC_LABELS = {
+    Bf16Fa4GqaTactic.WARP_16: "16warp",
+    Bf16Fa4GqaTactic.WARP_12: "12warp",
+}
+PINNED_TACTICS = {label: tactic for tactic, label in TACTIC_LABELS.items()}
+ALL_CONFIGS = tuple(
+    Bf16Fa4GqaConfig(tactic=tactic, pack_gqa=pack_gqa)
+    for tactic in Bf16Fa4GqaTactic
+    for pack_gqa in (False, True)
+)
+
+
+def format_config(config):
+    return f"{TACTIC_LABELS[config.tactic]}{'/packed' if config.pack_gqa else ''}"
 
 
 @dataclass(frozen=True)
@@ -153,19 +176,26 @@ class Bf16Fa4GqaBenchmark(BenchmarkBase):
         parser.add_argument("--scale", type=float, default=None)
         parser.add_argument(
             "--tactic",
-            choices=("16warp", "12warp"),
-            default="16warp",
+            choices=("auto", "16warp", "12warp"),
+            default="auto",
+            help="CTA schedule, or auto to autotune all schedules per case",
         )
         parser.add_argument(
             "--pack-gqa",
             action="store_true",
-            help="fold the four query heads into one packed-M CTA per K/V head",
+            help=(
+                "fold the four query heads into one packed-M CTA per K/V head "
+                "(requires an explicit --tactic)"
+            ),
         )
+        parser.add_argument("--debug", action="store_true")
         parser.add_argument("--no-accuracy", action="store_true")
         parser.add_argument("--atol", type=float, default=2e-2)
         parser.add_argument("--rtol", type=float, default=2e-2)
         self.add_timing_args(parser, warmup=5, iters=20, samples=7)
         self.add_sol_arg(parser)
+        self.add_cache_args(parser)
+        self.add_pre_parallel_jit_arg(parser)
         return parser
 
     def validate_args(self, args):
@@ -173,6 +203,8 @@ class Bf16Fa4GqaBenchmark(BenchmarkBase):
             raise SystemExit("all dimensions must be positive")
         if args.q_heads != 4 * args.kv_heads:
             raise SystemExit("this kernel requires --q-heads == 4 * --kv-heads")
+        if args.pack_gqa and args.tactic == "auto":
+            raise SystemExit("--pack-gqa requires an explicit --tactic (16warp or 12warp)")
         if args.scale is not None and (not math.isfinite(args.scale) or args.scale <= 0):
             raise SystemExit("--scale must be finite and positive")
         self.validate_timing_args(args, allow_zero_warmup=True)
@@ -194,20 +226,52 @@ class Bf16Fa4GqaBenchmark(BenchmarkBase):
             yield GqaCase("decode", batch, DEFAULT_Q_HEADS, DEFAULT_KV_HEADS, 1,
                           8192, DEFAULT_HEAD_DIM, False)
 
+    def resolve_config(self, case, args, kernel_factory):
+        def prepare(config):
+            run = kernel_factory(config)
+            run()
+            torch.cuda.synchronize()
+            return PreparedKernel(config, run)
+
+        options = self.make_tune_options(
+            args,
+            role="ours",
+            pre_parallel_jit=args.pre_parallel_jit,
+        )
+        return AutotuneRunner(options).resolve(
+            ALL_CONFIGS,
+            namespace="bf16_fa4_gqa",
+            key=(case.batch, case.q_heads, case.kv_heads, case.q_len,
+                 case.kv_len, case.head_dim, case.causal),
+            prepare=prepare,
+            benchmark=lambda prepared: benchmark_with_stats(
+                prepared.run, args.warmup, args.iters, args.samples,
+                cold_l2_flush=getattr(args, "_cold_l2_flush", None),
+            ),
+            probe=lambda prepared: quick_probe(
+                prepared.run, args.iters,
+                cold_l2_flush=getattr(args, "_cold_l2_flush", None),
+            ),
+            format_candidate=format_config,
+            metric_formatter=lambda _config, stats: (
+                f"{attention_tflops(case, stats['median_ms']):.3f} TF/s"
+            ),
+            pre_jit=compile_bf16_fa4_gqa,
+        )
+
     def run_with_args(self, args):
-        tactic = {
-            "16warp": Bf16Fa4GqaTactic.WARP_16,
-            "12warp": Bf16Fa4GqaTactic.WARP_12,
-        }[args.tactic]
-        schedule_label = f"{args.tactic}{'/packed' if args.pack_gqa else ''}"
+        autotune = args.tactic == "auto"
         fa4_fwd = load_official_fa4()
-        print(f"[tactic] {schedule_label}")
+        if autotune:
+            print("[runner] config selection is cached per workload and CUDA environment")
+        else:
+            print(f"[tactic] {args.tactic}{'/packed' if args.pack_gqa else ''}")
         columns = (("mode", 9), ("shape [B,Hq,Hkv,Q,KV,D]", 30), ("mask", 10),
                    ("Kernel ms", 13), ("Kernel TF/s", 14), ("FA4 ms", 13),
-                   ("FA4/kernel", 14), ("Diff", 12))
+                   ("FA4/kernel", 14), ("Diff", 12), ("Config", 16))
         if args.sol:
             columns += (("SOL selected(ms)", 17), ("SOL attainment", 15))
-        table = TablePrinter(columns)
+        table = self.make_table_printer(columns)
         table.print_header()
         for case in self.cases(args):
             q = torch.empty((case.batch, case.q_heads, case.q_len, case.head_dim), device="cuda", dtype=torch.bfloat16).uniform_(-1, 1)
@@ -221,28 +285,38 @@ class Bf16Fa4GqaBenchmark(BenchmarkBase):
             v_fa4 = v.permute(0, 2, 1, 3).contiguous()
             out_fa4 = torch.empty_like(q_fa4)
             scale = args.scale or 1.0 / math.sqrt(case.head_dim)
-            def kernel():
-                bf16_fa4_gqa_out(q, k, v, out, causal=case.causal, scale=scale,
-                                 tactic=tactic, pack_gqa=args.pack_gqa)
+            def make_kernel(config):
+                return lambda: bf16_fa4_gqa_out(q, k, v, out, causal=case.causal,
+                                                scale=scale, tactic=config)
             def fa4():
                 fa4_fwd(q_fa4, k_fa4, v_fa4, softmax_scale=scale,
                         causal=case.causal, out=out_fa4)
+            if autotune:
+                selection = self.resolve_config(case, args, make_kernel)
+                config = selection.candidate
+                kernel_stats = selection.stats
+            else:
+                config = Bf16Fa4GqaConfig(tactic=PINNED_TACTICS[args.tactic],
+                                          pack_gqa=args.pack_gqa)
+                kernel_stats = benchmark_with_stats(
+                    make_kernel(config), args.warmup, args.iters, args.samples,
+                    cold_l2_flush=args._cold_l2_flush)
+            kernel = make_kernel(config)
             kernel(); fa4(); torch.cuda.synchronize()
             out_fa4_bhsd = out_fa4.permute(0, 2, 1, 3)
             torch.testing.assert_close(out, out_fa4_bhsd, atol=args.atol, rtol=args.rtol)
             if args.single and not args.no_accuracy:
                 torch.testing.assert_close(out, reference_attention(q, k, v, causal=case.causal, scale=scale), atol=args.atol, rtol=args.rtol)
-            kernel_stats = benchmark_with_stats(kernel, args.warmup, args.iters, args.samples,
-                                                cold_l2_flush=args._cold_l2_flush)
             fa4_stats = benchmark_with_stats(fa4, args.warmup, args.iters, args.samples,
                                              cold_l2_flush=args._cold_l2_flush)
             diff = (out.float() - out_fa4_bhsd.float()).abs().max().item()
             values = (case.name, f"{case.batch}x{case.q_heads}x{case.kv_heads}x{case.q_len}x{case.kv_len}x{case.head_dim}",
                       "causal" if case.causal else "noncausal", f"{kernel_stats['median_ms']:.4f}",
                       f"{attention_tflops(case, kernel_stats['median_ms']):.3f}",
-                      f"{fa4_stats['median_ms']:.4f}", f"{fa4_stats['median_ms'] / kernel_stats['median_ms']:.3f}x", f"{diff:.6g}")
+                      f"{fa4_stats['median_ms']:.4f}", f"{fa4_stats['median_ms'] / kernel_stats['median_ms']:.3f}x", f"{diff:.6g}",
+                      format_config(config))
             if args.sol:
-                bounds = attention_sol_bounds(case, packed_gqa=args.pack_gqa)
+                bounds = attention_sol_bounds(case, packed_gqa=config.pack_gqa)
                 values += (f"{bounds['sol_ms']:.4f}",
                            f"{100.0 * bounds['sol_ms'] / kernel_stats['median_ms']:.1f}%")
             table.print_row(*values)

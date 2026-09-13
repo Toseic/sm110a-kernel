@@ -14,6 +14,11 @@ the four query heads of a K/V head into the logical query-row dimension of
 a single CTA and scatters output rows back to the original BHSD layout.
 Packed quarters the task count, which mainly benefits decode.
 
+The benchmark autotunes the 2x2 schedule space per workload by default
+(`--tactic auto`) through the shared `AutotuneRunner`, caching the winner in
+`profiles/autotune_cache.json`; pass an explicit `--tactic [--pack-gqa]` to
+pin one schedule and skip the sweep.
+
 ```bash
 /home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_bf16_fa4_gqa.py
 /home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_bf16_fa4_gqa.py \
