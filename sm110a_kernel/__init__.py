@@ -53,6 +53,14 @@ from .kernels.bf16_fa4_gqa import (
     compile_bf16_fa4_gqa_configs,
     get_bf16_fa4_gqa_module,
 )
+from .kernels.bf16_fa4_mla import (
+    Bf16Fa4MlaConfig,
+    bf16_fa4_mla,
+    bf16_fa4_mla_out,
+    compile_bf16_fa4_mla,
+    compile_bf16_fa4_mla_configs,
+    get_bf16_fa4_mla_module,
+)
 from .kernels.bf16_fa4_mqa import (
     Bf16Fa4MqaConfig,
     bf16_fa4_mqa,

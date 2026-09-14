@@ -360,7 +360,7 @@ def sol_table_columns():
     return (
         ("SOL", 22), ("SOL mma(ms)", 12), ("SOL hbm(ms)", 12),
         ("SOL gmem(ms)", 14), ("SOL pure-l2(ms)", 16),
-        ("SOL mixed(ms)", 14), ("SOL selected(ms)", 16),
+        ("SOL mixed(ms)", 14), ("SOL selected(ms)", 17),
         ("SOL attainment", 16), ("SOL tile-read(MB)", 18),
     )
 
