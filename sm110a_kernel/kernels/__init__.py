@@ -38,6 +38,14 @@ from .bf16_fa4_gqa import (
     compile_bf16_fa4_gqa_configs,
     get_bf16_fa4_gqa_module,
 )
+from .bf16_fa4_mqa import (
+    Bf16Fa4MqaConfig,
+    bf16_fa4_mqa,
+    bf16_fa4_mqa_out,
+    compile_bf16_fa4_mqa,
+    compile_bf16_fa4_mqa_configs,
+    get_bf16_fa4_mqa_module,
+)
 from .nvfp4_gemm import (
     Nvfp4GemmConfig,
     compile_nvfp4_gemm,
