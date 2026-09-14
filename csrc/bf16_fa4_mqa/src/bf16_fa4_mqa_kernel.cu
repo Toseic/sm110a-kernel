@@ -774,7 +774,8 @@ __global__ __launch_bounds__(512, 1) void fa_mqa_kernel_wg16(
     bool causal) {
     static_assert(TileQ == 128, "the FA MQA kernel currently supports TileQ=128 only");
     static_assert(TileKV > 0, "attention tiles must be positive");
-    static_assert(QSlots == 2, "the FA MQA mainloop currently supports two Q slots");
+    static_assert(QSlots == 1 || QSlots == 2,
+        "the FA MQA mainloop supports one or two Q slots");
     static_assert(KvStages == 2, "the K/V mainloop currently uses two stages");
     static_assert(HeadDim == 128, "the FA MQA kernel currently supports HeadDim=128 only");
 
@@ -834,9 +835,9 @@ __global__ __launch_bounds__(512, 1) void fa_mqa_kernel_wg16(
     constexpr int kMmaWarp = 2;      // QK and PV tcgen05 issuer
     constexpr int kIdleWarp = 3;
     constexpr int kWarpsPerGroup = TileQ / kWarpSize;
-    constexpr int kSoftmaxWarpBegin = 4; // Q0: warps 4-7; Q1: warps 8-11
+    constexpr int kSoftmaxWarpBegin = 4;
     constexpr int kSoftmaxWarpEnd = kSoftmaxWarpBegin + QSlots * kWarpsPerGroup;
-    constexpr int kEpilogueWarpBegin = kSoftmaxWarpEnd; // warps 12-15
+    constexpr int kEpilogueWarpBegin = kSoftmaxWarpEnd;
     constexpr int kEpilogueWarpEnd = kEpilogueWarpBegin + kWarpsPerGroup;
     constexpr int kTmaMbarArrivalCount = 1;
     constexpr int kMmaMbarArrivalCount = 1;
@@ -918,9 +919,9 @@ __global__ __launch_bounds__(512, 1) void fa_mqa_kernel_wg16(
     constexpr int kTmemColumnsPerBank = 128;
     constexpr int kSBankBase = 0;
     constexpr int kOBankBase = QSlots * kTmemColumnsPerBank;
-    // S0/S1/O0/O1: 4 * 128 = 512 TMEM columns.
+    // One S/O bank pair per resident Q slot.
     constexpr int mma_tmem_columns_per_stage = kTmemColumnsPerBank;
-    constexpr int mma_tmem_columns = 4 * kTmemColumnsPerBank;
+    constexpr int mma_tmem_columns = 2 * QSlots * kTmemColumnsPerBank;
     if (warp_idx == kMmaWarp) {
         const int mma_tmem_smem_addr = static_cast<int>(__cvta_generic_to_shared(mma_tmem_addr));
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" ::"r"(
@@ -955,12 +956,13 @@ __global__ __launch_bounds__(512, 1) void fa_mqa_kernel_wg16(
     const int bh = PackMqa ? 0 : task_bh;
     const int qo_bh = PackMqa ? task_bh : bh;
     const int kv_bh = batch_idx;
-    const int q_tile_start[QSlots] = {
-        (q_pair_idx * QSlots + 0) * TileQ,
-        (q_pair_idx * QSlots + 1) * TileQ,
-    };
-    const int logical_q_pair_end = q_tile_start[1] + TileQ < logical_query_len
-        ? q_tile_start[1] + TileQ
+    int q_tile_start[QSlots];
+#pragma unroll
+    for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
+        q_tile_start[q_slot] = (q_pair_idx * QSlots + q_slot) * TileQ;
+    }
+    const int logical_q_pair_end = q_tile_start[QSlots - 1] + TileQ < logical_query_len
+        ? q_tile_start[QSlots - 1] + TileQ
         : logical_query_len;
     const int q_pair_end = PackMqa
         ? (logical_q_pair_end + kMqaPackSize - 1) / kMqaPackSize
@@ -1277,6 +1279,78 @@ __global__ __launch_bounds__(512, 1) void fa_mqa_kernel_wg16(
             const uint32_t pv_instr_desc = (1U << 4U) | (1U << 7U) | (1U << 10U) | (1U << 16U) |
                                            ((uint32_t)HeadDim >> 3U << 17U) |
                                            ((uint32_t)TileQ >> 4U << 24U);
+            if constexpr (QSlots == 1) {
+                // Decode specialization: one packed Q tile is resident, so
+                // each KV iteration is simply Q0(i) followed by P0(i).
+                for (int kv_tile = 0; kv_tile < task_kv_tile_count; ++kv_tile) {
+                    constexpr int q_slot = 0;
+                    const int stage = kv_tile % KvStages;
+                    mbarrier_wait(
+                        tma1_mbar_base + stage * sizeof(uint64_t), qk_tma1_phase[stage]);
+                    qk_tma1_phase[stage] ^= 1;
+                    tcgen05_fence_after_thread_sync();
+
+                    const int q_addr = q_smem_addr;
+                    const int k_addr =
+                        kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16);
+                    const int s_addr = tmem_addr + kSBankBase;
+                    for (int d64 = 0; d64 < HeadDim / 64; ++d64)
+                        for (int d16 = 0; d16 < 4; ++d16) {
+                            tcgen05_mma_bf16(s_addr,
+                                make_128b_swizzle_desc(
+                                    q_addr + d64 * TileQ * 128 + d16 * 32),
+                                make_128b_swizzle_desc(
+                                    k_addr + d64 * TileKV * 128 + d16 * 32),
+                                kQkInstrDesc,
+                                d64 != 0 || d16 != 0);
+                        }
+                    tcgen05_commit_stage_reuse(
+                        mma1_mbar_base + stage * sizeof(uint64_t),
+                        k_ready_mbar_base + stage * sizeof(uint64_t));
+
+                    mbarrier_wait(
+                        tma2_mbar_base + stage * sizeof(uint64_t), pv_tma2_phase[stage]);
+                    pv_tma2_phase[stage] ^= 1;
+                    const int rescale_addr =
+                        rescale_mbar_base + stage * sizeof(uint64_t);
+                    mbarrier_wait(rescale_addr, pv_rescale_phase[q_slot][stage]);
+                    pv_rescale_phase[q_slot][stage] ^= 1;
+                    const int ppartial_addr =
+                        p_partial_mbar_base + stage * sizeof(uint64_t);
+                    mbarrier_wait(ppartial_addr, pv_ppartial_phase[q_slot][stage]);
+                    pv_ppartial_phase[q_slot][stage] ^= 1;
+                    tcgen05_fence_after_thread_sync();
+
+                    const int o_addr = tmem_addr + kOBankBase;
+                    const int v_addr =
+                        kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16);
+                    constexpr int kPvHalfChunks = TileKV / 32;
+                    for (int k16 = 0; k16 < kPvHalfChunks; ++k16) {
+                        tcgen05_mma_tmem_a_bf16(o_addr,
+                            s_addr + k16 * 8,
+                            make_128b_nmajor_desc(
+                                v_addr + k16 * 16 * 128, TileKV * 128),
+                            pv_instr_desc,
+                            kv_tile != 0 || k16 != 0);
+                    }
+                    const int pfull_addr = p_full_mbar_base + stage * sizeof(uint64_t);
+                    mbarrier_wait(pfull_addr, pv_pfull_phase[q_slot][stage]);
+                    pv_pfull_phase[q_slot][stage] ^= 1;
+                    tcgen05_fence_after_thread_sync();
+                    for (int k16 = kPvHalfChunks; k16 < TileKV / 16; ++k16) {
+                        tcgen05_mma_tmem_a_bf16(o_addr,
+                            s_addr + k16 * 8,
+                            make_128b_nmajor_desc(
+                                v_addr + k16 * 16 * 128, TileKV * 128),
+                            pv_instr_desc,
+                            kv_tile != 0 || k16 != 0);
+                    }
+                    tcgen05_commit_stage_reuse(
+                        mma2_mbar_base + stage * sizeof(uint64_t),
+                        v_ready_mbar_base + stage * sizeof(uint64_t));
+                }
+                tcgen05_commit_mbarrier(epilogue_mbar_addr);
+            } else {
             // Keep the two Q tiles staggered around the PV work.  At iteration
             // i the tensor-core issue order is Q0(i), P1(i - 1), Q1(i), P0(i).
             // P1(0) has no predecessor and is deliberately omitted.  This
@@ -1467,6 +1541,7 @@ __global__ __launch_bounds__(512, 1) void fa_mqa_kernel_wg16(
             // A fresh, non-ring completion point protects the final O from
             // parity wraparound on the recycled mma2 barriers.
             tcgen05_commit_mbarrier(epilogue_mbar_addr);
+            }
         }
         mbarrier_wait(tmem_release_mbar_addr, 0);
         tcgen05_fence_after_thread_sync();
@@ -1476,10 +1551,90 @@ __global__ __launch_bounds__(512, 1) void fa_mqa_kernel_wg16(
     }
 }
 
+// Q=1 MQA decode launcher. It instantiates the shared FA mainloop with one
+// resident Q slot: WG0 drives TMA/MMA, WG1 performs softmax, and WG2 handles
+// rescale and the epilogue.
+cudaError_t bf16_fa4_mqa_decode_cuda(
+    const __nv_bfloat16 *q,
+    const __nv_bfloat16 *k,
+    const __nv_bfloat16 *v,
+    __nv_bfloat16 *out,
+    int batch,
+    int heads,
+    int query_len,
+    int key_len,
+    int head_dim,
+    float scale,
+    bool causal,
+    cudaStream_t stream) {
+    constexpr int kTileQ = 128;
+    constexpr int kTileKV = 128;
+    constexpr int kQSlots = 1;
+    constexpr int kKvStages = 2;
+    constexpr int kHeadDim = 128;
+    constexpr int kDecodeWarps = 12;
+
+    if (query_len != 1 || head_dim != kHeadDim || heads <= 0 ||
+        heads % kMqaPackSize != 0 || key_len <= 0 || batch <= 0 ||
+        !(scale > 0.0f) || (causal && key_len < query_len)) {
+        return cudaErrorInvalidValue;
+    }
+
+    const int query_groups = heads / kMqaPackSize;
+    CUtensorMap q_tmap{};
+    CUtensorMap k_tmap{};
+    CUtensorMap v_tmap{};
+    CUtensorMap out_tmap{};
+    cudaError_t status = init_packed_qo_tmap<kMqaPackSize>(
+        &q_tmap, q, batch * query_groups, query_len, head_dim, kTileQ);
+    if (status == cudaSuccess) {
+        status = init_qkv_tmap(
+            &k_tmap, k, batch, key_len, head_dim, kTileKV);
+    }
+    if (status == cudaSuccess) {
+        status = init_qkv_tmap(
+            &v_tmap, v, batch, key_len, head_dim, kTileKV);
+    }
+    if (status == cudaSuccess) {
+        status = init_packed_qo_tmap<kMqaPackSize>(
+            &out_tmap, out, batch * query_groups, query_len, head_dim, kTileQ);
+    }
+    if (status != cudaSuccess) {
+        return status;
+    }
+
+    using SmemLayout =
+        FaMqaSmemLayout<kTileQ, kTileKV, kQSlots, kKvStages>;
+    const SmemLayout smem_layout = SmemLayout::make(head_dim);
+    if (smem_layout.dynamic_bytes + SmemLayout::kStaticMbarrierBytes +
+            SmemLayout::kSoftmaxHandoffBytes >
+        SmemLayout::kMaxSmemBytes) {
+        return cudaErrorInvalidConfiguration;
+    }
+
+    status = cudaFuncSetAttribute(
+        fa_mqa_kernel_wg16<
+            kTileQ, kTileKV, kQSlots, kKvStages, kHeadDim, true>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(smem_layout.dynamic_bytes));
+    if (status != cudaSuccess) {
+        return status;
+    }
+
+    const dim3 block(kDecodeWarps * 32);
+    const dim3 grid(batch * query_groups);
+    fa_mqa_kernel_wg16<
+        kTileQ, kTileKV, kQSlots, kKvStages, kHeadDim, true>
+        <<<grid, block, smem_layout.dynamic_bytes, stream>>>(
+            q_tmap, k_tmap, v_tmap, out_tmap, batch, heads, query_len,
+            key_len, scale, causal);
+    return cudaGetLastError();
+}
+
 
 } // namespace
 
-// Launch the sole 16-warp MQA schedule.
+// Dispatch between the 12-warp decode and 16-warp prefill schedules.
 cudaError_t bf16_fa4_mqa_cuda(
     const __nv_bfloat16 *q,
     const __nv_bfloat16 *k,
@@ -1493,6 +1648,11 @@ cudaError_t bf16_fa4_mqa_cuda(
     float scale,
     bool causal,
     cudaStream_t stream) {
+    if (query_len == 1) {
+        return bf16_fa4_mqa_decode_cuda(
+            q, k, v, out, batch, heads, query_len, key_len, head_dim,
+            scale, causal, stream);
+    }
     constexpr int kTileQ = 128;
     constexpr int kTileKV = 128;
     constexpr int kQSlots = 2;
