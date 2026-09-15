@@ -60,27 +60,27 @@ def reference_attention(q, k, v, scale):
 def mla_sol_bounds(batch, kv_len, *, tile_kv=64):
     """Traffic-aware SOL for the MLA decode schedule.
 
-    Compulsory traffic reads Q/K/V and writes O once. Each batch runs two
+    Compulsory traffic reads Q/K and writes O once. K stores
+    concat(cKV, K_rope), so its cKV prefix is V. Each batch runs two
     independent CTAs, each producing all 512 output features for 64 heads.
-    Q is partitioned over the CTAs; both CTAs read all of K and V.
+    Q is partitioned over the CTAs; both CTAs read all of K.
     """
     element_bytes = 2  # BF16 Q, K, V, O
     q_bytes = element_bytes * batch * H * (D_KV + D_rope)
     k_bytes = element_bytes * batch * kv_len * (D_KV + D_rope)
-    v_bytes = element_bytes * batch * kv_len * D_KV
     output_bytes = element_bytes * batch * H * D_KV
 
-    # Per KV tile both CTAs stream full-depth K and V tiles.
+    # Per KV tile both CTAs stream the full K=[cKV,K_rope] tile once.
     kv_tile_count = math.ceil(kv_len / tile_kv)
-    kv_tile_bytes = element_bytes * tile_kv * 2 * ((D_KV + D_rope) + D_KV)
+    kv_tile_bytes = element_bytes * tile_kv * 2 * (D_KV + D_rope)
     tile_read_bytes = q_bytes + batch * kv_tile_count * kv_tile_bytes
 
     # Useful FLOPs (QK + PV); neither operation is duplicated over output D.
     flops = 2 * batch * H * kv_len * (D_KV + D_rope + D_KV)
     return sol_bounds(
         flops,
-        q_bytes + k_bytes + v_bytes + output_bytes,
-        q_bytes + k_bytes + v_bytes,
+        q_bytes + k_bytes + output_bytes,
+        q_bytes + k_bytes,
         tile_read_bytes,
     )
 

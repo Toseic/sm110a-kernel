@@ -88,10 +88,11 @@ def _resolve_scale(q, scale):
 
 
 def bf16_fa4_mla(q, k, v, *, causal=False, scale=None):
-    """Compute MLA decode from Q [B,128,1,576], K [B,1,S,576], V [B,1,S,512].
+    """Compute MLA decode from Q [B,128,1,576] and K [B,1,S,576].
 
-    K stores concat(cKV, K_rope) row-wise; its transpose is the logical
-    K_input. Returns [B,128,1,512]. Default scale is 1/sqrt(576)."""
+    K stores concat(cKV, K_rope) row-wise; cKV is also V. ``v`` remains an
+    ABI-compatible argument and must represent that cKV prefix. Returns
+    [B,128,1,512]. Default scale is 1/sqrt(576)."""
     return compile_bf16_fa4_mla().fa_mla(
         q, k, v, bool(causal), _resolve_scale(q, scale)
     )
@@ -104,4 +105,3 @@ def bf16_fa4_mla_out(
     return compile_bf16_fa4_mla().fa_mla_out(
         q, k, v, out, bool(causal), _resolve_scale(q, scale)
     )
-

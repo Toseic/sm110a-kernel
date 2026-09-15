@@ -388,10 +388,10 @@ __host__ __device__ constexpr size_t align_up(
     return (value + alignment - 1) / alignment * alignment;
 }
 
-// Q [64,576] is resident.  Each of the two 72 KiB KV stages first holds K
-// [64,576], then its first eight 64x64 chunks hold V [64,512].  P0 has an
-// explicit 8 KiB allocation; P1 aliases the rope chunk of KV stage 1.  The
-// final O [64,512] epilogue reuses Q after the last QK.
+// Q [64,576] is resident.  Each KV stage holds K=[cKV,K_rope] [64,576];
+// its cKV prefix is also V, so PV reads the first eight chunks in place. P0
+// has an explicit 8 KiB allocation; P1 aliases the rope chunk of KV stage 1.
+// The final O [64,512] epilogue reuses Q after the last QK.
 template <int TileQ, int TileKV, int QSlots, int KvStages> struct FaMlaSmemLayout {
     static constexpr size_t kAlignment = 128;
     static constexpr size_t kMaxSmemBytes = 227 * 1024;
@@ -399,7 +399,7 @@ template <int TileQ, int TileKV, int QSlots, int KvStages> struct FaMlaSmemLayou
     static constexpr int kValueChunkCount = 8;
     static constexpr size_t kStaticMbarrierBytes =
         (kKChunkCount +
-         KvStages * (2 * kKChunkCount + kValueChunkCount + 5) + 3) *
+         KvStages * (2 * kKChunkCount + 5) + 3) *
         sizeof(uint64_t);
     static constexpr size_t kSoftmaxHandoffBytes =
         2 * QSlots * TileQ * sizeof(float);
@@ -530,7 +530,6 @@ inline cudaError_t init_packed_qo_tmap(
 __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
     const __grid_constant__ CUtensorMap q_tmap,
     const __grid_constant__ CUtensorMap k_tmap,
-    const __grid_constant__ CUtensorMap v_tmap,
     const __grid_constant__ CUtensorMap out_tmap,
     int batch,
     int heads,
@@ -566,7 +565,6 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
 
     __shared__ __align__(8) uint64_t q_tma_mbars[KChunkCount];
     __shared__ __align__(8) uint64_t k_tma_mbars[KvStages][KChunkCount];
-    __shared__ __align__(8) uint64_t v_tma_mbars[KvStages][ValueChunkCount];
     __shared__ __align__(8) uint64_t qk_done_mbars[KvStages];
     __shared__ __align__(8) uint64_t s_free_mbars[KvStages];
     __shared__ __align__(8) uint64_t p_ready_mbars[KvStages];
@@ -585,7 +583,6 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
     const int lane_idx = tid % kWarpSize;
     const int q_tma_base = static_cast<int>(__cvta_generic_to_shared(q_tma_mbars));
     const int k_tma_base = static_cast<int>(__cvta_generic_to_shared(k_tma_mbars));
-    const int v_tma_base = static_cast<int>(__cvta_generic_to_shared(v_tma_mbars));
     const int qk_done_base = static_cast<int>(__cvta_generic_to_shared(qk_done_mbars));
     const int s_free_base = static_cast<int>(__cvta_generic_to_shared(s_free_mbars));
     const int p_ready_base = static_cast<int>(__cvta_generic_to_shared(p_ready_mbars));
@@ -609,10 +606,6 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
                 mbarrier_init(
                     k_tma_base + (stage * KChunkCount + d64) * sizeof(uint64_t), 1);
             }
-            for (int chunk = 0; chunk < ValueChunkCount; ++chunk) {
-                mbarrier_init(
-                    v_tma_base + (stage * ValueChunkCount + chunk) * sizeof(uint64_t), 1);
-            }
             mbarrier_init(qk_done_base + stage * sizeof(uint64_t), 1);
             mbarrier_init(s_free_base + stage * sizeof(uint64_t), kWgArrivalCount);
             mbarrier_init(p_ready_base + stage * sizeof(uint64_t), kWgArrivalCount);
@@ -631,7 +624,6 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
     if (warp_idx == kTmaLoadWarp && lane_idx == 0) {
         prefetch_tensormap(&q_tmap);
         prefetch_tensormap(&k_tmap);
-        prefetch_tensormap(&v_tmap);
     }
     if (warp_idx == kTmaStoreWarp && lane_idx == 0) {
         prefetch_tensormap(&out_tmap);
@@ -656,11 +648,8 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
     const int kv_smem_addr = static_cast<int>(__cvta_generic_to_shared(kv_smem));
     const int p0_smem_addr = static_cast<int>(__cvta_generic_to_shared(p0_smem));
     const int out_smem_addr = static_cast<int>(__cvta_generic_to_shared(out_smem));
-    const int tmem_addr = mma_tmem_addr[0];
     const int query_groups = heads / kMlaPackSize;
     const int qo_bh = blockIdx.x;
-    const int batch_idx = qo_bh / query_groups;
-    const int kv_bh = batch_idx;
     const int kv_tile_count = (key_len + TileKV - 1) / TileKV;
     const int causal_offset = key_len - query_len;
     const int task_kv_tile_count = causal
@@ -670,6 +659,7 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
 
     if (warp_idx >= kSoftmaxWarpBegin && warp_idx < kEpilogueWarpBegin) {
         setmaxnreg_increase<192>();
+        const int tmem_addr = mma_tmem_addr[0];
         const int warp_in_group = warp_idx - kSoftmaxWarpBegin;
         const int logical_row = warp_in_group * 16 + (lane_idx & 15);
         float tilem = -__int_as_float(0x7F800000);
@@ -718,6 +708,7 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
 
     if (warp_idx >= kEpilogueWarpBegin && warp_idx < 12) {
         setmaxnreg_decrease<96>();
+        const int tmem_addr = mma_tmem_addr[0];
         const int warp_in_group = warp_idx - kEpilogueWarpBegin;
         const int logical_row = warp_in_group * 16 + (lane_idx & 15);
         const int output_half = lane_idx >> 4;
@@ -793,6 +784,7 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
 
     if (warp_idx == kTmaLoadWarp) {
         if (lane_idx == 0) {
+            const int kv_bh = qo_bh / query_groups;
             for (int d64 = 0; d64 < KChunkCount; ++d64) {
                 const int mbar = q_tma_base + d64 * sizeof(uint64_t);
                 mbarrier_expect_tx(mbar, ChunkBytes);
@@ -800,7 +792,6 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
                     0, 0, 0, d64, qo_bh, mbar);
             }
             int chunk_free_phase[KvStages][KChunkCount] = {};
-            int qk_phase[KvStages] = {};
             for (int kv_tile = 0; kv_tile < task_kv_tile_count; ++kv_tile) {
                 const int stage = kv_tile & 1;
                 const int stage_addr = kv_smem_addr + stage * StageBytes;
@@ -816,15 +807,6 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
                     mbarrier_expect_tx(mbar, ChunkBytes);
                     tma_4d_gmem2smem(stage_addr + d64 * ChunkBytes, &k_tmap,
                         0, kv_tile * TileKV, d64, kv_bh, mbar);
-                }
-                mbarrier_wait(qk_done_base + stage * sizeof(uint64_t), qk_phase[stage]);
-                qk_phase[stage] ^= 1;
-                for (int chunk = 0; chunk < ValueChunkCount; ++chunk) {
-                    const int mbar = v_tma_base +
-                        (stage * ValueChunkCount + chunk) * sizeof(uint64_t);
-                    mbarrier_expect_tx(mbar, ChunkBytes);
-                    tma_4d_gmem2smem(stage_addr + chunk * ChunkBytes, &v_tmap,
-                        0, kv_tile * TileKV, chunk, kv_bh, mbar);
                 }
             }
         }
@@ -842,6 +824,7 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
     }
 
     if (warp_idx == kMmaWarp) {
+        const int tmem_addr = mma_tmem_addr[0];
         if (elect_sync()) {
             constexpr uint32_t kQkInstrDesc =
                 (1U << 4U) | (1U << 7U) | (1U << 10U) |
@@ -850,7 +833,6 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
                 (1U << 4U) | (1U << 7U) | (1U << 10U) |
                 (1U << 16U) | (8U << 17U) | (4U << 24U); // M64 N64, B N-major
             int k_phase[KvStages][KChunkCount] = {};
-            int v_phase[KvStages][ValueChunkCount] = {};
             int s_free_phase[KvStages] = {};
             int p_ready_phase[KvStages] = {};
             int rescale_phase[KvStages] = {};
@@ -907,10 +889,6 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
                     : stage_addr + 8 * ChunkBytes;
                 tcgen05_fence_after_thread_sync();
                 for (int chunk = 0; chunk < ValueChunkCount; ++chunk) {
-                    mbarrier_wait(
-                        v_tma_base + (stage * ValueChunkCount + chunk) * sizeof(uint64_t),
-                        v_phase[stage][chunk]);
-                    v_phase[stage][chunk] ^= 1;
                     const int d_addr = tmem_addr + kOBase +
                         (chunk / 2) * 64 + ((chunk & 1) * 16 << 16);
                     for (int k16 = 0; k16 < 4; ++k16) {
@@ -954,7 +932,7 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
 cudaError_t bf16_fa4_mla_decode_cuda(
     const __nv_bfloat16 *q,
     const __nv_bfloat16 *k,
-    const __nv_bfloat16 *v,
+    const __nv_bfloat16 *,
     __nv_bfloat16 *out,
     int batch,
     int heads,
@@ -980,17 +958,12 @@ cudaError_t bf16_fa4_mla_decode_cuda(
     const int query_groups = heads / kMlaPackSize;
     CUtensorMap q_tmap{};
     CUtensorMap k_tmap{};
-    CUtensorMap v_tmap{};
     CUtensorMap out_tmap{};
     cudaError_t status = init_packed_qo_tmap<kMlaPackSize>(
         &q_tmap, q, batch * query_groups, query_len, head_dim, kTileQ, 64);
     if (status == cudaSuccess) {
         status = init_qkv_tmap(
             &k_tmap, k, batch, key_len, head_dim, kTileKV, 64);
-    }
-    if (status == cudaSuccess) {
-        status = init_qkv_tmap(
-            &v_tmap, v, batch, key_len, 512, kTileKV, 64);
     }
     if (status == cudaSuccess) {
         status = init_packed_qo_tmap<kMlaPackSize>(
@@ -1021,7 +994,7 @@ cudaError_t bf16_fa4_mla_decode_cuda(
     const dim3 grid(batch * query_groups);
     fa_mla_decode_kernel_m64
         <<<grid, block, smem_layout.dynamic_bytes, stream>>>(
-            q_tmap, k_tmap, v_tmap, out_tmap, batch, heads, query_len,
+            q_tmap, k_tmap, out_tmap, batch, heads, query_len,
             key_len, scale, causal);
     return cudaGetLastError();
 }
