@@ -593,19 +593,25 @@ __host__ __device__ constexpr size_t align_up(
     return (value + alignment - 1) / alignment * alignment;
 }
 
-// Q [128,576] remains resident. One 64 KiB buffer holds either a K chunk
-// [128,64] or V [128,256], while a second 16 KiB buffer prefetches the next
-// K chunk. O [128,256] reuses Q after the final MMA.
+// Q streams as 128x128 chunks through a two-entry ring.  The final 64-wide
+// tail is loaded with its own TensorMap. This releases the 144 KiB full-Q
+// allocation while leaving room for a two-stage 64 KiB K/V ring.
+// A separate 16 KiB buffer prefetches the next K chunk. O [128,256] reuses
+// the Q allocation after the final MMA.
 template <int TileQ, int TileKV, int QSlots, int KvStages> struct FaMlaSmemLayout {
     static constexpr size_t kAlignment = 128;
     static constexpr size_t kMaxSmemBytes = 227 * 1024;
     // Counts the __shared__ mbarrier arrays declared inside
-    // fa_mla_decode_kernel: q_prologue/out_store/epilogue/tmem_release plus,
-    // per stage, tma1/tma2/k_ready/v_ready and the QSlots-sized
+    // fa_mla_decode_kernel: out_store/epilogue/tmem_release plus, per Q
+    // chunk stage q_tma/q_ready, per K chunk stage tma1/k_ready, and per KV
+    // stage tma2/v_ready and the QSlots-sized
     // mma1/mma2/softmax/rescale/p_partial/p_full rings.
     static constexpr int kKChunkStages = 2;
+    static constexpr int kQChunkStages = 2;
+    static constexpr int kQChunkWidth = 128;
     static constexpr size_t kStaticMbarrierBytes =
-        (2 * QSlots + 2 + (4 + 6 * QSlots) * KvStages + 2 * kKChunkStages) *
+        (QSlots + 2 + (4 + 6 * QSlots) * KvStages +
+         2 * (kKChunkStages + kQChunkStages)) *
         sizeof(uint64_t);
     static constexpr size_t kSoftmaxHandoffBytes =
         2 * QSlots * TileQ * sizeof(float);
@@ -618,8 +624,8 @@ template <int TileQ, int TileKV, int QSlots, int KvStages> struct FaMlaSmemLayou
 
     __host__ __device__ static FaMlaSmemLayout make(
         int head_dim) {
-        const size_t q_bytes =
-            QSlots * TileQ * static_cast<size_t>(head_dim) * sizeof(__nv_bfloat16);
+        const size_t q_bytes = QSlots * kQChunkStages * TileQ * kQChunkWidth *
+            sizeof(__nv_bfloat16);
         const size_t kv_bytes =
             KvStages * TileKV * static_cast<size_t>(256) * sizeof(__nv_bfloat16);
         FaMlaSmemLayout layout{};
@@ -738,6 +744,7 @@ inline cudaError_t init_packed_qo_tmap(
 template <int TileQ, int TileKV, int QSlots, int KvStages, int HeadDim, bool PackMla>
 __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel(
     const __grid_constant__ CUtensorMap q_tmap,
+    const __grid_constant__ CUtensorMap q_tail_tmap,
     const __grid_constant__ CUtensorMap k_tmap,
     const __grid_constant__ CUtensorMap v_tmap,
     const __grid_constant__ CUtensorMap out_tmap,
@@ -750,14 +757,19 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel(
     static_assert(TileQ == 128, "the FA MLA kernel currently supports TileQ=128 only");
     static_assert(TileKV == 128, "MLA uses TileKV=128");
     static_assert(QSlots == 1,
-        "MLA decoding keeps one Q tile resident");
-    static_assert(KvStages == 1, "MLA shares one K/V stage");
+        "MLA decoding uses one logical Q tile");
+    static_assert(KvStages == 2, "MLA uses a two-stage K/V ring");
     static_assert(HeadDim == 576, "MLA requires QK dimension 576");
     static_assert(PackMla, "MLA decoding requires packed heads");
 
     using SmemLayout = FaMlaSmemLayout<TileQ, TileKV, QSlots, KvStages>;
     constexpr int ValueTile = 256;
     constexpr int KChunkStages = SmemLayout::kKChunkStages;
+    constexpr int QChunkStages = SmemLayout::kQChunkStages;
+    constexpr int QChunkWidth = SmemLayout::kQChunkWidth;
+    constexpr int QD64PerChunk = QChunkWidth / 64;
+    constexpr int KChunkCount = HeadDim / 64;
+    constexpr int QChunkCount = (KChunkCount + QD64PerChunk - 1) / QD64PerChunk;
     const int value_chunk = blockIdx.y * (ValueTile / 64);
 
     // P and alpha use exp2((raw_score - raw_m) * scale * log2(e)).
@@ -775,8 +787,9 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel(
 
     // Producer/consumer graph for each (Q slot, KV stage):
     //   K TMA -> QK MMA -> softmax -> O rescale -> PV MMA -> recycle K/V stage.
-    // Q has a one-shot prologue barrier; the remaining barriers are recycled.
-    __shared__ __align__(8) uint64_t q_prologue_mbars[QSlots];
+    // Q/K chunks and all K/V stages use recycled barriers.
+    __shared__ __align__(8) uint64_t q_tma_mbars[QChunkStages];
+    __shared__ __align__(8) uint64_t q_ready_mbars[QChunkStages];
     __shared__ __align__(8) uint64_t tma1_mbars[KChunkStages];
     __shared__ __align__(8) uint64_t tma2_mbars[KvStages];
     // K chunk reuse and V tile reuse have independent completion phases.
@@ -822,14 +835,14 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel(
     constexpr int kSoftmaxMbarArrivalCount = kWarpsPerGroup;
     constexpr int kRescaleMbarArrivalCount = kWarpsPerGroup;
     constexpr int kTmemReleaseMbarArrivalCount = kWarpsPerGroup;
-    constexpr int kQPrologueMbarArrivalCount = 1;
     constexpr int kOutStoreReadyMbarArrivalCount = kWarpsPerGroup;
 
     const int tid = threadIdx.x;
     const int warp_idx = threadIdx.x / kWarpSize;
     const int lane_idx = threadIdx.x % kWarpSize;
 
-    const int q_prologue_mbar_base = static_cast<int>(__cvta_generic_to_shared(q_prologue_mbars));
+    const int q_tma_mbar_base = static_cast<int>(__cvta_generic_to_shared(q_tma_mbars));
+    const int q_ready_mbar_base = static_cast<int>(__cvta_generic_to_shared(q_ready_mbars));
     const int tma1_mbar_base = static_cast<int>(__cvta_generic_to_shared(tma1_mbars));
     const int tma2_mbar_base = static_cast<int>(__cvta_generic_to_shared(tma2_mbars));
     const int k_ready_mbar_base =
@@ -851,9 +864,10 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel(
     // Follow the BF16 GEMM setup pattern: one thread initializes every
     // barrier slot, publishes the initialization, then the CTA synchronizes.
     if (tid == 0) {
-        for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
-            mbarrier_init(q_prologue_mbar_base + q_slot * sizeof(uint64_t),
-                kQPrologueMbarArrivalCount);
+        for (int q_stage = 0; q_stage < QChunkStages; ++q_stage) {
+            const int offset = q_stage * sizeof(uint64_t);
+            mbarrier_init(q_tma_mbar_base + offset, kTmaMbarArrivalCount);
+            mbarrier_init(q_ready_mbar_base + offset, kMmaMbarArrivalCount);
         }
         mbarrier_init(epilogue_mbar_addr, kMmaMbarArrivalCount);
         mbarrier_init(tmem_release_mbar_addr, kTmemReleaseMbarArrivalCount);
@@ -884,6 +898,7 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel(
     }
     if (warp_idx == kTmaLoadWarp && lane_idx == 0) {
         prefetch_tensormap(&q_tmap);
+        prefetch_tensormap(&q_tail_tmap);
         prefetch_tensormap(&k_tmap);
         prefetch_tensormap(&v_tmap);
     }
@@ -912,7 +927,8 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel(
     }
     __syncthreads();
 
-    // K/V share one stage ring; Q slots have fixed shared-memory and TMEM banks.
+    // K/V and Q chunks each use independent two-stage rings; Q slots have
+    // fixed TMEM banks.
     const int q_smem_addr = static_cast<int>(__cvta_generic_to_shared(q_smem));
     const int kv_smem_addr = static_cast<int>(__cvta_generic_to_shared(kv_smem));
     const int k_prefetch_smem_addr =
@@ -1154,63 +1170,97 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel(
     // Every CTA loads its private Q and K/V tiles.
     if (warp_idx == kTmaLoadWarp) {
         if (lane_idx == 0) {
-            const int q_transaction_bytes = TileQ * HeadDim * sizeof(__nv_bfloat16);
-            for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
-                const int q_mbar_addr = q_prologue_mbar_base + q_slot * sizeof(uint64_t);
-                mbarrier_expect_tx(q_mbar_addr, q_transaction_bytes);
-                if constexpr (PackMla) {
-                    tma_5d_gmem2smem(
-                        q_smem_addr + q_slot * TileQ * HeadDim * sizeof(__nv_bfloat16),
-                        &q_tmap, 0, 0, q_tile_start[q_slot] / kMlaPackSize, 0, qo_bh,
-                        q_mbar_addr);
-                } else {
-                    tma_4d_gmem2smem(
-                        q_smem_addr + q_slot * TileQ * HeadDim * sizeof(__nv_bfloat16),
-                        &q_tmap, 0, q_tile_start[q_slot], 0, bh, q_mbar_addr);
-                }
-            }
-            // The primary K/V buffer and the narrow K prefetch buffer form a
-            // two-stage K-chunk ring. Once the MMA issuer releases a chunk,
-            // immediately refill it with K(d64 + 2). V still aliases the
-            // primary buffer after all nine K chunks have been consumed.
+            // K streams in 64-wide chunks; Q streams in 128-wide chunks, so
+            // one Q entry serves two successive QK MMA steps. The 576-dim
+            // tail uses the 64-wide TensorMap.
             int k_ready_phase[KChunkStages] = {};
+            int q_ready_phase[QChunkStages] = {};
+            int v_ready_phase[KvStages] = {};
             for (int kv_tile = 0; kv_tile < task_kv_tile_count; ++kv_tile) {
-                if (kv_tile > 0) {
-                    mbarrier_wait(v_ready_mbar_base, (kv_tile - 1) & 1);
+                const int stage = kv_tile % KvStages;
+                if (kv_tile >= KvStages) {
+                    mbarrier_wait(v_ready_mbar_base + stage * sizeof(uint64_t),
+                        v_ready_phase[stage]);
+                    v_ready_phase[stage] ^= 1;
                 }
-                constexpr int kChunkCount = HeadDim / 64;
-                for (int d64 = 0; d64 < KChunkStages && d64 < kChunkCount; ++d64) {
+                for (int q_chunk = 0;
+                     q_chunk < QChunkStages && q_chunk < QChunkCount;
+                     ++q_chunk) {
+                    const int q_stage = q_chunk % QChunkStages;
+                    const int q_d64 = q_chunk * QD64PerChunk;
+                    const int q_tma_addr =
+                        q_tma_mbar_base + q_stage * sizeof(uint64_t);
+                    const int q_smem_chunk_addr = q_smem_addr +
+                        q_stage * TileQ * QChunkWidth * sizeof(__nv_bfloat16);
+                    const int q_width = q_d64 + QD64PerChunk <= KChunkCount
+                        ? QChunkWidth : 64;
+                    mbarrier_expect_tx(q_tma_addr,
+                        TileQ * q_width * sizeof(__nv_bfloat16));
+                    tma_5d_gmem2smem(q_smem_chunk_addr,
+                        q_width == QChunkWidth ? &q_tmap : &q_tail_tmap,
+                        0, 0, q_tile_start[0] / kMlaPackSize, q_d64, qo_bh,
+                        q_tma_addr);
+                }
+                for (int d64 = 0; d64 < KChunkStages && d64 < KChunkCount; ++d64) {
                     const int k_stage = d64 % KChunkStages;
                     const int tma1_addr =
                         tma1_mbar_base + k_stage * sizeof(uint64_t);
                     const int k_smem_addr = k_stage == 0
-                        ? kv_smem_addr
+                        ? kv_smem_addr + stage * TileKV * ValueTile * sizeof(__nv_bfloat16)
                         : k_prefetch_smem_addr;
                     mbarrier_expect_tx(tma1_addr, TileKV * 64 * sizeof(__nv_bfloat16));
                     tma_4d_gmem2smem(k_smem_addr, &k_tmap,
                         0, kv_tile * TileKV, d64, kv_bh, tma1_addr);
                 }
-                for (int d64 = 0; d64 < kChunkCount; ++d64) {
+                for (int d64 = 0; d64 < KChunkCount; ++d64) {
                     const int k_stage = d64 % KChunkStages;
                     const int k_ready_addr =
                         k_ready_mbar_base + k_stage * sizeof(uint64_t);
                     mbarrier_wait(k_ready_addr, k_ready_phase[k_stage]);
                     k_ready_phase[k_stage] ^= 1;
                     const int next_d64 = d64 + KChunkStages;
-                    if (next_d64 < kChunkCount) {
+                    if (next_d64 < KChunkCount) {
                         const int tma1_addr =
                             tma1_mbar_base + k_stage * sizeof(uint64_t);
                         const int k_smem_addr = k_stage == 0
-                            ? kv_smem_addr
+                            ? kv_smem_addr + stage * TileKV * ValueTile * sizeof(__nv_bfloat16)
                             : k_prefetch_smem_addr;
                         mbarrier_expect_tx(tma1_addr, TileKV * 64 * sizeof(__nv_bfloat16));
                         tma_4d_gmem2smem(k_smem_addr, &k_tmap,
                             0, kv_tile * TileKV, next_d64, kv_bh, tma1_addr);
                     }
+                    if ((d64 + 1) % QD64PerChunk == 0 || d64 + 1 == KChunkCount) {
+                        const int q_chunk = d64 / QD64PerChunk;
+                        const int q_stage = q_chunk % QChunkStages;
+                        const int q_ready_addr =
+                            q_ready_mbar_base + q_stage * sizeof(uint64_t);
+                        mbarrier_wait(q_ready_addr, q_ready_phase[q_stage]);
+                        q_ready_phase[q_stage] ^= 1;
+                        const int next_q_chunk = q_chunk + QChunkStages;
+                        if (next_q_chunk < QChunkCount) {
+                            const int next_q_d64 = next_q_chunk * QD64PerChunk;
+                            const int q_tma_addr =
+                                q_tma_mbar_base + q_stage * sizeof(uint64_t);
+                            const int q_smem_chunk_addr = q_smem_addr +
+                                q_stage * TileQ * QChunkWidth * sizeof(__nv_bfloat16);
+                            const int q_width =
+                                next_q_d64 + QD64PerChunk <= KChunkCount ? QChunkWidth : 64;
+                            mbarrier_expect_tx(q_tma_addr,
+                                TileQ * q_width * sizeof(__nv_bfloat16));
+                            tma_5d_gmem2smem(q_smem_chunk_addr,
+                                q_width == QChunkWidth ? &q_tmap : &q_tail_tmap,
+                                0, 0, q_tile_start[0] / kMlaPackSize, next_q_d64,
+                                qo_bh, q_tma_addr);
+                        }
+                    }
                 }
-                mbarrier_expect_tx(tma2_mbar_base, TileKV * ValueTile * sizeof(__nv_bfloat16));
-                tma_4d_gmem2smem(kv_smem_addr, &v_tmap,
-                    0, kv_tile * TileKV, value_chunk, kv_bh, tma2_mbar_base);
+                const int v_smem_addr = kv_smem_addr +
+                    stage * TileKV * ValueTile * sizeof(__nv_bfloat16);
+                mbarrier_expect_tx(tma2_mbar_base + stage * sizeof(uint64_t),
+                    TileKV * ValueTile * sizeof(__nv_bfloat16));
+                tma_4d_gmem2smem(v_smem_addr, &v_tmap,
+                    0, kv_tile * TileKV, value_chunk, kv_bh,
+                    tma2_mbar_base + stage * sizeof(uint64_t));
             }
         }
         return;
@@ -1240,14 +1290,11 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel(
     // engines perform the actual matrix work while the auxiliary WGs run.
     if (warp_idx == kMmaWarp) {
         int qk_tma1_phase[KChunkStages] = {};
+        int q_tma_phase[QChunkStages] = {};
         int pv_tma2_phase[KvStages] = {};
         int pv_rescale_phase[QSlots][KvStages] = {};
         int pv_ppartial_phase[QSlots][KvStages] = {};
         int pv_pfull_phase[QSlots][KvStages] = {};
-        // Q TMA completion replaces the former CTA-wide post-prologue barrier.
-        for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
-            mbarrier_wait(q_prologue_mbar_base + q_slot * sizeof(uint64_t), 0);
-        }
         if (elect_sync()) {
             constexpr uint32_t kQkInstrDesc = (1U << 4U) | (1U << 7U) | (1U << 10U) |
                                               ((uint32_t)TileKV >> 3U << 17U) |
@@ -1256,34 +1303,50 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel(
                                            ((uint32_t)ValueTile >> 3U << 17U) |
                                            ((uint32_t)TileQ >> 4U << 24U);
             if constexpr (QSlots == 1) {
-                // Decode specialization: one packed Q tile is resident, so
-                // each KV iteration is simply Q0(i) followed by P0(i).
+                // Decode specialization: one packed Q chunk ring feeds QK,
+                // followed by the PV work for each KV tile.
                 for (int kv_tile = 0; kv_tile < task_kv_tile_count; ++kv_tile) {
                     constexpr int q_slot = 0;
                     const int stage = kv_tile % KvStages;
-                    const int q_addr = q_smem_addr;
                     const int s_addr = tmem_addr + kSBankBase;
-                    for (int d64 = 0; d64 < HeadDim / 64; ++d64) {
+                    for (int d64 = 0; d64 < KChunkCount; ++d64) {
                         const int k_stage = d64 % KChunkStages;
+                        const int q_chunk = d64 / QD64PerChunk;
+                        const int q_stage = q_chunk % QChunkStages;
                         const int tma1_addr =
                             tma1_mbar_base + k_stage * sizeof(uint64_t);
+                        const int q_tma_addr =
+                            q_tma_mbar_base + q_stage * sizeof(uint64_t);
                         const int k_ready_addr =
                             k_ready_mbar_base + k_stage * sizeof(uint64_t);
+                        const int q_ready_addr =
+                            q_ready_mbar_base + q_stage * sizeof(uint64_t);
                         const int k_addr = k_stage == 0
-                            ? kv_smem_addr
+                            ? kv_smem_addr + stage * TileKV * ValueTile * sizeof(__nv_bfloat16)
                             : k_prefetch_smem_addr;
+                        const int q_addr = q_smem_addr +
+                            q_stage * TileQ * QChunkWidth * sizeof(__nv_bfloat16);
                         mbarrier_wait(tma1_addr, qk_tma1_phase[k_stage]);
                         qk_tma1_phase[k_stage] ^= 1;
+                        if (d64 % QD64PerChunk == 0) {
+                            mbarrier_wait(q_tma_addr, q_tma_phase[q_stage]);
+                            q_tma_phase[q_stage] ^= 1;
+                        }
                         tcgen05_fence_after_thread_sync();
                         for (int d16 = 0; d16 < 4; ++d16) {
                             tcgen05_mma_bf16(s_addr,
-                                make_128b_swizzle_desc(q_addr + d64 * TileQ * 128 + d16 * 32),
+                                make_128b_swizzle_desc(
+                                    q_addr + (d64 % QD64PerChunk) * TileQ * 128 + d16 * 32),
                                 make_128b_swizzle_desc(k_addr + d16 * 32),
                                 kQkInstrDesc, d64 != 0 || d16 != 0);
                         }
                         tcgen05_commit_mbarrier(k_ready_addr);
+                        if ((d64 + 1) % QD64PerChunk == 0 || d64 + 1 == KChunkCount) {
+                            tcgen05_commit_mbarrier(q_ready_addr);
+                        }
                     }
-                    tcgen05_commit_mbarrier(mma1_mbar_base);
+                    tcgen05_commit_mbarrier(
+                        mma1_mbar_base + stage * sizeof(uint64_t));
 
                     mbarrier_wait(
                         tma2_mbar_base + stage * sizeof(uint64_t), pv_tma2_phase[stage]);
@@ -1356,7 +1419,7 @@ cudaError_t bf16_fa4_mla_decode_cuda(
     constexpr int kTileQ = 128;
     constexpr int kTileKV = 128;
     constexpr int kQSlots = 1;
-    constexpr int kKvStages = 1;
+    constexpr int kKvStages = 2;
     constexpr int kHeadDim = 576;
     constexpr int kDecodeWarps = 12;
 
@@ -1368,11 +1431,16 @@ cudaError_t bf16_fa4_mla_decode_cuda(
 
     const int query_groups = heads / kMlaPackSize;
     CUtensorMap q_tmap{};
+    CUtensorMap q_tail_tmap{};
     CUtensorMap k_tmap{};
     CUtensorMap v_tmap{};
     CUtensorMap out_tmap{};
     cudaError_t status = init_packed_qo_tmap<kMlaPackSize>(
-        &q_tmap, q, batch * query_groups, query_len, head_dim, kTileQ);
+        &q_tmap, q, batch * query_groups, query_len, head_dim, kTileQ, 128);
+    if (status == cudaSuccess) {
+        status = init_packed_qo_tmap<kMlaPackSize>(
+            &q_tail_tmap, q, batch * query_groups, query_len, head_dim, kTileQ, 64);
+    }
     if (status == cudaSuccess) {
         status = init_qkv_tmap(
             &k_tmap, k, batch, key_len, head_dim, kTileKV, 64);
@@ -1412,7 +1480,7 @@ cudaError_t bf16_fa4_mla_decode_cuda(
     fa_mla_decode_kernel<
         kTileQ, kTileKV, kQSlots, kKvStages, kHeadDim, true>
         <<<grid, block, smem_layout.dynamic_bytes, stream>>>(
-            q_tmap, k_tmap, v_tmap, out_tmap, batch, heads, query_len,
+            q_tmap, q_tail_tmap, k_tmap, v_tmap, out_tmap, batch, heads, query_len,
             key_len, scale, causal);
     return cudaGetLastError();
 }

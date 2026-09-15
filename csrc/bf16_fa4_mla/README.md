@@ -24,10 +24,12 @@ M=N=128 for QK; all 128 heads fill M. Each batch uses two CTAs, each producing
 128 score columns plus 256 FP32 output columns within the 512-column TMEM
 allocation. PV uses M=128, N=256, K=128.
 
-Q stays in 144 KiB of shared memory. K streams through nine 64-feature
-chunks, each released by an MMA completion barrier. A shared 64 KiB K/V
-buffer then receives this CTA's V slice. After the final PV, the output
-epilogue reuses Q storage. Total dynamic shared memory is 208 KiB.
+Q streams as `128×128` chunks through a two-entry shared-memory ring; the
+final 64-feature tail uses a separate `128×64` TMA transfer. Each Q chunk is
+released by its QK MMA completion barrier. K follows 64-feature chunking,
+while V uses a two-stage 64 KiB K/V ring. After the final PV, the output
+epilogue reuses the low shared-memory region formerly occupied by Q/KV
+staging. Total dynamic shared memory is 208 KiB.
 
 The MQA mechanisms retained here are TMA, tcgen05 QK/PV, BF16 P in TMEM,
 online softmax, conditional O rescaling, partial-P completion, and separate
