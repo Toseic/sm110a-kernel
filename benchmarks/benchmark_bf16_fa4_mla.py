@@ -57,12 +57,12 @@ def reference_attention(q, k, v, scale):
     return out
 
 
-def mla_sol_bounds(batch, kv_len, *, tile_kv=128):
+def mla_sol_bounds(batch, kv_len, *, tile_kv=64):
     """Traffic-aware SOL for the MLA decode schedule.
 
     Compulsory traffic reads Q/K/V and writes O once. Each batch runs two
-    CTAs producing 256 output features each; both read all of Q and K and
-    one V half, so the tiled model doubles Q and K and counts V once.
+    independent CTAs, each producing all 512 output features for 64 heads.
+    Q is partitioned over the CTAs; both CTAs read all of K and V.
     """
     element_bytes = 2  # BF16 Q, K, V, O
     q_bytes = element_bytes * batch * H * (D_KV + D_rope)
@@ -70,15 +70,12 @@ def mla_sol_bounds(batch, kv_len, *, tile_kv=128):
     v_bytes = element_bytes * batch * kv_len * D_KV
     output_bytes = element_bytes * batch * H * D_KV
 
-    # Per KV tile: K streams at full 576-feature depth in both CTAs, and
-    # each CTA TMA-loads its 256-feature V slice. Every batch element owns
-    # its own K/V and CTA pair.
+    # Per KV tile both CTAs stream full-depth K and V tiles.
     kv_tile_count = math.ceil(kv_len / tile_kv)
-    kv_tile_bytes = element_bytes * tile_kv * (2 * (D_KV + D_rope) + D_KV)
-    tile_read_bytes = 2 * q_bytes + batch * kv_tile_count * kv_tile_bytes
+    kv_tile_bytes = element_bytes * tile_kv * 2 * ((D_KV + D_rope) + D_KV)
+    tile_read_bytes = q_bytes + batch * kv_tile_count * kv_tile_bytes
 
-    # Useful FLOPs (QK + PV); QK duplicated by output splitting is excluded,
-    # matching the table's TF/s column.
+    # Useful FLOPs (QK + PV); neither operation is duplicated over output D.
     flops = 2 * batch * H * kv_len * (D_KV + D_rope + D_KV)
     return sol_bounds(
         flops,
@@ -119,7 +116,7 @@ class Bf16Fa4MlaBenchmark(BenchmarkBase):
 
     def run_with_args(self, args):
         torch.manual_seed(0)
-        print("[config] MLA decode: H=128 D_KV=512 D_rope=64 M=N=128, 12 warps, V tile=256")
+        print("[config] MLA decode: 2 independent CTAs/batch, M=N=64, D=512, 12 warps")
         columns = (
             ("B", 6),
             ("S", 8),
@@ -146,7 +143,7 @@ class Bf16Fa4MlaBenchmark(BenchmarkBase):
                 diff = f"{(out.float() - ref.float()).abs().max().item():.6g}"
             stats = benchmark_with_stats(kernel, args.warmup, args.iters, args.samples,
                                          cold_l2_flush=args._cold_l2_flush)
-            # Useful FLOPs; QK work duplicated by output splitting is excluded.
+            # Useful FLOPs; the two CTAs partition H and compute full D.
             flops = 2 * batch * H * args.kv_len * (D_KV + D_rope + D_KV)
             ms = stats["median_ms"]
             values = (batch, args.kv_len, f"{ms:.4f}", f"{flops / (ms * 1e9):.3f}", diff)

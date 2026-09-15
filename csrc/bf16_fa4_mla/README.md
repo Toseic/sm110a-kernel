@@ -19,21 +19,27 @@ caches, and the final value up-projection are outside this decoding path.
 
 ## Schedule
 
-M=N=128 for QK; all 128 heads fill M. Each batch uses two CTAs, each producing
-256 of the 512 output features. This duplicates QK/softmax work but keeps
-128 score columns plus 256 FP32 output columns within the 512-column TMEM
-allocation. PV uses M=128, N=256, K=128.
+Each batch uses two independent CTAs. Each CTA owns 64 query heads and emits
+their complete 512-feature output, so QK and softmax are no longer duplicated
+over an output-D split. QK uses two interleaved M64N32 instructions for each
+K=16 step; PV uses eight M64N64 output chunks with K=64.
 
-Q streams as `128×128` chunks through a two-entry shared-memory ring; the
-final 64-feature tail uses a separate `128×64` TMA transfer. Each Q chunk is
-released by its QK MMA completion barrier. K follows 64-feature chunking,
-while V uses a two-stage 64 KiB K/V ring. After the final PV, the output
-epilogue reuses the low shared-memory region formerly occupied by Q/KV
-staging. Total dynamic shared memory is 208 KiB.
+The M=64 tcgen05 layout packs pairs of logical N tiles into alternate 16-row
+datapath groups. Consequently S0 and S1 need 32 TMEM columns each, while the
+logical O `[64,512]` needs 256 columns. P is kept in shared memory so PV can
+use the interleaved accumulator layout; a TMEM A operand would force the
+non-interleaved layout.
 
-The MQA mechanisms retained here are TMA, tcgen05 QK/PV, BF16 P in TMEM,
-online softmax, conditional O rescaling, partial-P completion, and separate
-load/MMA, softmax, and rescale/epilogue warpgroups.
+Q `[64,576]` occupies 72 KiB. Two `[64,576]` K/V stages occupy 144 KiB. P0
+has a dedicated 8 KiB slot, while P1 aliases stage 1's dead 64-feature RoPE
+chunk, for 224 KiB total dynamic shared memory. PV releases each of the first
+eight 64x64 V chunks independently to the following K load. Stage 0's RoPE
+chunk is released after QK; stage 1's aliased chunk is released after PV1.
+
+The steady-state tensor-core order is `QK0, PV1, QK1, PV0`. WG0 retains the
+TMA/MMA roles, WG1 uses four warps for online softmax, and WG2 uses four warps
+for conditional O rescaling and the epilogue. The final epilogue reuses Q
+shared memory as its 64 KiB output staging buffer.
 
 ## Usage
 
