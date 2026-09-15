@@ -2,11 +2,9 @@
 from __future__ import annotations
 
 import statistics
-import sys
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from pathlib import Path
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -16,16 +14,16 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from ...runner import AutotuneRunner, PreparedKernel, Selection, TuneOptions
 
-_POINTER_DEPRECATION = "Use explicit `struct.scalar.ptr` for pointer instead."
-_PROBE_WARMUP = 2
-_ROOT = Path(__file__).resolve().parents[3]
-_KERNEL_ROOT = _ROOT / "baselinedir" / "TensorRT-LLM" / "tensorrt_llm" / "_torch" / "cute_dsl_kernels"
-if str(_KERNEL_ROOT) not in sys.path:
-    sys.path.insert(0, str(_KERNEL_ROOT))
+from ._baseline_loader import install_baseline_packages
 
-from blackwell.blockscaled_contiguous_grouped_gemm import (  # noqa: E402
+install_baseline_packages()
+
+from tensorrt_llm._torch.cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm import (  # noqa: E402
     Sm100BlockScaledContiguousGroupedGemmKernel,
 )
+
+_POINTER_DEPRECATION = "Use explicit `struct.scalar.ptr` for pointer instead."
+_PROBE_WARMUP = 2
 
 
 @contextmanager

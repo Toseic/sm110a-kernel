@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import statistics
-import sys
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -16,6 +14,14 @@ import torch
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from ...runner import AutotuneRunner, PreparedKernel, Selection, TuneOptions
+
+from ._baseline_loader import install_baseline_packages
+
+install_baseline_packages()
+
+from tensorrt_llm._torch.cute_dsl_kernels.blackwell.dense_gemm_persistent import (
+    PersistentDenseGemmKernel,
+)
 
 
 # CUTLASS DSL 4.5 emits this warning for its own generated pointer plumbing.
@@ -40,14 +46,6 @@ def _suppress_cutlass_pointer_deprecation():
         yield
     finally:
         warnings.showwarning = showwarning
-
-
-_ROOT = Path(__file__).resolve().parents[3]
-_KERNEL_ROOT = _ROOT / "baselinedir" / "TensorRT-LLM" / "tensorrt_llm" / "_torch" / "cute_dsl_kernels"
-if str(_KERNEL_ROOT) not in sys.path:
-    sys.path.insert(0, str(_KERNEL_ROOT))
-
-from blackwell.dense_gemm_persistent import PersistentDenseGemmKernel
 
 
 @dataclass(frozen=True)
