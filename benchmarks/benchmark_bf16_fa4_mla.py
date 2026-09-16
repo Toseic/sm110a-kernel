@@ -93,6 +93,10 @@ class Bf16Fa4MlaBenchmark(BenchmarkBase):
         parser.add_argument("--kv-len", "--s", type=int, default=8192)
         parser.add_argument("--scale", type=float, default=1 / math.sqrt(D_KV + D_rope))
         parser.add_argument("--no-accuracy", action="store_true")
+        parser.add_argument(
+            "--impl", choices=("1cta", "2cta"), default="1cta",
+            help="MLA kernel implementation to benchmark (default: 1cta)",
+        )
         parser.add_argument("--atol", type=float, default=2e-2)
         parser.add_argument("--rtol", type=float, default=2e-2)
         self.add_timing_args(parser, warmup=5, iters=20, samples=7)
@@ -116,7 +120,7 @@ class Bf16Fa4MlaBenchmark(BenchmarkBase):
 
     def run_with_args(self, args):
         torch.manual_seed(0)
-        print("[config] MLA decode: 2 independent CTAs/batch, M=N=64, D=512, 12 warps")
+        print(f"[config] MLA decode: {args.implementation}, M=N=64, D=512, 12 warps")
         columns = (
             ("B", 6),
             ("S", 8),
@@ -132,7 +136,10 @@ class Bf16Fa4MlaBenchmark(BenchmarkBase):
             out = torch.empty((batch, H, 1, D_KV), device=q.device, dtype=q.dtype)
 
             def kernel():
-                return bf16_fa4_mla_out(q, k, v, out, scale=args.scale)
+                return bf16_fa4_mla_out(
+                    q, k, v, out, scale=args.scale,
+                    implementation=args.implementation,
+                )
 
             kernel()
             torch.cuda.synchronize()

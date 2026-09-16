@@ -19,24 +19,27 @@ caches, and the final value up-projection are outside this decoding path.
 
 ## Schedule
 
-Each batch uses two independent CTAs. Each CTA owns 64 query heads and emits
-their complete 512-feature output, so QK and softmax are no longer duplicated
-over an output-D split. QK uses two interleaved M64N32 instructions for each
-K=16 step; PV uses eight M64N64 output chunks with K=64.
+Two implementations are available. `1cta` (the default) keeps the original
+two independent CTAs per batch. `2cta` uses a two-CTA cluster to cooperate on
+QK and PV. Both variants assign 64 query heads to each CTA and emit their full
+512-feature output, so QK and softmax are not duplicated over an output-D
+split. The implementations share the Torch binding and public Python API, but
+live in separate CUDA translation units: `bf16_fa4_mla_kernel.cu` and
+`bf16_fa4_mla_2cta_kernel.cu`.
 
-The M=64 tcgen05 layout packs pairs of logical N tiles into alternate 16-row
+In `1cta`, the M=64 tcgen05 layout packs pairs of logical N tiles into alternate 16-row
 datapath groups. Consequently S0 and S1 need 32 TMEM columns each, while the
 logical O `[64,512]` needs 256 columns. P is kept in shared memory so PV can
 use the interleaved accumulator layout; a TMEM A operand would force the
 non-interleaved layout.
 
-Q `[64,576]` occupies 72 KiB. Two `[64,576]` K/V stages occupy 144 KiB. P0
+In `1cta`, Q `[64,576]` occupies 72 KiB. Two `[64,576]` K/V stages occupy 144 KiB. P0
 has a dedicated 8 KiB slot, while P1 aliases stage 1's dead 64-feature RoPE
 chunk, for 224 KiB total dynamic shared memory. PV releases each of the first
 eight 64x64 V chunks independently to the following K load. Stage 0's RoPE
 chunk is released after QK; stage 1's aliased chunk is released after PV1.
 
-The steady-state tensor-core order is `QK0, PV1, QK1, PV0`. WG0 retains the
+For `1cta`, the steady-state tensor-core order is `QK0, PV1, QK1, PV0`. WG0 retains the
 TMA/MMA roles, WG1 uses four warps for online softmax, and WG2 uses four warps
 for conditional O rescaling and the epilogue. The final epilogue reuses Q
 shared memory as its 64 KiB output staging buffer.
@@ -48,12 +51,13 @@ from sm110a_kernel import bf16_fa4_mla, bf16_fa4_mla_out
 
 out = bf16_fa4_mla(q, k, ckv)
 bf16_fa4_mla_out(q, k, ckv, out, scale=576 ** -0.5)
+out_2cta = bf16_fa4_mla(q, k, ckv, implementation="2cta")
 ```
 
 ```bash
 /home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_bf16_fa4_mla.py
 /home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_bf16_fa4_mla.py \
-  --single --batch 1 --kv-len 8192 --warmup 5 --iters 20
+  --single --batch 1 --kv-len 8192 --warmup 5 --iters 20 --implementation 2cta
 ```
 
 The default benchmark covers B=32/64/128 at S=8192. It constructs K and V
