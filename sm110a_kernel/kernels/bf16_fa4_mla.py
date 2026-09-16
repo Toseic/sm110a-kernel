@@ -39,7 +39,7 @@ class Bf16Fa4MlaModule:
         )
 
 
-def _kernel_cflags(config: Bf16Fa4MlaConfig, _variant) -> tuple[str, ...]:
+def _kernel_cflags(_config: Bf16Fa4MlaConfig, _variant) -> tuple[str, ...]:
     return ()
 
 
