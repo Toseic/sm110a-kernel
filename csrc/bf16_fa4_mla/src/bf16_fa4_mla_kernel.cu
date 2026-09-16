@@ -195,22 +195,18 @@ __device__ inline void tcgen05_mma_bf16(
         "r"(enable_input_d));
 }
 
-// Weight-stationary variant.  For M=64 the D matrix uses Layout E: the N
-// range splits into two 32-column halves mapped to the two 64-lane halves
-// of the datapath, so D[r][n] lives at lane r + 64*(n/32), column
-// base + n%32 — half the columns of the non-ws Layout F for the same tile.
-__device__ inline void tcgen05_mma_ws_bf16(
+__device__ inline void tcgen05_mma_tmem_a_bf16(
     int tmem_addr,
-    uint64_t a_desc,
+    int a_tmem_addr,
     uint64_t b_desc,
     uint32_t instr_desc,
     int enable_input_d) {
     asm volatile("{\n\t"
                  ".reg .pred p;\n\t"
                  "setp.ne.b32 p, %4, 0;\n\t"
-                 "tcgen05.mma.ws.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t"
+                 "tcgen05.mma.cta_group::1.kind::f16 [%0], [%1], %2, %3, p;\n\t"
                  "}" ::"r"(tmem_addr),
-        "l"(a_desc),
+        "r"(a_tmem_addr),
         "l"(b_desc),
         "r"(instr_desc),
         "r"(enable_input_d));
@@ -269,6 +265,12 @@ __device__ inline void tcgen05_st_f32_x32(
 }
 
 
+__device__ inline void tcgen05_st_b32_x4(const uint32_t *values, int tmem_addr) {
+    asm volatile("tcgen05.st.sync.aligned.32x32b.x4.b32 [%0], {%1, %2, %3, %4};"
+        :: "r"(tmem_addr), "r"(values[0]), "r"(values[1]),
+           "r"(values[2]), "r"(values[3]));
+}
+
 __device__ inline uint32_t pack_bf16x2(
     float lo,
     float hi) {
@@ -300,8 +302,7 @@ __device__ inline void mbarrier_arrive(int mbar_addr);
 template <bool AllScoresValid>
 __device__ __attribute__((noinline)) SoftmaxUpdate load_s_and_store_p_m64(
     int s_tmem_warp_addr,
-    char *p_smem_bytes,
-    int warp_in_group,
+    int p_tmem_warp_addr,
     int tile_key_begin,
     int key_len,
     int mask_q_row,
@@ -313,7 +314,6 @@ __device__ __attribute__((noinline)) SoftmaxUpdate load_s_and_store_p_m64(
     int lane_idx) {
     constexpr int kScoresPerLane = 32;
     const int half = lane_idx >> 4;
-    const int logical_row = warp_in_group * 16 + (lane_idx & 15);
     const int key_begin = tile_key_begin + half * kScoresPerLane;
     const int key_hi = min(key_len - 1, mask_q_row);
     float scores[kScoresPerLane];
@@ -354,20 +354,22 @@ __device__ __attribute__((noinline)) SoftmaxUpdate load_s_and_store_p_m64(
         partial_sum += scores[i];
     }
 
-    // Store this lane's 32-value half-row in the SW128 layout consumed by
-    // tcgen05.mma.  Paired lanes write disjoint halves of one logical row.
+    // Both Layout F PV atoms need the complete P row: one at datapath
+    // offset 0 and one at offset 16. Exchange the two score halves within
+    // each lane pair, then duplicate the packed BF16 row into both halves.
 #pragma unroll
     for (int group = 0; group < kScoresPerLane / 8; ++group) {
-        const int i = group * 8;
-        const uint4 packed = make_uint4(
-            pack_bf16x2(scores[i + 0], scores[i + 1]),
-            pack_bf16x2(scores[i + 2], scores[i + 3]),
-            pack_bf16x2(scores[i + 4], scores[i + 5]),
-            pack_bf16x2(scores[i + 6], scores[i + 7]));
-        const int logical_byte =
-            (logical_row * 64 + half * kScoresPerLane + i) * sizeof(__nv_bfloat16);
-        const int swizzled_byte = logical_byte ^ ((logical_byte >> 3) & 0x70);
-        *reinterpret_cast<uint4 *>(p_smem_bytes + swizzled_byte) = packed;
+        uint32_t lo[4], hi[4];
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            const int i = group * 8 + pair * 2;
+            const uint32_t packed = pack_bf16x2(scores[i], scores[i + 1]);
+            const uint32_t other = __shfl_xor_sync(0xFFFFFFFFU, packed, 16);
+            lo[pair] = half == 0 ? packed : other;
+            hi[pair] = half == 0 ? other : packed;
+        }
+        tcgen05_st_b32_x4(lo, p_tmem_warp_addr + group * 4);
+        tcgen05_st_b32_x4(hi, p_tmem_warp_addr + 16 + group * 4);
     }
 
     partial_sum += __shfl_xor_sync(0xFFFFFFFFU, partial_sum, 16);
@@ -410,8 +412,8 @@ __host__ __device__ constexpr size_t align_up(
 }
 
 // Q [64,576] is resident.  Each KV stage holds K=[cKV,K_rope] [64,576];
-// its cKV prefix is also V, so PV reads the first eight chunks in place. P0
-// has an explicit 8 KiB allocation; P1 aliases the rope chunk of KV stage 1.
+// its cKV prefix is also V, so PV reads the first eight chunks in place.
+// P has two independent TMEM stages and needs no shared-memory allocation.
 // The final O [64,512] epilogue reuses Q after the last QK.
 template <int TileQ, int TileKV, int QSlots, int KvStages> struct FaMlaSmemLayout {
     static constexpr size_t kAlignment = 128;
@@ -423,11 +425,10 @@ template <int TileQ, int TileKV, int QSlots, int KvStages> struct FaMlaSmemLayou
          KvStages * (2 * kKChunkCount + 5) + 3) *
         sizeof(uint64_t);
     static constexpr size_t kSoftmaxHandoffBytes =
-        2 * QSlots * TileQ * sizeof(float);
+        2 * KvStages * QSlots * TileQ * sizeof(float);
 
     size_t q_offset;
     size_t kv_offset;
-    size_t p_offset;
     size_t out_offset;
     size_t dynamic_bytes;
 
@@ -437,13 +438,11 @@ template <int TileQ, int TileKV, int QSlots, int KvStages> struct FaMlaSmemLayou
             sizeof(__nv_bfloat16);
         const size_t kv_bytes =
             KvStages * TileKV * static_cast<size_t>(head_dim) * sizeof(__nv_bfloat16);
-        const size_t p_bytes = TileQ * TileKV * sizeof(__nv_bfloat16);
         FaMlaSmemLayout layout{};
         layout.q_offset = 0;
         layout.kv_offset = align_up(layout.q_offset + q_bytes, kAlignment);
-        layout.p_offset = align_up(layout.kv_offset + kv_bytes, kAlignment);
         layout.out_offset = layout.q_offset;
-        layout.dynamic_bytes = align_up(layout.p_offset + p_bytes, kAlignment);
+        layout.dynamic_bytes = align_up(layout.kv_offset + kv_bytes, kAlignment);
         return layout;
     }
 };
@@ -546,8 +545,8 @@ inline cudaError_t init_packed_qo_tmap(
     return result == CUDA_SUCCESS ? cudaSuccess : cudaErrorInvalidValue;
 }
 
-// A CTA owns all 128 heads and 256 output columns. Both output CTAs read
-// the same Q/K; each normalizes independently over the full KV sequence.
+// A CTA owns 64 heads and all 512 output columns. Both head CTAs read
+// the same K; each normalizes independently over the full KV sequence.
 __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
     const __grid_constant__ CUtensorMap q_tmap,
     const __grid_constant__ CUtensorMap k_tmap,
@@ -581,7 +580,6 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
     const SmemLayout smem_layout = SmemLayout::make(HeadDim);
     auto *q_smem = reinterpret_cast<__nv_bfloat16 *>(smem + smem_layout.q_offset);
     auto *kv_smem = reinterpret_cast<__nv_bfloat16 *>(smem + smem_layout.kv_offset);
-    auto *p0_smem = reinterpret_cast<__nv_bfloat16 *>(smem + smem_layout.p_offset);
     auto *out_smem = reinterpret_cast<__nv_bfloat16 *>(smem + smem_layout.out_offset);
 
     __shared__ __align__(8) uint64_t q_tma_mbars[KChunkCount];
@@ -596,8 +594,10 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
     __shared__ __align__(8) uint64_t out_store_ready_mbar[1];
     __shared__ __align__(8) uint64_t tmem_release_mbar[1];
     __shared__ __align__(4) int mma_tmem_addr[1];
-    __shared__ __align__(16) float softmax_alpha[TileQ];
-    __shared__ __align__(16) float softmax_l[TileQ];
+    // The next QK/softmax can run before the preceding epilogue consumes
+    // alpha/l. Keep their handoff in the same two-stage ring as P.
+    __shared__ __align__(16) float softmax_alpha[KvStages][TileQ];
+    __shared__ __align__(16) float softmax_l[KvStages][TileQ];
 
     const int tid = threadIdx.x;
     const int warp_idx = tid / kWarpSize;
@@ -630,8 +630,8 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
             mbarrier_init(qk_done_base + stage * sizeof(uint64_t), 1);
             mbarrier_init(s_free_base + stage * sizeof(uint64_t), kWgArrivalCount);
             mbarrier_init(p_ready_base + stage * sizeof(uint64_t), kWgArrivalCount);
-            mbarrier_init(softmax_done_base + stage * sizeof(uint64_t), kWgArrivalCount);
-            mbarrier_init(rescale_done_base + stage * sizeof(uint64_t), kWgArrivalCount);
+            mbarrier_init(softmax_done_base + stage * sizeof(uint64_t), kWgArrivalCount * kWarpSize);
+            mbarrier_init(rescale_done_base + stage * sizeof(uint64_t), kWgArrivalCount * kWarpSize);
             for (int chunk = 0; chunk < KChunkCount; ++chunk) {
                 mbarrier_init(
                     chunk_free_base + (stage * KChunkCount + chunk) * sizeof(uint64_t), 1);
@@ -651,12 +651,15 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
     }
     __syncthreads();
 
-    // S0/S1 use 32 columns apiece. O starts at column 64: each PV tile is a
-    // .ws N=64 MMA whose Layout E packs the two 32-column halves of N into
-    // one 32-column range spanning all 128 lanes (8 tiles -> columns 64..319).
+    // S0/S1: columns 0..63. O: 64..319, two Layout F M64 N256 atoms
+    // interleaved at datapath offsets 0/16. P0/P1: 320..383, each with
+    // 32 packed BF16 columns and the full row duplicated at offsets 0/16.
     constexpr int kSCols = 32;
     constexpr int kOBase = 64;
+    constexpr int kPBase = 320;
+    constexpr int kPCols = TileKV / 2;
     constexpr int kTmemCols = 512;
+    static_assert(kPBase + KvStages * kPCols <= kTmemCols);
     if (warp_idx == kMmaWarp) {
         const int alloc_addr = static_cast<int>(__cvta_generic_to_shared(mma_tmem_addr));
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
@@ -668,7 +671,6 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
 
     const int q_smem_addr = static_cast<int>(__cvta_generic_to_shared(q_smem));
     const int kv_smem_addr = static_cast<int>(__cvta_generic_to_shared(kv_smem));
-    const int p0_smem_addr = static_cast<int>(__cvta_generic_to_shared(p0_smem));
     const int out_smem_addr = static_cast<int>(__cvta_generic_to_shared(out_smem));
     const int query_groups = heads / kMlaPackSize;
     const int qo_bh = blockIdx.x;
@@ -692,38 +694,46 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
             const int stage = kv_tile & 1;
             mbarrier_wait(qk_done_base + stage * sizeof(uint64_t), qk_phase[stage]);
             qk_phase[stage] ^= 1;
+            if (kv_tile >= KvStages) {
+                // Explicit generic-memory handoff for the alpha/l readers;
+                // MMA completion alone only retires the TMEM P consumer.
+                mbarrier_wait(rescale_done_base + stage * sizeof(uint64_t),
+                    ((kv_tile / KvStages) - 1) & 1);
+            }
             tcgen05_fence_after_thread_sync();
 
-            char *p_bytes = stage == 0
-                ? reinterpret_cast<char *>(p0_smem)
-                : reinterpret_cast<char *>(kv_smem) + StageBytes + 8 * ChunkBytes;
             const int mask_q_row = causal ? causal_offset : key_len - 1;
             const bool all_scores_valid =
                 (kv_tile + 1) * TileKV <= key_len &&
                 (!causal || (kv_tile + 1) * TileKV - 1 <= mask_q_row);
             const int s_warp_addr = tmem_addr + stage * kSCols +
                 (warp_in_group * 32 << 16);
+            const int p_warp_addr = tmem_addr + kPBase + stage * kPCols +
+                (warp_in_group * 32 << 16);
+            // QK(i) is issued after PV(i-2); qk_done therefore also retires
+            // the preceding use of this P stage before we overwrite it.
             const SoftmaxUpdate update = all_scores_valid
-                ? load_s_and_store_p_m64<true>(s_warp_addr, p_bytes, warp_in_group,
+                ? load_s_and_store_p_m64<true>(s_warp_addr, p_warp_addr,
                     kv_tile * TileKV, key_len, mask_q_row, scale, tilem, tilel,
                     kConditionalRescaleThresholdLn, scale_log2e, lane_idx)
-                : load_s_and_store_p_m64<false>(s_warp_addr, p_bytes, warp_in_group,
+                : load_s_and_store_p_m64<false>(s_warp_addr, p_warp_addr,
                     kv_tile * TileKV, key_len, mask_q_row, scale, tilem, tilel,
                     kConditionalRescaleThresholdLn, scale_log2e, lane_idx);
             tilem = update.m;
             tilel = update.l;
             if (lane_idx < 16) {
-                softmax_alpha[logical_row] = update.alpha;
-                softmax_l[logical_row] = tilel;
+                softmax_alpha[stage][logical_row] = update.alpha;
+                softmax_l[stage][logical_row] = tilel;
             }
-            // Make generic-proxy P stores visible to tcgen05.mma's async proxy.
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+            tcgen05_fence_before_thread_sync();
             __syncwarp();
             if (lane_idx == 0) {
                 mbarrier_arrive(s_free_base + stage * sizeof(uint64_t));
                 mbarrier_arrive(p_ready_base + stage * sizeof(uint64_t));
-                mbarrier_arrive(softmax_done_base + stage * sizeof(uint64_t));
             }
+            // Each thread publishes its generic-memory writes directly.
+            mbarrier_arrive(softmax_done_base + stage * sizeof(uint64_t));
         }
         return;
     }
@@ -732,11 +742,10 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
         setmaxnreg_decrease<96>();
         const int tmem_addr = mma_tmem_addr[0];
         const int warp_in_group = warp_idx - kEpilogueWarpBegin;
-        // O Layout E: lane == query row, so warps 0/1 own rows 0-31/32-63
-        // and the low 32-column half of every V chunk; warps 2/3 own the
-        // same rows and the high half.
-        const int logical_row = (warp_in_group & 1) * 32 + lane_idx;
-        const int output_half = warp_in_group >> 1;
+        // O uses the same 16-row-per-warp Layout F as S. Each lane pair
+        // owns one row, split into output columns 0..255 and 256..511.
+        const int logical_row = warp_in_group * 16 + (lane_idx & 15);
+        const int output_half = lane_idx >> 4;
         int softmax_phase[KvStages] = {};
         float final_l = 0.0f;
         for (int kv_tile = 0; kv_tile < task_kv_tile_count; ++kv_tile) {
@@ -744,12 +753,9 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
             mbarrier_wait(
                 softmax_done_base + stage * sizeof(uint64_t), softmax_phase[stage]);
             softmax_phase[stage] ^= 1;
-            const float alpha = softmax_alpha[logical_row];
-            final_l = softmax_l[logical_row];
-            // Softmax decides rescaling per 16-row softmax-warp group, but a
-            // Layout E epilogue warp spans two of those groups, so each lane
-            // scales by its own row's alpha (negative alpha encodes "no
-            // rescale" and must act as 1.0).
+            const float alpha = softmax_alpha[stage][logical_row];
+            final_l = softmax_l[stage][logical_row];
+            // Negative alpha encodes "no rescale" and must act as 1.0.
             const bool lane_needs_rescale =
                 (__float_as_uint(alpha) & 0x80000000U) == 0;
             const bool warp_needs_rescale =
@@ -771,9 +777,7 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
             }
             asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
             tcgen05_fence_before_thread_sync();
-            if (lane_idx == 0) {
-                mbarrier_arrive(rescale_done_base + stage * sizeof(uint64_t));
-            }
+            mbarrier_arrive(rescale_done_base + stage * sizeof(uint64_t));
         }
 
         mbarrier_wait(epilogue_mbar_addr, 0);
@@ -785,7 +789,7 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
                 float values[8];
                 tcgen05_ld_f32_x8(values, o_warp_addr + chunk * 32 + d8 * 8);
                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
-                const int d = chunk * 64 + output_half * 32 + d8 * 8;
+                const int d = output_half * 256 + chunk * 32 + d8 * 8;
                 const int logical_byte =
                     ((d / 64) * TileQ * 64 + logical_row * 64 + d % 64) *
                     sizeof(__nv_bfloat16);
@@ -823,7 +827,6 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
                 tma_5d_gmem2smem(q_smem_addr + d64 * ChunkBytes, &q_tmap,
                     0, 0, 0, d64, qo_bh, mbar);
             }
-            int chunk_free_phase[KvStages][KChunkCount] = {};
             for (int kv_tile = 0; kv_tile < task_kv_tile_count; ++kv_tile) {
                 const int stage = kv_tile & 1;
                 const int stage_addr = kv_smem_addr + stage * StageBytes;
@@ -831,8 +834,10 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
                     if (kv_tile >= KvStages) {
                         const int free_addr = chunk_free_base +
                             (stage * KChunkCount + d64) * sizeof(uint64_t);
-                        mbarrier_wait(free_addr, chunk_free_phase[stage][d64]);
-                        chunk_free_phase[stage][d64] ^= 1;
+                        // Reusing this stage waits for its preceding tile.
+                        // All chunks have the same generation, even though
+                        // their completion times differ.
+                        mbarrier_wait(free_addr, ((kv_tile / KvStages) - 1) & 1);
                     }
                     const int mbar = k_tma_base +
                         (stage * KChunkCount + d64) * sizeof(uint64_t);
@@ -863,7 +868,7 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
                 (4U << 17U) | (4U << 24U); // M64 N32
             constexpr uint32_t kPvInstrDesc =
                 (1U << 4U) | (1U << 7U) | (1U << 10U) |
-                (1U << 16U) | (8U << 17U) | (4U << 24U); // .ws M64 N64, B N-major
+                (1U << 16U) | (32U << 17U) | (4U << 24U); // M64 N256, B N-major
             int k_phase[KvStages][KChunkCount] = {};
             int s_free_phase[KvStages] = {};
             int p_ready_phase[KvStages] = {};
@@ -899,12 +904,9 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
                     }
                 }
                 tcgen05_commit_mbarrier(qk_done_base + stage * sizeof(uint64_t));
-                // P0 is separately allocated, so stage 0's rope chunk is
-                // dead immediately after QK. Stage 1 keeps it as P1.
-                if (stage == 0) {
-                    tcgen05_commit_mbarrier(
-                        chunk_free_base + (stage * KChunkCount + 8) * sizeof(uint64_t));
-                }
+                // Neither P stage aliases K, so both rope chunks are dead.
+                tcgen05_commit_mbarrier(
+                    chunk_free_base + (stage * KChunkCount + 8) * sizeof(uint64_t));
             };
 
             auto issue_pv = [&](int kv_tile) {
@@ -916,27 +918,24 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
                     rescale_done_base + stage * sizeof(uint64_t), rescale_phase[stage]);
                 rescale_phase[stage] ^= 1;
                 const int stage_addr = kv_smem_addr + stage * StageBytes;
-                const int p_addr = stage == 0
-                    ? p0_smem_addr
-                    : stage_addr + 8 * ChunkBytes;
+                const int p_addr = tmem_addr + kPBase + stage * kPCols;
                 tcgen05_fence_after_thread_sync();
-                for (int chunk = 0; chunk < ValueChunkCount; ++chunk) {
-                    const int d_addr = tmem_addr + kOBase + chunk * 32;
+                for (int n_half = 0; n_half < 2; ++n_half) {
+                    const int dp_offset = n_half * 16 << 16;
+                    const int d_addr = tmem_addr + kOBase + dp_offset;
                     for (int k16 = 0; k16 < 4; ++k16) {
-                        tcgen05_mma_ws_bf16(d_addr,
-                            make_128b_swizzle_desc(p_addr + k16 * 32),
+                        tcgen05_mma_tmem_a_bf16(d_addr,
+                            p_addr + dp_offset + k16 * 8,
                             make_128b_nmajor_desc(
-                                stage_addr + chunk * ChunkBytes + k16 * 16 * 128,
+                                stage_addr + n_half * 4 * ChunkBytes + k16 * 16 * 128,
                                 ChunkBytes),
                             kPvInstrDesc, kv_tile != 0 || k16 != 0);
                     }
-                    tcgen05_commit_mbarrier(
-                        chunk_free_base +
-                        (stage * KChunkCount + chunk) * sizeof(uint64_t));
-                }
-                if (stage == 1) {
-                    tcgen05_commit_mbarrier(
-                        chunk_free_base + (stage * KChunkCount + 8) * sizeof(uint64_t));
+                    for (int chunk = n_half * 4; chunk < (n_half + 1) * 4; ++chunk) {
+                        tcgen05_commit_mbarrier(
+                            chunk_free_base +
+                            (stage * KChunkCount + chunk) * sizeof(uint64_t));
+                    }
                 }
             };
 
