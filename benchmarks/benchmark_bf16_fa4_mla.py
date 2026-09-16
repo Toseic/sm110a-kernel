@@ -120,7 +120,7 @@ class Bf16Fa4MlaBenchmark(BenchmarkBase):
 
     def run_with_args(self, args):
         torch.manual_seed(0)
-        print(f"[config] MLA decode: {args.implementation}, M=N=64, D=512, 12 warps")
+        print(f"[config] MLA decode: {args.impl}, M=N=64, D=512, 12 warps")
         columns = (
             ("B", 6),
             ("S", 8),
@@ -138,7 +138,7 @@ class Bf16Fa4MlaBenchmark(BenchmarkBase):
             def kernel():
                 return bf16_fa4_mla_out(
                     q, k, v, out, scale=args.scale,
-                    implementation=args.implementation,
+                    implementation=args.impl,
                 )
 
             kernel()

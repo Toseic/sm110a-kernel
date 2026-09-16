@@ -195,6 +195,27 @@ __device__ inline void tcgen05_mma_bf16(
         "r"(enable_input_d));
 }
 
+// Weight-stationary variant.  For M=64 the D matrix uses Layout E: the N
+// range splits into two 32-column halves mapped to the two 64-lane halves
+// of the datapath, so D[r][n] lives at lane r + 64*(n/32), column
+// base + n%32 — half the columns of the non-ws Layout F for the same tile.
+__device__ inline void tcgen05_mma_ws_bf16(
+    int tmem_addr,
+    uint64_t a_desc,
+    uint64_t b_desc,
+    uint32_t instr_desc,
+    int enable_input_d) {
+    asm volatile("{\n\t"
+                 ".reg .pred p;\n\t"
+                 "setp.ne.b32 p, %4, 0;\n\t"
+                 "tcgen05.mma.ws.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t"
+                 "}" ::"r"(tmem_addr),
+        "l"(a_desc),
+        "l"(b_desc),
+        "r"(instr_desc),
+        "r"(enable_input_d));
+}
+
 __device__ inline void tcgen05_ld_f32_x8(
     float *values,
     int tmem_addr) {
@@ -630,8 +651,9 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
     }
     __syncthreads();
 
-    // S0/S1 use 32 columns apiece. O starts at column 64 and its eight
-    // logical N=64 tiles are packed in four interleaved pairs (256 columns).
+    // S0/S1 use 32 columns apiece. O starts at column 64: each PV tile is a
+    // .ws N=64 MMA whose Layout E packs the two 32-column halves of N into
+    // one 32-column range spanning all 128 lanes (8 tiles -> columns 64..319).
     constexpr int kSCols = 32;
     constexpr int kOBase = 64;
     constexpr int kTmemCols = 512;
@@ -710,8 +732,11 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
         setmaxnreg_decrease<96>();
         const int tmem_addr = mma_tmem_addr[0];
         const int warp_in_group = warp_idx - kEpilogueWarpBegin;
-        const int logical_row = warp_in_group * 16 + (lane_idx & 15);
-        const int output_half = lane_idx >> 4;
+        // O Layout E: lane == query row, so warps 0/1 own rows 0-31/32-63
+        // and the low 32-column half of every V chunk; warps 2/3 own the
+        // same rows and the high half.
+        const int logical_row = (warp_in_group & 1) * 32 + lane_idx;
+        const int output_half = warp_in_group >> 1;
         int softmax_phase[KvStages] = {};
         float final_l = 0.0f;
         for (int kv_tile = 0; kv_tile < task_kv_tile_count; ++kv_tile) {
@@ -721,20 +746,27 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
             softmax_phase[stage] ^= 1;
             const float alpha = softmax_alpha[logical_row];
             final_l = softmax_l[logical_row];
-            const bool warp_needs_rescale = __any_sync(
-                0xFFFFFFFFU, (__float_as_uint(alpha) & 0x80000000U) == 0);
+            // Softmax decides rescaling per 16-row softmax-warp group, but a
+            // Layout E epilogue warp spans two of those groups, so each lane
+            // scales by its own row's alpha (negative alpha encodes "no
+            // rescale" and must act as 1.0).
+            const bool lane_needs_rescale =
+                (__float_as_uint(alpha) & 0x80000000U) == 0;
+            const bool warp_needs_rescale =
+                __any_sync(0xFFFFFFFFU, lane_needs_rescale);
+            const float rescale = lane_needs_rescale ? alpha : 1.0f;
             if (kv_tile != 0 && warp_needs_rescale) {
                 const int o_warp_addr = tmem_addr + kOBase +
                     (warp_in_group * 32 << 16);
-                for (int d32 = 0; d32 < 256 / 32; ++d32) {
+                for (int chunk = 0; chunk < ValueChunkCount; ++chunk) {
                     float values[32];
-                    tcgen05_ld_f32_x32(values, o_warp_addr + d32 * 32);
+                    tcgen05_ld_f32_x32(values, o_warp_addr + chunk * 32);
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
 #pragma unroll
                     for (int i = 0; i < 32; ++i) {
-                        values[i] *= alpha;
+                        values[i] *= rescale;
                     }
-                    tcgen05_st_f32_x32(values, o_warp_addr + d32 * 32);
+                    tcgen05_st_f32_x32(values, o_warp_addr + chunk * 32);
                 }
             }
             asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
@@ -748,24 +780,24 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
         tcgen05_fence_after_thread_sync();
         const float inv_l = 1.0f / final_l;
         const int o_warp_addr = tmem_addr + kOBase + (warp_in_group * 32 << 16);
-        for (int d8 = 0; d8 < 256 / 8; ++d8) {
-            float values[8];
-            tcgen05_ld_f32_x8(values, o_warp_addr + d8 * 8);
-            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
-            const int physical_d = d8 * 8;
-            const int d = ((physical_d / 64) * 2 + output_half) * 64 +
-                physical_d % 64;
-            const int logical_byte =
-                ((d / 64) * TileQ * 64 + logical_row * 64 + d % 64) *
-                sizeof(__nv_bfloat16);
-            const int swizzled_byte = logical_byte ^ ((logical_byte >> 3) & 0x70);
-            const uint4 packed = make_uint4(
-                pack_bf16x2(values[0] * inv_l, values[1] * inv_l),
-                pack_bf16x2(values[2] * inv_l, values[3] * inv_l),
-                pack_bf16x2(values[4] * inv_l, values[5] * inv_l),
-                pack_bf16x2(values[6] * inv_l, values[7] * inv_l));
-            *reinterpret_cast<uint4 *>(reinterpret_cast<char *>(out_smem) + swizzled_byte) =
-                packed;
+        for (int chunk = 0; chunk < ValueChunkCount; ++chunk) {
+            for (int d8 = 0; d8 < 4; ++d8) {
+                float values[8];
+                tcgen05_ld_f32_x8(values, o_warp_addr + chunk * 32 + d8 * 8);
+                asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                const int d = chunk * 64 + output_half * 32 + d8 * 8;
+                const int logical_byte =
+                    ((d / 64) * TileQ * 64 + logical_row * 64 + d % 64) *
+                    sizeof(__nv_bfloat16);
+                const int swizzled_byte = logical_byte ^ ((logical_byte >> 3) & 0x70);
+                const uint4 packed = make_uint4(
+                    pack_bf16x2(values[0] * inv_l, values[1] * inv_l),
+                    pack_bf16x2(values[2] * inv_l, values[3] * inv_l),
+                    pack_bf16x2(values[4] * inv_l, values[5] * inv_l),
+                    pack_bf16x2(values[6] * inv_l, values[7] * inv_l));
+                *reinterpret_cast<uint4 *>(reinterpret_cast<char *>(out_smem) + swizzled_byte) =
+                    packed;
+            }
         }
         if (lane_idx == 0) {
             mbarrier_arrive(out_store_ready_addr);
@@ -831,7 +863,7 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
                 (4U << 17U) | (4U << 24U); // M64 N32
             constexpr uint32_t kPvInstrDesc =
                 (1U << 4U) | (1U << 7U) | (1U << 10U) |
-                (1U << 16U) | (8U << 17U) | (4U << 24U); // M64 N64, B N-major
+                (1U << 16U) | (8U << 17U) | (4U << 24U); // .ws M64 N64, B N-major
             int k_phase[KvStages][KChunkCount] = {};
             int s_free_phase[KvStages] = {};
             int p_ready_phase[KvStages] = {};
@@ -889,10 +921,9 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
                     : stage_addr + 8 * ChunkBytes;
                 tcgen05_fence_after_thread_sync();
                 for (int chunk = 0; chunk < ValueChunkCount; ++chunk) {
-                    const int d_addr = tmem_addr + kOBase +
-                        (chunk / 2) * 64 + ((chunk & 1) * 16 << 16);
+                    const int d_addr = tmem_addr + kOBase + chunk * 32;
                     for (int k16 = 0; k16 < 4; ++k16) {
-                        tcgen05_mma_bf16(d_addr,
+                        tcgen05_mma_ws_bf16(d_addr,
                             make_128b_swizzle_desc(p_addr + k16 * 32),
                             make_128b_nmajor_desc(
                                 stage_addr + chunk * ChunkBytes + k16 * 16 * 128,
