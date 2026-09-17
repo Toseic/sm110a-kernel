@@ -20,6 +20,7 @@ from sm110a_kernel import (
     create_green_contexts,
     sm_resource_info,
 )
+from common import B300Sim, BenchmarkBase
 
 
 SERVING_SMS = 16
@@ -358,6 +359,7 @@ def run_producer_speed_sweep(args):
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    BenchmarkBase.add_b300_sim_args(parser)
     parser.add_argument(
         "--test", action="store_true",
         help="run persistent serving correctness tests instead of timing",
@@ -393,10 +395,11 @@ def main():
     args = parse_args()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
-    if args.test:
-        run_persistent_serving_tests()
-    else:
-        run_producer_speed_sweep(args)
+    with B300Sim(args):
+        if args.test:
+            run_persistent_serving_tests()
+        else:
+            run_producer_speed_sweep(args)
 
 
 if __name__ == "__main__":
