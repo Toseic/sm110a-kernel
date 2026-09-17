@@ -100,11 +100,6 @@ class Bf16Fa4MlaBenchmark(BenchmarkBase):
         parser.add_argument("--rtol", type=float, default=2e-2)
         self.add_timing_args(parser, warmup=5, iters=20, samples=7)
         self.add_sol_arg(parser)
-        parser.add_argument(
-            "--full-sol",
-            action="store_true",
-            help="show all analytical SOL metrics (implies --sol)",
-        )
         parser.add_argument("--debug", action="store_true", help="print benchmark records line by line")
         return parser
 
@@ -114,7 +109,6 @@ class Bf16Fa4MlaBenchmark(BenchmarkBase):
         if not math.isfinite(args.scale) or args.scale <= 0:
             raise SystemExit("scale must be finite and positive")
         self.validate_timing_args(args, allow_zero_warmup=True)
-        args.sol = args.sol or args.full_sol
         return args
 
     def run_with_args(self, args):
@@ -126,10 +120,10 @@ class Bf16Fa4MlaBenchmark(BenchmarkBase):
             ("Kernel ms", 13),
             ("Kernel TF/s", 14),
             ("Max diff", 13),
-        ) + ((("SOL selected(ms)", 17), ("SOL attainment", 15)) if args.sol else ())
+        )
         table = TablePrinter(columns, debug=args.debug)
         table.print_header()
-        full_sol_report = SolReport(debug=args.debug) if args.full_sol else None
+        sol_report = SolReport(debug=args.debug) if args.sol else None
         for batch in ((args.batch,) if args.single else (32, 64, 128)):
             q, k, v = make_inputs(batch, args.kv_len)
             out = torch.empty((batch, H, 1, D_KV), device=q.device, dtype=q.dtype)
@@ -153,20 +147,16 @@ class Bf16Fa4MlaBenchmark(BenchmarkBase):
             flops = 2 * batch * H * args.kv_len * (D_KV + D_rope + D_KV)
             ms = stats["median_ms"]
             values = (batch, args.kv_len, f"{ms:.4f}", f"{flops / (ms * 1e9):.3f}", diff)
-            if args.sol:
+            if sol_report:
                 bounds = mla_sol_bounds(batch, args.kv_len)
-                values += (
-                    f"{bounds['sol_ms']:.4f}",
-                    f"{100.0 * bounds['sol_ms'] / ms:.1f}%",
-                )
             table.print_row(*values)
-            if args.full_sol:
-                full_sol_report.add(
+            if sol_report:
+                sol_report.add(
                     bounds, ms, label=f"MLA B={batch}, S={args.kv_len}"
                 )
 
-        if full_sol_report:
-            full_sol_report.print()
+        if sol_report:
+            sol_report.print()
 
 
 if __name__ == "__main__":

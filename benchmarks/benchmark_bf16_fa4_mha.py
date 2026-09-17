@@ -36,6 +36,7 @@ if str(ROOT) not in sys.path:
 
 from common import (
     BenchmarkBase,
+    SolReport,
     TablePrinter,
     benchmark_with_stats,
     sol_bounds,
@@ -419,9 +420,10 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
             (f"{baseline_label} ms", 15),
             (f"vs {baseline_label}", 12),
             ("Diff", 12),
-        ) + ((("SOL selected(ms)", 17), ("SOL attainment", 15)) if args.sol else ())
+        )
         table = TablePrinter(columns, debug=args.debug)
         table.print_header()
+        sol_report = SolReport(debug=args.debug) if args.sol else None
         for case in self.cases(args):
             kernel_stats, baseline_stats, max_diff = self.run_case(case, args)
             kernel_ms = kernel_stats["median_ms"]
@@ -437,13 +439,22 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
                 f"{baseline_ms / kernel_ms:.3f}x",
                 f"{max_diff:.6g}",
             )
-            if args.sol:
+            if sol_report:
                 bounds = attention_sol_bounds(case)
-                values += (
-                    f"{bounds['sol_ms']:.4f}",
-                    f"{100.0 * bounds['sol_ms'] / kernel_ms:.1f}%",
+                sol_report.add(
+                    bounds,
+                    kernel_ms,
+                    label=(
+                        f"MHA {case.name} "
+                        f"(B={case.batch}, H={case.heads}, Q={case.q_len}, "
+                        f"KV={case.kv_len}, D={case.head_dim}, "
+                        f"{'causal' if case.causal else 'noncausal'})"
+                    ),
                 )
             table.print_row(*values)
+
+        if sol_report:
+            sol_report.print()
 
 
 if __name__ == "__main__":

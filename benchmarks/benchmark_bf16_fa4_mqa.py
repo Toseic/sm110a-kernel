@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from common import BenchmarkBase, benchmark_with_stats, sol_bounds
+from common import BenchmarkBase, SolReport, benchmark_with_stats, sol_bounds
 from sm110a_kernel import bf16_fa4_mqa_out
 
 
@@ -189,10 +189,9 @@ class Bf16Fa4MqaBenchmark(BenchmarkBase):
         columns = (("mode", 9), ("shape [B,Hq,Hkv,Q,KV,D]", 30), ("mask", 10),
                    ("Kernel ms", 13), ("Kernel TF/s", 14), ("FA4 ms", 13),
                    ("FA4/kernel", 14), ("Diff", 12), ("Config", 16))
-        if args.sol:
-            columns += (("SOL selected(ms)", 17), ("SOL attainment", 15))
         table = self.make_table_printer(columns)
         table.print_header()
+        sol_report = SolReport(debug=args.debug) if args.sol else None
         for case in self.cases(args):
             q = torch.empty((case.batch, case.q_heads, case.q_len, case.head_dim), device="cuda", dtype=torch.bfloat16).uniform_(-1, 1)
             k = torch.empty((case.batch, case.kv_heads, case.kv_len, case.head_dim), device="cuda", dtype=torch.bfloat16).uniform_(-1, 1)
@@ -228,11 +227,22 @@ class Bf16Fa4MqaBenchmark(BenchmarkBase):
                       f"{attention_tflops(case, kernel_stats['median_ms']):.3f}",
                       f"{fa4_stats['median_ms']:.4f}", f"{fa4_stats['median_ms'] / kernel_stats['median_ms']:.3f}x", f"{diff:.6g}",
                       "16warp/pack32")
-            if args.sol:
+            if sol_report:
                 bounds = attention_sol_bounds(case)
-                values += (f"{bounds['sol_ms']:.4f}",
-                           f"{100.0 * bounds['sol_ms'] / kernel_stats['median_ms']:.1f}%")
+                sol_report.add(
+                    bounds,
+                    kernel_stats["median_ms"],
+                    label=(
+                        f"MQA {case.name} "
+                        f"(B={case.batch}, Hq={case.q_heads}, Hkv={case.kv_heads}, "
+                        f"Q={case.q_len}, KV={case.kv_len}, D={case.head_dim}, "
+                        f"{'causal' if case.causal else 'noncausal'})"
+                    ),
+                )
             table.print_row(*values)
+
+        if sol_report:
+            sol_report.print()
 
 
 if __name__ == "__main__":
