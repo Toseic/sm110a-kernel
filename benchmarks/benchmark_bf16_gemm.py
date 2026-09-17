@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
 
 from common import (
     GemmBenchmarkBase,
+    SolReport,
     benchmark_with_stats,
     benchmark_with_stats_batched,
     quick_probe,
@@ -263,6 +264,9 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
 
     def print_header(self, baseline_name):
         self.make_result_table(baseline_name).print_header()
+        self._sol_report = (
+            SolReport(debug=self._debug_enabled) if self._sol_enabled else None
+        )
 
     def run_case(self, m, n, k, args):
         a = torch.empty((m, k), device="cuda", dtype=torch.bfloat16)
@@ -406,12 +410,15 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
         )
         if self._sol_enabled:
             config, swap_ab = best_candidate
-            print_sol_report(
+            self._sol_report.add(
                 gemm_sol_bounds(m, n, k, config, swap_ab),
                 kernel_stats["median_ms"],
-                label="GEMM",
-                debug=self._debug_enabled,
+                label=f"GEMM ({m}x{n}x{k})",
             )
+
+    def finish_results(self):
+        if self._sol_report:
+            self._sol_report.print()
 
 
 def main():

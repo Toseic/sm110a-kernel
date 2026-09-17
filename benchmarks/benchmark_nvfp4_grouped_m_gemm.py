@@ -14,9 +14,9 @@ if str(ROOT) not in sys.path:
 
 from common import (
     BenchmarkBase,
+    SolReport,
     TablePrinter,
     benchmark_with_stats,
-    print_sol_report,
     quick_probe,
     sol_bounds,
     tflops_from_ms,
@@ -209,6 +209,7 @@ class Nvfp4GroupedMGemmBenchmark(BenchmarkBase):
             ("Speedup", 10), ("MaxDiff", 12), ("BestConfig", 34),
         ), debug=args.debug)
         table.print_header()
+        sol_report = SolReport(debug=args.debug) if args.sol else None
         for tokens in args.tokens_per_expert_values:
             aq, bq, sfa, sfb, layout, out, ref = make_workload(
                 tokens, args.experts, args.n, args.k
@@ -243,7 +244,7 @@ class Nvfp4GroupedMGemmBenchmark(BenchmarkBase):
                 f"{bms/kms:.2f}x", f"{diff:.6f}", format_candidate(selection.candidate),
             )
             if args.sol:
-                print_sol_report(
+                sol_report.add(
                     nvfp4_grouped_m_gemm_sol_bounds(
                         tokens,
                         args.experts,
@@ -252,9 +253,10 @@ class Nvfp4GroupedMGemmBenchmark(BenchmarkBase):
                         selection.candidate,
                     ),
                     kms,
-                    label="NVFP4 grouped-M GEMM",
-                    debug=args.debug,
+                    label=f"NVFP4 grouped-M GEMM (tokens/expert={tokens})",
                 )
+        if sol_report:
+            sol_report.print()
 
     def resolve_kernel(self, aq, bq, sfa, sfb, layout, out, tokens, args):
         candidates = compatible_candidates(args.n, args.k)

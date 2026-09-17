@@ -22,8 +22,7 @@ from common import (
     TablePrinter,
     benchmark_with_stats,
     sol_bounds,
-    sol_table_columns,
-    sol_table_values,
+    SolReport,
 )
 from sm110a_kernel import bf16_fa4_mla_out
 
@@ -130,7 +129,7 @@ class Bf16Fa4MlaBenchmark(BenchmarkBase):
         ) + ((("SOL selected(ms)", 17), ("SOL attainment", 15)) if args.sol else ())
         table = TablePrinter(columns, debug=args.debug)
         table.print_header()
-        full_sol_rows = []
+        full_sol_report = SolReport(debug=args.debug) if args.full_sol else None
         for batch in ((args.batch,) if args.single else (32, 64, 128)):
             q, k, v = make_inputs(batch, args.kv_len)
             out = torch.empty((batch, H, 1, D_KV), device=q.device, dtype=q.dtype)
@@ -162,13 +161,12 @@ class Bf16Fa4MlaBenchmark(BenchmarkBase):
                 )
             table.print_row(*values)
             if args.full_sol:
-                full_sol_rows.append((bounds, ms, f"MLA B={batch}, S={args.kv_len}"))
+                full_sol_report.add(
+                    bounds, ms, label=f"MLA B={batch}, S={args.kv_len}"
+                )
 
-        if full_sol_rows:
-            full_sol_table = TablePrinter(sol_table_columns(), debug=args.debug)
-            full_sol_table.print_header()
-            for bounds, ms, label in full_sol_rows:
-                full_sol_table.print_row(*sol_table_values(bounds, ms, label=label))
+        if full_sol_report:
+            full_sol_report.print()
 
 
 if __name__ == "__main__":

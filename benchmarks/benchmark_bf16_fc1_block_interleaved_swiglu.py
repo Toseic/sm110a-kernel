@@ -11,8 +11,8 @@ if str(ROOT) not in sys.path:
 
 from common import (
     BenchmarkBase,
+    SolReport,
     benchmark_with_stats,
-    print_sol_report,
     quick_probe,
     sol_bounds,
 )
@@ -394,6 +394,7 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
             f"tile_k={args.baseline_tile_k} cluster_m={args.baseline_cluster_m} mode={args.baseline_mode}"
         )
         self.make_result_table().print_header()
+        sol_report = SolReport(debug=args.debug) if args.sol else None
         for tokens in token_values:
             m = tokens * args.topk
             a = torch.empty(
@@ -467,14 +468,15 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
                 format_candidate(best_config),
             )
             if args.sol:
-                print_sol_report(
+                sol_report.add(
                     fc1_main_kernel_sol_bounds(
                         router_scores, args.topk, args.n, args.k, best_config
                     ),
                     kernel_stats["median_ms"],
-                    label="FC1 main kernel (routing excluded)",
-                    debug=args.debug,
+                    label=f"FC1 main kernel (tokens={tokens}, routing excluded)",
                 )
+        if sol_report:
+            sol_report.print()
 
 
 if __name__ == "__main__":

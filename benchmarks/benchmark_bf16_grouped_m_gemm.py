@@ -12,10 +12,10 @@ if str(ROOT) not in sys.path:
 
 from common import (
     BenchmarkBase,
+    SolReport,
     benchmark_with_stats,
     quick_probe,
     tflops_from_ms,
-    print_sol_report,
     sol_bounds,
 )
 from sm110a_kernel import (
@@ -306,6 +306,7 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
         b = torch.empty((EXPERTS, N, K), device="cuda", dtype=torch.bfloat16)
         b.uniform_(-1.0, 1.0)
         self.make_result_table().print_header()
+        sol_report = SolReport(debug=args.debug) if args.sol else None
         for tokens_per_expert in tokens_per_expert_values:
             a, layout, out_kernel, out_baseline = make_workload(
                 tokens_per_expert, b
@@ -348,14 +349,15 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
                 )
             )
             if args.sol:
-                print_sol_report(
+                sol_report.add(
                     grouped_m_gemm_sol_bounds(
                         tokens_per_expert, EXPERTS, N, K, best_config
                     ),
                     kernel_stats["median_ms"],
-                    label="grouped-M GEMM",
-                    debug=args.debug,
+                    label=f"grouped-M GEMM (tokens/expert={tokens_per_expert})",
                 )
+        if sol_report:
+            sol_report.print()
 
     def resolve_grouped_kernel(self, a, b, layout, out, args):
         candidates = compatible_candidates(b.size(1), a.size(1))

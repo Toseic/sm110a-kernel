@@ -12,8 +12,8 @@ if str(ROOT) not in sys.path:
 
 from common import (
     BenchmarkBase,
+    SolReport,
     benchmark_with_stats,
-    print_sol_report,
     quick_probe,
     sol_bounds,
 )
@@ -210,6 +210,7 @@ class Fc2FinalizeBenchmark(BenchmarkBase):
         print("[runner] resolving and caching the best compatible config")
         table = self.make_result_table()
         table.print_header()
+        sol_report = SolReport(debug=args.debug) if args.sol else None
         weights = torch.empty((args.experts, args.h, args.i), device="cuda", dtype=torch.bfloat16).uniform_(-1.0, 1.0)
         for tokens in tokens_values:
             fc1, routing, routing_weights, router_scores, selected, grouped_order = make_fc1_layout(
@@ -271,9 +272,13 @@ class Fc2FinalizeBenchmark(BenchmarkBase):
                             f"{fc2_tflops(tokens, args.topk, args.h, args.i, stats['median_ms']):.3f}",
                             f"{max_abs_diff:.6f}", format_candidate(best_config))
             if args.sol:
-                print_sol_report(fc2_sol_bounds(router_scores, args.topk, args.h, args.i, best_config),
-                                 stats["median_ms"], label="FC2 grouped GEMM + finalize",
-                                 debug=args.debug)
+                sol_report.add(
+                    fc2_sol_bounds(router_scores, args.topk, args.h, args.i, best_config),
+                    stats["median_ms"],
+                    label=f"FC2 grouped GEMM + finalize (tokens={tokens})",
+                )
+        if sol_report:
+            sol_report.print()
 
 
 if __name__ == "__main__":

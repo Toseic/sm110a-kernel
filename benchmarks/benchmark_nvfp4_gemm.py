@@ -14,9 +14,9 @@ if str(ROOT) not in sys.path:
 
 from common import (
     BenchmarkBase,
+    SolReport,
     TablePrinter,
     benchmark_with_stats,
-    print_sol_report,
     quick_probe,
     sol_bounds,
     tflops_from_ms,
@@ -210,6 +210,7 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
             print("[baseline] torch._scaled_mm NVFP4")
         print("[runner] config selection is cached per workload and CUDA environment")
         table.print_header()
+        sol_report = SolReport(debug=args.debug) if args.sol else None
         for m, n, k in args.shapes:
             a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
             b = torch.randn((k, n), device="cuda", dtype=torch.bfloat16)
@@ -260,12 +261,13 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
                 format_candidate(selection.candidate),
             )
             if args.sol:
-                print_sol_report(
+                sol_report.add(
                     nvfp4_gemm_sol_bounds(m, n, k, selection.candidate),
                     kernel_stats["median_ms"],
-                    label="NVFP4 GEMM",
-                    debug=args.debug,
+                    label=f"NVFP4 GEMM ({m}x{n}x{k})",
                 )
+        if sol_report:
+            sol_report.print()
 
     def resolve_kernel(self, aq, bq, sfa, sfb, out, m, n, k, args):
         candidates = compatible_candidates(m, n, k)

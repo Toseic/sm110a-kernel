@@ -15,9 +15,9 @@ if str(ROOT) not in sys.path:
 
 from common import (  # noqa: E402
     BenchmarkBase,
+    SolReport,
     TablePrinter,
     benchmark_with_stats,
-    print_sol_report,
     quick_probe,
     sol_bounds,
 )
@@ -293,6 +293,7 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
         print("[runner] resolving and caching the best compatible config")
         table = self.make_result_table()
         table.print_header()
+        sol_report = SolReport(debug=args.debug) if args.sol else None
 
         for tokens in args.token_values:
             case = make_case(tokens, args.experts, args.topk, args.n, args.k)
@@ -418,14 +419,15 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
                 format_candidate(selection.candidate),
             )
             if args.sol:
-                print_sol_report(
+                sol_report.add(
                     nvfp4_fc2_sol_bounds(
                         router_scores, args.topk, args.n, args.k, selection.candidate
                     ),
                     kernel_ms,
-                    label="NVFP4 FC2 grouped GEMM + reduction",
-                    debug=args.debug,
+                    label=f"NVFP4 FC2 kernel (tokens={tokens})",
                 )
+        if sol_report:
+            sol_report.print()
 
 
 if __name__ == "__main__":

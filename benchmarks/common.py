@@ -2,18 +2,209 @@
 
 import argparse
 import math
+from pathlib import Path
+import subprocess
 import statistics
+import sys
 
 import torch
 
 
 EARLY_STOP_RATIO = 1.3       # skip config if probe > best_probe * this
 MMA_PEAK_TFLOPS = 250.0
+# ``B300Sim`` changes this for the duration of one benchmark process.  Keep
+# the bandwidth constants unchanged: its purpose is to vary compute/GMEM
+# balance while EMC is explicitly pinned at maximum frequency.
+MMA_PEAK_SCALE = 1.0
 GMEM_BW_GBPS = 273.0
 L2_BW_GBPS = 1.281 * 1000.0
 BF16_BYTES = 2
 _DECIMAL_MB = 1000 ** 2
 _DECIMAL_GFLOP = 1000 ** 3
+
+
+class B300Sim:
+    """Temporarily lock Thor clocks, optionally at B300 balance.
+
+    Default mode locks GPC and EMC to their currently permitted maxima.  With
+    ``--b300-sim``, it instead lowers GPC to the closest B300-balance point.
+    The latter is a roofline-balance experiment, not a performance emulator.
+    Original devfreq limits are restored on normal exit and Python exceptions.
+    """
+
+    GPU_PATH = Path("/sys/class/devfreq/gpu-gpc-0")
+    EMC_PATH = Path("/sys/class/devfreq/bwmgr")
+    TARGET_HZ = {"bf16": 466_000_000, "nvfp4": 700_000_000}
+
+    def __init__(self, args):
+        self.args = args
+        self.b300_sim = getattr(args, "b300_sim", False)
+        self.enabled = not getattr(args, "no_lock_clocks", False)
+        requested_mode = getattr(args, "b300_sim_mode", "auto")
+        self.mode = self._resolve_mode(requested_mode)
+        self._original = {}
+        self._applied = False
+        self._previous_mma_peak_scale = None
+
+    @staticmethod
+    def _resolve_mode(requested_mode):
+        if requested_mode != "auto":
+            return requested_mode
+        # All current NVFP4 entry points include this in their filename.  Keep
+        # an explicit override for future mixed-precision benchmarks.
+        return "nvfp4" if "nvfp4" in Path(sys.argv[0]).stem.lower() else "bf16"
+
+    @staticmethod
+    def _read(path):
+        return int(path.read_text().strip())
+
+    @staticmethod
+    def _frequencies(path):
+        return tuple(int(value) for value in (path / "available_frequencies").read_text().split())
+
+    def _write(self, path, value):
+        """Write a sysfs value, escalating only for that single write."""
+        try:
+            path.write_text(f"{value}\n")
+            return
+        except PermissionError:
+            pass
+
+        # First support a least-privilege sudoers rule which permits only
+        # ``tee`` for these exact devfreq files.  Do not probe with ``sudo
+        # -v`` first: that probe itself is not covered by such a rule.
+        command = ("sudo", "-n", "tee", str(path))
+        result = subprocess.run(
+            command,
+            input=f"{value}\n",
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if result.returncode == 0:
+            return
+
+        # No NOPASSWD rule is available. Authenticate once, then retry every
+        # individual write non-interactively so restoration cannot prompt.
+        if not getattr(self, "_sudo_validated", False):
+            try:
+                subprocess.run(("sudo", "-v"), check=True)
+            except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+                raise RuntimeError(
+                    "--b300-sim needs permission to write devfreq sysfs nodes; "
+                    "run from a terminal that can authenticate with sudo"
+                ) from exc
+            self._sudo_validated = True
+        try:
+            subprocess.run(
+                command,
+                input=f"{value}\n",
+                text=True,
+                stdout=subprocess.DEVNULL,
+                check=True,
+            )
+        except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+            raise RuntimeError(f"unable to write {path} for --b300-sim") from exc
+
+    def __enter__(self):
+        if not self.enabled:
+            return self
+        required = (self.GPU_PATH, self.EMC_PATH)
+        missing = [str(path) for path in required if not path.is_dir()]
+        if missing:
+            raise RuntimeError(
+                "--b300-sim is supported only on Thor devfreq systems; missing "
+                + ", ".join(missing)
+            )
+
+        self._original = {
+            (self.GPU_PATH, "min_freq"): self._read(self.GPU_PATH / "min_freq"),
+            (self.GPU_PATH, "max_freq"): self._read(self.GPU_PATH / "max_freq"),
+            (self.EMC_PATH, "min_freq"): self._read(self.EMC_PATH / "min_freq"),
+            (self.EMC_PATH, "max_freq"): self._read(self.EMC_PATH / "max_freq"),
+        }
+        if self.b300_sim:
+            gpu_target = min(
+                self._frequencies(self.GPU_PATH),
+                key=lambda value: abs(value - self.TARGET_HZ[self.mode]),
+            )
+        else:
+            gpu_target = self._original[(self.GPU_PATH, "max_freq")]
+        emc_target = self._original[(self.EMC_PATH, "max_freq")]
+        try:
+            # Set the lower limit before the upper limit: this works whether
+            # the previous GPC range is above or below the requested point.
+            self._write(self.GPU_PATH / "min_freq", gpu_target)
+            self._write(self.GPU_PATH / "max_freq", gpu_target)
+            self._write(self.EMC_PATH / "min_freq", emc_target)
+            self._write(self.EMC_PATH / "max_freq", emc_target)
+            self._applied = True
+        except Exception:
+            self._restore()
+            raise
+
+        global MMA_PEAK_SCALE
+        self._previous_mma_peak_scale = MMA_PEAK_SCALE
+        MMA_PEAK_SCALE = gpu_target / self._original[(self.GPU_PATH, "max_freq")]
+        self.args._sol_mma_peak_scale = MMA_PEAK_SCALE
+        precision_multiplier = 4.0 if self.mode == "nvfp4" else 1.0
+        precision_name = "NVFP4" if self.mode == "nvfp4" else "BF16"
+        self.args._sol_mma_peak_tflops = (
+            precision_multiplier * MMA_PEAK_TFLOPS * MMA_PEAK_SCALE
+        )
+        if self.b300_sim:
+            print(
+                f"[b300-sim] mode={self.mode} GPC={gpu_target / 1e6:.0f} MHz "
+                f"(target {self.TARGET_HZ[self.mode] / 1e6:.0f} MHz), "
+                f"EMC={emc_target / 1e6:.0f} MHz locked"
+            )
+            print(
+                f"[b300-sim] SOL MMA peak scale={MMA_PEAK_SCALE:.4f}; "
+                f"{precision_name} peak={self.args._sol_mma_peak_tflops:.3f} TF/s"
+            )
+        else:
+            print(
+                f"[clocks] GPC={gpu_target / 1e6:.0f} MHz and "
+                f"EMC={emc_target / 1e6:.0f} MHz locked at maximum"
+            )
+        return self
+
+    def _restore(self):
+        if not self._original:
+            return
+        errors = []
+        # Raise maxima before minima so restoring a wider range is valid.
+        for path, name in ((self.GPU_PATH, "max_freq"), (self.EMC_PATH, "max_freq"),
+                           (self.GPU_PATH, "min_freq"), (self.EMC_PATH, "min_freq")):
+            try:
+                self._write(path / name, self._original[(path, name)])
+            except Exception as exc:  # Preserve the benchmark exception.
+                errors.append(exc)
+        self._applied = False
+        if self._previous_mma_peak_scale is not None:
+            global MMA_PEAK_SCALE
+            MMA_PEAK_SCALE = self._previous_mma_peak_scale
+            self._previous_mma_peak_scale = None
+        if errors:
+            raise RuntimeError("failed to restore devfreq limits after --b300-sim") from errors[0]
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self._applied:
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            except Exception:
+                # A failed CUDA operation must not prevent clock restoration.
+                print("[b300-sim] WARNING: CUDA synchronize failed before restoration", file=sys.stderr)
+            try:
+                self._restore()
+                print("[clocks] restored original GPC and EMC limits")
+            except Exception:
+                if exc_type is None:
+                    raise
+                print("[clocks] WARNING: failed to restore original devfreq limits", file=sys.stderr)
+        return False
 
 class TablePrinter:
     """Print benchmark records as tables, or as lines in debug mode."""
@@ -52,9 +243,37 @@ class BenchmarkBase:
         return argparse.ArgumentParser()
 
     def parse_args(self):
-        args = self.build_parser().parse_args()
+        parser = self.build_parser()
+        self.add_b300_sim_args(parser)
+        args = parser.parse_args()
         self.validate_args(args)
         return args
+
+    @staticmethod
+    def add_b300_sim_args(parser):
+        group = parser.add_mutually_exclusive_group()
+        group.add_argument(
+            "--b300-sim",
+            action="store_true",
+            help=(
+                "lock Thor EMC at maximum and lower GPC to emulate B300's "
+                "compute/GMEM roofline balance (requires sudo)"
+            ),
+        )
+        group.add_argument(
+            "--no-lock-clocks",
+            action="store_true",
+            help="leave GPC and EMC devfreq limits unchanged",
+        )
+        parser.add_argument(
+            "--b300-sim-mode",
+            choices=("auto", "bf16", "nvfp4"),
+            default="auto",
+            help=(
+                "precision balance for --b300-sim; auto selects NVFP4 for "
+                "NVFP4 benchmark filenames and BF16 otherwise"
+            ),
+        )
 
     def validate_args(self, args):
         return args
@@ -81,6 +300,19 @@ class BenchmarkBase:
         )
 
     @staticmethod
+    def _b300_sim_cache_path(args):
+        """Keep throttled autotune choices separate from normal-clock ones."""
+        configured = getattr(args, "cache_path", None)
+        base = (
+            Path(configured)
+            if configured
+            else Path(__file__).resolve().parent.parent / "profiles" / "autotune_cache.json"
+        )
+        mode = B300Sim._resolve_mode(getattr(args, "b300_sim_mode", "auto"))
+        suffix = base.suffix or ".json"
+        return base.with_name(f"{base.stem}.b300-sim-{mode}{suffix}")
+
+    @staticmethod
     def make_tune_options(args, *, role="ours", **overrides):
         """Build runner options for one side of a benchmark comparison.
 
@@ -91,12 +323,15 @@ class BenchmarkBase:
             raise ValueError(f"unsupported autotune role: {role}")
         from sm110a_kernel.runner import TuneOptions
 
+        cache_path = getattr(args, "cache_path", None)
+        if getattr(args, "b300_sim", False):
+            cache_path = BenchmarkBase._b300_sim_cache_path(args)
         values = dict(
             warmup=args.warmup,
             iters=args.iters,
             samples=args.samples,
             cold_l2_flush=getattr(args, "_cold_l2_flush", None),
-            cache_path=getattr(args, "cache_path", None),
+            cache_path=cache_path,
             force_sweep=(
                 getattr(args, "force_sweep", False)
                 or getattr(args, f"force_sweep_{role}", False)
@@ -223,9 +458,10 @@ class BenchmarkBase:
     def run(self):
         args = self.parse_args()
         self._debug_enabled = getattr(args, "debug", False)
-        self.initialize()
-        self.configure_cold_l2(args)
-        self.run_with_args(args)
+        with B300Sim(args):
+            self.initialize()
+            self.configure_cold_l2(args)
+            self.run_with_args(args)
 
     def run_with_args(self, args):
         raise NotImplementedError
@@ -295,6 +531,7 @@ class GemmBenchmarkBase(BenchmarkBase):
         for shape in self.iter_shapes(args):
             result = self.run_case(*shape, args=args)
             self.print_result(shape, result)
+        self.finish_results()
 
     def run_preflight(self, args):
         return None
@@ -315,6 +552,10 @@ class GemmBenchmarkBase(BenchmarkBase):
     def print_result(self, shape, result):
         raise NotImplementedError
 
+    def finish_results(self):
+        """Emit any deferred sweep output after all result rows."""
+        return None
+
 
 def tflops_from_ms(m, n, k, elapsed_ms):
     flops = 2.0 * m * n * k
@@ -333,7 +574,7 @@ def sol_bounds(
     mma_peak_tflops=MMA_PEAK_TFLOPS,
 ):
     """Return the shared GEMM SOL models for the requested MMA peak."""
-    mma_ms = flops / (mma_peak_tflops * _DECIMAL_GFLOP)
+    mma_ms = flops / (mma_peak_tflops * MMA_PEAK_SCALE * _DECIMAL_GFLOP)
     hbm_ms = _ms_for_bytes(compulsory_bytes, GMEM_BW_GBPS)
     gmem_ms = _ms_for_bytes(tile_read_bytes, GMEM_BW_GBPS)
     pure_l2_ms = _ms_for_bytes(tile_read_bytes, L2_BW_GBPS)
@@ -356,9 +597,9 @@ def sol_bounds(
     }
 
 
-def sol_table_columns():
+def sol_table_columns(label_width=22):
     return (
-        ("SOL", 22), ("SOL mma(ms)", 12), ("SOL hbm(ms)", 12),
+        ("SOL", label_width), ("SOL mma(ms)", 12), ("SOL hbm(ms)", 12),
         ("SOL gmem(ms)", 14), ("SOL pure-l2(ms)", 16),
         ("SOL mixed(ms)", 14), ("SOL selected(ms)", 17),
         ("SOL attainment", 16), ("SOL tile-read(MB)", 18),
@@ -376,10 +617,30 @@ def sol_table_values(bounds, measured_ms, *, label="SOL"):
 
 
 def print_sol_report(bounds, measured_ms, *, label="SOL", debug=False):
-    """Print SOL metrics using the benchmark output format."""
-    table = TablePrinter(sol_table_columns(), debug=debug)
-    table.print_header()
-    table.print_row(*sol_table_values(bounds, measured_ms, label=label))
+    """Print one SOL record; prefer :class:`SolReport` for sweeps."""
+    report = SolReport(debug=debug)
+    report.add(bounds, measured_ms, label=label)
+    report.print()
+
+
+class SolReport:
+    """Accumulate a benchmark sweep's SOL rows and render one stable table."""
+
+    def __init__(self, *, debug=False):
+        self.debug = debug
+        self._rows = []
+
+    def add(self, bounds, measured_ms, *, label="SOL"):
+        self._rows.append((label, bounds, measured_ms))
+
+    def print(self):
+        if not self._rows:
+            return
+        label_width = max(22, *(len(label) + 1 for label, _, _ in self._rows))
+        table = TablePrinter(sol_table_columns(label_width), debug=self.debug)
+        table.print_header()
+        for label, bounds, measured_ms in self._rows:
+            table.print_row(*sol_table_values(bounds, measured_ms, label=label))
 
 
 def summarize_samples(samples, measured_iters):
