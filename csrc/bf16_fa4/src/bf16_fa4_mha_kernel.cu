@@ -483,8 +483,7 @@ template <int TileQ, int TileKV, int QSlots, int KvStages> struct FaMhaSmemLayou
     }
 };
 
-// Q, K, and V share the contiguous [B, H, S, D] physical layout.  Only the
-// sequence length and the number of rows loaded per TMA transaction differ.
+// Dense Q/O use [B, H, S, D]. Paged K/V use init_strided_mha_tmap below.
 inline cudaError_t init_qkv_tmap(
     CUtensorMap *tmap,
     const __nv_bfloat16 *ptr,
@@ -527,28 +526,91 @@ inline cudaError_t init_qkv_tmap(
     return result == CUDA_SUCCESS ? cudaSuccess : cudaErrorInvalidValue;
 }
 
-inline cudaError_t init_qkv_tmaps(
-    CUtensorMap *q_tmap,
-    CUtensorMap *k_tmap,
-    CUtensorMap *v_tmap,
-    const __nv_bfloat16 *q,
-    const __nv_bfloat16 *k,
-    const __nv_bfloat16 *v,
-    int batch_heads,
-    int query_len,
-    int key_len,
-    int head_dim,
-    int tile_q,
-    int tile_kv) {
-    cudaError_t status = init_qkv_tmap(q_tmap, q, batch_heads, query_len, head_dim, tile_q);
-    if (status != cudaSuccess) {
-        return status;
+// Packed Q uses [sum_q, H, D]. Paged K/V use [num_pages, H, 16, D].
+// The TMA box still has the same [D64, rows, Dchunks, 1] shared layout.
+inline cudaError_t init_strided_mha_tmap(CUtensorMap *tmap,
+    const __nv_bfloat16 *ptr, int rows, int heads, int head_dim,
+    int tile_rows, int row_stride_elements, int head_stride_elements,
+    int tile_chunks = 2) {
+    constexpr uint32_t kRank = 4;
+    uint64_t dims[kRank] = {64, static_cast<uint64_t>(rows),
+        static_cast<uint64_t>(head_dim / 64), static_cast<uint64_t>(heads)};
+    uint64_t strides[kRank - 1] = {
+        static_cast<uint64_t>(row_stride_elements) * sizeof(__nv_bfloat16),
+        128, static_cast<uint64_t>(head_stride_elements) * sizeof(__nv_bfloat16)};
+    uint32_t box[kRank] = {64, static_cast<uint32_t>(tile_rows),
+        static_cast<uint32_t>(tile_chunks), 1};
+    uint32_t element_strides[kRank] = {1, 1, 1, 1};
+    const CUresult result = cuTensorMapEncodeTiled(tmap,
+        CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, kRank,
+        const_cast<__nv_bfloat16 *>(ptr), dims, strides, box, element_strides,
+        CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+        CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+        CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    return result == CUDA_SUCCESS ? cudaSuccess : cudaErrorInvalidValue;
+}
+
+// Page-sized TMA is worthwhile only when one page is exactly the 128-row KV
+// tile.  Smaller pages use the LDGSTS protocol from FC1's permute gather:
+// cp.async copies are completed by cp.async.mbarrier.arrive.noinc, rather than
+// using a software wait and a separate mbarrier arrival.  The explicit SW128
+// address transform matches the tensor-map layout consumed by tcgen05 below.
+__device__ inline void ldgsts_16b(int dst, const void *src) {
+    asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 16;" :: "r"(dst), "l"(src) : "memory");
+}
+
+__device__ inline void ldgsts_mbarrier_arrive_noinc(int mbar_addr) {
+    asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" :: "r"(mbar_addr) : "memory");
+}
+
+template <int BarrierId>
+__device__ inline void producer_sync(int participant_count) {
+    asm volatile("bar.sync %0, %1;" :: "n"(BarrierId), "r"(participant_count) : "memory");
+}
+
+__device__ inline void begin_kv_load(int mbar_addr, int bytes, int page_size) {
+    if (page_size == 128) {
+        const int tx_addr = mbar_addr & 0xFEFFFFFF;
+        asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;" ::
+                         "r"(tx_addr), "r"(bytes) : "memory");
     }
-    status = init_qkv_tmap(k_tmap, k, batch_heads, key_len, head_dim, tile_kv);
-    if (status != cudaSuccess) {
-        return status;
+}
+
+template <int TileKV, int HeadDim>
+__device__ inline void load_kv_tile(int dst, const CUtensorMap *tmap,
+    const __nv_bfloat16 *gmem, int page_size, int kv_tile, int batch_idx,
+    int head_idx, int heads, int key_len, const int32_t *block_table,
+    int block_table_stride, int mbar_addr, int copy_thread, int copy_threads) {
+    if (page_size == 128) {
+        if (copy_thread != 0) return;
+        for (int chunk = 0; chunk < HeadDim / 64; ++chunk) {
+            const int logical_page = min(kv_tile, (key_len - 1) / page_size);
+            const int physical_page = block_table[batch_idx * block_table_stride + logical_page];
+            tma_4d_gmem2smem(dst + chunk * TileKV * 64 * sizeof(__nv_bfloat16), tmap,
+                0, 0, chunk, physical_page * heads + head_idx, mbar_addr);
+        }
+        return;
     }
-    return init_qkv_tmap(v_tmap, v, batch_heads, key_len, head_dim, tile_kv);
+
+    // Every participating lane attaches its preceding LDGSTS operations to
+    // the stage barrier.  Wg16 uses two full warps; Wg12 adds half of the
+    // otherwise idle Q-prologue warp to each of its independent K/V streams.
+    for (int item = copy_thread; item < TileKV * (HeadDim / 8); item += copy_threads) {
+        const int row = item / (HeadDim / 8);
+        const int d8 = item % (HeadDim / 8);
+        const int token = kv_tile * TileKV + row;
+        const int logical_page = min(token / page_size, (key_len - 1) / page_size);
+        const int page_row = token % page_size;
+        const int physical_page = block_table[batch_idx * block_table_stride + logical_page];
+        const auto *src = gmem +
+            ((physical_page * heads + head_idx) * page_size + page_row) * HeadDim + d8 * 8;
+        const int logical_byte = ((d8 / 8) * TileKV * 64 + row * 64 + (d8 % 8) * 8) *
+            sizeof(__nv_bfloat16);
+        const int swizzled_byte = logical_byte ^ ((logical_byte >> 3) & 0x70);
+        ldgsts_16b(dst + swizzled_byte, src);
+    }
+    ldgsts_mbarrier_arrive_noinc(mbar_addr);
 }
 
 // A CTA owns two independent Q tiles for one head.  K/V are shared between
@@ -559,17 +621,36 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
     const __grid_constant__ CUtensorMap k_tmap,
     const __grid_constant__ CUtensorMap v_tmap,
     const __grid_constant__ CUtensorMap out_tmap,
+    const __nv_bfloat16 *k_gmem,
+    const __nv_bfloat16 *v_gmem,
     int batch,
     int heads,
     int query_len,
     int key_len,
     float scale,
-    bool causal) {
+    bool causal,
+    const int32_t *block_table,
+    int block_table_stride,
+    int page_size,
+    const int32_t *cu_seqlens_q,
+    const int32_t *kv_seqlens) {
     static_assert(TileQ == 128, "the FA MHA kernel currently supports TileQ=128 only");
     static_assert(TileKV > 0, "attention tiles must be positive");
     static_assert(QSlots == 2, "the FA MHA mainloop currently supports two Q slots");
     static_assert(KvStages == 2, "the K/V mainloop currently uses two stages");
     static_assert(HeadDim == 128, "the FA MHA kernel currently supports HeadDim=128 only");
+
+    const int q_pair_count = (query_len + QSlots * TileQ - 1) / (QSlots * TileQ);
+    const int task_id = blockIdx.x;
+    const int bh = task_id / q_pair_count;
+    const int batch_idx = bh / heads;
+    const int head_idx = bh % heads;
+    const int q_pair_idx = task_id % q_pair_count;
+    const int q_offset = cu_seqlens_q ? cu_seqlens_q[batch_idx] : 0;
+    const int local_query_len = cu_seqlens_q
+        ? cu_seqlens_q[batch_idx + 1] - q_offset : query_len;
+    if (q_pair_idx * QSlots * TileQ >= local_query_len) return;
+    const int local_key_len = kv_seqlens ? kv_seqlens[batch_idx] : key_len;
 
     // P and alpha use exp2((raw_score - raw_m) * scale * log2(e)).
     const float scale_log2e = scale * 1.4426950408889634f;
@@ -649,6 +730,8 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
     // Follow the BF16 GEMM setup pattern: one thread initializes every
     // barrier slot, publishes the initialization, then the CTA synchronizes.
     if (tid == 0) {
+        const int kv_load_arrivals =
+            page_size == 128 ? kTmaMbarArrivalCount : 2 * kWarpSize;
         for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
             mbarrier_init(q_prologue_mbar_base + q_slot * sizeof(uint64_t),
                 kQPrologueMbarArrivalCount);
@@ -661,8 +744,8 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
         }
         for (int stage = 0; stage < KvStages; ++stage) {
             const int offset = stage * sizeof(uint64_t);
-            mbarrier_init(tma1_mbar_base + offset, kTmaMbarArrivalCount);
-            mbarrier_init(tma2_mbar_base + offset, kTmaMbarArrivalCount);
+            mbarrier_init(tma1_mbar_base + offset, kv_load_arrivals);
+            mbarrier_init(tma2_mbar_base + offset, kv_load_arrivals);
             for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
                 const int q_offset = (q_slot * KvStages + stage) * sizeof(uint64_t);
                 mbarrier_init(mma1_mbar_base + q_offset, kMmaMbarArrivalCount);
@@ -711,22 +794,13 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
     const int tmem_addr = mma_tmem_addr[0];
 
     // Launch assigns exactly one adjacent Q-tile pair to each CTA.
-    const int q_tile_count = (query_len + TileQ - 1) / TileQ;
-    const int q_pair_count = (q_tile_count + QSlots - 1) / QSlots;
-    const int total_task_count = q_pair_count * batch * heads;
-    const int task_id = blockIdx.x;
-    if (task_id >= total_task_count) {
-        return;
-    }
-    const int kv_tile_count = (key_len + TileKV - 1) / TileKV;
-    const int bh = task_id / q_pair_count;
-    const int q_pair_idx = task_id - bh * q_pair_count;
+    const int kv_tile_count = (local_key_len + TileKV - 1) / TileKV;
     const int q_tile_start[QSlots] = {
         (q_pair_idx * QSlots + 0) * TileQ,
         (q_pair_idx * QSlots + 1) * TileQ,
     };
     const int q_pair_end =
-        q_tile_start[1] + TileQ < query_len ? q_tile_start[1] + TileQ : query_len;
+        q_tile_start[1] + TileQ < local_query_len ? q_tile_start[1] + TileQ : local_query_len;
     const int task_kv_tile_count = causal ? ((q_pair_end + TileKV - 1) / TileKV < kv_tile_count
                                                     ? (q_pair_end + TileKV - 1) / TileKV
                                                     : kv_tile_count)
@@ -768,24 +842,24 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
             mbarrier_wait(mma1_addr, softmax_mma1_phase[stage]);
             softmax_mma1_phase[stage] ^= 1;
 
-            const bool valid_q_row = q_row < query_len;
+            const bool valid_q_row = q_row < local_query_len;
             const int s_tmem_addr = tmem_addr + kSBankBase + q_slot * mma_tmem_columns_per_stage;
-            const int mask_q_row = causal ? q_row : key_len - 1;
+            const int mask_q_row = causal ? q_row : local_key_len - 1;
             // Select uniformly across the warp: the earliest row must see
             // the entire KV tile and all 32 query rows must be in bounds.
             const bool all_scores_valid =
-                q_tile_start[q_slot] + row_base + kWarpSize <= query_len &&
-                (kv_tile + 1) * TileKV <= key_len &&
+                q_tile_start[q_slot] + row_base + kWarpSize <= local_query_len &&
+                (kv_tile + 1) * TileKV <= local_key_len &&
                 (!causal || (kv_tile + 1) * TileKV - 1 <= q_tile_start[q_slot] + row_base);
             const SoftmaxUpdate softmax = all_scores_valid
                 ? load_s_and_store_p_chunked<true>(
-                    s_tmem_addr + (row_base << 16), kv_tile * TileKV, key_len,
+                    s_tmem_addr + (row_base << 16), kv_tile * TileKV, local_key_len,
                     mask_q_row, valid_q_row, scale, tilem, tilel,
                     kConditionalRescaleThresholdLn, scale_log2e)
                 : load_s_and_store_p_chunked<false>(
                 s_tmem_addr + (row_base << 16),
                 kv_tile * TileKV,
-                key_len,
+                local_key_len,
                 mask_q_row,
                 valid_q_row,
                 scale,
@@ -860,7 +934,7 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
         mbarrier_wait(epilogue_mbar_addr, 0);
         for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
             const int q_row = q_tile_start[q_slot] + row;
-            const bool valid_q_row = q_row < query_len;
+            const bool valid_q_row = q_row < local_query_len;
             const float inv_l = valid_q_row ? 1.0f / final_l[q_slot] : 0.0f;
             const int o_tmem_addr =
                 tmem_addr + kOBankBase + q_slot * mma_tmem_columns_per_stage;
@@ -901,12 +975,14 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
         return;
     }
 
-    // WG0 releases registers before its three driver roles diverge. Warp 3
-    // intentionally stays idle, but participates in this warpgroup-uniform
-    // redistribution instruction.
+    // WG0 releases registers before its three driver roles diverge.  For
+    // paged LDGSTS, the formerly idle warp 3 joins warp 0 as a 64-thread
+    // gather team; it remains idle for the page-sized TMA path.
     setmaxnreg_decrease<32>();
 
-    if (warp_idx == kIdleWarp) {
+    const bool ldgsts_load_team = page_size < 128 &&
+        (warp_idx == kTmaLoadWarp || warp_idx == kIdleWarp);
+    if (warp_idx == kIdleWarp && !ldgsts_load_team) {
         return;
     }
 
@@ -914,8 +990,10 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
     // loads K, waits until both QK operations release the aliased stage, then
     // overwrites that stage with V. Before ring reuse, both prior PV users
     // must have completed.
-    if (warp_idx == kTmaLoadWarp) {
-        if (lane_idx == 0) {
+    if (warp_idx == kTmaLoadWarp || ldgsts_load_team) {
+        const bool is_load_leader = warp_idx == kTmaLoadWarp && lane_idx == 0;
+        const int copy_thread = warp_idx == kTmaLoadWarp ? lane_idx : kWarpSize + lane_idx;
+        if (is_load_leader) {
             const int q_transaction_bytes = TileQ * HeadDim * sizeof(__nv_bfloat16);
             for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
                 const int q_mbar_addr = q_prologue_mbar_base + q_slot * sizeof(uint64_t);
@@ -928,83 +1006,87 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
                 tma_4d_gmem2smem(q_smem_addr + q_slot * TileQ * HeadDim * sizeof(__nv_bfloat16),
                     &q_tmap,
                     0,
-                    q_tile_start[q_slot],
+                    q_offset + q_tile_start[q_slot],
                     0,
-                    bh,
+                    cu_seqlens_q ? head_idx : bh,
                     q_transaction_mbar_addr);
             }
-            const int transaction_bytes = TileKV * HeadDim * sizeof(__nv_bfloat16);
-            // Fill both K stages before waiting for QK. This lets K(i + 1)
-            // transfer while the tensor core and softmax pipeline consume i.
-            const int k_prologue_tiles =
-                task_kv_tile_count < KvStages ? task_kv_tile_count : KvStages;
-            for (int kv_tile = 0; kv_tile < k_prologue_tiles; ++kv_tile) {
-                const int stage = kv_tile;
-                const int k_addr = tma1_mbar_base + stage * sizeof(uint64_t);
-                const int k_tx_addr = k_addr & 0xFEFFFFFF;
-                asm volatile(
-                    "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;" ::"r"(
-                        k_tx_addr),
-                    "r"(transaction_bytes)
-                    : "memory");
-                tma_4d_gmem2smem(kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16),
-                    &k_tmap,
-                    0,
-                    kv_tile * TileKV,
-                    0,
-                    bh,
-                    k_tx_addr);
+        }
+        if (page_size == 128) {
+            __syncwarp();
+        } else {
+            producer_sync<15>(2 * kWarpSize);
+        }
+        const int transaction_bytes = TileKV * HeadDim * sizeof(__nv_bfloat16);
+        const int k_prologue_tiles = task_kv_tile_count < KvStages ? task_kv_tile_count : KvStages;
+        for (int kv_tile = 0; kv_tile < k_prologue_tiles; ++kv_tile) {
+            const int stage = kv_tile;
+            const int k_tx_addr = (tma1_mbar_base + stage * sizeof(uint64_t)) & 0xFEFFFFFF;
+            if (is_load_leader) begin_kv_load(k_tx_addr, transaction_bytes, page_size);
+            if (page_size == 128) {
+                __syncwarp();
+            } else {
+                producer_sync<15>(2 * kWarpSize);
             }
-
-            for (int kv_tile = 0; kv_tile < task_kv_tile_count; ++kv_tile) {
-                const int stage = kv_tile % KvStages;
-                const int mma1_phase = (kv_tile / KvStages) & 1;
-                for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
-                    const int addr =
-                        mma1_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t);
-                    mbarrier_wait(addr, mma1_phase);
+            load_kv_tile<TileKV, HeadDim>(kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16),
+                &k_tmap, k_gmem, page_size, kv_tile, batch_idx, head_idx, heads, local_key_len,
+                block_table, block_table_stride, k_tx_addr, copy_thread, 2 * kWarpSize);
+            if (page_size == 128) {
+                __syncwarp();
+            } else {
+                producer_sync<15>(2 * kWarpSize);
+            }
+        }
+        for (int kv_tile = 0; kv_tile < task_kv_tile_count; ++kv_tile) {
+            const int stage = kv_tile % KvStages;
+            const int mma1_phase = (kv_tile / KvStages) & 1;
+            if (is_load_leader) for (int q_slot = 0; q_slot < QSlots; ++q_slot)
+                mbarrier_wait(mma1_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t), mma1_phase);
+            if (page_size == 128) {
+                __syncwarp();
+            } else {
+                producer_sync<15>(2 * kWarpSize);
+            }
+            const int v_tx_addr = (tma2_mbar_base + stage * sizeof(uint64_t)) & 0xFEFFFFFF;
+            if (is_load_leader) begin_kv_load(v_tx_addr, transaction_bytes, page_size);
+            if (page_size == 128) {
+                __syncwarp();
+            } else {
+                producer_sync<15>(2 * kWarpSize);
+            }
+            load_kv_tile<TileKV, HeadDim>(kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16),
+                &v_tmap, v_gmem, page_size, kv_tile, batch_idx, head_idx, heads, local_key_len,
+                block_table, block_table_stride, v_tx_addr, copy_thread, 2 * kWarpSize);
+            if (page_size == 128) {
+                __syncwarp();
+            } else {
+                producer_sync<15>(2 * kWarpSize);
+            }
+            const int next_k_tile = kv_tile + KvStages;
+            if (next_k_tile < task_kv_tile_count) {
+                const int recycle_phase = (kv_tile / KvStages) & 1;
+                if (is_load_leader) for (int q_slot = 0; q_slot < QSlots; ++q_slot)
+                    mbarrier_wait(mma2_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t), recycle_phase);
+                if (page_size == 128) {
+                    __syncwarp();
+                } else {
+                    producer_sync<15>(2 * kWarpSize);
                 }
-                const int v_addr = tma2_mbar_base + stage * sizeof(uint64_t);
-                const int v_tx_addr = v_addr & 0xFEFFFFFF;
-                asm volatile(
-                    "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;" ::"r"(
-                        v_tx_addr),
-                    "r"(transaction_bytes)
-                    : "memory");
-                tma_4d_gmem2smem(kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16),
-                    &v_tmap,
-                    0,
-                    kv_tile * TileKV,
-                    0,
-                    bh,
-                    v_tx_addr);
-
-                // Once both PV consumers release V(i), immediately refill
-                // that stage with K(i + 2). The other K stage was prefetched
-                // already, so the MMA issuer need not wait on this recycle.
-                const int next_k_tile = kv_tile + KvStages;
-                if (next_k_tile < task_kv_tile_count) {
-                    const int recycle_phase = (kv_tile / KvStages) & 1;
-                    for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
-                        const int addr =
-                            mma2_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t);
-                        mbarrier_wait(addr, recycle_phase);
-                    }
-                    const int next_k_addr = tma1_mbar_base + stage * sizeof(uint64_t);
-                    const int next_k_tx_addr = next_k_addr & 0xFEFFFFFF;
-                    asm volatile(
-                        "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;" ::
-                            "r"(next_k_tx_addr),
-                            "r"(transaction_bytes)
-                        : "memory");
-                    tma_4d_gmem2smem(
-                        kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16),
-                        &k_tmap,
-                        0,
-                        next_k_tile * TileKV,
-                        0,
-                        bh,
-                        next_k_tx_addr);
+                const int next_k_tx_addr = (tma1_mbar_base + stage * sizeof(uint64_t)) & 0xFEFFFFFF;
+                if (is_load_leader) begin_kv_load(next_k_tx_addr, transaction_bytes, page_size);
+                if (page_size == 128) {
+                    __syncwarp();
+                } else {
+                    producer_sync<15>(2 * kWarpSize);
+                }
+                load_kv_tile<TileKV, HeadDim>(kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16),
+                    &k_tmap, k_gmem, page_size, next_k_tile, batch_idx, head_idx, heads,
+                    local_key_len, block_table, block_table_stride, next_k_tx_addr, copy_thread,
+                    2 * kWarpSize);
+                if (page_size == 128) {
+                    __syncwarp();
+                } else {
+                    producer_sync<15>(2 * kWarpSize);
                 }
             }
         }
@@ -1019,9 +1101,9 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
                     out_smem_addr + q_slot * TileQ * HeadDim * sizeof(__nv_bfloat16),
                     &out_tmap,
                     0,
-                    q_tile_start[q_slot],
+                    q_offset + q_tile_start[q_slot],
                     0,
-                    bh);
+                    cu_seqlens_q ? head_idx : bh);
                 tma_store_commit_group();
             }
             asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
@@ -3304,17 +3386,36 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
     const __grid_constant__ CUtensorMap k_tmap,
     const __grid_constant__ CUtensorMap v_tmap,
     __nv_bfloat16 *__restrict__ out,
+    const __nv_bfloat16 *k_gmem,
+    const __nv_bfloat16 *v_gmem,
     int batch,
     int heads,
     int query_len,
     int key_len,
     float scale,
-    bool causal) {
+    bool causal,
+    const int32_t *block_table,
+    int block_table_stride,
+    int page_size,
+    const int32_t *cu_seqlens_q,
+    const int32_t *kv_seqlens) {
     static_assert(TileQ == 128, "the FA MHA kernel currently supports TileQ=128 only");
     static_assert(TileKV > 0, "attention tiles must be positive");
     static_assert(QSlots == 2, "the FA MHA mainloop currently supports two Q slots");
     static_assert(KvStages == 2, "the K/V mainloop currently uses two stages");
     static_assert(HeadDim == 128, "the FA MHA kernel currently supports HeadDim=128 only");
+
+    const int q_pair_count = (query_len + QSlots * TileQ - 1) / (QSlots * TileQ);
+    const int task_id = blockIdx.x;
+    const int bh = task_id / q_pair_count;
+    const int batch_idx = bh / heads;
+    const int head_idx = bh % heads;
+    const int q_pair_idx = task_id % q_pair_count;
+    const int q_offset = cu_seqlens_q ? cu_seqlens_q[batch_idx] : 0;
+    const int local_query_len = cu_seqlens_q
+        ? cu_seqlens_q[batch_idx + 1] - q_offset : query_len;
+    if (q_pair_idx * QSlots * TileQ >= local_query_len) return;
+    const int local_key_len = kv_seqlens ? kv_seqlens[batch_idx] : key_len;
 
     // P and alpha use exp2((raw_score - raw_m) * scale * log2(e)).
     const float scale_log2e = scale * 1.4426950408889634f;
@@ -3341,6 +3442,11 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
     __shared__ __align__(8) uint64_t epilogue_mbar[1];
     __shared__ __align__(8) uint64_t tmem_release_mbar[1];
     __shared__ __align__(4) int mma_tmem_addr[1];
+    // Warp 3 is split between K and V only for sub-page LDGSTS.  Each half
+    // waits for its owning producer to pass the stage-reuse dependency before
+    // contributing copies for the next generation.
+    __shared__ __align__(4) int k_ldgsts_generation[1];
+    __shared__ __align__(4) int v_ldgsts_generation[1];
 
     constexpr int kWarpSize = 32;
     // CTA role assignment (12 warps = 384 threads).  Each rescale warpgroup
@@ -3379,6 +3485,9 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
     // Follow the BF16 GEMM setup pattern: one thread initializes every
     // barrier slot, publishes the initialization, then the CTA synchronizes.
     if (tid == 0) {
+        // LDGSTS uses warp 0 plus the lower half of warp 3 for K, and warp 1
+        // plus the upper half of warp 3 for V.
+        const int kv_load_arrivals = page_size == 128 ? kTmaMbarArrivalCount : 48;
         for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
             mbarrier_init(q_prologue_mbar_base + q_slot * sizeof(uint64_t),
                 kQPrologueMbarArrivalCount);
@@ -3387,8 +3496,8 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
         mbarrier_init(tmem_release_mbar_addr, kTmemReleaseMbarArrivalCount);
         for (int stage = 0; stage < KvStages; ++stage) {
             const int offset = stage * sizeof(uint64_t);
-            mbarrier_init(tma1_mbar_base + offset, kTmaMbarArrivalCount);
-            mbarrier_init(tma2_mbar_base + offset, kTmaMbarArrivalCount);
+            mbarrier_init(tma1_mbar_base + offset, kv_load_arrivals);
+            mbarrier_init(tma2_mbar_base + offset, kv_load_arrivals);
             for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
                 const int q_offset = (q_slot * KvStages + stage) * sizeof(uint64_t);
                 mbarrier_init(mma1_mbar_base + q_offset, kMmaMbarArrivalCount);
@@ -3396,6 +3505,8 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
                 mbarrier_init(rescale_mbar_base + q_offset, kRescaleMbarArrivalCount);
             }
         }
+        k_ldgsts_generation[0] = 0;
+        v_ldgsts_generation[0] = 0;
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     if (warp_idx == kQPrologueWarp && lane_idx == 0) {
@@ -3413,22 +3524,13 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
     // before TMEM allocation.  The MMA warp still waits on those barriers
     // before issuing the first QK operation.
     const int q_smem_addr = static_cast<int>(__cvta_generic_to_shared(q_smem));
-    const int q_tile_count = (query_len + TileQ - 1) / TileQ;
-    const int q_pair_count = (q_tile_count + QSlots - 1) / QSlots;
-    const int total_task_count = q_pair_count * batch * heads;
-    const int task_id = blockIdx.x;
-    if (task_id >= total_task_count) {
-        return;
-    }
-    const int kv_tile_count = (key_len + TileKV - 1) / TileKV;
-    const int bh = task_id / q_pair_count;
-    const int q_pair_idx = task_id - bh * q_pair_count;
+    const int kv_tile_count = (local_key_len + TileKV - 1) / TileKV;
     const int q_tile_start[QSlots] = {
         (q_pair_idx * QSlots + 0) * TileQ,
         (q_pair_idx * QSlots + 1) * TileQ,
     };
     const int q_pair_end =
-        q_tile_start[1] + TileQ < query_len ? q_tile_start[1] + TileQ : query_len;
+        q_tile_start[1] + TileQ < local_query_len ? q_tile_start[1] + TileQ : local_query_len;
     const int task_kv_tile_count = causal ? ((q_pair_end + TileKV - 1) / TileKV < kv_tile_count
                                                     ? (q_pair_end + TileKV - 1) / TileKV
                                                     : kv_tile_count)
@@ -3446,9 +3548,9 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
             tma_4d_gmem2smem(q_smem_addr + q_slot * TileQ * HeadDim * sizeof(__nv_bfloat16),
                 &q_tmap,
                 0,
-                q_tile_start[q_slot],
+                q_offset + q_tile_start[q_slot],
                 0,
-                bh,
+                cu_seqlens_q ? head_idx : bh,
                 q_transaction_mbar_addr);
         }
     }
@@ -3513,17 +3615,17 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
             mbarrier_wait(mma1_addr, rescale_mma1_phase[stage]);
             rescale_mma1_phase[stage] ^= 1;
 
-            const bool valid_q_row = q_row < query_len;
+            const bool valid_q_row = q_row < local_query_len;
             const int s_tmem_addr = tmem_addr + kSBankBase + q_slot * mma_tmem_columns_per_stage;
-            const int mask_q_row = causal ? q_row : key_len - 1;
+            const int mask_q_row = causal ? q_row : local_key_len - 1;
             // The hardware reduction is correct only if all 128 S values
             // belong to this row's attention domain.  The diagonal causal
             // tile and the final KV tail remain on the masked scalar-max path.
-            const bool all_scores_valid = valid_q_row && (kv_tile + 1) * TileKV <= key_len &&
+            const bool all_scores_valid = valid_q_row && (kv_tile + 1) * TileKV <= local_key_len &&
                                           (kv_tile + 1) * TileKV <= mask_q_row + 1;
             const SoftmaxUpdate softmax = load_s_and_store_p_ptx(s_tmem_addr + (row_base << 16),
                 kv_tile * TileKV,
-                key_len,
+                local_key_len,
                 mask_q_row,
                 valid_q_row,
                 scale,
@@ -3561,9 +3663,11 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
 
         mbarrier_wait(epilogue_mbar_addr, epilogue_phase);
         epilogue_phase ^= 1;
-        const bool epilogue_valid_q_row = q_row < query_len;
+        const bool epilogue_valid_q_row = q_row < local_query_len;
         const float inv_l = epilogue_valid_q_row ? 1.0f / tilel : 0.0f;
-        const int out_base = epilogue_valid_q_row ? (bh * query_len + q_row) * HeadDim : 0;
+        const int out_base = epilogue_valid_q_row
+            ? (cu_seqlens_q ? ((q_offset + q_row) * heads + head_idx) * HeadDim
+                            : (bh * query_len + q_row) * HeadDim) : 0;
         const int o_tmem_addr = tmem_addr + kOBankBase + q_slot * mma_tmem_columns_per_stage;
         for (int d8 = 0; d8 < HeadDim / 8; ++d8) {
             float o_fragment[8];
@@ -3591,88 +3695,97 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
     // WG0 releases registers before its four permanent driver roles diverge.
     setmaxnreg_decrease<80>();
 
-    // The Q TMA requests were issued before TMEM allocation.
-    if (warp_idx == kQPrologueWarp) {
+    // The Q TMA requests were issued before TMEM allocation.  On the LDGSTS
+    // path, split this otherwise idle warp: lanes 0-15 help K, lanes 16-31
+    // help V.  Each stream has a separate named barrier.
+    if (warp_idx == kQPrologueWarp && page_size == 128) {
         return;
     }
 
     // K producer: stage may be overwritten only after PV has consumed it
     // for *both* Q slots, hence the two mma2 waits on ring reuse.
-    if (warp_idx == kKTmaWarp) {
+    const bool k_ldgsts_helper = page_size < 128 && warp_idx == kQPrologueWarp && lane_idx < 16;
+    if (warp_idx == kKTmaWarp || k_ldgsts_helper) {
+        const bool k_leader = warp_idx == kKTmaWarp && lane_idx == 0;
+        const int k_copy_thread = warp_idx == kKTmaWarp ? lane_idx : kWarpSize + lane_idx;
         int k_recycle_phase[QSlots][KvStages] = {};
         bool k_slot_initialized[KvStages] = {};
-        if (lane_idx == 0) {
-            for (int kv_tile = 0; kv_tile < task_kv_tile_count; ++kv_tile) {
-                const int stage = kv_tile % KvStages;
-                if (k_slot_initialized[stage]) {
-                    for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
-                        const int addr =
-                            mma2_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t);
-                        mbarrier_wait(addr, k_recycle_phase[q_slot][stage]);
-                        k_recycle_phase[q_slot][stage] ^= 1;
+        const int transaction_bytes = TileKV * HeadDim * sizeof(__nv_bfloat16);
+        for (int kv_tile = 0; kv_tile < task_kv_tile_count; ++kv_tile) {
+            const int stage = kv_tile % KvStages;
+            if (k_slot_initialized[stage]) {
+                if (k_leader) for (int q_slot = 0; q_slot < QSlots; ++q_slot)
+                    mbarrier_wait(mma2_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t),
+                        k_recycle_phase[q_slot][stage]);
+                for (int q_slot = 0; q_slot < QSlots; ++q_slot)
+                    k_recycle_phase[q_slot][stage] ^= 1;
+            }
+            const int tx_addr = (tma1_mbar_base + stage * sizeof(uint64_t)) & 0xFEFFFFFF;
+            if (k_leader) begin_kv_load(tx_addr, transaction_bytes, page_size);
+            if (page_size < 128) {
+                if (k_leader) {
+                    __threadfence_block();
+                    atomicExch(k_ldgsts_generation, kv_tile + 1);
+                } else {
+                    while (atomicAdd(k_ldgsts_generation, 0) < kv_tile + 1) {
                     }
                 }
-                const int addr = tma1_mbar_base + stage * sizeof(uint64_t);
-                const int tx_addr = addr & 0xFEFFFFFF;
-                const int transaction_bytes = TileKV * HeadDim * sizeof(__nv_bfloat16);
-                asm volatile(
-                    "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;" ::"r"(
-                        tx_addr),
-                    "r"(transaction_bytes)
-                    : "memory");
-                tma_4d_gmem2smem(kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16),
-                    &k_tmap,
-                    0,
-                    kv_tile * TileKV,
-                    0,
-                    bh,
-                    tx_addr);
-                k_slot_initialized[stage] = true;
+            } else {
+                __syncwarp();
             }
+            load_kv_tile<TileKV, HeadDim>(
+                kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16),
+                &k_tmap, k_gmem, page_size, kv_tile, batch_idx, head_idx, heads, local_key_len,
+                block_table, block_table_stride, tx_addr, k_copy_thread,
+                page_size == 128 ? kWarpSize : 48);
+            if (page_size == 128) __syncwarp();
+            k_slot_initialized[stage] = true;
         }
         return;
     }
 
     // V producer: QK must finish before V overwrites the stage (mma1), and
     // the prior PV must finish before a reused V stage is overwritten.
-    if (warp_idx == kVTmaWarp) {
+    const bool v_ldgsts_helper = page_size < 128 && warp_idx == kQPrologueWarp && lane_idx >= 16;
+    if (warp_idx == kVTmaWarp || v_ldgsts_helper) {
+        const bool v_leader = warp_idx == kVTmaWarp && lane_idx == 0;
+        const int v_copy_thread = warp_idx == kVTmaWarp ? lane_idx : kWarpSize + lane_idx - 16;
         int v_mma1_phase[QSlots][KvStages] = {};
         int v_recycle_phase[QSlots][KvStages] = {};
         bool v_slot_initialized[KvStages] = {};
-        if (lane_idx == 0) {
-            for (int kv_tile = 0; kv_tile < task_kv_tile_count; ++kv_tile) {
-                const int stage = kv_tile % KvStages;
-                for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
-                    const int addr =
-                        mma1_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t);
-                    mbarrier_wait(addr, v_mma1_phase[q_slot][stage]);
-                    v_mma1_phase[q_slot][stage] ^= 1;
-                }
-                if (v_slot_initialized[stage]) {
-                    for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
-                        const int addr =
-                            mma2_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t);
-                        mbarrier_wait(addr, v_recycle_phase[q_slot][stage]);
-                        v_recycle_phase[q_slot][stage] ^= 1;
+        const int transaction_bytes = TileKV * HeadDim * sizeof(__nv_bfloat16);
+        for (int kv_tile = 0; kv_tile < task_kv_tile_count; ++kv_tile) {
+            const int stage = kv_tile % KvStages;
+            if (v_leader) for (int q_slot = 0; q_slot < QSlots; ++q_slot)
+                mbarrier_wait(mma1_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t),
+                    v_mma1_phase[q_slot][stage]);
+            for (int q_slot = 0; q_slot < QSlots; ++q_slot) v_mma1_phase[q_slot][stage] ^= 1;
+            if (v_slot_initialized[stage]) {
+                if (v_leader) for (int q_slot = 0; q_slot < QSlots; ++q_slot)
+                    mbarrier_wait(mma2_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t),
+                        v_recycle_phase[q_slot][stage]);
+                for (int q_slot = 0; q_slot < QSlots; ++q_slot) v_recycle_phase[q_slot][stage] ^= 1;
+            }
+            const int tx_addr = (tma2_mbar_base + stage * sizeof(uint64_t)) & 0xFEFFFFFF;
+            if (v_leader) begin_kv_load(tx_addr, transaction_bytes, page_size);
+            if (page_size < 128) {
+                if (v_leader) {
+                    __threadfence_block();
+                    atomicExch(v_ldgsts_generation, kv_tile + 1);
+                } else {
+                    while (atomicAdd(v_ldgsts_generation, 0) < kv_tile + 1) {
                     }
                 }
-                const int addr = tma2_mbar_base + stage * sizeof(uint64_t);
-                const int tx_addr = addr & 0xFEFFFFFF;
-                const int transaction_bytes = TileKV * HeadDim * sizeof(__nv_bfloat16);
-                asm volatile(
-                    "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;" ::"r"(
-                        tx_addr),
-                    "r"(transaction_bytes)
-                    : "memory");
-                tma_4d_gmem2smem(kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16),
-                    &v_tmap,
-                    0,
-                    kv_tile * TileKV,
-                    0,
-                    bh,
-                    tx_addr);
-                v_slot_initialized[stage] = true;
+            } else {
+                __syncwarp();
             }
+            load_kv_tile<TileKV, HeadDim>(
+                kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16),
+                &v_tmap, v_gmem, page_size, kv_tile, batch_idx, head_idx, heads, local_key_len,
+                block_table, block_table_stride, tx_addr, v_copy_thread,
+                page_size == 128 ? kWarpSize : 48);
+            if (page_size == 128) __syncwarp();
+            v_slot_initialized[stage] = true;
         }
         return;
     }
@@ -3850,6 +3963,13 @@ cudaError_t bf16_fa4_mha_launch_impl(
     int head_dim,
     float scale,
     bool causal,
+    const int32_t *block_table,
+    int block_table_stride,
+    int num_pages,
+    int page_size,
+    const int32_t *cu_seqlens_q,
+    int total_q,
+    const int32_t *kv_seqlens,
     cudaStream_t stream) {
     constexpr int kTileQ = 128;
     constexpr int kTileKV = 128;
@@ -3857,25 +3977,35 @@ cudaError_t bf16_fa4_mha_launch_impl(
     constexpr int kKvStages = 2;
     constexpr int kHeadDim = 128;
     // S0/S1 plus long-lived O0/O1 consume all 512 available TMEM columns.
-    if (head_dim != kHeadDim) {
+    if (head_dim != kHeadDim || block_table == nullptr || kv_seqlens == nullptr ||
+        num_pages <= 0 || page_size <= 0 || page_size > kTileKV ||
+        kTileKV % page_size != 0 || block_table_stride < (key_len + page_size - 1) / page_size) {
         return cudaErrorInvalidValue;
+    }
+    // The 16-warp epilogue uses a TMA store whose tail mask is global to the
+    // packed tensor. The 12-warp epilogue masks each batch's local Q length.
+    if constexpr (kTactic == kFaMhaTactic16Warp) {
+        if (cu_seqlens_q) {
+            return bf16_fa4_mha_launch_impl<kFaMhaTactic12Warp>(q, k, v, out,
+                batch, heads, query_len, key_len, head_dim, scale, causal,
+                block_table, block_table_stride, num_pages, page_size, cu_seqlens_q,
+                total_q, kv_seqlens, stream);
+        }
     }
 
     CUtensorMap q_tmap{};
     CUtensorMap k_tmap{};
     CUtensorMap v_tmap{};
-    cudaError_t status = init_qkv_tmaps(&q_tmap,
-        &k_tmap,
-        &v_tmap,
-        q,
-        k,
-        v,
-        batch * heads,
-        query_len,
-        key_len,
-        head_dim,
-        kTileQ,
-        kTileKV);
+    cudaError_t status = cu_seqlens_q
+        ? init_strided_mha_tmap(&q_tmap, q, total_q, heads, head_dim,
+              kTileQ, heads * head_dim, head_dim)
+        : init_qkv_tmap(&q_tmap, q, batch * heads, query_len, head_dim, kTileQ);
+    if (status != cudaSuccess) return status;
+    status = init_strided_mha_tmap(&k_tmap, k, page_size, num_pages * heads,
+        head_dim, page_size, head_dim, page_size * head_dim, 1);
+    if (status != cudaSuccess) return status;
+    status = init_strided_mha_tmap(&v_tmap, v, page_size, num_pages * heads,
+        head_dim, page_size, head_dim, page_size * head_dim, 1);
     if (status != cudaSuccess) {
         return status;
     }
@@ -3909,12 +4039,15 @@ cudaError_t bf16_fa4_mha_launch_impl(
                 k_tmap,
                 v_tmap,
                 out,
+                k,
+                v,
                 batch,
                 heads,
                 query_len,
                 key_len,
                 scale,
-                causal);
+                causal,
+                block_table, block_table_stride, page_size, cu_seqlens_q, kv_seqlens);
         return cudaGetLastError();
     } else {
         CUtensorMap out_tmap{};
@@ -3946,12 +4079,15 @@ cudaError_t bf16_fa4_mha_launch_impl(
                 k_tmap,
                 v_tmap,
                 out_tmap,
+                k,
+                v,
                 batch,
                 heads,
                 query_len,
                 key_len,
                 scale,
-                causal);
+                causal,
+                block_table, block_table_stride, page_size, cu_seqlens_q, kv_seqlens);
         return cudaGetLastError();
     }
 }
@@ -3968,9 +4104,18 @@ cudaError_t bf16_fa4_mha_cuda(
     int head_dim,
     float scale,
     bool causal,
+    const int32_t *block_table,
+    int block_table_stride,
+    int num_pages,
+    int page_size,
+    const int32_t *cu_seqlens_q,
+    int total_q,
+    const int32_t *kv_seqlens,
     cudaStream_t stream) {
     return bf16_fa4_mha_launch_impl<SM110A_FA4_MHA_TACTIC>(
-        q, k, v, out, batch, heads, query_len, key_len, head_dim, scale, causal, stream);
+        q, k, v, out, batch, heads, query_len, key_len, head_dim, scale, causal,
+        block_table, block_table_stride, num_pages, page_size, cu_seqlens_q, total_q,
+        kv_seqlens, stream);
 }
 
 // Entry point resolved by the split JIT binding (sm110a_kernel.jit_runtime).
@@ -3987,7 +4132,16 @@ extern "C" cudaError_t sm110a_bf16_fa4_mha_launch(
     int head_dim,
     float scale,
     bool causal,
+    const int32_t *block_table,
+    int block_table_stride,
+    int num_pages,
+    int page_size,
+    const int32_t *cu_seqlens_q,
+    int total_q,
+    const int32_t *kv_seqlens,
     cudaStream_t stream) {
     return bf16_fa4_mha_cuda(
-        q, k, v, out, batch, heads, query_len, key_len, head_dim, scale, causal, stream);
+        q, k, v, out, batch, heads, query_len, key_len, head_dim, scale, causal,
+        block_table, block_table_stride, num_pages, page_size, cu_seqlens_q, total_q,
+        kv_seqlens, stream);
 }

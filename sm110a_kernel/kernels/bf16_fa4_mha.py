@@ -55,11 +55,19 @@ class Bf16Fa4MhaModule:
     def __init__(self, binding, library, config: Bf16Fa4MhaConfig):
         self._binding, self._launcher, self._config = binding, library.entry_address, config
 
-    def fa_mha(self, q, k, v, causal=False, scale=1.0):
-        return self._binding.fa_mha(q, k, v, self._launcher, bool(causal), scale)
+    def fa_mha(self, q, k, v, causal=False, scale=1.0,
+               block_table=None, cu_seqlens_q=None, kv_seqlens=None,
+               max_q_len=0, max_kv_len=0):
+        return self._binding.fa_mha(q, k, v, self._launcher, bool(causal), scale,
+                                    block_table, cu_seqlens_q, kv_seqlens,
+                                    max_q_len, max_kv_len)
 
-    def fa_mha_out(self, q, k, v, out, causal=False, scale=1.0):
-        return self._binding.fa_mha_out(q, k, v, out, self._launcher, bool(causal), scale)
+    def fa_mha_out(self, q, k, v, out, causal=False, scale=1.0,
+                   block_table=None, cu_seqlens_q=None, kv_seqlens=None,
+                   max_q_len=0, max_kv_len=0):
+        return self._binding.fa_mha_out(q, k, v, out, self._launcher, bool(causal), scale,
+                                        block_table, cu_seqlens_q, kv_seqlens,
+                                        max_q_len, max_kv_len)
 
 
 def _kernel_cflags(config: Bf16Fa4MhaConfig, _variant) -> tuple[str, ...]:
@@ -114,15 +122,28 @@ def _config_for(
     return Bf16Fa4MhaConfig(tactic=tactic)
 
 
-def bf16_fa4_mha(q, k, v, *, causal=False, scale=None, tactic=TACTIC_16WARP):
-    """Compute BF16 MHA for contiguous `[B, H, S, D]` CUDA tensors."""
+def _require_paged(block_table, kv_seqlens, max_kv_len):
+    if block_table is None or kv_seqlens is None or max_kv_len <= 0:
+        raise ValueError("paged KV requires block_table, kv_seqlens, and positive max_kv_len")
+
+
+def bf16_fa4_mha(q, k, v, *, causal=False, scale=None, tactic=TACTIC_16WARP,
+                 block_table=None, cu_seqlens_q=None, kv_seqlens=None,
+                 max_q_len=0, max_kv_len=0):
+    """Compute MHA with K/V pages `[num_pages, H, page_size, D]` (page_size divides 128)."""
+    _require_paged(block_table, kv_seqlens, max_kv_len)
     return compile_bf16_fa4_mha(_config_for(tactic)).fa_mha(
-        q, k, v, bool(causal), _resolve_scale(q, scale)
+        q, k, v, bool(causal), _resolve_scale(q, scale), block_table,
+        cu_seqlens_q, kv_seqlens, max_q_len, max_kv_len
     )
 
 
-def bf16_fa4_mha_out(q, k, v, out, *, causal=False, scale=None, tactic=TACTIC_16WARP):
-    """Write BF16 FA MHA to a caller-provided contiguous output."""
+def bf16_fa4_mha_out(q, k, v, out, *, causal=False, scale=None, tactic=TACTIC_16WARP,
+                     block_table=None, cu_seqlens_q=None, kv_seqlens=None,
+                     max_q_len=0, max_kv_len=0):
+    """Write paged-KV BF16 FA MHA to a caller-provided output."""
+    _require_paged(block_table, kv_seqlens, max_kv_len)
     return compile_bf16_fa4_mha(_config_for(tactic)).fa_mha_out(
-        q, k, v, out, bool(causal), _resolve_scale(q, scale)
+        q, k, v, out, bool(causal), _resolve_scale(q, scale), block_table,
+        cu_seqlens_q, kv_seqlens, max_q_len, max_kv_len
     )
