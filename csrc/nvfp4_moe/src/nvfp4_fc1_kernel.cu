@@ -143,15 +143,19 @@ struct KernelConfig {
     static constexpr int kMainloopSmemBytes = kStageCount * kPerStageSmemBytes;
     static constexpr int kDynamicSmemBytes = kMainloopSmemBytes + kEpilogueSmemBytes;
     static constexpr int kScaleColsPerMma = 4 + 4 * kSFBScaleTileCount;
-    // N=256 cannot keep two accumulator banks alongside every staged scale
-    // fragment.  Reuse one accumulator bank and one scale slot, as the
-    // grouped-M kernel does.  Narrow tiles retain double-buffered TMEM.
-    static constexpr int kTmemStageCount =
-        kClusterN == 1 && kTileN < 256 ? 2 : 1;
+    // CuTE's 2-CTA N=256 path keeps two logical accumulator stages by
+    // aliasing 128 physical TMEM columns. The stage stride is therefore 128,
+    // matching CuTE's C-fragment layout rather than a 256-column double buffer.
+    static constexpr int kAccumulatorOverlapCols =
+        kTileN == 256 && kEpilogueTileN == 128 ? 128 : 0;
+    static constexpr int kTmemStageCount = kClusterN == 1 ? 2 : 1;
+    static constexpr int kAccumulatorStageStride =
+        kTileN - kAccumulatorOverlapCols;
     static constexpr int kScaleTmemSlotCount =
         kTileN < 256 ? kStageCount * kMmaStepsPerStage : 1;
     static constexpr int kScaleTmemCols = kScaleTmemSlotCount * kScaleColsPerMma;
-    static constexpr int kAccumulatorTmemCols = kTileN * kTmemStageCount;
+    static constexpr int kAccumulatorTmemCols =
+        kTileN * kTmemStageCount - kAccumulatorOverlapCols;
     static constexpr int kTmemColumnsNeeded = 512;
     static_assert(kAccumulatorTmemCols + kScaleTmemCols <= kTmemColumnsNeeded);
     // tcgen05.alloc requires a power-of-two column count. In particular,
@@ -937,6 +941,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
     __shared__ uint64_t mma_mbars[kStageCount];
     __shared__ uint64_t mainloop_mbars[kTmemStageCount];
     __shared__ uint64_t epilogue_mbars[kTmemStageCount];
+    __shared__ uint64_t overlap_mbars[kTmemStageCount];
 
     extern __shared__ __align__(1024) char dynamic_smem[];
     const int mainloop_smem = static_cast<int>(__cvta_generic_to_shared(dynamic_smem));
@@ -955,6 +960,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
     const int base_mma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(mma_mbars));
     const int base_mainloop_mbar_addr = static_cast<int>(__cvta_generic_to_shared(mainloop_mbars));
     const int base_epilogue_mbar_addr = static_cast<int>(__cvta_generic_to_shared(epilogue_mbars));
+    const int base_overlap_mbar_addr = static_cast<int>(__cvta_generic_to_shared(overlap_mbars));
 
     if (tid == 0) {
         for (int stage = 0; stage < kStageCount; ++stage) {
@@ -979,6 +985,10 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
             mbarrier_init(base_mainloop_mbar_addr + stage * sizeof(uint64_t), 1);
             if constexpr (kPersistent || kDynamicClc) {
                 mbarrier_init(base_epilogue_mbar_addr + stage * sizeof(uint64_t), 4 * kClusterM);
+                if constexpr (Config::kAccumulatorOverlapCols != 0) {
+                    mbarrier_init(base_overlap_mbar_addr + stage * sizeof(uint64_t),
+                        4 * kClusterM);
+                }
             }
         }
         if constexpr (kUseTaskPipeline) {
@@ -1036,7 +1046,8 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
             const int logical_col = n_block * kOutputEpilogueTileN + n_group * 8;
             const int logical_block = logical_col / kInterleaveBlock;
             const int logical_in_block = logical_col % kInterleaveBlock;
-            const int gate_tmem_col = mainloop_stage * kTileN +
+            const int gate_tmem_col =
+                mainloop_stage * Config::kAccumulatorStageStride +
                 logical_block * (2 * kInterleaveBlock) + logical_in_block;
             const int up_tmem_col = gate_tmem_col + kInterleaveBlock;
             // Kept for the unused swap-AB specialization below.
@@ -1147,6 +1158,8 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
     int consumer_tma_phase = 0;
     int consumer_mainloop_stage = 0;
     int consumer_epilogue_phase = 1;
+    int consumer_overlap_phase = 0;
+    bool consumer_has_previous_overlap = false;
     int epilogue_mainloop_stage = 0;
     int epilogue_mainloop_phase = 0;
     int cached_source_row_start = -1;
@@ -1488,9 +1501,24 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                     mbarrier_wait_epilogue_slot(
                         base_epilogue_mbar_addr + consumer_mainloop_stage * sizeof(uint64_t),
                         consumer_epilogue_phase);
+                    if constexpr (Config::kAccumulatorOverlapCols != 0) {
+                        if (consumer_has_previous_overlap) {
+                            const int previous_stage =
+                                (consumer_mainloop_stage + kTmemStageCount - 1) %
+                                kTmemStageCount;
+                            mbarrier_wait_epilogue_slot(
+                                base_overlap_mbar_addr + previous_stage * sizeof(uint64_t),
+                                consumer_overlap_phase);
+                            if (previous_stage == kTmemStageCount - 1) {
+                                consumer_overlap_phase ^= 1;
+                            }
+                        }
+                        consumer_has_previous_overlap = true;
+                    }
                 }
 
-                const int stage_tmem_addr = tmem_addr + consumer_mainloop_stage * kTileN;
+                const int stage_tmem_addr =
+                    tmem_addr + consumer_mainloop_stage * Config::kAccumulatorStageStride;
                 const int tile_col =
                     (tasks[cluster_bid].tile_n * kClusterN + n_rank) * kTileN;
                 for (int tile_k = 0; tile_k < k_tiles; ++tile_k) {
@@ -1617,15 +1645,40 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                     }
                 };
 
-                tmem_to_smem(epilogue_mainloop_stage, 0, 0, cta_row, tile_col, valid_rows);
+                auto release_overlap = [&]() {
+                    if constexpr ((kPersistent || kDynamicClc) &&
+                                  Config::kAccumulatorOverlapCols != 0) {
+                        if (elect_sync()) {
+                            const int pair_root_rank = cta_rank & ~1;
+                            const int mbar_addr = map_shared_to_cluster_cta(
+                                base_overlap_mbar_addr +
+                                    epilogue_mainloop_stage * sizeof(uint64_t),
+                                pair_root_rank);
+                            asm volatile("mbarrier.arrive.release.cta.shared::cluster.b64 "
+                                         "_, [%0];" :: "r"(mbar_addr) : "memory");
+                        }
+                    }
+                };
+
+                // A 128-column logical-stage shift aliases stage 0's upper
+                // half with stage 1's lower half. Drain that half first:
+                // stage 0 consumes block 1, stage 1 consumes block 0.
+                const int first_n_block = Config::kAccumulatorOverlapCols != 0 &&
+                        epilogue_mainloop_stage == 0 ? 1 : 0;
+                tmem_to_smem(epilogue_mainloop_stage, first_n_block, 0,
+                    cta_row, tile_col, valid_rows);
                 if constexpr (!kDirectGmem || kSwapAB) {
                     asm volatile("bar.sync 1, 128;" ::: "memory");
                 }
+                release_overlap();
                 if constexpr (kEpilogueBlockCount == 1) {
                     release_tmem();
                 }
 
-                for (int n_block = 0; n_block < kEpilogueBlockCount; ++n_block) {
+                for (int n_block_index = 0; n_block_index < kEpilogueBlockCount;
+                     ++n_block_index) {
+                    const int n_block = Config::kAccumulatorOverlapCols != 0
+                        ? (first_n_block ^ n_block_index) : n_block_index;
                     const int smem_stage = n_block % kEpilogueStageCount;
                     const int stage_smem = epilogue_smem + smem_stage * kEpilogueStageBytes;
                     if constexpr (!kSwapAB) {
@@ -1716,8 +1769,8 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                         }
                     }
 
-                    if (n_block + 1 < kEpilogueBlockCount) {
-                        if (kEpilogueStageCount == 1 || n_block > 0) {
+                    if (n_block_index + 1 < kEpilogueBlockCount) {
+                        if (kEpilogueStageCount == 1 || n_block_index > 0) {
                             if constexpr (!kDirectGmem || kSwapAB) {
                                 if (tid == 0) {
                                     asm volatile("cp.async.bulk.wait_group.read %0;"
@@ -1729,9 +1782,11 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                             }
                         }
 
-                        const int next_stage = (n_block + 1) % kEpilogueStageCount;
+                        const int next_n_block = Config::kAccumulatorOverlapCols != 0
+                            ? (first_n_block ^ (n_block_index + 1)) : n_block_index + 1;
+                        const int next_stage = next_n_block % kEpilogueStageCount;
                         tmem_to_smem(epilogue_mainloop_stage,
-                            n_block + 1,
+                            next_n_block,
                             next_stage,
                             cta_row,
                             tile_col,
@@ -1739,7 +1794,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                         if constexpr (!kDirectGmem || kSwapAB) {
                             asm volatile("bar.sync 1, 128;" ::: "memory");
                         }
-                        if (n_block + 2 == kEpilogueBlockCount) {
+                        if (n_block_index + 2 == kEpilogueBlockCount) {
                             release_tmem();
                         }
                     }
