@@ -21,7 +21,6 @@ class Nvfp4Fc1Config:
     epilogue_tile_n: int = 64
     cluster_m: int = 1
     cluster_n: int = 1
-    mode: int = 0
     direct_gmem: bool = False
     macro_swizzle_n_major: bool = True
 
@@ -36,8 +35,6 @@ class Nvfp4Fc1Config:
             raise ValueError("cluster_m must be 1 or 2")
         if self.cluster_n != 1:
             raise ValueError("cluster_n must be 1")
-        if self.mode not in (0, 1, 2):
-            raise ValueError("mode must be 0, 1, or 2")
         if not isinstance(self.macro_swizzle_n_major, bool):
             raise ValueError("macro_swizzle_n_major must be bool")
 
@@ -106,7 +103,6 @@ def _flags(config: Nvfp4Fc1Config, variant):
         ("TILE_M", config.tile_m), ("TILE_N", config.tile_n),
         ("TILE_K", config.tile_k), ("EPILOGUE_TILE_N", config.epilogue_tile_n),
         ("CLUSTER_M", config.cluster_m), ("CLUSTER_N", config.cluster_n),
-        ("MODE", config.mode),
         ("DIRECT_GMEM", int(config.direct_gmem)),
         ("MACRO_SWIZZLE_N_MAJOR", int(config.macro_swizzle_n_major))))
 

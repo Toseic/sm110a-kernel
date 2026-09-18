@@ -38,9 +38,6 @@
 #ifndef SM110A_NVFP4_FC1_CLUSTER_N
 #define SM110A_NVFP4_FC1_CLUSTER_N 1
 #endif
-#ifndef SM110A_NVFP4_FC1_MODE
-#define SM110A_NVFP4_FC1_MODE 0
-#endif
 #ifndef SM110A_NVFP4_FC1_DIRECT_GMEM
 #define SM110A_NVFP4_FC1_DIRECT_GMEM 0
 #endif
@@ -70,9 +67,6 @@ constexpr int kTaskPipelineStageCount = 2;
 constexpr int kBlockThreads = kWarpSize * kWarpCount;
 constexpr int kProducerThreadCount = kProducerWarpCount * kWarpSize;
 constexpr int kPersistentTileCount = 2;
-// Each mode-2 CLC worker cluster starts with two tasks.  Once it completes
-// them it steals the work of an unstarted cluster through Cluster Launch Control.
-constexpr int kClcWorkerTileCount = 2;
 constexpr int kInterleaveBlock = 64;
 
 __device__ inline float silu(float x) {
@@ -524,62 +518,6 @@ __device__ __forceinline__ void load_gather_a_and_sfa(
     cp_async_a_mbarrier_arrive_noinc(a_mbar_addr);
 }
 
-__device__ inline void clc_mbarrier_wait(
-    int mbar_addr,
-    int phase) {
-    constexpr uint32_t kSuspendTicks = 0x989680;
-    asm volatile("{\n\t"
-                 ".reg .pred done;\n\t"
-                 "WAIT_CLC:\n\t"
-                 "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 "
-                 "done, [%0], %1, %2;\n\t"
-                 "@done bra.uni COMPLETE_CLC;\n\t"
-                 "bra.uni WAIT_CLC;\n\t"
-                 "COMPLETE_CLC:\n\t"
-                 "}" :: "r"(mbar_addr),
-        "r"(phase),
-        "r"(kSuspendTicks)
-        : "memory");
-}
-
-__device__ inline void clc_issue_request(
-    int response_addr,
-    int mbar_addr) {
-    asm volatile("mbarrier.arrive.expect_tx.relaxed.cluster."
-                 "shared::cta.b64 _, [%0], 16;" :: "r"(mbar_addr)
-        : "memory");
-    asm volatile("clusterlaunchcontrol.try_cancel.async.shared::cta."
-                 "mbarrier::complete_tx::bytes.multicast::cluster::all."
-                 "b128 [%0], [%1];" :: "r"(response_addr), "r"(mbar_addr)
-        : "memory");
-}
-
-__device__ inline bool clc_wait_and_query(
-    const uint4 *response,
-    int mbar_addr,
-    int phase,
-    int *canceled_cta_x) {
-    clc_mbarrier_wait(mbar_addr, phase);
-    const uint4 value = response[0];
-    int canceled;
-    int first_cta_x = 0;
-    asm volatile("{\n\t"
-                 ".reg .pred was_canceled;\n\t"
-                 ".reg .b128 response;\n\t"
-                 "mov.b128 response, {%2, %3, %4, %5};\n\t"
-                 "clusterlaunchcontrol.query_cancel.is_canceled.pred."
-                 "b128 was_canceled, response;\n\t"
-                 "selp.u32 %0, 1, 0, was_canceled;\n\t"
-                 "@was_canceled clusterlaunchcontrol.query_cancel."
-                 "get_first_ctaid::x.b32.b128 %1, response;\n\t"
-                 "}"
-        : "=r"(canceled), "=r"(first_cta_x)
-        : "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w)
-        : "memory");
-    *canceled_cta_x = first_cta_x;
-    return canceled != 0;
-}
-
 // Map a shared-memory object to the address at which it is hosted by another
 // CTA in the cluster.  The CTA-group::2 pipeline uses rank 0 as the owner for
 // barriers that aggregate work completed independently by both CTAs.
@@ -855,8 +793,6 @@ template <
     int kEpilogueTileN,
     int kClusterM,
     int kClusterN,
-    bool kPersistent,
-    bool kDynamicClc = false,
     bool kSwapAB = false,
     bool kDirectGmem = false>
 __global__ __cluster_dims__(kClusterM, kClusterN, 1)
@@ -899,23 +835,15 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
     constexpr int kTmemStageCount = Config::kTmemStageCount;
     constexpr int kTmemAllocationColumns = Config::kTmemAllocationColumns;
     constexpr bool kUseTaskPipeline = kEnableTaskPipeline && kClusterM == 1 &&
-        kClusterN == 1 && (kPersistent || kDynamicClc);
+        kClusterN == 1;
     const int tid = threadIdx.x;
     const int warp_id = tid / kWarpSize;
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
     const int m_rank = cta_rank % kClusterM;
     const int n_rank = cta_rank / kClusterM;
-    const int worker_id = blockIdx.x / kClusterM;
     const int cluster_tiles = *task_count;
-    constexpr int kWorkerTileCount = kDynamicClc ? kClcWorkerTileCount :
-        (kPersistent ? kPersistentTileCount : 1);
-    const int static_first_cluster_bid = worker_id * kWorkerTileCount;
-    if constexpr (!kPersistent && !kDynamicClc) {
-        if (static_first_cluster_bid >= cluster_tiles) {
-            return;
-        }
-    }
+    constexpr int kWorkerTileCount = kPersistentTileCount;
 
     __shared__ int tmem_base[1];
     __shared__ int next_work_smem[2];
@@ -925,8 +853,6 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
     __shared__ int scheduled_cluster_bids[kTaskPipelineStageCount];
     __shared__ uint64_t task_ready_mbars[kTaskPipelineStageCount];
     __shared__ uint64_t task_free_mbars[kTaskPipelineStageCount];
-    __shared__ __align__(16) uint4 clc_response[1];
-    __shared__ __align__(8) uint64_t clc_mbar[1];
     __shared__ int task_source_rows[kTileM];
     __shared__ uint64_t tma_mbars[kStageCount];
     __shared__ uint64_t tma_issue_mbars[kStageCount];
@@ -983,12 +909,10 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
         }
         for (int stage = 0; stage < kTmemStageCount; ++stage) {
             mbarrier_init(base_mainloop_mbar_addr + stage * sizeof(uint64_t), 1);
-            if constexpr (kPersistent || kDynamicClc) {
-                mbarrier_init(base_epilogue_mbar_addr + stage * sizeof(uint64_t), 4 * kClusterM);
-                if constexpr (Config::kAccumulatorOverlapCols != 0) {
-                    mbarrier_init(base_overlap_mbar_addr + stage * sizeof(uint64_t),
-                        4 * kClusterM);
-                }
+            mbarrier_init(base_epilogue_mbar_addr + stage * sizeof(uint64_t), 4 * kClusterM);
+            if constexpr (Config::kAccumulatorOverlapCols != 0) {
+                mbarrier_init(base_overlap_mbar_addr + stage * sizeof(uint64_t),
+                    4 * kClusterM);
             }
         }
         if constexpr (kUseTaskPipeline) {
@@ -997,9 +921,6 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                 mbarrier_init(base_task_free_mbar_addr + stage * sizeof(uint64_t),
                     kEpilogueWarpCount);
             }
-        }
-        if constexpr (kDynamicClc) {
-            mbarrier_init(static_cast<int>(__cvta_generic_to_shared(clc_mbar)), 1);
         }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
@@ -1163,73 +1084,23 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
     int epilogue_mainloop_stage = 0;
     int epilogue_mainloop_phase = 0;
     int cached_source_row_start = -1;
-    int clc_phase = 0;
-    int dynamic_first_cluster_bid = static_first_cluster_bid;
     // Each role tracks the task-ring parity independently.  It is intentionally
     // separate from the mainloop SMEM/TMEM stage state: a task spans all K
     // stages, while its metadata must remain stable until the epilogue ends.
     int task_pipe_stage = 0;
     int task_ready_phase = 0;
     int scheduler_free_phase = 1;
-    int scheduler_packet_next = static_first_cluster_bid;
-    int scheduler_packet_end =
-        static_first_cluster_bid + kWorkerTileCount < cluster_tiles
-            ? static_first_cluster_bid + kWorkerTileCount
-            : cluster_tiles;
-    bool scheduler_clc_pending = false;
-    bool scheduler_clc_done = false;
 
     while (true) {
         int first_cluster_bid;
-        int clc_mbar_addr = 0;
         if constexpr (kUseTaskPipeline) {
             if (warp_id == kSchedulerWarp) {
-                // The scheduler is the sole task-source producer.  Persistent
-                // mode pulls one atomic task; CLC mode publishes its initial
-                // static packet and overlaps an asynchronous steal request.
+                // The scheduler is the sole task-source producer.
                 mbarrier_wait(base_task_free_mbar_addr +
                                   task_pipe_stage * sizeof(uint64_t),
                               scheduler_free_phase);
                 if (elect_sync()) {
-                    int scheduled_bid;
-                    if constexpr (kDynamicClc) {
-                        const int clc_response_addr =
-                            static_cast<int>(__cvta_generic_to_shared(clc_response));
-                        const int scheduler_clc_mbar_addr =
-                            static_cast<int>(__cvta_generic_to_shared(clc_mbar));
-
-                        // Invalid/finished packets are skipped inside the
-                        // scheduler warp.  Data-path roles only see real tasks
-                        // followed by one terminal sentinel.
-                        while (scheduler_packet_next >= scheduler_packet_end &&
-                               !scheduler_clc_done) {
-                            if (!scheduler_clc_pending) {
-                                clc_issue_request(clc_response_addr, scheduler_clc_mbar_addr);
-                                scheduler_clc_pending = true;
-                            }
-                            int canceled_cta_x = 0;
-                            const bool canceled = clc_wait_and_query(clc_response,
-                                scheduler_clc_mbar_addr, clc_phase, &canceled_cta_x);
-                            scheduler_clc_pending = false;
-                            clc_phase ^= 1;
-                            if (!canceled) {
-                                scheduler_clc_done = true;
-                                break;
-                            }
-
-                            scheduler_packet_next =
-                                canceled_cta_x / kClusterM * kWorkerTileCount;
-                            scheduler_packet_end =
-                                scheduler_packet_next + kWorkerTileCount < cluster_tiles
-                                    ? scheduler_packet_next + kWorkerTileCount
-                                    : cluster_tiles;
-                        }
-
-                        scheduled_bid = scheduler_packet_next < scheduler_packet_end
-                            ? scheduler_packet_next++ : cluster_tiles;
-                    } else {
-                        scheduled_bid = atomicAdd(next_cluster_tile, 1);
-                    }
+                    const int scheduled_bid = atomicAdd(next_cluster_tile, 1);
 
                     const int task_ready_mbar_addr = base_task_ready_mbar_addr +
                         task_pipe_stage * static_cast<int>(sizeof(uint64_t));
@@ -1258,28 +1129,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
             if (first_cluster_bid >= cluster_tiles) {
                 break;
             }
-        } else if constexpr (kDynamicClc) {
-            first_cluster_bid = dynamic_first_cluster_bid;
-
-            // One request per cluster.  CLC multicasts the cancellation response
-            // to every CTA so all ranks advance together after finishing work.
-            const int clc_response_addr = static_cast<int>(__cvta_generic_to_shared(clc_response));
-            clc_mbar_addr = static_cast<int>(__cvta_generic_to_shared(clc_mbar));
-            if (tid == 0) {
-                asm volatile("mbarrier.arrive.expect_tx.relaxed.cluster."
-                             "shared::cta.b64 _, [%0], 16;" :: "r"(clc_mbar_addr)
-                    : "memory");
-            }
-            asm volatile("barrier.cluster.arrive.relaxed.aligned;");
-            asm volatile("barrier.cluster.wait.aligned;");
-            if (cta_rank == 0 && tid == 0) {
-                asm volatile("clusterlaunchcontrol.try_cancel.async.shared::cta."
-                             "mbarrier::complete_tx::bytes.multicast::cluster::all."
-                             "b128 [%0], [%1];" :: "r"(clc_response_addr),
-                    "r"(clc_mbar_addr)
-                    : "memory");
-            }
-        } else if constexpr (kPersistent) {
+        } else {
             if (cta_rank == 0 && tid == 0) {
                 next_work_smem[0] = atomicAdd(next_cluster_tile, kPersistentTileCount);
             }
@@ -1295,13 +1145,9 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                 : "=r"(first_cluster_bid)
                 : "r"(rank_zero_work_addr)
                 : "memory");
-        } else {
-            first_cluster_bid = static_first_cluster_bid;
         }
-        if constexpr (!kDynamicClc) {
-            if (first_cluster_bid >= cluster_tiles) {
-                break;
-            }
+        if (first_cluster_bid >= cluster_tiles) {
+            break;
         }
         const bool has_work = first_cluster_bid < cluster_tiles;
         constexpr int kTasksPerPipelineIteration = kUseTaskPipeline ? 1 : kWorkerTileCount;
@@ -1497,24 +1343,22 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
         if (m_rank == 0 && warp_id == kMmaWarp && elect_sync()) {
             for (int cluster_bid = first_cluster_bid; cluster_bid < last_cluster_bid;
                 ++cluster_bid) {
-                if constexpr (kPersistent || kDynamicClc) {
-                    mbarrier_wait_epilogue_slot(
-                        base_epilogue_mbar_addr + consumer_mainloop_stage * sizeof(uint64_t),
-                        consumer_epilogue_phase);
-                    if constexpr (Config::kAccumulatorOverlapCols != 0) {
-                        if (consumer_has_previous_overlap) {
-                            const int previous_stage =
-                                (consumer_mainloop_stage + kTmemStageCount - 1) %
-                                kTmemStageCount;
-                            mbarrier_wait_epilogue_slot(
-                                base_overlap_mbar_addr + previous_stage * sizeof(uint64_t),
-                                consumer_overlap_phase);
-                            if (previous_stage == kTmemStageCount - 1) {
-                                consumer_overlap_phase ^= 1;
-                            }
+                mbarrier_wait_epilogue_slot(
+                    base_epilogue_mbar_addr + consumer_mainloop_stage * sizeof(uint64_t),
+                    consumer_epilogue_phase);
+                if constexpr (Config::kAccumulatorOverlapCols != 0) {
+                    if (consumer_has_previous_overlap) {
+                        const int previous_stage =
+                            (consumer_mainloop_stage + kTmemStageCount - 1) %
+                            kTmemStageCount;
+                        mbarrier_wait_epilogue_slot(
+                            base_overlap_mbar_addr + previous_stage * sizeof(uint64_t),
+                            consumer_overlap_phase);
+                        if (previous_stage == kTmemStageCount - 1) {
+                            consumer_overlap_phase ^= 1;
                         }
-                        consumer_has_previous_overlap = true;
                     }
+                    consumer_has_previous_overlap = true;
                 }
 
                 const int stage_tmem_addr =
@@ -1604,9 +1448,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
 
                 consumer_mainloop_stage = (consumer_mainloop_stage + 1) % kTmemStageCount;
                 if (consumer_mainloop_stage == 0) {
-                    if constexpr (kPersistent || kDynamicClc) {
-                        consumer_epilogue_phase ^= 1;
-                    }
+                    consumer_epilogue_phase ^= 1;
                 }
             }
         }
@@ -1631,8 +1473,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                 const int tile_col = tile_n * (kSwapAB ? kClusterTileM : kTileN);
 
                 auto release_tmem = [&]() {
-                    if constexpr (kPersistent || kDynamicClc) {
-                        if (elect_sync()) {
+                    if (elect_sync()) {
                             const int pair_root_rank = cta_rank & ~1;
                             const int mbar_addr = map_shared_to_cluster_cta(
                                 base_epilogue_mbar_addr +
@@ -1641,13 +1482,11 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
                             asm volatile("mbarrier.arrive.release.cta.shared::cluster.b64 "
                                          "_, [%0];" ::"r"(mbar_addr)
                                 : "memory");
-                        }
                     }
                 };
 
                 auto release_overlap = [&]() {
-                    if constexpr ((kPersistent || kDynamicClc) &&
-                                  Config::kAccumulatorOverlapCols != 0) {
+                    if constexpr (Config::kAccumulatorOverlapCols != 0) {
                         if (elect_sync()) {
                             const int pair_root_rank = cta_rank & ~1;
                             const int mbar_addr = map_shared_to_cluster_cta(
@@ -1833,46 +1672,6 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc1_kernel(
             }
         }
 
-        if constexpr (kDynamicClc && !kUseTaskPipeline) {
-            if (tid == 0) {
-                clc_mbarrier_wait(clc_mbar_addr, clc_phase);
-
-                const uint4 response = clc_response[0];
-                int canceled;
-                int canceled_cta_x = 0;
-                asm volatile("{\n\t"
-                         ".reg .pred was_canceled;\n\t"
-                         ".reg .b128 response;\n\t"
-                         "mov.b128 response, {%2, %3, %4, %5};\n\t"
-                         "clusterlaunchcontrol.query_cancel.is_canceled.pred."
-                         "b128 was_canceled, response;\n\t"
-                         "selp.u32 %0, 1, 0, was_canceled;\n\t"
-                         "@was_canceled "
-                         "clusterlaunchcontrol.query_cancel.get_first_ctaid::x."
-                         "b32.b128 %1, response;\n\t"
-                         "}"
-                : "=r"(canceled), "=r"(canceled_cta_x)
-                : "r"(response.x), "r"(response.y), "r"(response.z), "r"(response.w)
-                : "memory");
-                next_work_smem[0] = canceled;
-                next_work_smem[1] = canceled_cta_x / kClusterM * kWorkerTileCount;
-            }
-            __syncthreads();
-            if (next_work_smem[0] == 0) {
-                break;
-            }
-            dynamic_first_cluster_bid = next_work_smem[1];
-            clc_phase ^= 1;
-
-            asm volatile("fence.proxy.async::generic.release."
-                         "sync_restrict::shared::cta.cluster;" ::: "memory");
-            asm volatile("barrier.cluster.arrive.relaxed.aligned;");
-            asm volatile("barrier.cluster.wait.aligned;");
-            asm volatile("fence.proxy.async::generic.acquire."
-                         "sync_restrict::shared::cluster.cluster;" ::: "memory");
-        } else if constexpr (!kPersistent && !kDynamicClc) {
-            break;
-        }
     }
 
     if constexpr (!kUseTaskPipeline) {
@@ -1971,90 +1770,43 @@ void launch_nvfp4_fc1_impl(
     auto *next_cluster_tile = d_state + 1;
     cudaMemsetAsync(next_cluster_tile, 0, sizeof(int32_t), stream);
 
-    if constexpr (SM110A_NVFP4_FC1_MODE == 2) {
-        const int worker_clusters =
-            (max_tasks + kClcWorkerTileCount - 1) / kClcWorkerTileCount;
-        auto kernel = nvfp4_fc1_kernel<kTileM,
+    const int persistent_clusters =
+        (max_tasks + kPersistentTileCount - 1) / kPersistentTileCount;
+    auto kernel = nvfp4_fc1_kernel<kTileM,
             kTileN,
             kTileK,
             kEpilogueTileN,
             kClusterM,
-            kClusterN,
-            false,
-            true,
-            kSwapAB,
+            kClusterN, kSwapAB,
             (SM110A_NVFP4_FC1_DIRECT_GMEM != 0)>;
-        if constexpr (kDynamicSmemBytes > 48 * 1024) {
-            cudaFuncSetAttribute(kernel,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                kDynamicSmemBytes);
-        }
-        kernel<<<dim3(kClusterM * worker_clusters, kClusterN, 1), kBlockThreads,
-            kDynamicSmemBytes, stream>>>(
-            d_a, a_tensor_map, b_tensor_map, d_sfa, sfa_tensor_map, sfb_tensor_map, c_tensor_map, d_source_rows, tasks, task_count,
-            next_cluster_tile, d_c, n, k);
-    } else if constexpr (SM110A_NVFP4_FC1_MODE == 1) {
-        const int persistent_clusters =
-            (max_tasks + kPersistentTileCount - 1) / kPersistentTileCount;
-        auto kernel = nvfp4_fc1_kernel<kTileM,
-            kTileN,
-            kTileK,
-            kEpilogueTileN,
-            kClusterM,
-            kClusterN,
-            true,
-            false,
-            kSwapAB,
-            (SM110A_NVFP4_FC1_DIRECT_GMEM != 0)>;
-        if constexpr (kDynamicSmemBytes > 48 * 1024) {
-            cudaFuncSetAttribute(kernel,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                kDynamicSmemBytes);
-        }
-        cudaLaunchConfig_t launch_config{};
-        launch_config.gridDim = dim3(kClusterM * persistent_clusters, kClusterN, 1);
-        launch_config.blockDim = dim3(kBlockThreads, 1, 1);
-        launch_config.dynamicSmemBytes = kDynamicSmemBytes;
-        launch_config.stream = stream;
-        int resident_clusters = 0;
-        const cudaError_t occupancy_status =
-            cudaOccupancyMaxActiveClusters(&resident_clusters, kernel, &launch_config);
-        if (occupancy_status != cudaSuccess || resident_clusters <= 0) {
+    if constexpr (kDynamicSmemBytes > 48 * 1024) {
+        cudaFuncSetAttribute(kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            kDynamicSmemBytes);
+    }
+    cudaLaunchConfig_t launch_config{};
+    launch_config.gridDim = dim3(kClusterM * persistent_clusters, kClusterN, 1);
+    launch_config.blockDim = dim3(kBlockThreads, 1, 1);
+    launch_config.dynamicSmemBytes = kDynamicSmemBytes;
+    launch_config.stream = stream;
+    int resident_clusters = 0;
+    const cudaError_t occupancy_status =
+        cudaOccupancyMaxActiveClusters(&resident_clusters, kernel, &launch_config);
+    if (occupancy_status != cudaSuccess || resident_clusters <= 0) {
             int device = 0;
             int sm_count = 0;
             cudaGetDevice(&device);
             cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
             constexpr int kClusterCtas = kClusterM * kClusterN;
             resident_clusters = sm_count / kClusterCtas > 0 ? sm_count / kClusterCtas : 1;
-        }
-        const int cluster_limit = max_active_clusters > 0 ? max_active_clusters : resident_clusters;
-        const int launched_clusters = cluster_limit < persistent_clusters
-            ? cluster_limit : persistent_clusters;
-        kernel<<<dim3(kClusterM * launched_clusters, kClusterN, 1), kBlockThreads,
-            kDynamicSmemBytes, stream>>>(
-            d_a, a_tensor_map, b_tensor_map, d_sfa, sfa_tensor_map, sfb_tensor_map, c_tensor_map, d_source_rows, tasks, task_count,
-            next_cluster_tile, d_c, n, k);
-    } else {
-        auto kernel = nvfp4_fc1_kernel<kTileM,
-            kTileN,
-            kTileK,
-            kEpilogueTileN,
-            kClusterM,
-            kClusterN,
-            false,
-            false,
-            kSwapAB,
-            (SM110A_NVFP4_FC1_DIRECT_GMEM != 0)>;
-        if constexpr (kDynamicSmemBytes > 48 * 1024) {
-            cudaFuncSetAttribute(kernel,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                kDynamicSmemBytes);
-        }
-        kernel<<<dim3(kClusterM * max_tasks, kClusterN, 1), kBlockThreads,
-            kDynamicSmemBytes, stream>>>(
-            d_a, a_tensor_map, b_tensor_map, d_sfa, sfa_tensor_map, sfb_tensor_map, c_tensor_map, d_source_rows, tasks, task_count,
-            next_cluster_tile, d_c, n, k);
     }
+    const int cluster_limit = max_active_clusters > 0 ? max_active_clusters : resident_clusters;
+    const int launched_clusters = cluster_limit < persistent_clusters
+        ? cluster_limit : persistent_clusters;
+    kernel<<<dim3(kClusterM * launched_clusters, kClusterN, 1), kBlockThreads,
+        kDynamicSmemBytes, stream>>>(
+        d_a, a_tensor_map, b_tensor_map, d_sfa, sfa_tensor_map, sfb_tensor_map, c_tensor_map, d_source_rows, tasks, task_count,
+        next_cluster_tile, d_c, n, k);
 }
 
 void launch_nvfp4_fc1_entry(

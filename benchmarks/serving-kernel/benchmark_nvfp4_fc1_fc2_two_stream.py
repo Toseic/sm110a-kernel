@@ -66,7 +66,7 @@ def main():
         # Matches the standalone FC1 autotune winner for this workload.
         config = Nvfp4Fc1Config(
             tile_n=128, tile_k=256, epilogue_tile_n=128,
-            cluster_m=2, mode=1,
+            cluster_m=2,
         )
         bq, sfb = make_quantized_interleaved_weights(args.experts, args.n, args.k)
         work = []

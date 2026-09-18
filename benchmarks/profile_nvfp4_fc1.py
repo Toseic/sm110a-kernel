@@ -47,7 +47,6 @@ def main():
     parser.add_argument("--k", type=int, default=1024)
     parser.add_argument("--tile-n", type=int, default=256)
     parser.add_argument("--cluster-m", type=int, default=1)
-    parser.add_argument("--mode", type=int, choices=(0, 1, 2), default=0)
     parser.add_argument("--direct-gmem", action="store_true")
     parser.add_argument("--iters", type=int, default=20)
     args = parser.parse_args()
@@ -69,7 +68,6 @@ def main():
         tile_k=256,
         epilogue_tile_n=128,
         cluster_m=args.cluster_m,
-        mode=args.mode,
         direct_gmem=args.direct_gmem,
     )
     metadata = prepare_nvfp4_fc1_metadata(

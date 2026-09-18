@@ -41,7 +41,6 @@ DEFAULT_K = 6144
 DEFAULT_TOKEN_VALUES = (64 * 32, 128 * 32, 256 * 32, 512 * 32, 1024 * 32)
 DEFAULT_TOPK = 8
 NVFP4_MMA_PEAK_TFLOPS = 4.0 * 250.0
-_MODE_LABELS = {0: "np", 1: "pe", 2: "clc"}
 
 NVFP4_FC1_CONFIGS = tuple(
     Nvfp4Fc1Config(
@@ -50,14 +49,12 @@ NVFP4_FC1_CONFIGS = tuple(
         epilogue_tile_n=epilogue_tile_n,
         cluster_m=cluster_m,
         cluster_n=cluster_n,
-        mode=mode,
         direct_gmem=direct_gmem,
     )
     for tile_n in (128, 256)
     for tile_k in (256,)
     for epilogue_tile_n in (128,)
     for cluster_m in (1, 2)
-    for mode in (0, 1, 2)
     for direct_gmem in (False, True)
     for cluster_n in (1,)
     if tile_n % epilogue_tile_n == 0
@@ -70,7 +67,6 @@ def format_candidate(config):
         f"{config.tile_m}x{config.tile_n}x{config.tile_k}",
         f"e{config.epilogue_tile_n}",
         f"c{config.cluster_m}n{config.cluster_n}",
-        _MODE_LABELS[config.mode],
         epilogue,
         "nmaj" if config.macro_swizzle_n_major else "mmaj",
     ]
@@ -107,8 +103,6 @@ def selected_candidates(n, k, args):
         candidates = tuple(c for c in candidates if c.cluster_m == args.cluster_m)
     if args.cluster_n is not None:
         candidates = tuple(c for c in candidates if c.cluster_n == args.cluster_n)
-    if args.mode is not None:
-        candidates = tuple(c for c in candidates if c.mode == args.mode)
     if args.direct_gmem:
         candidates = tuple(c for c in candidates if c.direct_gmem)
     if args.tma_epilogue:
@@ -286,7 +280,6 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
         parser.add_argument("--epilogue-tile-n", type=int, choices=(64, 128))
         parser.add_argument("--cluster-m", type=int, choices=(1, 2))
         parser.add_argument("--cluster-n", type=int, choices=(1,))
-        parser.add_argument("--mode", type=int, choices=(0, 1, 2))
         parser.add_argument(
             "--extended-tuning", action="store_true",
             help="also tune macro traversal",
@@ -457,8 +450,9 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
                 baseline_fn = baseline_runner.run_kernel
             else:
                 baseline_out = torch.empty_like(out)
+                baseline_metadata = self.prepare_baseline_metadata(router, args)
                 baseline_runner = TorchNvfp4Fc1Runner(
-                    aq, bq, sfa, sfb, metadata,
+                    aq, bq, sfa, sfb, baseline_metadata,
                     args.experts, args.n, args.k, baseline_out,
                 )
                 baseline_runner.run()
