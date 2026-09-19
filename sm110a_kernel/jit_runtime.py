@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import os
+import re
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -20,12 +21,76 @@ __all__ = [
     "SplitCudaJit",
     "jit_build_directory",
     "source_digest",
+    "pipeline_delay_cflags",
+    "pipeline_delay_variant",
 ]
 
 
 ConfigT = TypeVar("ConfigT")
 FacadeT = TypeVar("FacadeT")
 ValueT = TypeVar("ValueT")
+
+
+_PIPELINE_DELAY_ENV_PREFIX = "SM110A_PIPELINE_DELAY_"
+_PIPELINE_DELAY_POINT_RE = re.compile(r"[a-z][a-z0-9_]*")
+
+
+def _normalize_pipeline_delay_point(value: str, source: str) -> str:
+    point = value.strip().lower()
+    if not _PIPELINE_DELAY_POINT_RE.fullmatch(point):
+        raise ValueError(
+            f"{source} point names must contain lowercase letters, digits, and underscores"
+        )
+    return point
+
+
+def _parse_pipeline_delay(value: str, source: str) -> int:
+    try:
+        cycles = int(value, 10)
+    except ValueError as error:
+        raise ValueError(f"{source} must be a non-negative integer cycle count") from error
+    if cycles < 0:
+        raise ValueError(f"{source} must be a non-negative integer cycle count")
+    return cycles
+
+
+def pipeline_delay_variant() -> tuple[tuple[str, int], ...]:
+    """Read the pipeline-delay environment into a stable JIT cache key.
+
+    ``SM110A_PIPELINE_DELAYS`` accepts comma-separated ``point=cycles`` pairs.
+    Any ``SM110A_PIPELINE_DELAY_<POINT>`` variable overrides a matching pair.
+    Point ownership is local to kernels: this generic JIT layer forwards their
+    macro definitions without maintaining a global point registry.
+    """
+    values: dict[str, int] = {}
+    packed = os.environ.get("SM110A_PIPELINE_DELAYS", "")
+    if packed:
+        for item in packed.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            point, separator, value = item.partition("=")
+            if not separator:
+                raise ValueError("SM110A_PIPELINE_DELAYS entries must be point=cycles")
+            point = _normalize_pipeline_delay_point(point, "SM110A_PIPELINE_DELAYS")
+            values[point] = _parse_pipeline_delay(value.strip(), "SM110A_PIPELINE_DELAYS")
+    for env_name, value in os.environ.items():
+        if not env_name.startswith(_PIPELINE_DELAY_ENV_PREFIX):
+            continue
+        point = _normalize_pipeline_delay_point(
+            env_name[len(_PIPELINE_DELAY_ENV_PREFIX):], env_name
+        )
+        values[point] = _parse_pipeline_delay(value, env_name)
+    return tuple(sorted(values.items()))
+
+
+def pipeline_delay_cflags() -> tuple[str, ...]:
+    """Return CUDA defines for the current pipeline-delay configuration."""
+    return tuple(
+        f"-DSM110A_PIPELINE_DELAY_{point.upper()}={cycles}"
+        for point, cycles in pipeline_delay_variant()
+        if cycles
+    )
 
 
 @dataclass(frozen=True)
@@ -131,7 +196,15 @@ class SplitCudaJit(Generic[ConfigT, FacadeT]):
         self._binding_sources = tuple(binding_sources)
         self._binding_dependencies = tuple(binding_dependencies)
         self._kernel_sources = tuple(kernel_sources)
-        self._kernel_dependencies = tuple(kernel_dependencies)
+        # This public header is intentionally a dependency of every CUDA JIT:
+        # a kernel can opt into a probe by merely including it, without each
+        # kernel wrapper having to remember to extend its cache dependency list.
+        kernel_dependencies = tuple(kernel_dependencies)
+        pipeline_delay_header = root / "include" / "pipeline_delay.h"
+        self._kernel_dependencies = kernel_dependencies + (
+            (pipeline_delay_header,) if pipeline_delay_header.exists()
+            and pipeline_delay_header not in kernel_dependencies else ()
+        )
         self._kernel_symbol = kernel_symbol
         self._config_key = config_key
         self._kernel_cflags = kernel_cflags
@@ -151,7 +224,7 @@ class SplitCudaJit(Generic[ConfigT, FacadeT]):
         self._build_locks: dict[str, threading.Lock] = {}
         self._kernel_cache: dict[str, LoadedCudaLibrary] = {}
         self._facade_cache: dict[str, FacadeT] = {}
-        self._fast_cache: dict[tuple[Hashable, str, str, Hashable], FacadeT] = {}
+        self._fast_cache: dict[tuple[Hashable, str, str, Hashable, Hashable], FacadeT] = {}
 
     def _verbose(self) -> bool:
         return os.environ.get(self._verbose_env, "0") == "1"
@@ -211,12 +284,13 @@ class SplitCudaJit(Generic[ConfigT, FacadeT]):
     def _fast_key(
         self,
         config: ConfigT,
-    ) -> tuple[Hashable, str, str, Hashable]:
+    ) -> tuple[Hashable, str, str, Hashable, Hashable]:
         return (
             self._config_key(config),
             os.environ.get("CUDA_ARCH", "sm_110a"),
             os.environ.get("COMPUTE_CUDA_ARCH", "compute_110a"),
             self._variant_key(),
+            pipeline_delay_variant(),
         )
 
     def _load_binding(self) -> ModuleType:
@@ -251,7 +325,7 @@ class SplitCudaJit(Generic[ConfigT, FacadeT]):
             "COMPUTE_CUDA_ARCH", "compute_110a"
         )
         variant = self._variant_key()
-        extra_cuda_cflags = tuple(self._kernel_cflags(config, variant))
+        extra_cuda_cflags = tuple(self._kernel_cflags(config, variant)) + pipeline_delay_cflags()
         name = self._kernel_name(
             config,
             variant,

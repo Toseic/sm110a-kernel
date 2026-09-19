@@ -118,7 +118,7 @@ _JIT = SplitCudaJit(
     binding_sources=(_SRC / "nvfp4_fc1_torch_binding.cpp",),
     kernel_sources=(_SRC / "nvfp4_fc1_kernel.cu", _SRC / "nvfp4_fc1_metadata.cu",
                     _SRC / "nvfp4_fc1_routing.cu"),
-    kernel_dependencies=(_INC / "nvfp4_moe_fc1.h", _INC / "common.h"),
+    kernel_dependencies=(_INC / "nvfp4_moe_fc1.h", _INC / "common.h", _SRC / "nvfp4_fc1_pipeline_delay.cuh"),
     kernel_symbol="sm110a_nvfp4_fc1_launch", config_key=lambda config: config,
     kernel_cflags=_flags, make_facade=Nvfp4Fc1Module, include_paths=(_INC,))
 

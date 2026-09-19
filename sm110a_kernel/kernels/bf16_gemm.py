@@ -84,7 +84,7 @@ _JIT = SplitCudaJit(
     name="sm110a_bf16_gemm", root=_ROOT,
     binding_sources=(_SOURCE_DIR / "bf16_gemm_split_torch_binding.cpp",),
     kernel_sources=(_SOURCE_DIR / "bf16_gemm_kernel.cu",),
-    kernel_dependencies=(_INCLUDE_DIR / "bf16_gemm.h", _INCLUDE_DIR / "common.h", _INCLUDE_DIR / "profiler.h"),
+    kernel_dependencies=(_INCLUDE_DIR / "bf16_gemm.h", _INCLUDE_DIR / "common.h", _INCLUDE_DIR / "profiler.h", _SOURCE_DIR / "bf16_gemm_pipeline_delay.cuh"),
     kernel_symbol="sm110a_bf16_gemm_launch", config_key=lambda config: config,
     kernel_cflags=_kernel_cflags, make_facade=Bf16GemmModule, include_paths=(_INCLUDE_DIR,))
 

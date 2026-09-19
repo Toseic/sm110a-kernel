@@ -19,6 +19,8 @@
 #include <cuda_runtime.h>
 
 #include "nvfp4_moe_fc1.h"
+#include "nvfp4_fc1_pipeline_delay.cuh"
+#include "pipeline_delay.h"
 
 #ifndef SM110A_NVFP4_FC1_TILE_M
 #define SM110A_NVFP4_FC1_TILE_M 128
@@ -1140,6 +1142,7 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void n
                 mbarrier_wait(base_task_free_mbar_addr +
                                   task_pipe_stage * sizeof(uint64_t),
                               scheduler_free_phase);
+                sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_NVFP4_FC1_TASK_WAIT>();
                 if (elect_sync()) {
                     const int scheduled_bid = atomicAdd(next_cluster_tile, 1);
 
@@ -1149,6 +1152,7 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void n
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];" ::
                         "r"(task_ready_mbar_addr) : "memory");
+                    sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_NVFP4_FC1_TASK_PUBLISH>();
                 }
                 __syncwarp();
                 const bool scheduler_done =
@@ -1245,6 +1249,7 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void n
                         base_a_mbar_addr + producer_stage * sizeof(uint64_t);
 
                     mbarrier_wait_mma_reuse(mma_mbar_addr, producer_mma_phase);
+                    sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_NVFP4_FC1_PRODUCER_WAIT_REUSE>();
                     if (producer_rank == 0 && elect_sync()) {
                         mbarrier_arrive_tma_issue(
                             base_tma_issue_mbar_addr + producer_stage * sizeof(uint64_t));
@@ -1266,6 +1271,9 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void n
                                 kASmemBytes + kBSmemBytes,
                             a_mbar_addr, false, false);
                     }
+                    // A/SFA is gathered by four producer warps.  Delay only
+                    // after the gather has published its stage completion.
+                    sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_NVFP4_FC1_LOAD_A>();
 
                     producer_stage = (producer_stage + 1) % kStageCount;
                     if (producer_stage == 0) {
@@ -1295,6 +1303,7 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void n
                     const int sfb_smem = sfa_smem + kSFASmemBytes;
 
                     mbarrier_wait_tma_issue(issue_mbar_addr, tma_issue_phase);
+                    sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_NVFP4_FC1_B_WAIT_ISSUE>();
                     if (elect_sync()) {
                         const int tma_transaction_mbar_addr = tma_mbar_addr & 0xFEFFFFFF;
                         const int off_k = tile_k * kTileK;
@@ -1319,6 +1328,8 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void n
                                     static_cast<int16_t>(3 << (n_rank * kClusterM)));
                             }
                         }
+                        // B/SFB TMA requests have been issued for this stage.
+                        sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_NVFP4_FC1_LOAD_B>();
                     }
 
                     tma_stage = (tma_stage + 1) % kStageCount;
@@ -1371,6 +1382,7 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void n
                 mbarrier_wait_epilogue_slot(
                     base_epilogue_mbar_addr + consumer_mainloop_stage * sizeof(uint64_t),
                     consumer_epilogue_phase);
+                sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_NVFP4_FC1_CONSUMER_WAIT_EPILOGUE>();
                 if constexpr (Config::kAccumulatorOverlapCols != 0) {
                     if (consumer_has_previous_overlap) {
                         const int previous_stage =
@@ -1430,7 +1442,9 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void n
                             base_a_cluster_mbar_addr + consumer_stage * sizeof(uint64_t),
                             consumer_a_phase);
                     }
+                    sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_NVFP4_FC1_CONSUMER_WAIT_A>();
                     mbarrier_wait_tma_ready(tma_mbar_addr, consumer_tma_phase);
+                    sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_NVFP4_FC1_CONSUMER_WAIT_B>();
                     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
                     {
                         const int a_smem = mainloop_smem + consumer_stage * kStageSmemBytes;
@@ -1458,6 +1472,7 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void n
                         }
                     }
                     tcgen05_commit<kClusterM>(mma_mbar_addr, cta_rank);
+                    sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_NVFP4_FC1_MMA>();
 
                     consumer_stage = (consumer_stage + 1) % kStageCount;
                     if (consumer_stage == 0) {
@@ -1485,6 +1500,7 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void n
                 mbarrier_wait_mainloop_output(
                     base_mainloop_mbar_addr + epilogue_mainloop_stage * sizeof(uint64_t),
                     epilogue_mainloop_phase);
+                sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_NVFP4_FC1_EPILOGUE_WAIT>();
                 asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
                 const ExpertTileTask task = tasks[cluster_bid];
@@ -1534,6 +1550,7 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void n
                 tmem_to_smem(epilogue_mainloop_stage, first_n_block,
                     epilogue_c_stage,
                     cta_row, tile_col, valid_rows);
+                sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_NVFP4_FC1_EPILOGUE_TMEM_TO_SMEM>();
                 if constexpr (!kDirectGmem || kSwapAB) {
                     asm volatile("bar.sync 1, 128;" ::: "memory");
                 }
@@ -1650,6 +1667,7 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void n
                         // until they observe that completion.
                         asm volatile("bar.sync 1, 128;" ::: "memory");
                     }
+                    sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_NVFP4_FC1_EPILOGUE_STORE>();
 
                     epilogue_c_stage = (epilogue_c_stage + 1) % kEpilogueStageCount;
 
@@ -1662,6 +1680,7 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void n
                             cta_row,
                             tile_col,
                             valid_rows);
+                        sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_NVFP4_FC1_EPILOGUE_TMEM_TO_SMEM>();
                         if constexpr (!kDirectGmem || kSwapAB) {
                             asm volatile("bar.sync 1, 128;" ::: "memory");
                         }

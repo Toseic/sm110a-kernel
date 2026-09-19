@@ -227,6 +227,8 @@
 #include <cuda_runtime.h>
 
 #include "bf16_gemm.h"
+#include "bf16_gemm_pipeline_delay.cuh"
+#include "pipeline_delay.h"
 #include "profiler.h"
 
 #ifndef SM110A_BF16_TILE_M
@@ -675,6 +677,7 @@ void bf16_gemm_kernel(
     }
 
     const int taddr = tmem_addr[0];
+    sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_SETUP>();
 
     // tma load
     auto load = [&](int iter_k, int mma_phase, int stage_id, int off_m, int off_n) {
@@ -683,6 +686,7 @@ void bf16_gemm_kernel(
             profiler.start(ProfilerTag::WaitMMA);
         }
         wait_mma_slot(mma_mbar_addr, mma_phase);
+        sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_PRODUCER_WAIT_MMA>();
         if constexpr (DO_PROFILE) {
             profiler.stop();
         }
@@ -709,6 +713,7 @@ void bf16_gemm_kernel(
             off_n + cta_rank * (kTileN / kClusterM),
             off_k_64,
             tma_mbar_addr);
+        sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_PRODUCER_ISSUE_TMA>();
         if constexpr (DO_PROFILE) {
             profiler.stop();
         }
@@ -721,6 +726,7 @@ void bf16_gemm_kernel(
             profiler.start(ProfilerTag::WaitTMA);
         }
         wait_tma(tma_mbar_addr, tma_phase);
+        sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_CONSUMER_WAIT_TMA>();
         if constexpr (DO_PROFILE) {
             profiler.stop();
         }
@@ -766,6 +772,7 @@ void bf16_gemm_kernel(
             "h"(cta_mask),
             "n"(kClusterM)
             : "memory");
+        sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_CONSUMER_ISSUE_MMA>();
         if constexpr (DO_PROFILE) {
             profiler.stop();
         }
@@ -986,6 +993,7 @@ void bf16_gemm_kernel(
                 profiler.start(ProfilerTag::WaitEpilogue);
             }
             wait_epilogue(_base_epilogue_mbar_addr + mainloop_stage * 8, epilogue_phase);
+            sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_CONSUMER_WAIT_EPILOGUE>();
             if constexpr (DO_PROFILE) {
                 profiler.stop();
             }
@@ -1023,6 +1031,7 @@ void bf16_gemm_kernel(
                 if (elect_sync())
                     profiler.start(ProfilerTag::WaitMainloop);
             wait_mainloop(_base_mainloop_mbar_addr + 8 * mainloop_stage, mainloop_phase);
+            sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_EPILOGUE_WAIT_MAINLOOP>();
             asm volatile("tcgen05.fence::after_thread_sync;");
             if constexpr (DO_PROFILE)
                 if (elect_sync())
@@ -1032,6 +1041,7 @@ void bf16_gemm_kernel(
                 if (elect_sync())
                     profiler.start(ProfilerTag::Epilogue);
             epilogue(mainloop_stage, off_m, off_n);
+            sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_EPILOGUE>();
             if constexpr (DO_PROFILE)
                 if (elect_sync())
                     profiler.stop();
