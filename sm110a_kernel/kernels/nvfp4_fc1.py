@@ -19,6 +19,9 @@ class Nvfp4Fc1Config:
     tile_n: int = 128
     tile_k: int = 64
     epilogue_tile_n: int = 64
+    # Zero selects the CUDA kernel's measured fixed-C=3 default policy.
+    # Explicit values remain useful for focused pipeline experiments.
+    num_c_stage: int = 0
     cluster_m: int = 1
     cluster_n: int = 1
     direct_gmem: bool = False
@@ -31,6 +34,8 @@ class Nvfp4Fc1Config:
             raise ValueError("tile_k must be 64, 128, or 256")
         if self.epilogue_tile_n not in (64, 128) or self.tile_n % self.epilogue_tile_n:
             raise ValueError("invalid epilogue_tile_n")
+        if self.num_c_stage not in (0, 3, 4, 5):
+            raise ValueError("num_c_stage must be 0 (auto) or in [3, 5]")
         if self.cluster_m not in (1, 2):
             raise ValueError("cluster_m must be 1 or 2")
         if self.cluster_n != 1:
@@ -102,6 +107,7 @@ def _flags(config: Nvfp4Fc1Config, variant):
     return tuple(f"-DSM110A_NVFP4_FC1_{key}={value}" for key, value in (
         ("TILE_M", config.tile_m), ("TILE_N", config.tile_n),
         ("TILE_K", config.tile_k), ("EPILOGUE_TILE_N", config.epilogue_tile_n),
+        ("NUM_C_STAGE", config.num_c_stage),
         ("CLUSTER_M", config.cluster_m), ("CLUSTER_N", config.cluster_n),
         ("DIRECT_GMEM", int(config.direct_gmem)),
         ("MACRO_SWIZZLE_N_MAJOR", int(config.macro_swizzle_n_major))))
