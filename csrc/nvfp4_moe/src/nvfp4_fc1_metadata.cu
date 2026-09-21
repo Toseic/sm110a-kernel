@@ -9,8 +9,6 @@ constexpr int kThreads = 256;
 #ifndef SM110A_NVFP4_FC1_CLUSTER_N
 #define SM110A_NVFP4_FC1_CLUSTER_N 1
 #endif
-constexpr int kMacroSwizzleM = 8;
-constexpr int kMacroSwizzleN = 8;
 
 struct ExpertTileTask {
     int row_start, row_count, tile_row, expert, tile_n;
@@ -40,30 +38,33 @@ __global__ void build_expert_tile_tasks(
     int task_tile_rows,
     ExpertTileTask *tasks,
     int32_t *state) {
+    // Match the CuTE gather baseline's padded global-M tile space exactly:
+    // experts are concatenated in index order, each expert is rounded up to a
+    // full cluster-M tile, and N is the fastest-moving coordinate.  Deriving
+    // the per-expert offset from the preceding counts keeps the order stable
+    // while allowing experts to materialize their tiles in parallel.
     const int expert = blockIdx.x * blockDim.x + threadIdx.x;
     if (expert >= experts) return;
+    int next = 0;
+    for (int previous = 0; previous < expert; ++previous) {
+        const int previous_rows = counts[previous];
+        next += ((previous_rows + task_tile_rows - 1) / task_tile_rows) * grid_n;
+    }
     const int rows = counts[expert];
-    if (!rows) return;
     const int start = offsets[expert];
-    const int m_tasks = (rows + task_tile_rows - 1) / task_tile_rows;
-    int next = atomicAdd(state, m_tasks * grid_n);
-        for (int group_row = 0; group_row < rows; group_row += kMacroSwizzleM * task_tile_rows) {
-            const int group_end = min(group_row + kMacroSwizzleM * task_tile_rows, rows);
-            for (int macro_n = 0; macro_n < grid_n; macro_n += kMacroSwizzleN) {
-                const int band_end = min(macro_n + kMacroSwizzleN, grid_n);
+    const int expert_tasks = ((rows + task_tile_rows - 1) / task_tile_rows) * grid_n;
+    atomicMax(state, next + expert_tasks);
+    if (!rows) return;
+
 #if SM110A_NVFP4_FC1_MACRO_SWIZZLE_N_MAJOR
-                // Reuse the same expert B/SFB tile over adjacent M tiles.
-                for (int tile_n = macro_n; tile_n < band_end; ++tile_n)
-                    for (int tile_row = group_row; tile_row < group_end;
-                         tile_row += task_tile_rows)
-                        tasks[next++] = {start, rows, tile_row, expert, tile_n};
+    for (int tile_row = 0; tile_row < rows; tile_row += task_tile_rows)
+        for (int tile_n = 0; tile_n < grid_n; ++tile_n)
+            tasks[next++] = {start, rows, tile_row, expert, tile_n};
 #else
-                for (int tile_row = group_row; tile_row < group_end; tile_row += task_tile_rows)
-                    for (int tile_n = macro_n; tile_n < band_end; ++tile_n)
-                        tasks[next++] = {start, rows, tile_row, expert, tile_n};
+    for (int tile_n = 0; tile_n < grid_n; ++tile_n)
+        for (int tile_row = 0; tile_row < rows; tile_row += task_tile_rows)
+            tasks[next++] = {start, rows, tile_row, expert, tile_n};
 #endif
-            }
-        }
 }
 } // namespace
 
