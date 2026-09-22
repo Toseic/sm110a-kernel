@@ -341,9 +341,11 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
                 ),
                 format_candidate=format_candidate,
                 namespace="nvfp4_fc2",
-                # v3 isolates persistent-only candidates from prior mixed-mode
-                # sweeps, whose cache entries may select CLC or non-persistent.
-                key=("v3", tokens, args.experts, args.topk, args.n, args.k),
+                # v4 retunes after enabling the 2-CTA scheduler pipeline and
+                # removing its redundant SFA forwarding warp.  The environment
+                # fingerprint only contains Git HEAD, so dirty kernel changes
+                # do not otherwise invalidate an existing 1-CTA winner.
+                key=("v4", tokens, args.experts, args.topk, args.n, args.k),
                 pre_jit=compile_nvfp4_fc2,
                 metric_formatter=lambda config, stats: (
                     f"{fc2_tflops(tokens, args.topk, args.n, args.k, stats['median_ms']):.1f} TF/s"

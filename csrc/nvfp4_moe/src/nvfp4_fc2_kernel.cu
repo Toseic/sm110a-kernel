@@ -50,10 +50,6 @@ constexpr int kTmaWarp = kEpilogueWarpCount;
 constexpr int kSfaWarp = kTmaWarp + 1;
 constexpr int kMmaWarp = kSfaWarp + 1;
 constexpr int kSchedulerWarp = kMmaWarp + 1;
-// cta_group::2 needs a separate warp to turn each CTA-local SFA completion
-// into the paired-CTA ready event consumed by the leader MMA warp.  Keep the
-// warp out of cta_group::1 launches so their occupancy stays unchanged.
-constexpr int kSyncTransformWarp = kSchedulerWarp + 1;
 constexpr int kBaseWarpCount = kSchedulerWarp + 1;
 constexpr int kTaskPipelineStageCount = 2;
 constexpr int kPersistentTileCount = 2;
@@ -462,7 +458,7 @@ template <
     bool kPersistent,
     bool kDynamicClc = false>
 __global__ __cluster_dims__(kClusterM, 1, 1)
-__launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0)))
+__launch_bounds__(kWarpSize * kBaseWarpCount)
 void nvfp4_fc2_fused_kernel(
     const uint8_t *sfa,
     const __grid_constant__ CUtensorMap a_tensor_map,
@@ -519,9 +515,6 @@ void nvfp4_fc2_fused_kernel(
     __shared__ __align__(8) uint64_t clc_mbar[1];
     __shared__ uint64_t tma_mbars[kStageCount];
     __shared__ uint64_t sfa_tma_mbars[kStageCount];
-    // SFA reconstruction completes locally.  The 2-CTA sync-transform warp
-    // consumes this signal before publishing the aggregate rank-0 event.
-    __shared__ uint64_t sfa_ready_mbars[kStageCount];
     __shared__ uint64_t sfa_mbars[kStageCount];
     __shared__ uint64_t mma_mbars[kStageCount];
     __shared__ uint64_t mainloop_mbars[kTmemStageCount];
@@ -533,8 +526,6 @@ void nvfp4_fc2_fused_kernel(
     const int base_tma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(tma_mbars));
     const int base_sfa_tma_mbar_addr =
         static_cast<int>(__cvta_generic_to_shared(sfa_tma_mbars));
-    const int base_sfa_ready_mbar_addr =
-        static_cast<int>(__cvta_generic_to_shared(sfa_ready_mbars));
     const int base_task_ready_mbar_addr =
         static_cast<int>(__cvta_generic_to_shared(task_ready_mbars));
     const int base_task_free_mbar_addr =
@@ -550,7 +541,6 @@ void nvfp4_fc2_fused_kernel(
         for (int stage = 0; stage < kStageCount; ++stage) {
             mbarrier_init(base_tma_mbar_addr + stage * sizeof(uint64_t), kClusterM);
             mbarrier_init(base_sfa_tma_mbar_addr + stage * sizeof(uint64_t), 1);
-            mbarrier_init(base_sfa_ready_mbar_addr + stage * sizeof(uint64_t), 1);
             // cta_group::2 aggregates one completed SFA gather arrival from
             // each CTA on rank 0. cta_group::1 folds SFA into tma_mbars.
             mbarrier_init(base_sfa_mbar_addr + stage * sizeof(uint64_t), kClusterM);
@@ -570,7 +560,7 @@ void nvfp4_fc2_fused_kernel(
             for (int stage = 0; stage < kTaskPipelineStageCount; ++stage) {
                 mbarrier_init(base_task_ready_mbar_addr + stage * sizeof(uint64_t), 1);
                 mbarrier_init(base_task_free_mbar_addr + stage * sizeof(uint64_t),
-                    kEpilogueWarpCount * kClusterM);
+                    kClusterM);
             }
         }
         if constexpr (kDynamicClc) {
@@ -612,8 +602,6 @@ void nvfp4_fc2_fused_kernel(
     int producer_mma_phase = 1;
     int sfa_stage = 0;
     int sfa_tma_phase = 0;
-    int sync_transform_stage = 0;
-    int sync_transform_phase = 0;
     int consumer_stage = 0;
     int consumer_tma_phase = 0;
     int consumer_mainloop_stage = 0;
@@ -975,44 +963,17 @@ void nvfp4_fc2_fused_kernel(
                             mbarrier_arrive_on_cluster_cta(
                                 base_sfa_mbar_addr + sfa_stage * sizeof(uint64_t), 0);
                         } else {
-                            const int sfa_ready_mbar_addr =
-                                base_sfa_ready_mbar_addr +
-                                sfa_stage * static_cast<int>(sizeof(uint64_t));
-                            asm volatile(
-                                "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];" ::
-                                "r"(sfa_ready_mbar_addr) : "memory");
+                            // This warp has just completed the CTA-local SFA
+                            // transform, so it can publish directly to rank 0.
+                            // A separate forwarding warp and local barrier add
+                            // no overlap and inflate every 2-CTA block.
+                            mbarrier_arrive_on_cluster_cta(
+                                base_sfa_mbar_addr + sfa_stage * sizeof(uint64_t), 0);
                         }
                     }
                     sfa_stage = (sfa_stage + 1) % kStageCount;
                     if (sfa_stage == 0) {
                         sfa_tma_phase ^= 1;
-                    }
-                }
-            }
-        }
-
-        // Match FC1's 2-CTA producer split: this warp waits for its CTA's
-        // reconstructed SFA stage, then forwards one arrival to rank 0.  The
-        // MMA warp therefore waits once for a fully ready cta_group::2 scale
-        // operand instead of being coupled to either CTA's local transform.
-        if constexpr (kClusterM > 1) {
-            if (warp_id == kSyncTransformWarp && elect_sync()) {
-                for (int cluster_bid = first_cluster_bid; cluster_bid < last_cluster_bid;
-                    ++cluster_bid) {
-                    for (int tile_k = 0; tile_k < k_tiles; ++tile_k) {
-                        mbarrier_wait(
-                            base_sfa_ready_mbar_addr +
-                                sync_transform_stage * sizeof(uint64_t),
-                            sync_transform_phase);
-                        mbarrier_arrive_on_cluster_cta(
-                            base_sfa_mbar_addr +
-                                sync_transform_stage * sizeof(uint64_t),
-                            0);
-                        sync_transform_stage =
-                            (sync_transform_stage + 1) % kStageCount;
-                        if (sync_transform_stage == 0) {
-                            sync_transform_phase ^= 1;
-                        }
                     }
                 }
             }
@@ -1283,7 +1244,10 @@ void nvfp4_fc2_fused_kernel(
         }
 
         if constexpr (kUseTaskPipeline) {
-            if (warp_id < kEpilogueWarpCount && elect_sync()) {
+            // The four epilogue warps have already reconverged at bar.sync 1,
+            // so one elected lane per CTA is sufficient to release the task
+            // slot.  The 2-CTA barrier counts one arrival from each rank.
+            if (warp_id == 0 && elect_sync()) {
                 const int free_addr = base_task_free_mbar_addr +
                     task_pipe_stage * sizeof(uint64_t);
                 if constexpr (kClusterM == 1) {
@@ -1375,8 +1339,7 @@ void launch_nvfp4_fc2_impl(
     cudaStream_t stream) {
     using Config = Nvfp4Fc2Config<kTileM, kTileN, kTileK, kClusterM>;
     constexpr int kDynamicSmemBytes = Config::kDynamicSmemBytes;
-    constexpr int kBlockThreads =
-        kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0));
+    constexpr int kBlockThreads = kWarpSize * kBaseWarpCount;
     if (m % 128 || n % kTileN != 0 || n % 128 || k % kTileK != 0) {
         return;
     }
