@@ -23,6 +23,28 @@ _DECIMAL_MB = 1000 ** 2
 _DECIMAL_GFLOP = 1000 ** 3
 
 
+def powerlaw_router_scores(tokens, experts, alpha, *, device, dtype):
+    """Sample router logits whose selected-expert load follows rank^-alpha.
+
+    Gumbel-top-k produces weighted samples without replacement for every
+    token.  Adding ``log(rank^-alpha)`` to the Gumbel noise therefore gives
+    each expert a power-law routing prior while preserving valid, distinct
+    top-k expert selections.
+    """
+    if tokens <= 0 or experts <= 0:
+        raise ValueError("tokens and experts must be positive")
+    if alpha < 0:
+        raise ValueError("alpha must be non-negative")
+
+    ranks = torch.arange(1, experts + 1, device=device, dtype=torch.float32)
+    log_weights = -alpha * ranks.log()
+    # If x ~ Exp(1), -log(x) has the standard Gumbel distribution.
+    gumbel = -torch.empty(
+        (tokens, experts), device=device, dtype=torch.float32
+    ).exponential_().log_()
+    return (gumbel + log_weights).to(dtype)
+
+
 class B300Sim:
     """Temporarily lock Thor clocks, optionally at B300 balance.
 

@@ -19,6 +19,7 @@ from common import (  # noqa: E402
     TablePrinter,
     benchmark_with_stats,
     quick_probe,
+    powerlaw_router_scores,
     sol_bounds,
 )
 from sm110a_kernel import (  # noqa: E402
@@ -41,6 +42,7 @@ DEFAULT_K = 2048
 # projections are compared at the same routed-token counts.
 DEFAULT_TOKEN_VALUES = (64 * 32, 128 * 32, 256 * 32, 512 * 32, 1024 * 32)
 DEFAULT_TOPK = 8
+ROUTER_POWERLAW_ALPHA = 0.8
 NVFP4_MMA_PEAK_TFLOPS = 4.0 * 250.0
 NVFP4_FC2_CONFIGS = tuple(
     Nvfp4Fc2Config(
@@ -157,8 +159,9 @@ def dequantize(q, scales, rows, k):
 
 
 def make_case(tokens, experts, topk, n, k):
-    router_scores = torch.randn(
-        (tokens, experts), device="cuda", dtype=torch.bfloat16
+    router_scores = powerlaw_router_scores(
+        tokens, experts, ROUTER_POWERLAW_ALPHA,
+        device="cuda", dtype=torch.bfloat16,
     )
     topk_result = torch.topk(router_scores.float(), topk, dim=1)
     selected = topk_result.indices.to(torch.int32)
@@ -279,7 +282,8 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
         candidates = compatible_candidates(args.n, args.k, args)
         print(
             f"[config] experts={args.experts} n={args.n} k={args.k} "
-            f"topk={args.topk} tokens={args.token_values}"
+            f"topk={args.topk} tokens={args.token_values} "
+            f"routing=powerlaw(alpha={ROUTER_POWERLAW_ALPHA})"
         )
         print("[baseline] TRT-LLM CuTE DSL fused-finalize NVFP4 FC2 (autotuned)")
         print("[runner] resolving and caching the best compatible config")
@@ -341,11 +345,12 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
                 ),
                 format_candidate=format_candidate,
                 namespace="nvfp4_fc2",
-                # v4 retunes after enabling the 2-CTA scheduler pipeline and
+                # v5 retunes for the power-law router distribution after v4
+                # enabled the 2-CTA scheduler pipeline and
                 # removing its redundant SFA forwarding warp.  The environment
                 # fingerprint only contains Git HEAD, so dirty kernel changes
                 # do not otherwise invalidate an existing 1-CTA winner.
-                key=("v4", tokens, args.experts, args.topk, args.n, args.k),
+                key=("v5", tokens, args.experts, args.topk, args.n, args.k),
                 pre_jit=compile_nvfp4_fc2,
                 metric_formatter=lambda config, stats: (
                     f"{fc2_tflops(tokens, args.topk, args.n, args.k, stats['median_ms']):.1f} TF/s"

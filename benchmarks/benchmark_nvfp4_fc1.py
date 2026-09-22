@@ -19,6 +19,7 @@ from common import (
     TablePrinter,
     benchmark_with_stats,
     quick_probe,
+    powerlaw_router_scores,
     sol_bounds,
     tflops_from_ms,
 )
@@ -40,6 +41,7 @@ DEFAULT_N = 2048
 DEFAULT_K = 6144
 DEFAULT_TOKEN_VALUES = (64 * 32, 128 * 32, 256 * 32, 512 * 32, 1024 * 32)
 DEFAULT_TOPK = 8
+ROUTER_POWERLAW_ALPHA = 0.8
 NVFP4_MMA_PEAK_TFLOPS = 4.0 * 250.0
 
 NVFP4_FC1_CONFIGS = tuple(
@@ -356,7 +358,7 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
         selection = AutotuneRunner(options).resolve(
             candidates,
             namespace="nvfp4_fc1",
-            key=("v9", aq.size(0), args.experts, args.topk, args.n, args.k),
+            key=("v10", aq.size(0), args.experts, args.topk, args.n, args.k),
             prepare=prepare_for_runner,
             benchmark=lambda prepared: benchmark_with_stats(
                 prepared.run,
@@ -400,7 +402,8 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
 
         print(
             f"[config] experts={args.experts} topk={args.topk} "
-            f"n={args.n} k={args.k} tokens={args.token_values}"
+            f"n={args.n} k={args.k} tokens={args.token_values} "
+            f"routing=powerlaw(alpha={ROUTER_POWERLAW_ALPHA})"
         )
         print("[runner] config selection cached by tokens/experts/topk/N/K")
         if args.baseline == "cutedsl":
@@ -418,8 +421,9 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
 
         for tokens in args.token_values:
             a = torch.randn((tokens, args.k), device="cuda", dtype=torch.bfloat16)
-            router = torch.randn(
-                (tokens, args.experts), device="cuda", dtype=torch.bfloat16
+            router = powerlaw_router_scores(
+                tokens, args.experts, ROUTER_POWERLAW_ALPHA,
+                device="cuda", dtype=torch.bfloat16,
             )
             aq, sfa = quantize_nvfp4_rows(a)
             del a
