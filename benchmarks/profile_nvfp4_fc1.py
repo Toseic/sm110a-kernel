@@ -60,7 +60,12 @@ def main():
         (args.tokens, args.experts), device="cuda", dtype=torch.bfloat16
     )
     out = torch.empty(
-        (args.tokens * args.topk, args.n), device="cuda", dtype=torch.bfloat16
+        (args.tokens * args.topk, args.n // 2), device="cuda",
+        dtype=torch.float4_e2m1fn_x2,
+    )
+    out_scale = torch.empty(
+        (args.tokens * args.topk * (args.n // 16),), device="cuda",
+        dtype=torch.float8_e4m3fn,
     )
 
     native_config = Nvfp4Fc1Config(
@@ -75,10 +80,13 @@ def main():
     )
     if args.impl == "ours":
         module = compile_nvfp4_fc1(native_config)
-        run = lambda: module.nvfp4_fc1_out(a_q, b_q, sfa, sfb, metadata, out)
+        run = lambda: module.nvfp4_fc1_out(
+            a_q, b_q, sfa, sfb, metadata, out, out_scale
+        )
     else:
         runner = CuteDslNvfp4Fc1Runner(
-            a_q, b_q, sfa, sfb, out, metadata.source_rows, metadata.tasks, metadata.state
+            a_q, b_q, sfa, sfb, out, out_scale,
+            metadata.source_rows, metadata.tasks, metadata.state
         )
         config = CuteDslNvfp4Fc1Config(
             mma_tile_m=128 * args.cluster_m,

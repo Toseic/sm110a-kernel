@@ -105,8 +105,8 @@ def format_config(config):
 
 
 # ---------------------------------------------------------------------------
-# Custom CuTE JIT launch for TensorRT-LLM's fused gather FC1 kernel.  It
-# deliberately passes no SFC tensors so the fused epilogue writes BF16.
+# Custom CuTE JIT launch for TensorRT-LLM's fused gather FC1 kernel with its
+# built-in NVFP4 output quantization enabled.
 # ---------------------------------------------------------------------------
 @cute.jit
 def _launch_fc1(
@@ -116,6 +116,8 @@ def _launch_fc1(
     a_sf_ptr: cute.Pointer,
     b_sf_ptr: cute.Pointer,
     c_ptr: cute.Pointer,
+    c_sf_ptr: cute.Pointer,
+    norm_const_ptr: cute.Pointer,
     alpha_ptr: cute.Pointer,
     tile_idx_to_expert_idx_ptr: cute.Pointer,
     tile_idx_to_mn_limit_ptr: cute.Pointer,
@@ -155,6 +157,13 @@ def _launch_fc1(
     c = cute.make_tensor(
         c_ptr, layout=cute.make_ordered_layout((m, interm_size, 1), order=(1, 0, 2))
     )
+    c_sf = cute.make_tensor(
+        c_sf_ptr,
+        layout=cute.make_ordered_layout(
+            (m, interm_size // scaling_vector_size, 1), order=(1, 0, 2)
+        ),
+    )
+    norm_const = cute.make_tensor(norm_const_ptr, layout=cute.make_layout((1,)))
     alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l,)))
     tile_idx_to_expert_idx = cute.make_tensor(
         tile_idx_to_expert_idx_ptr, layout=cute.make_layout((num_tiles,))
@@ -175,8 +184,8 @@ def _launch_fc1(
         c,
         a_sf,
         b_sf,
-        None,   # sfc_tensor
-        None,   # norm_const_tensor
+        c_sf,
+        norm_const,
         tile_idx_to_expert_idx,
         tile_idx_to_mn_limit,
         token_id_mapping,
@@ -248,23 +257,29 @@ class CuteDslNvfp4Fc1Runner:
         sfa: torch.Tensor,
         sfb: torch.Tensor,
         out: torch.Tensor,
+        out_scale: torch.Tensor,
         source_rows: torch.Tensor,
         tasks: torch.Tensor,
         state: torch.Tensor,
     ):
         if not all(
-            t.is_cuda for t in (a, b, sfa, sfb, out, source_rows, tasks, state)
+            t.is_cuda for t in (
+                a, b, sfa, sfb, out, out_scale, source_rows, tasks, state
+            )
         ):
             raise ValueError("all CuTE DSL NVFP4 FC1 tensors must be CUDA tensors")
         if a.dtype != torch.float4_e2m1fn_x2 or b.dtype != torch.float4_e2m1fn_x2:
             raise ValueError("a and b must be packed torch.float4_e2m1fn_x2 tensors")
         if sfa.dtype != torch.float8_e4m3fn or sfb.dtype != torch.float8_e4m3fn:
             raise ValueError("expected E4M3 scale factors")
-        if out.dtype != torch.bfloat16:
-            raise ValueError("expected BF16 output")
+        if out.dtype != torch.float4_e2m1fn_x2:
+            raise ValueError("expected packed float4_e2m1fn_x2 output")
+        if out_scale.dtype != torch.float8_e4m3fn:
+            raise ValueError("expected E4M3 output scales")
         if a.ndim != 2 or b.ndim != 3 or out.ndim != 2:
             raise ValueError(
-                "expected a[tokens,K/2], b[experts,2*N,K/2], out[permuted_m,N]"
+                "expected a[tokens,K/2], b[experts,2*N,K/2], "
+                "out[permuted_m,N/2]"
             )
         if source_rows.dtype != torch.int32 or tasks.dtype != torch.int32 or state.dtype != torch.int32:
             raise ValueError("metadata tensors must be int32")
@@ -290,10 +305,12 @@ class CuteDslNvfp4Fc1Runner:
             )
 
         self.logical_m = source_rows.numel()  # permuted rows = tokens * topk
-        if out.shape != (self.logical_m, self.n // 2):
+        if out.shape != (self.logical_m, self.n // 4):
             raise ValueError(
-                f"out shape mismatch: {out.shape} vs ({self.logical_m},{self.n // 2})"
+                f"out shape mismatch: {out.shape} vs ({self.logical_m},{self.n // 4})"
             )
+        if out_scale.numel() != self.logical_m * (self.n // 32):
+            raise ValueError("out_scale has invalid blocked scale storage")
 
         # ExpertTileTask is {row_start, row_count, tile_row, expert, tile_n}.
         # The native list contains one entry per M/N tile; retain just the
@@ -369,6 +386,7 @@ class CuteDslNvfp4Fc1Runner:
         self._expert_ranges = tuple(padded_ranges)
         self.m = padded_start
         self.out_target = out
+        self.out_scale_target = out_scale
 
         # The fused-gather kernel consumes logical A/SFA rows, retaining the
         # native physical scale layout only at this API boundary.
@@ -403,11 +421,16 @@ class CuteDslNvfp4Fc1Runner:
         )[:, :, (1, 0)].reshape_as(sfb_logical_2d)
         self.sfb_storage = to_blocked_nvfp4_scales(sfb_cute_logical_2d.contiguous())
         self.out_storage = torch.empty(
-            (self.m, self.n // 2), device=out.device, dtype=out.dtype
+            (self.m, self.n // 4), device=out.device, dtype=out.dtype
+        )
+        self.out_scale_storage = torch.empty(
+            (self.m * (self.n // 32),), device=out.device,
+            dtype=torch.float8_e4m3fn,
         )
 
         # One alpha per expert (multiplicative identity).
         self.alpha = torch.ones((self.experts,), device=a.device, dtype=torch.float32)
+        self.norm_const = torch.ones((1,), device=a.device, dtype=torch.float32)
 
         self.stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         self.selection: Optional[Selection] = None
@@ -449,7 +472,7 @@ class CuteDslNvfp4Fc1Runner:
                 ab_dtype=cutlass.Float4E2M1FN,
                 sf_dtype=cutlass.Float8E4M3FN,
                 sf_vec_size=16,  # NVFP4
-                c_dtype=cutlass.BFloat16,
+                c_dtype=cutlass.Float4E2M1FN,
                 mma_tiler_mn=(config.mma_tile_m, config.mma_tile_n),
                 cluster_shape_mn=(config.cluster_m, config.cluster_n),
                 m=self.m,
@@ -492,8 +515,14 @@ class CuteDslNvfp4Fc1Runner:
             cutlass.Float8E4M3FN, self.sfb_storage.data_ptr(),
             cutlass.cute.AddressSpace.gmem, assumed_align=16)
         c_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.BFloat16, self.out_storage.data_ptr(),
+            cutlass.Float4E2M1FN, self.out_storage.data_ptr(),
             cutlass.cute.AddressSpace.gmem, assumed_align=16)
+        c_sf_ptr = cutlass.cute.runtime.make_ptr(
+            cutlass.Float8E4M3FN, self.out_scale_storage.data_ptr(),
+            cutlass.cute.AddressSpace.gmem, assumed_align=16)
+        norm_const_ptr = cutlass.cute.runtime.make_ptr(
+            cutlass.Float32, self.norm_const.data_ptr(),
+            cutlass.cute.AddressSpace.gmem)
         alpha_ptr = cutlass.cute.runtime.make_ptr(
             cutlass.Float32, self.alpha.data_ptr(),
             cutlass.cute.AddressSpace.gmem)
@@ -511,7 +540,8 @@ class CuteDslNvfp4Fc1Runner:
             cutlass.cute.AddressSpace.gmem)
 
         compile_args = [
-            a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha_ptr,
+            a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr,
+            norm_const_ptr, alpha_ptr,
             tile_expert_ptr, tile_mn_limit_ptr, token_mapping_ptr, num_tiles_ptr,
             self.tokens, self.m, self.n, self.k, self.experts,
         ]
@@ -544,8 +574,14 @@ class CuteDslNvfp4Fc1Runner:
             cutlass.Float8E4M3FN, self.sfb_storage.data_ptr(),
             cutlass.cute.AddressSpace.gmem, assumed_align=16)
         c_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.BFloat16, self.out_storage.data_ptr(),
+            cutlass.Float4E2M1FN, self.out_storage.data_ptr(),
             cutlass.cute.AddressSpace.gmem, assumed_align=16)
+        c_sf_ptr = cutlass.cute.runtime.make_ptr(
+            cutlass.Float8E4M3FN, self.out_scale_storage.data_ptr(),
+            cutlass.cute.AddressSpace.gmem, assumed_align=16)
+        norm_const_ptr = cutlass.cute.runtime.make_ptr(
+            cutlass.Float32, self.norm_const.data_ptr(),
+            cutlass.cute.AddressSpace.gmem)
         alpha_ptr = cutlass.cute.runtime.make_ptr(
             cutlass.Float32, self.alpha.data_ptr(),
             cutlass.cute.AddressSpace.gmem)
@@ -567,7 +603,8 @@ class CuteDslNvfp4Fc1Runner:
             # ``compiled`` only receives their raw device pointers.
             _ = tile_expert_idx, tile_mn_limits, num_non_exiting
             compiled(
-                a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha_ptr,
+                a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr,
+                norm_const_ptr, alpha_ptr,
                 tile_expert_ptr, tile_mn_limit_ptr, token_mapping_ptr, num_tiles_ptr,
                 self.tokens, self.m, self.n, self.k, self.experts,
                 stream=self.stream,
@@ -579,11 +616,21 @@ class CuteDslNvfp4Fc1Runner:
 
     def _scatter_output(self):
         """Materialize the logical output after an untimed CuTE launch."""
-        self.out_target.index_copy_(
+        self.out_target.view(torch.uint8).index_copy_(
             0,
             self._valid_output_rows,
-            self.out_storage.index_select(0, self._valid_padded_rows),
+            self.out_storage.view(torch.uint8).index_select(
+                0, self._valid_padded_rows
+            ),
         )
+        from sm110a_kernel.kernels.nvfp4_gemm import (
+            from_blocked_nvfp4_scales,
+            to_blocked_nvfp4_scales,
+        )
+        logical_scales = from_blocked_nvfp4_scales(
+            self.out_scale_storage, self.m, self.n // 2
+        ).index_select(0, self._valid_padded_rows)
+        self.out_scale_target.copy_(to_blocked_nvfp4_scales(logical_scales))
 
     def autotune(self, options: TuneOptions | None = None):
         options = options or TuneOptions()
@@ -597,9 +644,11 @@ class CuteDslNvfp4Fc1Runner:
         self.selection = AutotuneRunner(options).resolve(
             configs,
             namespace="cute_dsl_nvfp4_fc1",
-            # v6 measures the CuTE launch alone.  The output scatter is an
+            # v7 enables fused NVFP4 output quantization and measures the CuTE
+            # launch alone.  The output scatter is an
             # independent PyTorch kernel and must not influence tactic choice.
-            key=("v6-gather64-pure", self.tokens, self.experts, self.m, self.n // 2, self.k),
+            key=("v7-gather64-fp4-pure", self.tokens, self.experts, self.m,
+                 self.n // 2, self.k),
             prepare=self._prepare,
             benchmark=lambda prepared: _stats(prepared.run, options),
             probe=lambda prepared: _quick_probe(prepared.run, options),
@@ -630,12 +679,13 @@ def cute_dsl_nvfp4_fc1_out(
     sfa: torch.Tensor,
     sfb: torch.Tensor,
     out: torch.Tensor,
+    out_scale: torch.Tensor,
     source_rows: torch.Tensor,
     tasks: torch.Tensor,
     state: torch.Tensor,
     options: TuneOptions | None = None,
 ):
-    """Autotuned CuTE DSL NVFP4 FC1: grouped GEMM + fused SwiGLU → BF16.
+    """Autotuned CuTE DSL NVFP4 FC1 with fused NVFP4 output quantization.
 
     Pre-gathers A and SFA via ``source_rows`` on the Python side, then
     delegates to the persistent grouped-GEMM SwiGLU kernel.
@@ -645,13 +695,16 @@ def cute_dsl_nvfp4_fc1_out(
         b: Packed E2M1 weights ``(experts, 2*N, K/2)`` (interleaved gate/up).
         sfa: E4M3 activation scales ``(tokens, K/16)``.
         sfb: E4M3 weight scales ``(experts*2*N, K/16)``, flat.
-        out: BF16 output ``(tokens*topk, N)`` (pre-allocated).
+        out: Packed E2M1 output ``(tokens*topk, N/2)`` (pre-allocated).
+        out_scale: Blocked E4M3 scales, one per 16 logical output values.
         source_rows: int32 map from permuted row → source token.
         tasks: int32 flat ExpertTileTask array.
         state: int32 ``[num_tasks, 0]``.
         options: Autotune options.
     """
-    runner = CuteDslNvfp4Fc1Runner(a, b, sfa, sfb, out, source_rows, tasks, state)
+    runner = CuteDslNvfp4Fc1Runner(
+        a, b, sfa, sfb, out, out_scale, source_rows, tasks, state
+    )
     runner.autotune(options)
     runner.run()
     return runner

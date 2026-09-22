@@ -5,15 +5,16 @@ from the NVFP4 grouped-M GEMM pipeline. It consumes unpermuted token rows and
 fuses `source_rows` gathering for both packed E2M1 activations and their
 blocked UE4M3 scales into the mainloop producer stage.
 
-Weights use a 64-column block-interleaved `[gate, up]` layout.
-BF16 FC1 path. The main kernel applies `silu(gate) * up` in its epilogue, so
-the result width is half the physical weight width. The public Python API
+Weights use a 64-column block-interleaved `[gate, up]` layout. The main kernel
+applies `silu(gate) * up` and quantizes it to packed E2M1 plus blocked UE4M3
+scales in the epilogue, so the logical result width is half the physical
+weight width. The public Python API
 mirrors the BF16 FC1 metadata/main split (pass the physical, interleaved N to
 metadata preparation):
 
 ```python
 metadata = prepare_nvfp4_fc1_metadata(router_scores, topk, 2 * hidden, config)
-out = nvfp4_fc1(aq, bq, sfa, sfb, metadata, config)
+out, out_scale = nvfp4_fc1(aq, bq, sfa, sfb, metadata, config)
 ```
 
 The fused gather path supports `cluster_m=1` and `cluster_m=2` (with B/SFB

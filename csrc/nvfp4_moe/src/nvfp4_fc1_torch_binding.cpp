@@ -7,7 +7,7 @@
 
 namespace {
 using Launcher = void (*)(const uint8_t*, const uint8_t*, const uint8_t*, const uint8_t*,
-    const int32_t*, const int32_t*, int32_t*, __nv_bfloat16*, int, int, int, int,
+    const int32_t*, const int32_t*, int32_t*, uint8_t*, uint8_t*, int, int, int, int,
     int, int, int, cudaStream_t);
 using MetadataLauncher = void (*)(const int32_t*, int32_t*, int32_t*, int32_t*, int32_t*,
     int, int, int, int, int, int, bool, cudaStream_t);
@@ -76,7 +76,7 @@ std::vector<torch::Tensor> prepare_routing(
 
 torch::Tensor run_out(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb,
     torch::Tensor source_rows, torch::Tensor tasks, torch::Tensor state,
-    torch::Tensor out, uint64_t address, int64_t max_active_clusters) {
+    torch::Tensor out, torch::Tensor out_scale, uint64_t address, int64_t max_active_clusters) {
   check_fp4(a, "A", 2); check_fp4(b, "B", 3);
   const int64_t tokens = a.size(0), m = out.size(0);
   const int64_t e = b.size(0), n = b.size(1), k = a.size(1) * 2;
@@ -92,12 +92,14 @@ torch::Tensor run_out(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch
       "source_rows must be contiguous CUDA int32 [M]");
   TORCH_CHECK(state.is_cuda() && state.scalar_type() == torch::kInt32 && state.numel() == 2,
       "state must be CUDA int32[2]");
-  TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kBFloat16 && out.is_contiguous() &&
-      out.sizes() == torch::IntArrayRef({m, n / 2}),
-      "output must be contiguous BF16 [M, physical-N/2]");
+  TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kFloat4_e2m1fn_x2 &&
+      out.is_contiguous() && out.sizes() == torch::IntArrayRef({m, n / 4}),
+      "output must be contiguous float4_e2m1fn_x2 [M, physical-N/4]");
+  check_scale(out_scale, m * (n / 32), "output scale");
   TORCH_CHECK(a.device() == sfa.device() && a.device() == sfb.device() &&
       a.device() == source_rows.device() && a.device() == tasks.device() &&
-      a.device() == state.device() && a.device() == out.device(),
+      a.device() == state.device() && a.device() == out.device() &&
+      a.device() == out_scale.device(),
       "all NVFP4 FC1 tensors must share a CUDA device");
   c10::cuda::CUDAGuard guard(a.device());
   auto stream = c10::cuda::getCurrentCUDAStream(a.device().index());
@@ -105,15 +107,21 @@ torch::Tensor run_out(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch
       reinterpret_cast<uint8_t*>(b.data_ptr()), reinterpret_cast<uint8_t*>(sfa.data_ptr()),
       reinterpret_cast<uint8_t*>(sfb.data_ptr()), source_rows.data_ptr<int32_t>(),
       tasks.data_ptr<int32_t>(), state.data_ptr<int32_t>(),
-      reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()), tokens, m, e, n, k,
+      reinterpret_cast<uint8_t*>(out.data_ptr()),
+      reinterpret_cast<uint8_t*>(out_scale.data_ptr()), tokens, m, e, n, k,
       tasks.size(0), static_cast<int>(max_active_clusters), stream);
   C10_CUDA_KERNEL_LAUNCH_CHECK(); return out;
 }
-torch::Tensor run(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb,
+std::vector<torch::Tensor> run(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb,
     torch::Tensor source_rows, torch::Tensor tasks, torch::Tensor state, uint64_t address, int64_t max_active_clusters) {
-  auto out = torch::empty({source_rows.numel(), b.size(1) / 2},
-      a.options().dtype(torch::kBFloat16));
-  return run_out(a,b,sfa,sfb,source_rows,tasks,state,out,address,max_active_clusters);
+  const auto m = source_rows.numel();
+  const auto logical_n = b.size(1) / 2;
+  auto out = torch::empty({m, logical_n / 2},
+      a.options().dtype(at::kFloat4_e2m1fn_x2));
+  auto out_scale = torch::empty({m * (logical_n / 16)},
+      a.options().dtype(at::kFloat8_e4m3fn));
+  run_out(a,b,sfa,sfb,source_rows,tasks,state,out,out_scale,address,max_active_clusters);
+  return {out, out_scale};
 }
 }
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

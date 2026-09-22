@@ -16,6 +16,7 @@
 #include <cudaTypedefs.h>
 #include <cuda_bf16.h>
 #include <cuda_fp4.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include "nvfp4_moe_fc1.h"
@@ -122,7 +123,7 @@ struct KernelConfig {
     static constexpr int kPerStageSmemBytes = (kPerStagePayloadBytes + 1023) & ~1023;
     static constexpr int kOutputEpilogueTileN = kEpilogueTileN / 2;
     static constexpr int kEpilogueStageBytes =
-        kTileM * kOutputEpilogueTileN * sizeof(nv_bfloat16);
+        kTileM * kOutputEpilogueTileN / 2;
     // The CuTE SMEM heuristic varies C depth by tactic (for example, it picks
     // four stages for N=256/cluster_m=1). FC1 measurements show that a fixed
     // three-stage C pipeline is better across the selected tactics: it keeps
@@ -746,20 +747,20 @@ inline bool init_scale_tensor_map(CUtensorMap *map, const uint8_t *ptr,
 template <int kTileM, int kEpilogueTileN>
 inline bool init_c_tensor_map(
     CUtensorMap *tensor_map,
-    nv_bfloat16 *ptr,
+    uint8_t *ptr,
     uint64_t m,
     uint64_t n) {
     constexpr uint32_t rank = 3;
     uint64_t global_dim[rank] = {n, m, 1};
-    uint64_t global_stride[rank - 1] = {n * sizeof(nv_bfloat16), m * n * sizeof(nv_bfloat16)};
-    constexpr int kStoreTileN = kEpilogueTileN < 64 ? kEpilogueTileN : 64;
+    uint64_t global_stride[rank - 1] = {n, m * n};
+    constexpr int kStoreTileN = kEpilogueTileN < 32 ? kEpilogueTileN : 32;
     uint32_t box_dim[rank] = {kStoreTileN, kTileM, 1};
     uint32_t element_stride[rank] = {1, 1, 1};
     constexpr CUtensorMapSwizzle kSwizzle =
-        kStoreTileN == 32 ? CU_TENSOR_MAP_SWIZZLE_64B : CU_TENSOR_MAP_SWIZZLE_128B;
+        kStoreTileN == 16 ? CU_TENSOR_MAP_SWIZZLE_NONE : CU_TENSOR_MAP_SWIZZLE_32B;
 
     return cuTensorMapEncodeTiled(tensor_map,
-               CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+               CU_TENSOR_MAP_DATA_TYPE_UINT8,
                rank,
                ptr,
                global_dim,
@@ -824,7 +825,8 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void n
     const ExpertTileTask *tasks,
     const int *task_count,
     int *next_cluster_tile,
-    nv_bfloat16 *c,
+    uint8_t *c,
+    uint8_t *sfc,
     int n,
     int k) {
     using Config = KernelConfig<kTileM, kTileN, kTileK, kEpilogueTileN, kClusterM, kClusterN>;
@@ -842,11 +844,14 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void n
     constexpr int kEpilogueStageBytes = Config::kEpilogueStageBytes;
     constexpr int kEpilogueStageCount = Config::kEpilogueStageCount;
     constexpr int kOutputEpilogueTileN = Config::kOutputEpilogueTileN;
-    constexpr int kEpilogueStoreTileN = kOutputEpilogueTileN < 64 ? kOutputEpilogueTileN : 64;
-    constexpr int kEpilogueStoreTiles = kOutputEpilogueTileN / kEpilogueStoreTileN;
-    constexpr int kChunksPerStoreTile = kEpilogueStoreTileN / 8;
-    constexpr int kSwizzlePhaseMask = kEpilogueStoreTileN == 32 ? 3 : 7;
-    constexpr int kStoreTileBytes = kTileM * kEpilogueStoreTileN * sizeof(nv_bfloat16);
+    constexpr int kPackedOutputEpilogueTileN = kOutputEpilogueTileN / 2;
+    constexpr int kEpilogueStoreTileN =
+        kPackedOutputEpilogueTileN < 32 ? kPackedOutputEpilogueTileN : 32;
+    constexpr int kEpilogueStoreTiles =
+        kPackedOutputEpilogueTileN / kEpilogueStoreTileN;
+    constexpr int kChunksPerStoreTile = kEpilogueStoreTileN / 16;
+    constexpr int kSwizzlePhaseMask = kChunksPerStoreTile - 1;
+    constexpr int kStoreTileBytes = kTileM * kEpilogueStoreTileN;
     constexpr int kMmaStepsPerStage = kTileK / kMmaK;
     constexpr int kTmemStageCount = Config::kTmemStageCount;
     constexpr int kTmemAllocationColumns = Config::kTmemAllocationColumns;
@@ -1025,44 +1030,70 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void n
                     : "r"(up_load_addr));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
 
-                nv_bfloat162 packed[kTmemLoadColumns / 2];
+                float activated[kTmemLoadColumns];
+                float abs_max = 0.0f;
+                for (int i = 0; i < kTmemLoadColumns; ++i) {
+                    activated[i] = silu(gate_values[i]) * up_values[i];
+                    abs_max = fmaxf(abs_max, fabsf(activated[i]));
+                }
+                const uint8_t scale_raw = __nv_cvt_float_to_fp8(
+                    abs_max / 6.0f, __NV_SATFINITE, __NV_E4M3);
+                const __half_raw scale_half_raw =
+                    __nv_cvt_fp8_to_halfraw(scale_raw, __NV_E4M3);
+                const float scale_value = abs_max == 0.0f
+                    ? 1.0f
+                    : __half2float(*reinterpret_cast<const __half *>(&scale_half_raw));
+                // The scale is shared by all 16 values in this NVFP4 block.
+                // Writing each normalization as a division makes nvcc emit a
+                // separate reciprocal/refinement sequence for every value.
+                // Hoist that invariant work so the quantizer pays for one
+                // reciprocal followed by inexpensive multiplies.
+                const float inverse_scale = 1.0f / scale_value;
+                uint8_t packed[kTmemLoadColumns / 2];
                 for (int i = 0; i < kTmemLoadColumns / 2; ++i) {
-                    packed[i] = __float22bfloat162_rn({
-                        silu(gate_values[2 * i]) * up_values[2 * i],
-                        silu(gate_values[2 * i + 1]) * up_values[2 * i + 1]});
+                    packed[i] = __nv_cvt_float2_to_fp4x2(
+                        {activated[2 * i] * inverse_scale,
+                         activated[2 * i + 1] * inverse_scale},
+                        __NV_E2M1, cudaRoundNearest);
+                }
+
+                if (tid < valid_rows) {
+                    const int output_row = cta_row + tid;
+                    const int output_col = tile_col / 2 + logical_col;
+                    const int scale_col = output_col / 16;
+                    const int scale_cols = n / 32;
+                    const int scale_index =
+                        (((output_row / 128) * (scale_cols / 4) + scale_col / 4) * 32 +
+                         output_row % 32) * 16 + (output_row % 128) / 32 * 4 +
+                        scale_col % 4;
+                    sfc[scale_index] = scale_raw;
                 }
 
                 if constexpr (kDirectGmem) {
-                    // Direct TMEM → RMEM → GMEM: write packed values straight
-                    // to global memory, bypassing shared memory.
+                    // Direct TMEM → RMEM → packed NVFP4 GMEM.
                     if (tid < valid_rows) {
                         const int gmem_row = cta_row + tid;
-                        const int gmem_col = tile_col / 2 + logical_col;
-                        for (int half = 0; half < 2; ++half) {
-                            store_output_16b(
-                                reinterpret_cast<int4 *>(c + gmem_row * (n / 2) +
-                                    gmem_col + half * 8),
-                                reinterpret_cast<int4 *>(packed)[half]);
-                        }
+                        const int gmem_col = (tile_col / 2 + logical_col) / 2;
+                        *reinterpret_cast<uint64_t *>(c + gmem_row * (n / 4) + gmem_col) =
+                            *reinterpret_cast<const uint64_t *>(packed);
                     }
                 } else {
-                    // One x16 TMEM fragment produces two adjacent 16-byte
-                    // chunks. Map each half independently through the TMA
-                    // swizzle; treating registers 8-15 as a linear append to
-                    // the first chunk would corrupt the shared-memory tile.
-                    for (int half = 0; half < 2; ++half) {
-                        const int chunk_group = n_group * 2 + half;
-                        const int store_tile = chunk_group / kChunksPerStoreTile;
-                        const int chunk_in_store = tid * kChunksPerStoreTile +
-                            chunk_group % kChunksPerStoreTile;
-                        const int swizzled_chunk =
-                            (chunk_in_store & ~7) +
+                    // Two adjacent 16-value groups share one 16-byte TMA
+                    // chunk. Each group contributes one packed 8-byte half.
+                    const int packed_group_offset = n_group * (kTmemLoadColumns / 2);
+                    const int store_tile = packed_group_offset / kEpilogueStoreTileN;
+                    const int packed_in_store = packed_group_offset % kEpilogueStoreTileN;
+                    const int chunk_group = packed_in_store / 16;
+                    const int chunk_in_store = tid * kChunksPerStoreTile + chunk_group;
+                    const int swizzled_chunk = kSwizzlePhaseMask == 0
+                        ? chunk_in_store
+                        : (chunk_in_store & ~7) +
                             ((chunk_in_store & 7) ^
-                                ((chunk_in_store >> 3) & kSwizzlePhaseMask));
-                        reinterpret_cast<int4 *>(
-                            stage_smem + store_tile * kStoreTileBytes)[swizzled_chunk] =
-                            reinterpret_cast<int4 *>(packed)[half];
-                    }
+                             ((chunk_in_store >> 3) & kSwizzlePhaseMask));
+                    *reinterpret_cast<uint64_t *>(
+                        stage_smem + store_tile * kStoreTileBytes +
+                        swizzled_chunk * 16 + (packed_in_store & 8)) =
+                            *reinterpret_cast<const uint64_t *>(packed);
                 }
             } else {
                 // Match STSM's register fragment directly: each warp reads
@@ -1569,7 +1600,8 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void n
                         // Direct gmem: data already written by tmem_to_smem.
                         // Only the SMEM→TMA path needs TMA store / fallback.
                         if constexpr (!kDirectGmem) {
-                            const int block_col = tile_col / 2 + n_block * kOutputEpilogueTileN;
+                            const int block_col =
+                                (tile_col / 2 + n_block * kOutputEpilogueTileN) / 2;
                             if (valid_rows == kTileM) {
                                 if (tid == 0) {
                                     for (int store_tile = 0; store_tile < kEpilogueStoreTiles;
@@ -1585,19 +1617,24 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void n
                             } else if (tid < valid_rows) {
                                 char *stage_smem_ptr = dynamic_smem + kMainloopSmemBytes +
                                                        smem_stage * kEpilogueStageBytes;
-                                for (int n_group = 0; n_group < kOutputEpilogueTileN / 8; ++n_group) {
-                                    const int store_tile = n_group / kChunksPerStoreTile;
+                                for (int chunk_group = 0;
+                                     chunk_group < kPackedOutputEpilogueTileN / 16;
+                                     ++chunk_group) {
+                                    const int store_tile = chunk_group / kChunksPerStoreTile;
+                                    const int chunk_in_tile = chunk_group % kChunksPerStoreTile;
                                     const int chunk_in_store =
-                                        tid * kChunksPerStoreTile + n_group % kChunksPerStoreTile;
-                                    const int swizzled_chunk =
-                                        (chunk_in_store & ~7) +
-                                        ((chunk_in_store & 7) ^
-                                            ((chunk_in_store >> 3) & kSwizzlePhaseMask));
+                                        tid * kChunksPerStoreTile + chunk_in_tile;
+                                    const int swizzled_chunk = kSwizzlePhaseMask == 0
+                                        ? chunk_in_store
+                                        : (chunk_in_store & ~7) +
+                                            ((chunk_in_store & 7) ^
+                                             ((chunk_in_store >> 3) & kSwizzlePhaseMask));
                                     const int4 value = reinterpret_cast<int4 *>(
                                         stage_smem_ptr +
                                         store_tile * kStoreTileBytes)[swizzled_chunk];
                                     const int output_offset =
-                                        (cta_row + tid) * (n / 2) + block_col + n_group * 8;
+                                        (cta_row + tid) * (n / 4) + block_col +
+                                        chunk_group * 16;
                                     store_output_16b(
                                         reinterpret_cast<int4 *>(c + output_offset), value);
                                 }
@@ -1645,7 +1682,8 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void n
                                     atom * atom_elements +
                                     row * (kSwizzleAtomBytes / sizeof(nv_bfloat16)) +
                                     (bank_group ^ (row & 7)) * kBankGroupElements + value_in_group;
-                                c[(block_row + row) * n + block_col + tid] =
+                                reinterpret_cast<nv_bfloat16 *>(c)[
+                                    (block_row + row) * n + block_col + tid] =
                                     stage_values[swizzled_index];
                             }
                         }
@@ -1761,7 +1799,8 @@ void launch_nvfp4_fc1_impl(
     const int32_t *d_source_rows,
     const int32_t *d_tasks,
     int32_t *d_state,
-    __nv_bfloat16 *d_c,
+    uint8_t *d_c,
+    uint8_t *d_sfc,
     int tokens,
     int m,
     int experts,
@@ -1794,7 +1833,8 @@ void launch_nvfp4_fc1_impl(
             k / 64, kTileK / 64) &&
         init_scale_tensor_map(&sfb_tensor_map, d_sfb, experts * (n / 128),
             k / 64, kTileK / 64) &&
-        init_c_tensor_map<kTileM, Config::kOutputEpilogueTileN>(&c_tensor_map, d_c, m, n / 2);
+        init_c_tensor_map<kTileM, Config::kOutputEpilogueTileN / 2>(
+            &c_tensor_map, d_c, m, n / 4);
     if (!tensor_maps_ok) {
         return;
     }
@@ -1864,21 +1904,22 @@ void launch_nvfp4_fc1_impl(
     kernel<<<dim3(kClusterM * launched_clusters, kClusterN, 1), kBlockThreads,
         kDynamicSmemBytes, stream>>>(
         d_a, a_tensor_map, b_tensor_map, d_sfa, sfa_tensor_map, sfb_tensor_map, c_tensor_map, d_source_rows, tasks, task_count,
-        next_cluster_tile, d_c, n, k);
+        next_cluster_tile, d_c, d_sfc, n, k);
 }
 
 void launch_nvfp4_fc1_entry(
     const uint8_t *a, const uint8_t *b, const uint8_t *sfa, const uint8_t *sfb,
-    const int32_t *source_rows, const int32_t *tasks, int32_t *state, nv_bfloat16 *c,
+    const int32_t *source_rows, const int32_t *tasks, int32_t *state, uint8_t *c,
+    uint8_t *sfc,
     int tokens, int m, int experts, int n, int k, int max_tasks, int max_active_clusters, cudaStream_t stream) {
-    if (!a || !b || !sfa || !sfb || !source_rows || !tasks || !state || !c ||
+    if (!a || !b || !sfa || !sfb || !source_rows || !tasks || !state || !c || !sfc ||
         tokens <= 0 || m <= 0 || experts <= 0 || n <= 0 || k <= 0 || max_tasks <= 0)
         return;
     launch_nvfp4_fc1_impl<SM110A_NVFP4_FC1_TILE_M,
         SM110A_NVFP4_FC1_TILE_N, SM110A_NVFP4_FC1_TILE_K,
         SM110A_NVFP4_FC1_EPILOGUE_TILE_N, SM110A_NVFP4_FC1_CLUSTER_M,
         SM110A_NVFP4_FC1_CLUSTER_N,
-        false>(a, b, sfa, sfb, source_rows, tasks, state, c, tokens, m, experts,
+        false>(a, b, sfa, sfb, source_rows, tasks, state, c, sfc, tokens, m, experts,
             n, k, max_tasks, max_active_clusters, stream);
 }
 
@@ -1886,18 +1927,20 @@ void launch_nvfp4_fc1_entry(
 
 void launch_nvfp4_fc1_main(
     const uint8_t *a, const uint8_t *b, const uint8_t *sfa, const uint8_t *sfb,
-    const int32_t *source_rows, const int32_t *tasks, int32_t *state, nv_bfloat16 *c,
+    const int32_t *source_rows, const int32_t *tasks, int32_t *state, uint8_t *c,
+    uint8_t *sfc,
     int tokens, int m, int experts, int n, int k, int max_tasks, int max_active_clusters, cudaStream_t stream) {
     launch_nvfp4_fc1_entry(
-        a, b, sfa, sfb, source_rows, tasks, state, c, tokens, m, experts, n, k,
+        a, b, sfa, sfb, source_rows, tasks, state, c, sfc, tokens, m, experts, n, k,
         max_tasks, max_active_clusters, stream);
 }
 
 extern "C" void sm110a_nvfp4_fc1_launch(
     const uint8_t *a, const uint8_t *b, const uint8_t *sfa, const uint8_t *sfb,
-    const int32_t *source_rows, const int32_t *tasks, int32_t *state, nv_bfloat16 *c,
+    const int32_t *source_rows, const int32_t *tasks, int32_t *state, uint8_t *c,
+    uint8_t *sfc,
     int tokens, int m, int experts, int n, int k, int max_tasks, int max_active_clusters, cudaStream_t stream) {
     launch_nvfp4_fc1_main(
-        a, b, sfa, sfb, source_rows, tasks, state, c, tokens, m, experts, n, k,
+        a, b, sfa, sfb, source_rows, tasks, state, c, sfc, tokens, m, experts, n, k,
         max_tasks, max_active_clusters, stream);
 }

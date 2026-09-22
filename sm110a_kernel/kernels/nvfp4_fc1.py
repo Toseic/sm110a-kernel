@@ -89,18 +89,26 @@ class Nvfp4Fc1Module:
             raise ValueError("max_active_clusters must be positive")
         return int(value)
 
-    def nvfp4_fc1_out(self, a, b, sfa, sfb, metadata: Nvfp4Fc1Metadata, out,
+    def nvfp4_fc1_out(self, a, b, sfa, sfb, metadata: Nvfp4Fc1Metadata, out, out_scale,
                       max_active_clusters=None):
         return self._binding.nvfp4_fc1_out(
             a, b, sfa, sfb, metadata.source_rows, metadata.tasks, metadata.state,
-            out, self._address, self._max_active_clusters(a.device, max_active_clusters))
+            out, out_scale, self._address,
+            self._max_active_clusters(a.device, max_active_clusters))
 
     def nvfp4_fc1(self, a, b, sfa, sfb, metadata: Nvfp4Fc1Metadata, max_active_clusters=None):
         import torch
+        m = metadata.source_rows.numel()
+        logical_n = b.size(1) // 2
         out = torch.empty(
-            (metadata.source_rows.numel(), b.size(1) // 2),
-            device=a.device, dtype=torch.bfloat16)
-        return self.nvfp4_fc1_out(a, b, sfa, sfb, metadata, out, max_active_clusters)
+            (m, logical_n // 2), device=a.device,
+            dtype=torch.float4_e2m1fn_x2)
+        out_scale = torch.empty(
+            (m * (logical_n // 16),), device=a.device,
+            dtype=torch.float8_e4m3fn)
+        self.nvfp4_fc1_out(
+            a, b, sfa, sfb, metadata, out, out_scale, max_active_clusters)
+        return out, out_scale
 
 
 def _flags(config: Nvfp4Fc1Config, variant):
@@ -148,5 +156,7 @@ def nvfp4_fc1(a, b, sfa, sfb, metadata, config=None, max_active_clusters=None):
     return compile_nvfp4_fc1(config).nvfp4_fc1(a, b, sfa, sfb, metadata, max_active_clusters)
 
 
-def nvfp4_fc1_out(a, b, sfa, sfb, metadata, out, config=None, max_active_clusters=None):
-    return compile_nvfp4_fc1(config).nvfp4_fc1_out(a, b, sfa, sfb, metadata, out, max_active_clusters)
+def nvfp4_fc1_out(a, b, sfa, sfb, metadata, out, out_scale, config=None,
+                  max_active_clusters=None):
+    return compile_nvfp4_fc1(config).nvfp4_fc1_out(
+        a, b, sfa, sfb, metadata, out, out_scale, max_active_clusters)

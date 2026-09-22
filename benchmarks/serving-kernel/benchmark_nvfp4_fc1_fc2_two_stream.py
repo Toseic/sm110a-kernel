@@ -75,11 +75,22 @@ def main():
             aq, sfa = quantize_nvfp4_rows(a)
             router = torch.randn((args.tokens, args.experts), device="cuda", dtype=torch.bfloat16)
             meta = prepare_nvfp4_fc1_metadata(router, args.topk, 2 * args.n, config=config)
-            work.append((aq, sfa, meta, torch.empty((args.tokens * args.topk, args.n), device="cuda", dtype=torch.bfloat16)))
+            out = torch.empty(
+                (args.tokens * args.topk, args.n // 2), device="cuda",
+                dtype=torch.float4_e2m1fn_x2,
+            )
+            out_scale = torch.empty(
+                (args.tokens * args.topk * (args.n // 16),), device="cuda",
+                dtype=torch.float8_e4m3fn,
+            )
+            work.append((aq, sfa, meta, out, out_scale))
         compile_nvfp4_fc1(config)
         def launch(item, clusters):
-            aq, sfa, meta, out = item
-            return nvfp4_fc1_out(aq, bq, sfa, sfb, meta, out, config=config, max_active_clusters=clusters)
+            aq, sfa, meta, out, out_scale = item
+            return nvfp4_fc1_out(
+                aq, bq, sfa, sfb, meta, out, out_scale,
+                config=config, max_active_clusters=clusters,
+            )
         flops = 4 * args.tokens * args.topk * args.n * args.k
     else:
         # Matches the standalone FC2 autotune winner for this workload.
