@@ -42,22 +42,17 @@ DEFAULT_K = 2048
 DEFAULT_TOKEN_VALUES = (64 * 32, 128 * 32, 256 * 32, 512 * 32, 1024 * 32)
 DEFAULT_TOPK = 8
 NVFP4_MMA_PEAK_TFLOPS = 4.0 * 250.0
-_MODE_LABELS = {0: "np", 1: "pe", 2: "clc"}
-
-
 NVFP4_FC2_CONFIGS = tuple(
     Nvfp4Fc2Config(
         tile_n=tile_n,
         tile_k=tile_k,
         epilogue_tile_n=epilogue_tile_n,
         cluster_m=cluster_m,
-        mode=mode,
     )
     for tile_n in (64, 128, 256)
     for tile_k in (64, 128, 256)
     for epilogue_tile_n in (32, 64, 128)
     for cluster_m in (1, 2)
-    for mode in (0, 1, 2)
     if tile_n % epilogue_tile_n == 0
 )
 
@@ -72,7 +67,7 @@ def format_candidate(config):
         order += "s"
     return (
         f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
-        f"/e{config.epilogue_tile_n}/c{config.cluster_m}/{_MODE_LABELS[config.mode]}"
+        f"/e{config.epilogue_tile_n}/c{config.cluster_m}/persistent"
         f"/r{config.reduce_tile_n}/{order}{config.macro_swizzle_m}x{config.macro_swizzle_n}"
     )
 
@@ -92,8 +87,6 @@ def compatible_candidates(n, k, args):
         )
     if args.cluster_m is not None:
         candidates = tuple(c for c in candidates if c.cluster_m == args.cluster_m)
-    if args.mode is not None:
-        candidates = tuple(c for c in candidates if c.mode == args.mode)
     if args.reduce_tile_n is not None:
         candidates = tuple(c for c in candidates if c.tile_n % args.reduce_tile_n == 0)
     n_major = args.macro_order.startswith("n")
@@ -245,7 +238,6 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
         parser.add_argument("--tile-k", type=int, choices=(64, 128, 256))
         parser.add_argument("--epilogue-tile-n", type=int, choices=(32, 64, 128))
         parser.add_argument("--cluster-m", type=int, choices=(1, 2))
-        parser.add_argument("--mode", type=int, choices=(0, 1, 2))
         parser.add_argument("--reduce-tile-n", type=int, choices=(32, 64, 128, 256))
         parser.add_argument(
             "--macro-order", choices=("n", "n-serp", "m", "m-serp"), default="n"
@@ -349,9 +341,9 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
                 ),
                 format_candidate=format_candidate,
                 namespace="nvfp4_fc2",
-                # v2 retunes after switching the API default to the
-                # persistent 128x256x256 configuration.
-                key=("v2", tokens, args.experts, args.topk, args.n, args.k),
+                # v3 isolates persistent-only candidates from prior mixed-mode
+                # sweeps, whose cache entries may select CLC or non-persistent.
+                key=("v3", tokens, args.experts, args.topk, args.n, args.k),
                 pre_jit=compile_nvfp4_fc2,
                 metric_formatter=lambda config, stats: (
                     f"{fc2_tflops(tokens, args.topk, args.n, args.k, stats['median_ms']):.1f} TF/s"

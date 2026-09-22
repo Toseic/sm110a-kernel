@@ -37,9 +37,6 @@
 #ifndef SM110A_NVFP4_FC2_CLUSTER_M
 #define SM110A_NVFP4_FC2_CLUSTER_M 2
 #endif
-#ifndef SM110A_NVFP4_FC2_MODE
-#define SM110A_NVFP4_FC2_MODE 0
-#endif
 #ifndef SM110A_NVFP4_FC2_REDUCE_TILE_N
 #define SM110A_NVFP4_FC2_REDUCE_TILE_N 64
 #endif
@@ -53,8 +50,11 @@ constexpr int kTmaWarp = kEpilogueWarpCount;
 constexpr int kSfaWarp = kTmaWarp + 1;
 constexpr int kMmaWarp = kSfaWarp + 1;
 constexpr int kSchedulerWarp = kMmaWarp + 1;
-constexpr int kWarpCount = kSchedulerWarp + 1;
-constexpr int kBlockThreads = kWarpSize * kWarpCount;
+// cta_group::2 needs a separate warp to turn each CTA-local SFA completion
+// into the paired-CTA ready event consumed by the leader MMA warp.  Keep the
+// warp out of cta_group::1 launches so their occupancy stays unchanged.
+constexpr int kSyncTransformWarp = kSchedulerWarp + 1;
+constexpr int kBaseWarpCount = kSchedulerWarp + 1;
 constexpr int kTaskPipelineStageCount = 2;
 constexpr int kPersistentTileCount = 2;
 // Each mode-2 CLC worker cluster starts with two tasks.  Once it completes
@@ -324,6 +324,22 @@ __device__ inline void mbarrier_arrive_on_cluster_cta(
         : "memory");
 }
 
+__device__ inline void store_shared_on_cluster_cta(
+    int local_smem_addr, int target_cta_rank, int value) {
+    const int remote_smem_addr =
+        map_shared_to_cluster_cta(local_smem_addr, target_cta_rank);
+    asm volatile("st.shared::cluster.u32 [%0], %1;" ::
+        "r"(remote_smem_addr), "r"(value) : "memory");
+}
+
+__device__ inline void mbarrier_arrive_release_cluster_on_cluster_cta(
+    int local_mbar_addr, int target_cta_rank) {
+    const int remote_mbar_addr =
+        map_shared_to_cluster_cta(local_mbar_addr, target_cta_rank);
+    asm volatile("mbarrier.arrive.release.cluster.shared::cluster.b64 _, [%0];" ::
+        "r"(remote_mbar_addr) : "memory");
+}
+
 template <int kClusterM>
 __device__ inline void tcgen05_cp_scale(int tmem_addr, uint64_t smem_desc) {
     if constexpr (kClusterM == 1)
@@ -446,7 +462,8 @@ template <
     bool kPersistent,
     bool kDynamicClc = false>
 __global__ __cluster_dims__(kClusterM, 1, 1)
-__launch_bounds__(kBlockThreads) void nvfp4_fc2_fused_kernel(
+__launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0)))
+void nvfp4_fc2_fused_kernel(
     const uint8_t *sfa,
     const __grid_constant__ CUtensorMap a_tensor_map,
     const __grid_constant__ CUtensorMap b_tensor_map,
@@ -477,7 +494,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc2_fused_kernel(
     constexpr int kTmemAllocationColumns = Config::kTmemAllocationColumns;
     constexpr int kAccumulatorOverlapCols = Config::kAccumulatorOverlapCols;
     constexpr int kAccumulatorStageStride = Config::kAccumulatorStageStride;
-    constexpr bool kUseTaskPipeline = kClusterM == 1 && kPersistent;
+    constexpr bool kUseTaskPipeline = kPersistent;
     const int tid = threadIdx.x;
     const int warp_id = tid / kWarpSize;
     int cta_rank;
@@ -502,6 +519,9 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc2_fused_kernel(
     __shared__ __align__(8) uint64_t clc_mbar[1];
     __shared__ uint64_t tma_mbars[kStageCount];
     __shared__ uint64_t sfa_tma_mbars[kStageCount];
+    // SFA reconstruction completes locally.  The 2-CTA sync-transform warp
+    // consumes this signal before publishing the aggregate rank-0 event.
+    __shared__ uint64_t sfa_ready_mbars[kStageCount];
     __shared__ uint64_t sfa_mbars[kStageCount];
     __shared__ uint64_t mma_mbars[kStageCount];
     __shared__ uint64_t mainloop_mbars[kTmemStageCount];
@@ -513,6 +533,8 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc2_fused_kernel(
     const int base_tma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(tma_mbars));
     const int base_sfa_tma_mbar_addr =
         static_cast<int>(__cvta_generic_to_shared(sfa_tma_mbars));
+    const int base_sfa_ready_mbar_addr =
+        static_cast<int>(__cvta_generic_to_shared(sfa_ready_mbars));
     const int base_task_ready_mbar_addr =
         static_cast<int>(__cvta_generic_to_shared(task_ready_mbars));
     const int base_task_free_mbar_addr =
@@ -528,6 +550,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc2_fused_kernel(
         for (int stage = 0; stage < kStageCount; ++stage) {
             mbarrier_init(base_tma_mbar_addr + stage * sizeof(uint64_t), kClusterM);
             mbarrier_init(base_sfa_tma_mbar_addr + stage * sizeof(uint64_t), 1);
+            mbarrier_init(base_sfa_ready_mbar_addr + stage * sizeof(uint64_t), 1);
             // cta_group::2 aggregates one completed SFA gather arrival from
             // each CTA on rank 0. cta_group::1 folds SFA into tma_mbars.
             mbarrier_init(base_sfa_mbar_addr + stage * sizeof(uint64_t), kClusterM);
@@ -547,7 +570,7 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc2_fused_kernel(
             for (int stage = 0; stage < kTaskPipelineStageCount; ++stage) {
                 mbarrier_init(base_task_ready_mbar_addr + stage * sizeof(uint64_t), 1);
                 mbarrier_init(base_task_free_mbar_addr + stage * sizeof(uint64_t),
-                    kEpilogueWarpCount);
+                    kEpilogueWarpCount * kClusterM);
             }
         }
         if constexpr (kDynamicClc) {
@@ -589,6 +612,8 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc2_fused_kernel(
     int producer_mma_phase = 1;
     int sfa_stage = 0;
     int sfa_tma_phase = 0;
+    int sync_transform_stage = 0;
+    int sync_transform_phase = 0;
     int consumer_stage = 0;
     int consumer_tma_phase = 0;
     int consumer_mainloop_stage = 0;
@@ -613,60 +638,99 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc2_fused_kernel(
         int clc_mbar_addr = 0;
         if constexpr (kUseTaskPipeline) {
             if (warp_id == kSchedulerWarp) {
-                mbarrier_wait(base_task_free_mbar_addr +
-                                  task_pipe_stage * sizeof(uint64_t),
-                              scheduler_free_phase);
-                if (elect_sync()) {
-                    int scheduled_bid;
-                    if constexpr (kDynamicClc) {
-                        const int response_addr =
-                            static_cast<int>(__cvta_generic_to_shared(clc_response));
-                        const int scheduler_mbar_addr =
-                            static_cast<int>(__cvta_generic_to_shared(clc_mbar));
-                        while (scheduler_packet_next >= scheduler_packet_end &&
-                               !scheduler_clc_done) {
-                            if (!scheduler_clc_pending) {
-                                clc_issue_request(response_addr, scheduler_mbar_addr);
-                                scheduler_clc_pending = true;
+                if constexpr (kClusterM == 1) {
+                    mbarrier_wait(base_task_free_mbar_addr +
+                                      task_pipe_stage * sizeof(uint64_t),
+                                  scheduler_free_phase);
+                    if (elect_sync()) {
+                        int scheduled_bid;
+                        if constexpr (kDynamicClc) {
+                            const int response_addr =
+                                static_cast<int>(__cvta_generic_to_shared(clc_response));
+                            const int scheduler_mbar_addr =
+                                static_cast<int>(__cvta_generic_to_shared(clc_mbar));
+                            while (scheduler_packet_next >= scheduler_packet_end &&
+                                   !scheduler_clc_done) {
+                                if (!scheduler_clc_pending) {
+                                    clc_issue_request(response_addr, scheduler_mbar_addr);
+                                    scheduler_clc_pending = true;
+                                }
+                                int canceled_cta_x = 0;
+                                const bool canceled = clc_wait_and_query(clc_response,
+                                    scheduler_mbar_addr, clc_phase, &canceled_cta_x);
+                                scheduler_clc_pending = false;
+                                clc_phase ^= 1;
+                                if (!canceled) {
+                                    scheduler_clc_done = true;
+                                    break;
+                                }
+                                scheduler_packet_next =
+                                    canceled_cta_x / kClusterM * kWorkerTileCount;
+                                scheduler_packet_end = min(
+                                    scheduler_packet_next + kWorkerTileCount, cluster_tiles);
                             }
-                            int canceled_cta_x = 0;
-                            const bool canceled = clc_wait_and_query(clc_response,
-                                scheduler_mbar_addr, clc_phase, &canceled_cta_x);
-                            scheduler_clc_pending = false;
-                            clc_phase ^= 1;
-                            if (!canceled) {
-                                scheduler_clc_done = true;
-                                break;
-                            }
-                            scheduler_packet_next =
-                                canceled_cta_x / kClusterM * kWorkerTileCount;
-                            scheduler_packet_end = min(
-                                scheduler_packet_next + kWorkerTileCount, cluster_tiles);
+                            scheduled_bid = scheduler_packet_next < scheduler_packet_end
+                                ? scheduler_packet_next++
+                                : cluster_tiles;
+                        } else {
+                            scheduled_bid = atomicAdd(next_cluster_tile, 1);
                         }
-                        scheduled_bid = scheduler_packet_next < scheduler_packet_end
-                            ? scheduler_packet_next++
-                            : cluster_tiles;
-                    } else {
-                        scheduled_bid = atomicAdd(next_cluster_tile, 1);
+                        scheduled_cluster_bids[task_pipe_stage] = scheduled_bid;
+                        const int ready_addr = base_task_ready_mbar_addr +
+                            task_pipe_stage * sizeof(uint64_t);
+                        asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];" ::
+                            "r"(ready_addr) : "memory");
                     }
-                    scheduled_cluster_bids[task_pipe_stage] = scheduled_bid;
-                    const int ready_addr = base_task_ready_mbar_addr +
-                        task_pipe_stage * sizeof(uint64_t);
-                    asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];" ::
-                        "r"(ready_addr) : "memory");
+                } else if (cta_rank == 0) {
+                    // Rank 0 is the cluster's sole task-source producer.  It
+                    // publishes the same task into each CTA-local ring so all
+                    // data-path roles can keep using cheap CTA-local waits.
+                    clc_mbarrier_wait(base_task_free_mbar_addr +
+                                          task_pipe_stage * sizeof(uint64_t),
+                                      scheduler_free_phase);
+                    if (elect_sync()) {
+                        const int scheduled_bid = atomicAdd(next_cluster_tile, 1);
+                        const int scheduled_bid_addr = static_cast<int>(
+                            __cvta_generic_to_shared(
+                                scheduled_cluster_bids + task_pipe_stage));
+                        const int ready_addr = base_task_ready_mbar_addr +
+                            task_pipe_stage * sizeof(uint64_t);
+                        scheduled_cluster_bids[task_pipe_stage] = scheduled_bid;
+                        store_shared_on_cluster_cta(
+                            scheduled_bid_addr, 1, scheduled_bid);
+                        asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];" ::
+                            "r"(ready_addr) : "memory");
+                        mbarrier_arrive_release_cluster_on_cluster_cta(
+                            ready_addr, 1);
+                    }
+                } else {
+                    clc_mbarrier_wait(base_task_ready_mbar_addr +
+                                          task_pipe_stage * sizeof(uint64_t),
+                                      task_ready_phase);
                 }
                 __syncwarp();
                 const bool done =
                     scheduled_cluster_bids[task_pipe_stage] >= cluster_tiles;
                 task_pipe_stage =
                     (task_pipe_stage + 1) % kTaskPipelineStageCount;
-                if (task_pipe_stage == 0) scheduler_free_phase ^= 1;
+                if (task_pipe_stage == 0) {
+                    scheduler_free_phase ^= 1;
+                    if constexpr (kClusterM > 1) {
+                        if (cta_rank != 0) task_ready_phase ^= 1;
+                    }
+                }
                 if (done) break;
                 continue;
             }
-            mbarrier_wait(base_task_ready_mbar_addr +
-                              task_pipe_stage * sizeof(uint64_t),
-                          task_ready_phase);
+            if constexpr (kClusterM == 1) {
+                mbarrier_wait(base_task_ready_mbar_addr +
+                                  task_pipe_stage * sizeof(uint64_t),
+                              task_ready_phase);
+            } else {
+                clc_mbarrier_wait(base_task_ready_mbar_addr +
+                                      task_pipe_stage * sizeof(uint64_t),
+                                  task_ready_phase);
+            }
             first_cluster_bid = scheduled_cluster_bids[task_pipe_stage];
             if (first_cluster_bid >= cluster_tiles) break;
         } else if constexpr (kDynamicClc) {
@@ -907,12 +971,48 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc2_fused_kernel(
                     __syncwarp();
                     if (elect_sync()) {
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                        mbarrier_arrive_on_cluster_cta(
-                            base_sfa_mbar_addr + sfa_stage * sizeof(uint64_t), 0);
+                        if constexpr (kClusterM == 1) {
+                            mbarrier_arrive_on_cluster_cta(
+                                base_sfa_mbar_addr + sfa_stage * sizeof(uint64_t), 0);
+                        } else {
+                            const int sfa_ready_mbar_addr =
+                                base_sfa_ready_mbar_addr +
+                                sfa_stage * static_cast<int>(sizeof(uint64_t));
+                            asm volatile(
+                                "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];" ::
+                                "r"(sfa_ready_mbar_addr) : "memory");
+                        }
                     }
                     sfa_stage = (sfa_stage + 1) % kStageCount;
                     if (sfa_stage == 0) {
                         sfa_tma_phase ^= 1;
+                    }
+                }
+            }
+        }
+
+        // Match FC1's 2-CTA producer split: this warp waits for its CTA's
+        // reconstructed SFA stage, then forwards one arrival to rank 0.  The
+        // MMA warp therefore waits once for a fully ready cta_group::2 scale
+        // operand instead of being coupled to either CTA's local transform.
+        if constexpr (kClusterM > 1) {
+            if (warp_id == kSyncTransformWarp && elect_sync()) {
+                for (int cluster_bid = first_cluster_bid; cluster_bid < last_cluster_bid;
+                    ++cluster_bid) {
+                    for (int tile_k = 0; tile_k < k_tiles; ++tile_k) {
+                        mbarrier_wait(
+                            base_sfa_ready_mbar_addr +
+                                sync_transform_stage * sizeof(uint64_t),
+                            sync_transform_phase);
+                        mbarrier_arrive_on_cluster_cta(
+                            base_sfa_mbar_addr +
+                                sync_transform_stage * sizeof(uint64_t),
+                            0);
+                        sync_transform_stage =
+                            (sync_transform_stage + 1) % kStageCount;
+                        if (sync_transform_stage == 0) {
+                            sync_transform_phase ^= 1;
+                        }
                     }
                 }
             }
@@ -1186,8 +1286,13 @@ __launch_bounds__(kBlockThreads) void nvfp4_fc2_fused_kernel(
             if (warp_id < kEpilogueWarpCount && elect_sync()) {
                 const int free_addr = base_task_free_mbar_addr +
                     task_pipe_stage * sizeof(uint64_t);
-                asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];" ::
-                    "r"(free_addr) : "memory");
+                if constexpr (kClusterM == 1) {
+                    asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];" ::
+                        "r"(free_addr) : "memory");
+                } else {
+                    mbarrier_arrive_release_cluster_on_cluster_cta(
+                        free_addr, 0);
+                }
             }
             task_pipe_stage = (task_pipe_stage + 1) % kTaskPipelineStageCount;
             if (task_pipe_stage == 0) task_ready_phase ^= 1;
@@ -1270,6 +1375,8 @@ void launch_nvfp4_fc2_impl(
     cudaStream_t stream) {
     using Config = Nvfp4Fc2Config<kTileM, kTileN, kTileK, kClusterM>;
     constexpr int kDynamicSmemBytes = Config::kDynamicSmemBytes;
+    constexpr int kBlockThreads =
+        kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0));
     if (m % 128 || n % kTileN != 0 || n % 128 || k % kTileK != 0) {
         return;
     }
@@ -1295,77 +1402,41 @@ void launch_nvfp4_fc2_impl(
     auto *next_cluster_tile = d_state + 1;
     cudaMemsetAsync(next_cluster_tile, 0, sizeof(int32_t), stream);
 
-    if constexpr (SM110A_NVFP4_FC2_MODE == 2) {
-        const int worker_clusters =
-            (max_tasks + kClcWorkerTileCount - 1) / kClcWorkerTileCount;
-        auto kernel = nvfp4_fc2_fused_kernel<kTileM,
-            kTileN,
-            kTileK,
-            kClusterM,
-            false,
-            true>;
-        if constexpr (kDynamicSmemBytes > 48 * 1024) {
-            cudaFuncSetAttribute(kernel,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                kDynamicSmemBytes);
-        }
-        kernel<<<kClusterM * worker_clusters, kBlockThreads, kDynamicSmemBytes, stream>>>(
-            d_sfa, a_tensor_map, b_tensor_map, sfa_tensor_map, sfb_tensor_map,
-            tasks, task_count,
-            next_cluster_tile, grouped_assignments, routing_weights, final_output, n, k, topk);
-    } else if constexpr (SM110A_NVFP4_FC2_MODE == 1) {
-        const int persistent_clusters =
-            (max_tasks + kPersistentTileCount - 1) / kPersistentTileCount;
-        auto kernel = nvfp4_fc2_fused_kernel<kTileM,
-            kTileN,
-            kTileK,
-            kClusterM,
-            true,
-            false>;
-        if constexpr (kDynamicSmemBytes > 48 * 1024) {
-            cudaFuncSetAttribute(kernel,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                kDynamicSmemBytes);
-        }
-        cudaLaunchConfig_t launch_config{};
-        launch_config.gridDim = dim3(kClusterM * persistent_clusters, 1, 1);
-        launch_config.blockDim = dim3(kBlockThreads, 1, 1);
-        launch_config.dynamicSmemBytes = kDynamicSmemBytes;
-        launch_config.stream = stream;
-        int resident_clusters = 0;
-        const cudaError_t occupancy_status =
-            cudaOccupancyMaxActiveClusters(&resident_clusters, kernel, &launch_config);
-        if (occupancy_status != cudaSuccess || resident_clusters <= 0) {
-            int device = 0;
-            int sm_count = 0;
-            cudaGetDevice(&device);
-            cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
-            resident_clusters = sm_count / kClusterM > 0 ? sm_count / kClusterM : 1;
-        }
-        const int cluster_limit = max_active_clusters > 0 ? max_active_clusters : resident_clusters;
-        const int launched_clusters = cluster_limit < persistent_clusters
-            ? cluster_limit : persistent_clusters;
-        kernel<<<kClusterM * launched_clusters, kBlockThreads, kDynamicSmemBytes, stream>>>(
-            d_sfa, a_tensor_map, b_tensor_map, sfa_tensor_map, sfb_tensor_map,
-            tasks, task_count,
-            next_cluster_tile, grouped_assignments, routing_weights, final_output, n, k, topk);
-    } else {
-        auto kernel = nvfp4_fc2_fused_kernel<kTileM,
-            kTileN,
-            kTileK,
-            kClusterM,
-            false,
-            false>;
-        if constexpr (kDynamicSmemBytes > 48 * 1024) {
-            cudaFuncSetAttribute(kernel,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                kDynamicSmemBytes);
-        }
-        kernel<<<kClusterM * max_tasks, kBlockThreads, kDynamicSmemBytes, stream>>>(
-            d_sfa, a_tensor_map, b_tensor_map, sfa_tensor_map, sfb_tensor_map,
-            tasks, task_count,
-            next_cluster_tile, grouped_assignments, routing_weights, final_output, n, k, topk);
+    const int persistent_clusters =
+        (max_tasks + kPersistentTileCount - 1) / kPersistentTileCount;
+    auto kernel = nvfp4_fc2_fused_kernel<kTileM,
+        kTileN,
+        kTileK,
+        kClusterM,
+        true,
+        false>;
+    if constexpr (kDynamicSmemBytes > 48 * 1024) {
+        cudaFuncSetAttribute(kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            kDynamicSmemBytes);
     }
+    cudaLaunchConfig_t launch_config{};
+    launch_config.gridDim = dim3(kClusterM * persistent_clusters, 1, 1);
+    launch_config.blockDim = dim3(kBlockThreads, 1, 1);
+    launch_config.dynamicSmemBytes = kDynamicSmemBytes;
+    launch_config.stream = stream;
+    int resident_clusters = 0;
+    const cudaError_t occupancy_status =
+        cudaOccupancyMaxActiveClusters(&resident_clusters, kernel, &launch_config);
+    if (occupancy_status != cudaSuccess || resident_clusters <= 0) {
+        int device = 0;
+        int sm_count = 0;
+        cudaGetDevice(&device);
+        cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
+        resident_clusters = sm_count / kClusterM > 0 ? sm_count / kClusterM : 1;
+    }
+    const int cluster_limit = max_active_clusters > 0 ? max_active_clusters : resident_clusters;
+    const int launched_clusters = cluster_limit < persistent_clusters
+        ? cluster_limit : persistent_clusters;
+    kernel<<<kClusterM * launched_clusters, kBlockThreads, kDynamicSmemBytes, stream>>>(
+        d_sfa, a_tensor_map, b_tensor_map, sfa_tensor_map, sfb_tensor_map,
+        tasks, task_count,
+        next_cluster_tile, grouped_assignments, routing_weights, final_output, n, k, topk);
 }
 
 void launch_nvfp4_fc2_entry(

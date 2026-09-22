@@ -85,7 +85,7 @@ def main():
         # Matches the standalone FC2 autotune winner for this workload.
         config = Nvfp4Fc2Config(
             tile_n=128, tile_k=256, epilogue_tile_n=64,
-            cluster_m=2, mode=2,
+            cluster_m=2,
         )
         cases = [make_case(args.tokens, args.experts, args.topk, args.n, args.k) for _ in range(2)]
         bq, sfb = cases[0][1], cases[0][3]

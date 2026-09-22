@@ -25,7 +25,6 @@ class Nvfp4Fc2Config:
     tile_k: int = 256
     epilogue_tile_n: int = 32
     cluster_m: int = 1
-    mode: int = 1
     reduce_tile_n: int = 64
     macro_swizzle_n_major: bool = True
     macro_swizzle_serpentine: bool = False
@@ -41,8 +40,6 @@ class Nvfp4Fc2Config:
             raise ValueError("invalid epilogue_tile_n")
         if self.cluster_m not in (1, 2):
             raise ValueError("cluster_m must be 1 or 2")
-        if self.mode not in (0, 1, 2):
-            raise ValueError("mode must be 0, 1, or 2")
         if self.reduce_tile_n % 8 or self.tile_n % self.reduce_tile_n:
             raise ValueError("reduce_tile_n must be a multiple of 8 dividing tile_n")
         if not isinstance(self.macro_swizzle_n_major, bool) or not isinstance(
@@ -114,7 +111,7 @@ def _flags(config: Nvfp4Fc2Config, _variant):
             ("TILE_M", config.tile_m), ("TILE_N", config.tile_n),
             ("TILE_K", config.tile_k),
             ("EPILOGUE_TILE_N", config.epilogue_tile_n),
-            ("CLUSTER_M", config.cluster_m), ("MODE", config.mode),
+            ("CLUSTER_M", config.cluster_m),
             ("REDUCE_TILE_N", config.reduce_tile_n),
         )
     ) + (
