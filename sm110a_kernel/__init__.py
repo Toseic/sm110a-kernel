@@ -130,6 +130,11 @@ from .kernels.nvfp4_fc2 import (
     compile_nvfp4_fc2_configs, prepare_nvfp4_fc2_metadata, nvfp4_fc2,
     nvfp4_fc2_out,
 )
+from .kernels.nvfp4_fc1fc2 import (
+    compile_nvfp4_fc1fc2,
+    nvfp4_fc1fc2,
+    nvfp4_fc1fc2_out,
+)
 _RUNNER_EXPORTS = {"AutotuneRunner", "PreparedKernel", "Selection", "TuneOptions"}
 _CUTEDSL_EXPORTS = {
     "CuteDslBf16GemmConfig",
