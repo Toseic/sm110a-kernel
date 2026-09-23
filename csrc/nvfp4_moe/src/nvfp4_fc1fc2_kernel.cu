@@ -3,7 +3,9 @@
  *
  * The fixed-shape implementation uses two independent cta_group::2 pairs in
  * one cta_group::2 pair, persistent row-task workers, TMA mainloop staging,
- * a direct FC1-epilogue SMEM layout, and a complete-I SMEM buffer.
+ * a direct FC1-epilogue SMEM layout, and a configurable-I SMEM streaming
+ * buffer. The shared memory released by smaller buffers is used for deeper
+ * FC1 and FC2 pipelines.
  */
 
 #include <cmath>
@@ -22,7 +24,10 @@ namespace {
 constexpr int kH = 6144;
 constexpr int kI = 2048;
 constexpr int kPhysicalFc1N = 2 * kI;
-constexpr int kBufferI = 2048;
+#ifndef SM110A_NVFP4_FC1FC2_BUFFER_I
+#define SM110A_NVFP4_FC1FC2_BUFFER_I 2048
+#endif
+constexpr int kBufferI = SM110A_NVFP4_FC1FC2_BUFFER_I;
 constexpr int kTileM = 128;
 constexpr int kClusterM = 2;
 constexpr int kPairTileM = kClusterM * kTileM;
@@ -38,9 +43,6 @@ constexpr int kMmaWarp = 4;
 constexpr int kTmaWarp = 5;
 constexpr int kTmaReadyWarp = 6;
 constexpr int kWarpCount = 7;
-constexpr int kFc1StageCount = 2;
-constexpr int kFc2StageCount = 5;
-constexpr int kBarrierStageCount = kFc2StageCount;
 
 constexpr int kMatrixSmemBytes = kTileM * 128;
 constexpr int kWeightSmemBytes = (kTileN / kClusterM) * 128;
@@ -53,6 +55,11 @@ constexpr int kIntermediateBytes =
 constexpr int kWorkspaceBytes =
     kMatrixSmemBytes + kWeightSmemBytes + 2 * kScaleStageBytes;
 constexpr int kFc2WorkspaceBytes = kWeightSmemBytes + kScaleStageBytes;
+constexpr int kFc1StageCount = kBufferI >= 2048 ? 2 :
+    (kBufferI >= 1024 ? 4 : 5);
+constexpr int kFc2StageCount =
+    (kFc1StageCount * kWorkspaceBytes) / kFc2WorkspaceBytes;
+constexpr int kBarrierStageCount = kFc2StageCount;
 constexpr int kReduceN = 64;
 constexpr int kFinalizeSmemBytes =
     kTileM * kReduceN * sizeof(__nv_bfloat16);
@@ -62,7 +69,9 @@ constexpr int kTmemColumns = 512;
 constexpr int kAccumulatorStages = 2;
 constexpr int kScaleTmemCol = kAccumulatorStages * kTileN;
 
-static_assert(kDynamicSmemBytes == 221184);
+constexpr int kMaxOptInSmemBytes = 232448;
+static_assert(kDynamicSmemBytes <= kMaxOptInSmemBytes);
+static_assert(kI % kBufferI == 0);
 static_assert(kBufferI % kStageK == 0);
 
 __device__ __forceinline__ float silu(float x) {
@@ -187,6 +196,16 @@ __device__ __forceinline__ void bulk_store_bf16(
     const uint32_t source_addr =
         static_cast<uint32_t>(__cvta_generic_to_shared(source));
     asm volatile("cp.async.bulk.global.shared::cta.bulk_group "
+                 "[%0], [%1], %2;"
+        :: "l"(destination_addr), "r"(source_addr), "r"(bytes) : "memory");
+}
+
+__device__ __forceinline__ void bulk_reduce_add_bf16(
+    __nv_bfloat16* destination, const __nv_bfloat16* source, int bytes) {
+    const uint64_t destination_addr = reinterpret_cast<uint64_t>(destination);
+    const uint32_t source_addr =
+        static_cast<uint32_t>(__cvta_generic_to_shared(source));
+    asm volatile("cp.reduce.async.bulk.global.shared::cta.bulk_group.add.noftz.bf16 "
                  "[%0], [%1], %2;"
         :: "l"(destination_addr), "r"(source_addr), "r"(bytes) : "memory");
 }
@@ -514,11 +533,28 @@ void nvfp4_fc1fc2_kernel(
         pair_barrier(pair_gather_addr, pair_release_addr,
                      pair_id * kClusterM, pair_sync_phase, tid);
         pair_sync_phase ^= 1;
-        cluster_barrier();
 
-        // FC1 completes an even number of uses of both shared stages for the
-        // fixed shape. Reset the role-local cursors before reinterpreting the
-        // same workspace as five compact FC2 B/SFB stages.
+        // FC1 and FC2 use different ring depths in the same shared-memory
+        // workspace. Both roles have drained, so reset the stage barriers
+        // before switching modes instead of relying on a particular loop
+        // count to land on the initial slot/parity.
+        if constexpr (kBufferI < kI) {
+            if (tid == 0) {
+                for (int stage = 0; stage < kBarrierStageCount; ++stage) {
+                    asm volatile("mbarrier.init.shared::cta.b64 [%0], 2;"
+                        :: "r"(pair_ready_addr +
+                            stage * static_cast<int>(sizeof(uint64_t))));
+                    mbarrier_init(tma_done_addr + stage * sizeof(uint64_t));
+                    mbarrier_init(stage_free_addr + stage * sizeof(uint64_t));
+                }
+                asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+            }
+            __syncthreads();
+            cluster_barrier();
+        }
+
+        // Reset the role-local cursors before reinterpreting the same
+        // workspace as compact FC2 B/SFB stages.
         tma_stage = 0;
         tma_free_phase = 1;
         ready_tma_stage = 0;
@@ -653,10 +689,17 @@ void nvfp4_fc1fc2_kernel(
                     }
                     asm volatile("bar.sync 1, 128;" ::: "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                    bulk_store_bf16(
-                        output + static_cast<size_t>(global_row) * kH + h + slab,
-                        finalize_smem + local_row * kReduceN,
-                        kReduceN * sizeof(__nv_bfloat16));
+                    auto* destination = output +
+                        static_cast<size_t>(global_row) * kH + h + slab;
+                    if (chunk == 0) {
+                        bulk_store_bf16(destination,
+                            finalize_smem + local_row * kReduceN,
+                            kReduceN * sizeof(__nv_bfloat16));
+                    } else {
+                        bulk_reduce_add_bf16(destination,
+                            finalize_smem + local_row * kReduceN,
+                            kReduceN * sizeof(__nv_bfloat16));
+                    }
                     bulk_commit_and_wait_read();
                     asm volatile("bar.sync 1, 128;" ::: "memory");
                 }
@@ -676,10 +719,32 @@ void nvfp4_fc1fc2_kernel(
         pair_barrier(pair_gather_addr, pair_release_addr,
                      pair_id * kClusterM, pair_sync_phase, tid);
         pair_sync_phase ^= 1;
-        cluster_barrier();
+
+        // Every chunk may leave the variable-depth TMA ring at a different
+        // slot/parity. All users have drained here, so reset the mode-local
+        // barriers before the next FC1 chunk reuses the overlaid workspace.
+        if (chunk + 1 < kI / kBufferI) {
+            if (tid == 0) {
+                for (int stage = 0; stage < kBarrierStageCount; ++stage) {
+                    asm volatile("mbarrier.init.shared::cta.b64 [%0], 2;"
+                        :: "r"(pair_ready_addr +
+                            stage * static_cast<int>(sizeof(uint64_t))));
+                    mbarrier_init(tma_done_addr + stage * sizeof(uint64_t));
+                    mbarrier_init(stage_free_addr + stage * sizeof(uint64_t));
+                }
+                asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+            }
+            __syncthreads();
+            cluster_barrier();
+            tma_stage = 0;
+            tma_free_phase = 1;
+            ready_tma_stage = 0;
+            ready_tma_phase = 0;
+            mma_stage = 0;
+            mma_ready_phase = 0;
+        }
     }
 
-        cluster_barrier();
     }
 
     cluster_barrier();

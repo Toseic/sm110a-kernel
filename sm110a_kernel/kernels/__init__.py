@@ -98,6 +98,13 @@ from .nvfp4_fc1 import (
     Nvfp4Fc1Config, Nvfp4Fc1Metadata, compile_nvfp4_fc1, compile_nvfp4_fc1_configs,
     prepare_nvfp4_fc1_metadata, nvfp4_fc1, nvfp4_fc1_out,
 )
+from .nvfp4_fc1fc2 import (
+    Nvfp4Fc1Fc2Config,
+    compile_nvfp4_fc1fc2,
+    compile_nvfp4_fc1fc2_configs,
+    nvfp4_fc1fc2,
+    nvfp4_fc1fc2_out,
+)
 from .moe_routing import pack_routing_metadata
 
 __all__ = [name for name in globals() if not name.startswith("_")]

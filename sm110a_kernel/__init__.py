@@ -131,7 +131,9 @@ from .kernels.nvfp4_fc2 import (
     nvfp4_fc2_out,
 )
 from .kernels.nvfp4_fc1fc2 import (
+    Nvfp4Fc1Fc2Config,
     compile_nvfp4_fc1fc2,
+    compile_nvfp4_fc1fc2_configs,
     nvfp4_fc1fc2,
     nvfp4_fc1fc2_out,
 )

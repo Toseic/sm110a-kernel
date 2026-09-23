@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 
 from sm110a_kernel import (  # noqa: E402
     Nvfp4Fc1Config,
+    Nvfp4Fc1Fc2Config,
     Nvfp4Fc2Config,
     compile_nvfp4_fc1,
     compile_nvfp4_fc1fc2,
@@ -55,6 +56,9 @@ def main():
     parser.add_argument("--m", type=int, default=512)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=5)
+    parser.add_argument(
+        "--buffer-i", type=int, choices=(256, 512, 1024, 2048), default=2048
+    )
     parser.add_argument("--no-accuracy", action="store_true")
     args = parser.parse_args()
     if args.m <= 0 or args.m % 512:
@@ -75,7 +79,8 @@ def main():
     )
     w2q = w2q.unsqueeze(0)
 
-    fused = compile_nvfp4_fc1fc2()
+    fused_config = Nvfp4Fc1Fc2Config(buffer_i=args.buffer_i)
+    fused = compile_nvfp4_fc1fc2(fused_config)
     output = torch.empty((args.m, h), device="cuda", dtype=torch.bfloat16)
 
     fc1_config = Nvfp4Fc1Config(
@@ -108,7 +113,7 @@ def main():
 
     def run_fused():
         return nvfp4_fc1fc2_out(
-            aq, w1q, sfa, sfw1, w2q, sfw2, output
+            aq, w1q, sfa, sfw1, w2q, sfw2, output, config=fused_config
         )
 
     def run_standalone():
@@ -137,6 +142,7 @@ def main():
 
     fused_ms = time_ms(run_fused, args.warmup, args.iters)
     standalone_ms = time_ms(run_standalone, args.warmup, args.iters)
+    print(f"[config] buffer_i={args.buffer_i}")
     print(f"[fused] {fused_ms:.6f} ms")
     print(f"[fc1+fc2] {standalone_ms:.6f} ms")
     print(f"[ratio] {standalone_ms / fused_ms:.4f}x")
