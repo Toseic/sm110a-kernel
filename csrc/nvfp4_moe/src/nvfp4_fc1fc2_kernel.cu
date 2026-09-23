@@ -18,6 +18,8 @@
 #include <cuda_runtime.h>
 
 #include "nvfp4_fc1fc2.h"
+#include "nvfp4_fc1fc2_pipeline_delay.cuh"
+#include "pipeline_delay.h"
 
 namespace {
 
@@ -35,7 +37,16 @@ constexpr int kHSplit = SM110A_NVFP4_FC1FC2_H_SPLIT;
 #ifndef SM110A_NVFP4_FC1FC2_CLUSTER_PAIRS
 #define SM110A_NVFP4_FC1FC2_CLUSTER_PAIRS 1
 #endif
+#ifndef SM110A_NVFP4_FC1FC2_FUSE_ROUTING
+#define SM110A_NVFP4_FC1FC2_FUSE_ROUTING 0
+#endif
+#ifndef SM110A_NVFP4_FC1FC2_CACHE_SOURCE_ROWS
+#define SM110A_NVFP4_FC1FC2_CACHE_SOURCE_ROWS 0
+#endif
 constexpr int kClusterPairs = SM110A_NVFP4_FC1FC2_CLUSTER_PAIRS;
+constexpr bool kFuseRouting = SM110A_NVFP4_FC1FC2_FUSE_ROUTING != 0;
+constexpr int kCacheSourceRows = SM110A_NVFP4_FC1FC2_CACHE_SOURCE_ROWS;
+static_assert(kCacheSourceRows >= 0 && kCacheSourceRows <= 2);
 constexpr int kTileM = 128;
 constexpr int kClusterM = 2;
 constexpr int kPairTileM = kClusterM * kTileM;
@@ -50,7 +61,10 @@ constexpr int kEpilogueWarps = 4;
 constexpr int kMmaWarp = 4;
 constexpr int kTmaWarp = 5;
 constexpr int kTmaReadyWarp = 6;
-constexpr int kWarpCount = 7;
+constexpr int kGatherWarpBase = 7;
+constexpr int kGatherWarpCount = 4;
+constexpr int kWarpCount = kFuseRouting ? 11 : 7;
+constexpr int kFc1TasksPerRowTask = kPhysicalFc1N / kTileN;
 
 constexpr int kMatrixSmemBytes = kTileM * 128;
 constexpr int kWeightSmemBytes = (kTileN / kClusterM) * 128;
@@ -105,6 +119,14 @@ static_assert(kBufferI % kStageK == 0);
 static_assert((kH / kTileN) % kHSplit == 0);
 static_assert((kH / kTileN) % (kHSplit * kClusterPairs) == 0);
 static_assert(kIntermediateAtoms % kClusterPairs == 0);
+
+struct ExpertTileTask {
+    int row_start;
+    int row_count;
+    int tile_row;
+    int expert;
+    int tile_n;
+};
 
 __device__ __forceinline__ float silu(float x) {
     constexpr float kLog2E = 1.4426950408889634f;
@@ -234,6 +256,29 @@ __device__ __forceinline__ void mbarrier_expect_tx(int addr, int bytes) {
                  "_, [%0], %1;" :: "r"(addr), "r"(bytes) : "memory");
 }
 
+__device__ __forceinline__ void cp_async_16b(
+    int destination, const void* source, bool valid) {
+    const uint32_t ignore = valid ? 0U : 1U;
+    asm volatile("{\n\t.reg .pred p;\n\t"
+                 "setp.ne.u32 p, %2, 0;\n\t"
+                 "cp.async.cg.shared::cta.global [%0], [%1], 16, p;\n\t}"
+        :: "r"(destination), "l"(source), "r"(ignore) : "memory");
+}
+
+__device__ __forceinline__ void cp_async_4b(
+    int destination, const void* source, bool valid) {
+    const uint32_t ignore = valid ? 0U : 1U;
+    asm volatile("{\n\t.reg .pred p;\n\t"
+                 "setp.ne.u32 p, %2, 0;\n\t"
+                 "cp.async.ca.shared::cta.global [%0], [%1], 4, p;\n\t}"
+        :: "r"(destination), "l"(source), "r"(ignore) : "memory");
+}
+
+__device__ __forceinline__ void cp_async_mbarrier_arrive_noinc(int addr) {
+    asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];"
+        :: "r"(addr) : "memory");
+}
+
 __device__ __forceinline__ void tma_load_4d(
     int destination, const void* tensor_map,
     int x, int y, int z, int w, int mbar_addr) {
@@ -342,7 +387,12 @@ void nvfp4_fc1fc2_kernel(
     const __grid_constant__ CUtensorMap sfw1_map,
     const __grid_constant__ CUtensorMap w2_map,
     const __grid_constant__ CUtensorMap sfw2_map,
-    __nv_bfloat16* output, uint8_t* global_workspace, int row_task_count) {
+    const uint8_t* raw_a, const uint8_t* raw_sfa,
+    const int32_t* source_rows, const ExpertTileTask* tasks,
+    const int32_t* task_state, const int32_t* grouped_assignments,
+    const __nv_bfloat16* routing_weights,
+    __nv_bfloat16* output, uint8_t* global_workspace,
+    int tokens, int m, int topk, int row_task_count_arg) {
     const int tid = threadIdx.x;
     const int warp = tid / kWarpSize;
     int cta_rank;
@@ -351,20 +401,23 @@ void nvfp4_fc1fc2_kernel(
     const int pair_rank = cta_rank & 1;
     const int worker_id = blockIdx.x / kClusterCtas;
     const int worker_count = gridDim.x / kClusterCtas;
+    const int row_task_count = row_task_count_arg;
     auto* grid_barrier_words = reinterpret_cast<uint32_t*>(
         global_workspace +
-        static_cast<size_t>(row_task_count) * kClusterM *
+        static_cast<size_t>(row_task_count_arg) * kClusterM *
             kIntermediateBytes);
 
     __shared__ int tmem_base[1];
     __shared__ uint64_t pair_ready[kBarrierStageCount];
     __shared__ uint64_t tma_done[kBarrierStageCount];
     __shared__ uint64_t stage_free[kBarrierStageCount];
+    __shared__ uint64_t gather_done[kFc1StageCount];
     __shared__ uint64_t output_done[kAccumulatorStages];
     __shared__ uint64_t epilogue_free[kAccumulatorStages];
     __shared__ uint64_t pair_gather[1];
     __shared__ uint64_t pair_release[1];
     __shared__ uint64_t allgather_done[kClusterPairs];
+    __shared__ int task_source_rows[kTileM];
     extern __shared__ __align__(1024) uint8_t smem[];
     uint8_t* intermediate_values = smem;
     uint8_t* intermediate_scales =
@@ -389,6 +442,8 @@ void nvfp4_fc1fc2_kernel(
         static_cast<int>(__cvta_generic_to_shared(tma_done));
     const int stage_free_addr =
         static_cast<int>(__cvta_generic_to_shared(stage_free));
+    const int gather_done_addr =
+        static_cast<int>(__cvta_generic_to_shared(gather_done));
     const int output_done_addr =
         static_cast<int>(__cvta_generic_to_shared(output_done));
     const int epilogue_free_addr =
@@ -456,7 +511,26 @@ void nvfp4_fc1fc2_kernel(
                 h_tiles_per_partition;
         int h_tile_end = h_tile_begin + h_tiles_per_partition;
         const int pair_row = row_task * kClusterRows;
-        const int cta_row = pair_row + pair_rank * kTileM;
+        ExpertTileTask row_info{pair_row, kClusterRows, 0, 0, 0};
+        if constexpr (kFuseRouting) {
+            row_info = tasks[row_task * kFc1TasksPerRowTask];
+        }
+        const int cta_tile_row = row_info.tile_row + pair_rank * kTileM;
+        const int cta_row = row_info.row_start + cta_tile_row;
+        const int remaining_rows = row_info.row_count - cta_tile_row;
+        const int valid_rows = remaining_rows <= 0 ? 0 :
+            (remaining_rows < kTileM ? remaining_rows : kTileM);
+        const int expert = row_info.expert;
+        if constexpr (kFuseRouting) {
+            if (warp >= kGatherWarpBase &&
+                warp < kGatherWarpBase + kGatherWarpCount) {
+                const int row = (warp - kGatherWarpBase) * kWarpSize +
+                    (tid & (kWarpSize - 1));
+                task_source_rows[row] = row < valid_rows
+                    ? __ldg(source_rows + cta_row + row) : 0;
+                asm volatile("bar.sync 4, 128;" ::: "memory");
+            }
+        }
         if (tid == 0) {
             for (int stage = 0; stage < kBarrierStageCount; ++stage) {
                 asm volatile("mbarrier.init.shared::cta.b64 [%0], 2;"
@@ -464,6 +538,11 @@ void nvfp4_fc1fc2_kernel(
                         stage * static_cast<int>(sizeof(uint64_t))));
                 mbarrier_init(tma_done_addr + stage * sizeof(uint64_t));
                 mbarrier_init(stage_free_addr + stage * sizeof(uint64_t));
+                if (stage < kFc1StageCount) {
+                    asm volatile("mbarrier.init.shared::cta.b64 [%0], 128;"
+                        :: "r"(gather_done_addr +
+                            stage * static_cast<int>(sizeof(uint64_t))));
+                }
             }
             for (int stage = 0; stage < kAccumulatorStages; ++stage) {
                 mbarrier_init(output_done_addr + stage * sizeof(uint64_t));
@@ -485,6 +564,9 @@ void nvfp4_fc1fc2_kernel(
         int tma_free_phase = 1;
         int ready_tma_stage = 0;
         int ready_tma_phase = 0;
+        int gather_stage = 0;
+        int gather_free_phase = 1;
+        int gather_done_phase = 0;
         int mma_stage = 0;
         int mma_ready_phase = 0;
         int output_phase = 0;
@@ -529,21 +611,123 @@ void nvfp4_fc1fc2_kernel(
                     mbarrier_wait(
                         stage_free_addr + tma_stage * sizeof(uint64_t),
                         tma_free_phase);
-                    mbarrier_expect_tx(local_tma_done, kWorkspaceBytes);
-                    tma_load_4d(stage_a, &a_map,
-                        h, cta_row, 0, 0, local_tma_done);
+                    mbarrier_expect_tx(local_tma_done,
+                        kFuseRouting ? kWeightSmemBytes + kScaleStageBytes :
+                            kWorkspaceBytes);
+                    if constexpr (!kFuseRouting) {
+                        tma_load_4d(stage_a, &a_map,
+                            h, cta_row, 0, 0, local_tma_done);
+                    }
                     tma_load_4d(stage_b, &w1_map,
-                        h, physical_n + pair_rank * (kTileN / kClusterM),
+                        h, expert * kPhysicalFc1N + physical_n +
+                            pair_rank * (kTileN / kClusterM),
                         0, 0, local_tma_done);
-                    tma_load_4d(stage_sfa, &sfa_map,
-                        0, 0, h / kMmaK, cta_row / kTileM,
-                        local_tma_done);
+                    if constexpr (!kFuseRouting) {
+                        tma_load_4d(stage_sfa, &sfa_map,
+                            0, 0, h / kMmaK, cta_row / kTileM,
+                            local_tma_done);
+                    }
                     tma_load_4d(stage_sfb, &sfw1_map,
-                        0, 0, h / kMmaK, physical_n / kTileN,
+                        0, 0, h / kMmaK,
+                        expert * (kPhysicalFc1N / kTileN) +
+                            physical_n / kTileN,
                         local_tma_done);
                     tma_stage = (tma_stage + 1) % kFc1StageCount;
                     if (tma_stage == 0) {
                         tma_free_phase ^= 1;
+                    }
+                }
+            }
+        }
+        if constexpr (kFuseRouting) {
+            if (warp >= kGatherWarpBase &&
+                warp < kGatherWarpBase + kGatherWarpCount) {
+                const int gather_rank = warp - kGatherWarpBase;
+                const int lane = tid & (kWarpSize - 1);
+                constexpr int kVectorsPerRow = kStageK / 32;
+                constexpr int kRowsPerIssue = kWarpSize / kVectorsPerRow;
+                constexpr int kRowsPerGatherWarp =
+                    kTileM / kGatherWarpCount;
+                constexpr int kRowGroupCount =
+                    kRowsPerGatherWarp / kRowsPerIssue;
+                int a_source_row_cache[
+                    kCacheSourceRows == 2 ? kRowGroupCount : 1];
+                int sfa_source_row = 0;
+                if constexpr (kCacheSourceRows == 2) {
+#pragma unroll
+                    for (int row_group = 0; row_group < kRowGroupCount;
+                         ++row_group) {
+                        const int local_row =
+                            gather_rank * kRowsPerGatherWarp +
+                            row_group * kRowsPerIssue + lane / kVectorsPerRow;
+                        a_source_row_cache[row_group] =
+                            task_source_rows[local_row];
+                    }
+                }
+                const int sfa_local_row = gather_rank * kWarpSize + lane;
+                if constexpr (kCacheSourceRows >= 1) {
+                    sfa_source_row = task_source_rows[sfa_local_row];
+                }
+                for (int i64 = pair_i64_begin; i64 < pair_i64_end; ++i64) {
+                    for (int h_stage = 0; h_stage < kH / kStageK; ++h_stage) {
+                        const int h = h_stage * kStageK;
+                        const int stage_base = fc1_workspace_addr +
+                            gather_stage * kWorkspaceBytes;
+                        const int stage_a = stage_base;
+                        const int stage_sfa = stage_base +
+                            kMatrixSmemBytes + kWeightSmemBytes;
+                        mbarrier_wait(
+                            stage_free_addr + gather_stage * sizeof(uint64_t),
+                            gather_free_phase);
+                        const int vec = lane % kVectorsPerRow;
+#pragma unroll
+                        for (int row_group = 0; row_group < kRowGroupCount;
+                             ++row_group) {
+                            const int local_row = gather_rank *
+                                kRowsPerGatherWarp +
+                                row_group * kRowsPerIssue +
+                                lane / kVectorsPerRow;
+                            const bool valid = local_row < valid_rows;
+                            const int source_row = kCacheSourceRows == 2
+                                ? a_source_row_cache[row_group]
+                                : task_source_rows[local_row];
+                            const size_t source_offset =
+                                static_cast<size_t>(source_row) * (kH / 2) +
+                                h / 2 + vec * 16;
+                            const int destination = stage_a +
+                                swizzled_vector(local_row, vec) * 16;
+                            cp_async_16b(destination, raw_a + source_offset,
+                                         valid);
+                        }
+                        const int local_row = sfa_local_row;
+                        const bool valid = local_row < valid_rows;
+                        const int source_row = kCacheSourceRows >= 1
+                            ? sfa_source_row
+                            : task_source_rows[local_row];
+#pragma unroll
+                        for (int mma_k = 0; mma_k < kMmaSteps; ++mma_k) {
+                            const int source_in_tile =
+                                (source_row & 31) * 16 +
+                                ((source_row >> 5) & 3) * 4;
+                            const size_t source_tile =
+                                static_cast<size_t>(source_row >> 7);
+                            const size_t global_mma_k = h / kMmaK + mma_k;
+                            const int destination = stage_sfa + mma_k * 512 +
+                                scale_offset(local_row, 0);
+                            cp_async_4b(destination,
+                                raw_sfa +
+                                    (source_tile * (kH / kMmaK) +
+                                     global_mma_k) * 512 + source_in_tile,
+                                valid);
+                        }
+                        asm volatile("fence.proxy.async.shared::cta;" :::
+                            "memory");
+                        cp_async_mbarrier_arrive_noinc(
+                            gather_done_addr + gather_stage * sizeof(uint64_t));
+                        sm110a::pipeline_delay<
+                            SM110A_PIPELINE_DELAY_NVFP4_FC1FC2_ROUTED_GATHER>();
+                        gather_stage = (gather_stage + 1) % kFc1StageCount;
+                        if (gather_stage == 0) gather_free_phase ^= 1;
                     }
                 }
             }
@@ -554,12 +738,21 @@ void nvfp4_fc1fc2_kernel(
                     mbarrier_wait(
                         tma_done_addr + ready_tma_stage * sizeof(uint64_t),
                         ready_tma_phase);
+                    if constexpr (kFuseRouting) {
+                        mbarrier_wait(
+                            gather_done_addr +
+                                ready_tma_stage * sizeof(uint64_t),
+                            gather_done_phase);
+                    }
                     mbarrier_arrive_on_cluster_cta(
                         pair_ready_addr + ready_tma_stage * sizeof(uint64_t),
                         pair_id * kClusterM);
                     ready_tma_stage =
                         (ready_tma_stage + 1) % kFc1StageCount;
                     if (ready_tma_stage == 0) ready_tma_phase ^= 1;
+                    if constexpr (kFuseRouting) {
+                        if (ready_tma_stage == 0) gather_done_phase ^= 1;
+                    }
                 }
             }
         }
@@ -695,7 +888,8 @@ void nvfp4_fc1fc2_kernel(
                     if (in_atom + 1 == kMmaSteps) {
                         if (warp == 0 && (tid & 31) == 0) {
                             auto* scratch = global_workspace +
-                                static_cast<size_t>(cta_row / kTileM) *
+                                static_cast<size_t>(row_task * kClusterM +
+                                    pair_rank) *
                                     kIntermediateBytes;
                             asm volatile("fence.proxy.async.shared::cta;" :::
                                 "memory");
@@ -754,7 +948,7 @@ void nvfp4_fc1fc2_kernel(
             const int scale_bytes_per_partition =
                 (pair_i64_end - pair_i64_begin) * 512;
             auto* scratch = global_workspace +
-                static_cast<size_t>(cta_row / kTileM) *
+                static_cast<size_t>(row_task * kClusterM + pair_rank) *
                     kIntermediateBytes;
             if (warp == kTmaWarp && elect_sync()) {
                 for (int atom = 0; atom < atoms_per_partition; ++atom) {
@@ -827,7 +1021,8 @@ void nvfp4_fc1fc2_kernel(
 
         if constexpr (kStreamIntermediate) {
             auto* scratch = global_workspace +
-                static_cast<size_t>(cta_row / kTileM) * kIntermediateBytes;
+                static_cast<size_t>(row_task * kClusterM + pair_rank) *
+                    kIntermediateBytes;
             if (h_partition_count > 1) {
                 grid_barrier(grid_barrier_words, grid_barrier_words + 1,
                              8, 1, cta_rank, tid);
@@ -913,20 +1108,18 @@ void nvfp4_fc1fc2_kernel(
         // workspace. Both roles have drained, so reset the stage barriers
         // before switching modes instead of relying on a particular loop
         // count to land on the initial slot/parity.
-        if constexpr (kBufferI < kI) {
-            if (tid == 0) {
-                for (int stage = 0; stage < kBarrierStageCount; ++stage) {
-                    asm volatile("mbarrier.init.shared::cta.b64 [%0], 2;"
-                        :: "r"(pair_ready_addr +
-                            stage * static_cast<int>(sizeof(uint64_t))));
-                    mbarrier_init(tma_done_addr + stage * sizeof(uint64_t));
-                    mbarrier_init(stage_free_addr + stage * sizeof(uint64_t));
-                }
-                asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+        if (tid == 0) {
+            for (int stage = 0; stage < kBarrierStageCount; ++stage) {
+                asm volatile("mbarrier.init.shared::cta.b64 [%0], 2;"
+                    :: "r"(pair_ready_addr +
+                        stage * static_cast<int>(sizeof(uint64_t))));
+                mbarrier_init(tma_done_addr + stage * sizeof(uint64_t));
+                mbarrier_init(stage_free_addr + stage * sizeof(uint64_t));
             }
-            __syncthreads();
-            cluster_barrier();
+            asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
+        __syncthreads();
+        cluster_barrier();
 
         // Reset the role-local cursors before reinterpreting the same
         // workspace as compact FC2 B/SFB stages.
@@ -957,10 +1150,12 @@ void nvfp4_fc1fc2_kernel(
                     mbarrier_expect_tx(local_tma_done,
                         kWeightSmemBytes + kScaleStageBytes);
                     tma_load_4d(stage_b, &w2_map,
-                        global_i, h + pair_rank * (kTileN / kClusterM),
+                        global_i, expert * kH + h +
+                            pair_rank * (kTileN / kClusterM),
                         0, 0, local_tma_done);
                     tma_load_4d(stage_sfb, &sfw2_map,
-                        0, 0, global_i / kMmaK, h / kTileN,
+                        0, 0, global_i / kMmaK,
+                        expert * (kH / kTileN) + h / kTileN,
                         local_tma_done);
                     tma_stage = (tma_stage + 1) % kFc2StageCount;
                     if (tma_stage == 0) {
@@ -1040,6 +1235,18 @@ void nvfp4_fc1fc2_kernel(
                 const int local_row = warp * kWarpSize + (tid & 31);
                 const int global_row = cta_row + local_row;
                 const int tmem_row = pair_rank * kTileM + warp * kWarpSize;
+                const bool valid_row = local_row < valid_rows;
+                int token_row = global_row;
+                float router_scale = 1.0f;
+                if constexpr (kFuseRouting) {
+                    if (valid_row) {
+                        const int assignment =
+                            grouped_assignments[global_row];
+                        token_row = assignment / topk;
+                        router_scale = __bfloat162float(
+                            routing_weights[assignment]);
+                    }
+                }
 #pragma unroll
                 for (int slab = 0; slab < kTileN; slab += kReduceN) {
 #pragma unroll
@@ -1059,23 +1266,34 @@ void nvfp4_fc1fc2_kernel(
 #pragma unroll
                         for (int col = 0; col < 8; ++col) {
                             finalize_smem[local_row * kReduceN + group * 8 + col] =
-                                __float2bfloat16_rn(values[col]);
+                                __float2bfloat16_rn(
+                                    values[col] * router_scale);
                         }
                     }
                     asm volatile("bar.sync 1, 128;" ::: "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     auto* destination = output +
-                        static_cast<size_t>(global_row) * kH + h + slab;
-                    if (chunk == 0) {
-                        bulk_store_bf16(destination,
-                            finalize_smem + local_row * kReduceN,
-                            kReduceN * sizeof(__nv_bfloat16));
-                    } else {
-                        bulk_reduce_add_bf16(destination,
-                            finalize_smem + local_row * kReduceN,
-                            kReduceN * sizeof(__nv_bfloat16));
+                        static_cast<size_t>(token_row) * kH + h + slab;
+                    if (valid_row) {
+                        if constexpr (kFuseRouting) {
+                            bulk_reduce_add_bf16(destination,
+                                finalize_smem + local_row * kReduceN,
+                                kReduceN * sizeof(__nv_bfloat16));
+                        } else if (chunk == 0) {
+                            bulk_store_bf16(destination,
+                                finalize_smem + local_row * kReduceN,
+                                kReduceN * sizeof(__nv_bfloat16));
+                        } else {
+                            bulk_reduce_add_bf16(destination,
+                                finalize_smem + local_row * kReduceN,
+                                kReduceN * sizeof(__nv_bfloat16));
+                        }
                     }
                     bulk_commit_and_wait_read();
+                    if constexpr (kFuseRouting) {
+                        sm110a::pipeline_delay<
+                            SM110A_PIPELINE_DELAY_NVFP4_FC1FC2_FINALIZE_REDUCE>();
+                    }
                     asm volatile("bar.sync 1, 128;" ::: "memory");
                 }
                 asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
@@ -1167,12 +1385,22 @@ bool init_scale_map(
 void launch_nvfp4_fc1fc2(
     const uint8_t* a, const uint8_t* w1, const uint8_t* sfa,
     const uint8_t* sfw1, const uint8_t* w2, const uint8_t* sfw2,
-    __nv_bfloat16* output, uint8_t* global_workspace,
-    int m, cudaStream_t stream) {
+    const int32_t* source_rows, const int32_t* grouped_assignments,
+    const int32_t* tasks, const int32_t* state,
+    const __nv_bfloat16* routing_weights, __nv_bfloat16* output,
+    uint8_t* global_workspace, int tokens, int m, int experts, int topk,
+    int row_task_count, int max_tasks, cudaStream_t stream) {
     if (!a || !w1 || !sfa || !sfw1 || !w2 || !sfw2 || !output ||
         !global_workspace ||
-        m <= 0 || m % kClusterRows) {
+        tokens <= 0 || m <= 0 || experts <= 0 || topk <= 0) {
         return;
+    }
+    if constexpr (kFuseRouting) {
+        if (!source_rows || !grouped_assignments || !tasks || !state ||
+            !routing_weights || row_task_count <= 0 || max_tasks <= 0 ||
+            max_tasks % kFc1TasksPerRowTask) return;
+    } else {
+        if (m % kClusterRows) return;
     }
     CUtensorMap a_map;
     CUtensorMap w1_map;
@@ -1181,27 +1409,29 @@ void launch_nvfp4_fc1fc2(
     CUtensorMap w2_map;
     CUtensorMap sfw2_map;
     const bool maps_ok =
-        init_matrix_map<kTileM>(&a_map, a, m, kH) &&
+        init_matrix_map<kTileM>(&a_map, a, tokens, kH) &&
         init_matrix_map<kTileN / kClusterM>(
-            &w1_map, w1, kPhysicalFc1N, kH) &&
-        init_scale_map(&sfa_map, sfa, m / kTileM, kH / kMmaK) &&
+            &w1_map, w1, experts * kPhysicalFc1N, kH) &&
+        init_scale_map(&sfa_map, sfa, tokens / kTileM, kH / kMmaK) &&
         init_scale_map(&sfw1_map, sfw1,
-            kPhysicalFc1N / kTileN, kH / kMmaK) &&
-        init_matrix_map<kTileN / kClusterM>(&w2_map, w2, kH, kI) &&
-        init_scale_map(&sfw2_map, sfw2, kH / kTileN, kI / kMmaK);
+            experts * (kPhysicalFc1N / kTileN), kH / kMmaK) &&
+        init_matrix_map<kTileN / kClusterM>(
+            &w2_map, w2, experts * kH, kI) &&
+        init_scale_map(&sfw2_map, sfw2,
+            experts * (kH / kTileN), kI / kMmaK);
     if (!maps_ok) {
         return;
     }
     auto kernel = nvfp4_fc1fc2_kernel;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          kDynamicSmemBytes);
-    const int row_tasks = m / kClusterRows;
-    int tasks = row_tasks * kHSplit;
+    const int row_tasks = kFuseRouting ? row_task_count : m / kClusterRows;
+    int launch_task_count = row_tasks * kHSplit;
     if constexpr (kHSplit == 3) {
-        if (row_tasks == 4) tasks = 10;
+        if (row_tasks == 4) launch_task_count = 10;
     }
     cudaLaunchConfig_t launch_config{};
-    launch_config.gridDim = dim3(kClusterCtas * tasks, 1, 1);
+    launch_config.gridDim = dim3(kClusterCtas * launch_task_count, 1, 1);
     launch_config.blockDim = dim3(kWarpCount * kWarpSize, 1, 1);
     launch_config.dynamicSmemBytes = kDynamicSmemBytes;
     launch_config.stream = stream;
@@ -1216,37 +1446,49 @@ void launch_nvfp4_fc1fc2(
         resident_clusters = sm_count / kClusterCtas;
         if (resident_clusters <= 0) resident_clusters = 1;
     }
-    const int workers = tasks < resident_clusters ? tasks : resident_clusters;
+    const int workers = launch_task_count < resident_clusters ?
+        launch_task_count : resident_clusters;
+    auto* workspace_control = global_workspace +
+        static_cast<size_t>(row_tasks) * kClusterM * kIntermediateBytes;
+    if constexpr (kFuseRouting) {
+        cudaMemsetAsync(output, 0,
+            static_cast<size_t>(tokens) * kH * sizeof(__nv_bfloat16), stream);
+        cudaMemsetAsync(workspace_control, 0, 8, stream);
+    }
     if constexpr (kHSplit > 1) {
         // Resident small-M variants use two words for their grid barrier.
         // Oversubscribed h_split=2 instead uses one completion counter per
         // row and lets the last FC1 partition take ownership of FC2.
-        if (tasks > resident_clusters && kHSplit != 2) return;
-        cudaMemsetAsync(
-            global_workspace + static_cast<size_t>(m / kTileM) *
-                kIntermediateBytes,
-            0, tasks <= resident_clusters ? 8 :
-                (row_tasks + tasks) * sizeof(uint32_t),
+        if (launch_task_count > resident_clusters && kHSplit != 2) return;
+        cudaMemsetAsync(workspace_control, 0,
+            launch_task_count <= resident_clusters ? 8 :
+                (row_tasks + launch_task_count) * sizeof(uint32_t),
             stream);
     }
     if constexpr (kHSplit == 1) {
         if (row_tasks == 12) {
-            cudaMemsetAsync(
-                global_workspace + static_cast<size_t>(m / kTileM) *
-                    kIntermediateBytes,
-                0, 8, stream);
+            cudaMemsetAsync(workspace_control, 0, 8, stream);
         }
     }
     kernel<<<dim3(kClusterCtas * workers, 1, 1), kWarpCount * kWarpSize,
         kDynamicSmemBytes, stream>>>(
-            a_map, w1_map, sfa_map, sfw1_map, w2_map, sfw2_map,
-            output, global_workspace, row_tasks);
+        a_map, w1_map, sfa_map, sfw1_map, w2_map, sfw2_map,
+            a, sfa, source_rows,
+            reinterpret_cast<const ExpertTileTask*>(tasks), state,
+            grouped_assignments, routing_weights, output, global_workspace,
+            tokens, m, topk, row_tasks);
 }
 
 extern "C" void sm110a_nvfp4_fc1fc2_launch(
     const uint8_t* a, const uint8_t* w1, const uint8_t* sfa,
     const uint8_t* sfw1, const uint8_t* w2, const uint8_t* sfw2,
-    __nv_bfloat16* output, uint8_t* workspace, int m, cudaStream_t stream) {
+    const int32_t* source_rows, const int32_t* grouped_assignments,
+    const int32_t* tasks, const int32_t* state,
+    const __nv_bfloat16* routing_weights, __nv_bfloat16* output,
+    uint8_t* workspace, int tokens, int m, int experts, int topk,
+    int row_task_count, int max_tasks, cudaStream_t stream) {
     launch_nvfp4_fc1fc2(
-        a, w1, sfa, sfw1, w2, sfw2, output, workspace, m, stream);
+        a, w1, sfa, sfw1, w2, sfw2, source_rows,
+        grouped_assignments, tasks, state, routing_weights, output, workspace,
+        tokens, m, experts, topk, row_task_count, max_tasks, stream);
 }

@@ -136,6 +136,7 @@ from .kernels.nvfp4_fc1fc2 import (
     compile_nvfp4_fc1fc2_configs,
     nvfp4_fc1fc2,
     nvfp4_fc1fc2_out,
+    nvfp4_fc1fc2_routed_out,
 )
 _RUNNER_EXPORTS = {"AutotuneRunner", "PreparedKernel", "Selection", "TuneOptions"}
 _CUTEDSL_EXPORTS = {
