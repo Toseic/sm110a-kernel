@@ -28,11 +28,19 @@ constexpr int kPhysicalFc1N = 2 * kI;
 #define SM110A_NVFP4_FC1FC2_BUFFER_I 2048
 #endif
 constexpr int kBufferI = SM110A_NVFP4_FC1FC2_BUFFER_I;
+#ifndef SM110A_NVFP4_FC1FC2_H_SPLIT
+#define SM110A_NVFP4_FC1FC2_H_SPLIT 1
+#endif
+constexpr int kHSplit = SM110A_NVFP4_FC1FC2_H_SPLIT;
+#ifndef SM110A_NVFP4_FC1FC2_CLUSTER_PAIRS
+#define SM110A_NVFP4_FC1FC2_CLUSTER_PAIRS 1
+#endif
+constexpr int kClusterPairs = SM110A_NVFP4_FC1FC2_CLUSTER_PAIRS;
 constexpr int kTileM = 128;
 constexpr int kClusterM = 2;
 constexpr int kPairTileM = kClusterM * kTileM;
-constexpr int kClusterPairs = 1;
-constexpr int kClusterRows = kClusterPairs * kPairTileM;
+constexpr int kClusterCtas = kClusterPairs * kClusterM;
+constexpr int kClusterRows = kPairTileM;
 constexpr int kTileN = 128;
 constexpr int kStageK = 256;
 constexpr int kMmaK = 64;
@@ -52,19 +60,40 @@ constexpr int kIntermediateValueBytes = kIntermediateAtoms * kMatrixSmemBytes;
 constexpr int kIntermediateScaleBytes = (kBufferI / kMmaK) * 512;
 constexpr int kIntermediateBytes =
     kIntermediateValueBytes + kIntermediateScaleBytes;
+constexpr bool kGlobalSplit = kHSplit > 1;
+constexpr bool kStreamIntermediate =
+    !kGlobalSplit && kClusterPairs == 1 && kBufferI == kI;
+constexpr int kFc1CompactAtoms = kStreamIntermediate ? 4 :
+    (!kGlobalSplit ? kIntermediateAtoms :
+    (kHSplit <= 3 ? (kIntermediateAtoms + 1) / 2 :
+        (kIntermediateAtoms + kHSplit - 1) / kHSplit));
+constexpr int kFc1CompactValueBytes =
+    kFc1CompactAtoms * kMatrixSmemBytes;
+constexpr int kFc1CompactScaleBytes =
+    kFc1CompactAtoms * kMmaSteps * 512;
+constexpr int kFc1CompactIntermediateBytes =
+    kFc1CompactValueBytes + kFc1CompactScaleBytes;
 constexpr int kWorkspaceBytes =
     kMatrixSmemBytes + kWeightSmemBytes + 2 * kScaleStageBytes;
 constexpr int kFc2WorkspaceBytes = kWeightSmemBytes + kScaleStageBytes;
-constexpr int kFc1StageCount = kBufferI >= 2048 ? 2 :
-    (kBufferI >= 1024 ? 4 : 5);
-constexpr int kFc2StageCount =
+constexpr int kFc1StageCount = kStreamIntermediate ? 4 :
+    (kGlobalSplit ? (kHSplit >= 4 ? 4 : 3) :
+    (kBufferI >= 2048 ? 2 : (kBufferI >= 1024 ? 4 : 5)));
+
+constexpr int kFc2StageCount = (kGlobalSplit || kStreamIntermediate) ? 6 :
     (kFc1StageCount * kWorkspaceBytes) / kFc2WorkspaceBytes;
 constexpr int kBarrierStageCount = kFc2StageCount;
 constexpr int kReduceN = 64;
 constexpr int kFinalizeSmemBytes =
     kTileM * kReduceN * sizeof(__nv_bfloat16);
-constexpr int kDynamicSmemBytes =
-    kIntermediateBytes + kFc1StageCount * kWorkspaceBytes + kFinalizeSmemBytes;
+constexpr int kFc1ModeSmemBytes =
+    kFc1CompactIntermediateBytes + kFc1StageCount * kWorkspaceBytes;
+constexpr int kFc2ModeSmemBytes =
+    kIntermediateBytes + kFc2StageCount * kFc2WorkspaceBytes;
+constexpr int kModeSmemBytes =
+    kFc1ModeSmemBytes > kFc2ModeSmemBytes ?
+        kFc1ModeSmemBytes : kFc2ModeSmemBytes;
+constexpr int kDynamicSmemBytes = kModeSmemBytes + kFinalizeSmemBytes;
 constexpr int kTmemColumns = 512;
 constexpr int kAccumulatorStages = 2;
 constexpr int kScaleTmemCol = kAccumulatorStages * kTileN;
@@ -73,6 +102,9 @@ constexpr int kMaxOptInSmemBytes = 232448;
 static_assert(kDynamicSmemBytes <= kMaxOptInSmemBytes);
 static_assert(kI % kBufferI == 0);
 static_assert(kBufferI % kStageK == 0);
+static_assert((kH / kTileN) % kHSplit == 0);
+static_assert((kH / kTileN) % (kHSplit * kClusterPairs) == 0);
+static_assert(kIntermediateAtoms % kClusterPairs == 0);
 
 __device__ __forceinline__ float silu(float x) {
     constexpr float kLog2E = 1.4426950408889634f;
@@ -157,6 +189,28 @@ __device__ __forceinline__ void mbarrier_arrive_on_cluster_cta(
         :: "r"(remote_addr) : "memory");
 }
 
+__device__ __forceinline__ void bulk_copy_to_cluster_cta(
+    int src_smem_addr, int dst_smem_addr, int bytes,
+    int local_mbar_addr, int target_cta_rank) {
+    const int remote_dst =
+        map_shared_to_cluster_cta(dst_smem_addr, target_cta_rank);
+    const int remote_mbar =
+        map_shared_to_cluster_cta(local_mbar_addr, target_cta_rank);
+    asm volatile("cp.async.bulk.shared::cluster.shared::cta."
+                 "mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::
+        "r"(remote_dst), "r"(src_smem_addr), "r"(bytes), "r"(remote_mbar)
+        : "memory");
+}
+
+__device__ __forceinline__ void mbarrier_expect_tx_on_cluster_cta(
+    int local_mbar_addr, int bytes, int target_cta_rank) {
+    const int remote_mbar =
+        map_shared_to_cluster_cta(local_mbar_addr, target_cta_rank);
+    asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 "
+                 "_, [%0], %1;" ::
+        "r"(remote_mbar), "r"(bytes) : "memory");
+}
+
 __device__ __forceinline__ void pair_barrier(
     int gather_addr, int release_addr, int pair_root,
     int phase, int tid) {
@@ -198,6 +252,36 @@ __device__ __forceinline__ void bulk_store_bf16(
     asm volatile("cp.async.bulk.global.shared::cta.bulk_group "
                  "[%0], [%1], %2;"
         :: "l"(destination_addr), "r"(source_addr), "r"(bytes) : "memory");
+}
+
+__device__ __forceinline__ void bulk_load_bytes(
+    int destination_smem_addr, const void* source, int bytes,
+    int mbar_addr) {
+    const uint64_t source_addr = reinterpret_cast<uint64_t>(source);
+    asm volatile("cp.async.bulk.shared::cluster.global."
+                 "mbarrier::complete_tx::bytes "
+                 "[%0], [%1], %2, [%3];" ::
+        "r"(destination_smem_addr), "l"(source_addr), "r"(bytes),
+        "r"(mbar_addr) : "memory");
+}
+
+__device__ __forceinline__ void grid_barrier(
+    uint32_t* count, uint32_t* sense, int expected_clusters,
+    uint32_t phase, int cta_rank, int tid) {
+    cluster_barrier();
+    if (cta_rank == 0 && tid == 0) {
+        __threadfence();
+        const uint32_t ticket = atomicAdd(count, 1U);
+        if (ticket + 1U == static_cast<uint32_t>(expected_clusters)) {
+            atomicExch(count, 0U);
+            __threadfence();
+            atomicExch(sense, phase);
+        } else {
+            while (atomicAdd(sense, 0U) != phase) {
+            }
+        }
+    }
+    cluster_barrier();
 }
 
 __device__ __forceinline__ void bulk_reduce_add_bf16(
@@ -249,7 +333,8 @@ __device__ __forceinline__ void commit_pair_mma(
                  "[%0], %1;" :: "r"(done_mbar_addr), "h"(mask) : "memory");
 }
 
-__global__ __cluster_dims__(2, 1, 1) __launch_bounds__(kWarpCount * kWarpSize, 1)
+__global__ __cluster_dims__(kClusterCtas, 1, 1)
+__launch_bounds__(kWarpCount * kWarpSize, 1)
 void nvfp4_fc1fc2_kernel(
     const __grid_constant__ CUtensorMap a_map,
     const __grid_constant__ CUtensorMap w1_map,
@@ -257,15 +342,19 @@ void nvfp4_fc1fc2_kernel(
     const __grid_constant__ CUtensorMap sfw1_map,
     const __grid_constant__ CUtensorMap w2_map,
     const __grid_constant__ CUtensorMap sfw2_map,
-    __nv_bfloat16* output, int task_count) {
+    __nv_bfloat16* output, uint8_t* global_workspace, int row_task_count) {
     const int tid = threadIdx.x;
     const int warp = tid / kWarpSize;
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
     const int pair_id = cta_rank >> 1;
     const int pair_rank = cta_rank & 1;
-    const int worker_id = blockIdx.x >> 1;
-    const int worker_count = gridDim.x >> 1;
+    const int worker_id = blockIdx.x / kClusterCtas;
+    const int worker_count = gridDim.x / kClusterCtas;
+    auto* grid_barrier_words = reinterpret_cast<uint32_t*>(
+        global_workspace +
+        static_cast<size_t>(row_task_count) * kClusterM *
+            kIntermediateBytes);
 
     __shared__ int tmem_base[1];
     __shared__ uint64_t pair_ready[kBarrierStageCount];
@@ -275,15 +364,21 @@ void nvfp4_fc1fc2_kernel(
     __shared__ uint64_t epilogue_free[kAccumulatorStages];
     __shared__ uint64_t pair_gather[1];
     __shared__ uint64_t pair_release[1];
+    __shared__ uint64_t allgather_done[kClusterPairs];
     extern __shared__ __align__(1024) uint8_t smem[];
     uint8_t* intermediate_values = smem;
     uint8_t* intermediate_scales =
         intermediate_values + kIntermediateValueBytes;
-    uint8_t* workspace = smem + kIntermediateBytes;
+    uint8_t* fc1_intermediate_scales =
+        intermediate_values + kFc1CompactValueBytes;
+    uint8_t* fc1_workspace = smem + kFc1CompactIntermediateBytes;
+    uint8_t* fc2_workspace = smem + kIntermediateBytes;
     auto* finalize_smem = reinterpret_cast<__nv_bfloat16*>(
-        workspace + kFc1StageCount * kWorkspaceBytes);
-    const int workspace_addr =
-        static_cast<int>(__cvta_generic_to_shared(workspace));
+        smem + kModeSmemBytes);
+    const int fc1_workspace_addr =
+        static_cast<int>(__cvta_generic_to_shared(fc1_workspace));
+    const int fc2_workspace_addr =
+        static_cast<int>(__cvta_generic_to_shared(fc2_workspace));
     const int intermediate_values_addr =
         static_cast<int>(__cvta_generic_to_shared(intermediate_values));
     const int intermediate_scales_addr =
@@ -302,6 +397,8 @@ void nvfp4_fc1fc2_kernel(
         static_cast<int>(__cvta_generic_to_shared(pair_gather));
     const int pair_release_addr =
         static_cast<int>(__cvta_generic_to_shared(pair_release));
+    const int allgather_done_addr =
+        static_cast<int>(__cvta_generic_to_shared(allgather_done));
 
     if (warp == kMmaWarp) {
         const int tmem_base_addr =
@@ -312,8 +409,53 @@ void nvfp4_fc1fc2_kernel(
     cluster_barrier();
     const int tmem_addr = tmem_base[0];
 
+    int task_count = row_task_count * kHSplit;
+    if constexpr (kHSplit == 3) {
+        if (row_task_count == 4) task_count = 10;
+    }
+    if constexpr (kHSplit == 1) {
+        // Twelve rows leave only two full-row tasks in the second wave.
+        // Split those two tail rows four ways across eight resident workers.
+        if (row_task_count == 12) task_count = 18;
+    }
     for (int task = worker_id; task < task_count; task += worker_count) {
-        const int pair_row = task * kClusterRows + pair_id * kPairTileM;
+        int row_task;
+        int h_partition;
+        int h_partition_count;
+        if constexpr (kHSplit == 3) {
+            if (row_task_count == 4 && task >= 6) {
+                const int tail_task = task - 6;
+                row_task = 2 + tail_task / 2;
+                h_partition = tail_task % 2;
+                h_partition_count = 2;
+            } else {
+                row_task = task / 3;
+                h_partition = task % 3;
+                h_partition_count = 3;
+            }
+        } else if constexpr (kHSplit == 1) {
+            if (row_task_count == 12 && task >= 10) {
+                const int tail_task = task - 10;
+                row_task = 10 + tail_task / 4;
+                h_partition = tail_task % 4;
+                h_partition_count = 4;
+            } else {
+                row_task = task;
+                h_partition = 0;
+                h_partition_count = 1;
+            }
+        } else {
+            row_task = task / kHSplit;
+            h_partition = task % kHSplit;
+            h_partition_count = kHSplit;
+        }
+        const int h_tiles_per_partition =
+            (kH / kTileN) / (h_partition_count * kClusterPairs);
+        int h_tile_begin =
+            (h_partition * kClusterPairs + pair_id) *
+                h_tiles_per_partition;
+        int h_tile_end = h_tile_begin + h_tiles_per_partition;
+        const int pair_row = row_task * kClusterRows;
         const int cta_row = pair_row + pair_rank * kTileM;
         if (tid == 0) {
             for (int stage = 0; stage < kBarrierStageCount; ++stage) {
@@ -332,6 +474,9 @@ void nvfp4_fc1fc2_kernel(
             asm volatile("mbarrier.init.shared::cta.b64 [%0], 2;"
                 :: "r"(pair_gather_addr));
             mbarrier_init(pair_release_addr);
+            for (int pair = 0; pair < kClusterPairs; ++pair) {
+                mbarrier_init(allgather_done_addr + pair * sizeof(uint64_t));
+            }
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
         __syncthreads();
@@ -346,15 +491,35 @@ void nvfp4_fc1fc2_kernel(
         int pair_sync_phase = 0;
 
         for (int chunk = 0; chunk < kI / kBufferI; ++chunk) {
+        int pair_atom_begin;
+        int pair_atom_end;
+        if constexpr (kClusterPairs > 1) {
+            constexpr int kAtomsPerPair =
+                kIntermediateAtoms / kClusterPairs;
+            pair_atom_begin = pair_id * kAtomsPerPair;
+            pair_atom_end = pair_atom_begin + kAtomsPerPair;
+        } else {
+            const int atoms_per_partition =
+                kIntermediateAtoms / h_partition_count;
+            const int extra_atoms =
+                kIntermediateAtoms % h_partition_count;
+            pair_atom_begin = h_partition * atoms_per_partition +
+                (h_partition < extra_atoms ? h_partition : extra_atoms);
+            pair_atom_end = pair_atom_begin + atoms_per_partition +
+                (h_partition < extra_atoms ? 1 : 0);
+        }
+        const int pair_i64_begin = pair_atom_begin * kMmaSteps;
+        const int pair_i64_end = pair_atom_end * kMmaSteps;
         // FC1 mode. Each physical 128-column tile produces 64 logical I
         // columns; 32 tiles fill the complete-I persistent SMEM buffer.
         if (warp == kTmaWarp && elect_sync()) {
-            for (int i64 = 0; i64 < kBufferI / kMmaK; ++i64) {
+            for (int i64 = pair_i64_begin; i64 < pair_i64_end; ++i64) {
                 const int physical_n =
                     (chunk * (kBufferI / kMmaK) + i64) * kTileN;
                 for (int h_stage = 0; h_stage < kH / kStageK; ++h_stage) {
                     const int h = h_stage * kStageK;
-                    const int stage_base = workspace_addr + tma_stage * kWorkspaceBytes;
+                    const int stage_base =
+                        fc1_workspace_addr + tma_stage * kWorkspaceBytes;
                     const int stage_a = stage_base;
                     const int stage_b = stage_a + kMatrixSmemBytes;
                     const int stage_sfa = stage_b + kWeightSmemBytes;
@@ -384,7 +549,7 @@ void nvfp4_fc1fc2_kernel(
             }
         }
         if (warp == kTmaReadyWarp && elect_sync()) {
-            for (int i64 = 0; i64 < kBufferI / kMmaK; ++i64) {
+            for (int i64 = pair_i64_begin; i64 < pair_i64_end; ++i64) {
                 for (int h_stage = 0; h_stage < kH / kStageK; ++h_stage) {
                     mbarrier_wait(
                         tma_done_addr + ready_tma_stage * sizeof(uint64_t),
@@ -401,14 +566,15 @@ void nvfp4_fc1fc2_kernel(
         if (pair_rank == 0 && warp == kMmaWarp && elect_sync()) {
             int accumulator_stage = 0;
             int accumulator_free_phase = 1;
-            for (int i64 = 0; i64 < kBufferI / kMmaK; ++i64) {
+            for (int i64 = pair_i64_begin; i64 < pair_i64_end; ++i64) {
                 mbarrier_wait(
                     epilogue_free_addr + accumulator_stage * sizeof(uint64_t),
                     accumulator_free_phase);
                 const int accumulator_addr =
                     tmem_addr + accumulator_stage * kTileN;
                 for (int h_stage = 0; h_stage < kH / kStageK; ++h_stage) {
-                    const int stage_base = workspace_addr + mma_stage * kWorkspaceBytes;
+                    const int stage_base =
+                        fc1_workspace_addr + mma_stage * kWorkspaceBytes;
                     mbarrier_wait(
                         pair_ready_addr + mma_stage * sizeof(uint64_t),
                         mma_ready_phase);
@@ -441,7 +607,7 @@ void nvfp4_fc1fc2_kernel(
 
         if (warp < kEpilogueWarps) {
             int accumulator_stage = 0;
-            for (int i64 = 0; i64 < kBufferI / kMmaK; ++i64) {
+            for (int i64 = pair_i64_begin; i64 < pair_i64_end; ++i64) {
                 const int accumulator_addr =
                     tmem_addr + accumulator_stage * kTileN;
                 mbarrier_wait(
@@ -505,21 +671,58 @@ void nvfp4_fc1fc2_kernel(
                                  activated[pair * 2 + 1] * inverse_scale},
                                 __NV_E2M1, cudaRoundNearest);
                     }
-                    intermediate_scales[i64 * 512 +
+                    const int stored_i64 = kStreamIntermediate ?
+                        i64 % (kFc1CompactAtoms * kMmaSteps) :
+                        (kGlobalSplit ? i64 - pair_i64_begin : i64);
+                    fc1_intermediate_scales[stored_i64 * 512 +
                         scale_offset(local_row, group)] = scale_raw;
                 }
                 const int atom = i64 / kMmaSteps;
+                const int stored_atom = kStreamIntermediate ?
+                    atom % kFc1CompactAtoms :
+                    (kGlobalSplit ? atom - pair_atom_begin : atom);
                 const int in_atom = i64 % kMmaSteps;
 #pragma unroll
                 for (int vector = 0; vector < 2; ++vector) {
                     const auto value =
                         reinterpret_cast<const uint4*>(row_packed)[vector];
                     reinterpret_cast<uint4*>(intermediate_values +
-                        atom * kMatrixSmemBytes)[swizzled_vector(
+                        stored_atom * kMatrixSmemBytes)[swizzled_vector(
                             local_row, in_atom * 2 + vector)] = value;
                 }
                 asm volatile("bar.sync 2, 128;" ::: "memory");
-                if (warp == 0 && elect_sync()) {
+                if constexpr (kStreamIntermediate) {
+                    if (in_atom + 1 == kMmaSteps) {
+                        if (warp == 0 && (tid & 31) == 0) {
+                            auto* scratch = global_workspace +
+                                static_cast<size_t>(cta_row / kTileM) *
+                                    kIntermediateBytes;
+                            asm volatile("fence.proxy.async.shared::cta;" :::
+                                "memory");
+                            bulk_store_bf16(
+                                reinterpret_cast<__nv_bfloat16*>(
+                                    scratch + atom * kMatrixSmemBytes),
+                                reinterpret_cast<const __nv_bfloat16*>(
+                                    intermediate_values +
+                                        stored_atom * kMatrixSmemBytes),
+                                kMatrixSmemBytes);
+                            bulk_store_bf16(
+                                reinterpret_cast<__nv_bfloat16*>(scratch +
+                                    kIntermediateValueBytes +
+                                    atom * kMmaSteps * 512),
+                                reinterpret_cast<const __nv_bfloat16*>(
+                                    fc1_intermediate_scales +
+                                        stored_atom * kMmaSteps * 512),
+                                kMmaSteps * 512);
+                            asm volatile("cp.async.bulk.commit_group;" :::
+                                "memory");
+                            asm volatile("cp.async.bulk.wait_group 0;" :::
+                                "memory");
+                        }
+                        asm volatile("bar.sync 3, 128;" ::: "memory");
+                    }
+                }
+                if (warp == 0 && (tid & 31) == 0) {
                     mbarrier_arrive_on_cluster_cta(
                         epilogue_free_addr +
                             accumulator_stage * sizeof(uint64_t),
@@ -529,10 +732,182 @@ void nvfp4_fc1fc2_kernel(
                     (accumulator_stage + 1) % kAccumulatorStages;
                 if (accumulator_stage == 0) output_phase ^= 1;
             }
+            if constexpr (kStreamIntermediate) {
+                if (warp == 0 && (tid & 31) == 0) {
+                    asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+                    asm volatile("fence.proxy.async.global;" ::: "memory");
+                }
+                asm volatile("bar.sync 3, 128;" ::: "memory");
+            }
         }
         pair_barrier(pair_gather_addr, pair_release_addr,
                      pair_id * kClusterM, pair_sync_phase, tid);
         pair_sync_phase ^= 1;
+
+        // Small-M mode: independent clusters split both FC1-I and FC2-H.
+        // They exchange the complete intermediate through a temporary region
+        // at the start of each output row slice. A resident-grid barrier makes
+        // the in-place scratch safe before FC2 overwrites it.
+        if constexpr (kHSplit > 1) {
+            const int atoms_per_partition =
+                pair_atom_end - pair_atom_begin;
+            const int scale_bytes_per_partition =
+                (pair_i64_end - pair_i64_begin) * 512;
+            auto* scratch = global_workspace +
+                static_cast<size_t>(cta_row / kTileM) *
+                    kIntermediateBytes;
+            if (warp == kTmaWarp && elect_sync()) {
+                for (int atom = 0; atom < atoms_per_partition; ++atom) {
+                    const int local_atom = pair_atom_begin + atom;
+                    bulk_store_bf16(
+                        reinterpret_cast<__nv_bfloat16*>(
+                            scratch + local_atom * kMatrixSmemBytes),
+                        reinterpret_cast<const __nv_bfloat16*>(
+                            intermediate_values +
+                                atom * kMatrixSmemBytes),
+                        kMatrixSmemBytes);
+                }
+                const int scale_offset_bytes = pair_i64_begin * 512;
+                bulk_store_bf16(
+                    reinterpret_cast<__nv_bfloat16*>(
+                        scratch + kIntermediateValueBytes +
+                            scale_offset_bytes),
+                    reinterpret_cast<const __nv_bfloat16*>(
+                        fc1_intermediate_scales),
+                    scale_bytes_per_partition);
+                asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+                asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+            }
+            // When all logical tasks fit concurrently, synchronize the whole
+            // resident grid and let every partition share FC2-H. For larger
+            // M, h_split=2 intentionally oversubscribes the resident grid:
+            // the last FC1 partition for a row becomes that row's sole FC2
+            // owner. This avoids a deadlocking grid barrier while keeping all
+            // ten cluster slots busy during FC1.
+            bool run_fc2 = true;
+            if (task_count <= worker_count) {
+                grid_barrier(grid_barrier_words, grid_barrier_words + 1,
+                             worker_count, 1, cta_rank, tid);
+            } else {
+                auto* row_owner_words = grid_barrier_words + row_task_count;
+                cluster_barrier();
+                if (cta_rank == 0 && tid == 0) {
+                    __threadfence();
+                    const uint32_t prior = atomicAdd(
+                        grid_barrier_words + row_task, 1U);
+                    atomicExch(row_owner_words + task,
+                        prior + 1U ==
+                            static_cast<uint32_t>(h_partition_count));
+                    __threadfence();
+                }
+                cluster_barrier();
+                run_fc2 = atomicAdd(row_owner_words + task, 0U) != 0;
+                if (run_fc2) {
+                    h_tile_begin = 0;
+                    h_tile_end = kH / kTileN;
+                }
+            }
+            if (!run_fc2) continue;
+            if (warp == kTmaWarp && elect_sync()) {
+                mbarrier_expect_tx(allgather_done_addr, kIntermediateBytes);
+#pragma unroll
+                for (int atom = 0; atom < kIntermediateAtoms; ++atom) {
+                    bulk_load_bytes(
+                        intermediate_values_addr + atom * kMatrixSmemBytes,
+                        scratch + atom * kMatrixSmemBytes,
+                        kMatrixSmemBytes, allgather_done_addr);
+                }
+                bulk_load_bytes(
+                    intermediate_scales_addr,
+                    scratch + kIntermediateValueBytes,
+                    kIntermediateScaleBytes, allgather_done_addr);
+                mbarrier_wait(allgather_done_addr, 0);
+            }
+        }
+
+        if constexpr (kStreamIntermediate) {
+            auto* scratch = global_workspace +
+                static_cast<size_t>(cta_row / kTileM) * kIntermediateBytes;
+            if (h_partition_count > 1) {
+                grid_barrier(grid_barrier_words, grid_barrier_words + 1,
+                             8, 1, cta_rank, tid);
+            }
+            // The same lane that completed the async stores performs the
+            // reload. cp.async.bulk.wait_group makes global writes visible
+            // to its executing thread; handing the reload to another warp
+            // needs additional async-proxy publication and was racy.
+            if (warp == 0 && (tid & 31) == 0) {
+                mbarrier_expect_tx(allgather_done_addr, kIntermediateBytes);
+#pragma unroll
+                for (int atom = 0; atom < kIntermediateAtoms; ++atom) {
+                    bulk_load_bytes(
+                        intermediate_values_addr + atom * kMatrixSmemBytes,
+                        scratch + atom * kMatrixSmemBytes,
+                        kMatrixSmemBytes, allgather_done_addr);
+                }
+                bulk_load_bytes(
+                    intermediate_scales_addr,
+                    scratch + kIntermediateValueBytes,
+                    kIntermediateScaleBytes, allgather_done_addr);
+                mbarrier_wait(allgather_done_addr, 0);
+            }
+            cluster_barrier();
+        }
+
+        // Each pair computes a disjoint FC1-I slice. Copy that slice to the
+        // matching row CTA in every peer pair so all pairs enter FC2 with the
+        // complete intermediate in their local shared memory.
+        if constexpr (kClusterPairs > 1) {
+            constexpr int kAtomsPerPair =
+                kIntermediateAtoms / kClusterPairs;
+            constexpr int kValueBytesPerPair =
+                kAtomsPerPair * kMatrixSmemBytes;
+            constexpr int kScaleBytesPerPair =
+                ((kBufferI / kMmaK) / kClusterPairs) * 512;
+            constexpr int kGatherBytesPerPair =
+                kValueBytesPerPair + kScaleBytesPerPair;
+            if (warp == kTmaWarp && elect_sync()) {
+                for (int destination_pair = 0;
+                     destination_pair < kClusterPairs; ++destination_pair) {
+                    if (destination_pair == pair_id) continue;
+                    const int target_cta =
+                        destination_pair * kClusterM + pair_rank;
+                    mbarrier_expect_tx_on_cluster_cta(
+                        allgather_done_addr + pair_id * sizeof(uint64_t),
+                        kGatherBytesPerPair, target_cta);
+#pragma unroll
+                    for (int atom = 0; atom < kAtomsPerPair; ++atom) {
+                        const int offset =
+                            (pair_id * kAtomsPerPair + atom) *
+                            kMatrixSmemBytes;
+                        bulk_copy_to_cluster_cta(
+                            intermediate_values_addr + offset,
+                            intermediate_values_addr + offset,
+                            kMatrixSmemBytes,
+                            allgather_done_addr + pair_id * sizeof(uint64_t),
+                            target_cta);
+                    }
+                    const int scale_offset_bytes = pair_i64_begin * 512;
+                    bulk_copy_to_cluster_cta(
+                        intermediate_scales_addr + scale_offset_bytes,
+                        intermediate_scales_addr + scale_offset_bytes,
+                        kScaleBytesPerPair,
+                        allgather_done_addr + pair_id * sizeof(uint64_t),
+                        target_cta);
+                }
+            }
+            if (warp == kTmaReadyWarp && elect_sync()) {
+                for (int source_pair = 0;
+                     source_pair < kClusterPairs; ++source_pair) {
+                    if (source_pair == pair_id) continue;
+                    mbarrier_wait(
+                        allgather_done_addr +
+                            source_pair * sizeof(uint64_t),
+                        chunk & 1);
+                }
+            }
+            cluster_barrier();
+        }
 
         // FC1 and FC2 use different ring depths in the same shared-memory
         // workspace. Both roles have drained, so reset the stage barriers
@@ -566,12 +941,12 @@ void nvfp4_fc1fc2_kernel(
         // accumulator stages let MMA start tile n+1 while the epilogue drains
         // tile n; SMEM stage barriers continue to provide TMA/MMA backpressure.
         if (warp == kTmaWarp && elect_sync()) {
-            for (int h_tile = 0; h_tile < kH / kTileN; ++h_tile) {
+            for (int h_tile = h_tile_begin; h_tile < h_tile_end; ++h_tile) {
                 const int h = h_tile * kTileN;
                 for (int i_stage = 0; i_stage < kBufferI / kStageK; ++i_stage) {
                     const int global_i = chunk * kBufferI + i_stage * kStageK;
                     const int stage_base =
-                        workspace_addr + tma_stage * kFc2WorkspaceBytes;
+                        fc2_workspace_addr + tma_stage * kFc2WorkspaceBytes;
                     const int stage_b = stage_base;
                     const int stage_sfb = stage_b + kWeightSmemBytes;
                     const int local_tma_done =
@@ -595,7 +970,7 @@ void nvfp4_fc1fc2_kernel(
             }
         }
         if (warp == kTmaReadyWarp && elect_sync()) {
-            for (int h_tile = 0; h_tile < kH / kTileN; ++h_tile) {
+            for (int h_tile = h_tile_begin; h_tile < h_tile_end; ++h_tile) {
                 for (int i_stage = 0; i_stage < kBufferI / kStageK; ++i_stage) {
                     mbarrier_wait(
                         tma_done_addr + ready_tma_stage * sizeof(uint64_t),
@@ -612,7 +987,7 @@ void nvfp4_fc1fc2_kernel(
         if (pair_rank == 0 && warp == kMmaWarp && elect_sync()) {
             int accumulator_stage = 0;
             int accumulator_free_phase = 1;
-            for (int h_tile = 0; h_tile < kH / kTileN; ++h_tile) {
+            for (int h_tile = h_tile_begin; h_tile < h_tile_end; ++h_tile) {
                 mbarrier_wait(
                     epilogue_free_addr + accumulator_stage * sizeof(uint64_t),
                     accumulator_free_phase);
@@ -620,7 +995,7 @@ void nvfp4_fc1fc2_kernel(
                     tmem_addr + accumulator_stage * kTileN;
                 for (int i_stage = 0; i_stage < kBufferI / kStageK; ++i_stage) {
                     const int stage_base =
-                        workspace_addr + mma_stage * kFc2WorkspaceBytes;
+                        fc2_workspace_addr + mma_stage * kFc2WorkspaceBytes;
                     mbarrier_wait(
                         pair_ready_addr + mma_stage * sizeof(uint64_t),
                         mma_ready_phase);
@@ -654,7 +1029,7 @@ void nvfp4_fc1fc2_kernel(
 
         if (warp < kEpilogueWarps) {
             int accumulator_stage = 0;
-            for (int h_tile = 0; h_tile < kH / kTileN; ++h_tile) {
+            for (int h_tile = h_tile_begin; h_tile < h_tile_end; ++h_tile) {
                 const int h = h_tile * kTileN;
                 const int accumulator_addr =
                     tmem_addr + accumulator_stage * kTileN;
@@ -792,8 +1167,10 @@ bool init_scale_map(
 void launch_nvfp4_fc1fc2(
     const uint8_t* a, const uint8_t* w1, const uint8_t* sfa,
     const uint8_t* sfw1, const uint8_t* w2, const uint8_t* sfw2,
-    __nv_bfloat16* output, int m, cudaStream_t stream) {
+    __nv_bfloat16* output, uint8_t* global_workspace,
+    int m, cudaStream_t stream) {
     if (!a || !w1 || !sfa || !sfw1 || !w2 || !sfw2 || !output ||
+        !global_workspace ||
         m <= 0 || m % kClusterRows) {
         return;
     }
@@ -818,9 +1195,13 @@ void launch_nvfp4_fc1fc2(
     auto kernel = nvfp4_fc1fc2_kernel;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          kDynamicSmemBytes);
-    const int clusters = m / kClusterRows;
+    const int row_tasks = m / kClusterRows;
+    int tasks = row_tasks * kHSplit;
+    if constexpr (kHSplit == 3) {
+        if (row_tasks == 4) tasks = 10;
+    }
     cudaLaunchConfig_t launch_config{};
-    launch_config.gridDim = dim3(2 * clusters, 1, 1);
+    launch_config.gridDim = dim3(kClusterCtas * tasks, 1, 1);
     launch_config.blockDim = dim3(kWarpCount * kWarpSize, 1, 1);
     launch_config.dynamicSmemBytes = kDynamicSmemBytes;
     launch_config.stream = stream;
@@ -832,20 +1213,40 @@ void launch_nvfp4_fc1fc2(
         int sm_count = 0;
         cudaGetDevice(&device);
         cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
-        resident_clusters = sm_count / kClusterM;
+        resident_clusters = sm_count / kClusterCtas;
         if (resident_clusters <= 0) resident_clusters = 1;
     }
-    const int workers = clusters < resident_clusters
-        ? clusters : resident_clusters;
-    kernel<<<dim3(2 * workers, 1, 1), kWarpCount * kWarpSize,
+    const int workers = tasks < resident_clusters ? tasks : resident_clusters;
+    if constexpr (kHSplit > 1) {
+        // Resident small-M variants use two words for their grid barrier.
+        // Oversubscribed h_split=2 instead uses one completion counter per
+        // row and lets the last FC1 partition take ownership of FC2.
+        if (tasks > resident_clusters && kHSplit != 2) return;
+        cudaMemsetAsync(
+            global_workspace + static_cast<size_t>(m / kTileM) *
+                kIntermediateBytes,
+            0, tasks <= resident_clusters ? 8 :
+                (row_tasks + tasks) * sizeof(uint32_t),
+            stream);
+    }
+    if constexpr (kHSplit == 1) {
+        if (row_tasks == 12) {
+            cudaMemsetAsync(
+                global_workspace + static_cast<size_t>(m / kTileM) *
+                    kIntermediateBytes,
+                0, 8, stream);
+        }
+    }
+    kernel<<<dim3(kClusterCtas * workers, 1, 1), kWarpCount * kWarpSize,
         kDynamicSmemBytes, stream>>>(
             a_map, w1_map, sfa_map, sfw1_map, w2_map, sfw2_map,
-            output, clusters);
+            output, global_workspace, row_tasks);
 }
 
 extern "C" void sm110a_nvfp4_fc1fc2_launch(
     const uint8_t* a, const uint8_t* w1, const uint8_t* sfa,
     const uint8_t* sfw1, const uint8_t* w2, const uint8_t* sfw2,
-    __nv_bfloat16* output, int m, cudaStream_t stream) {
-    launch_nvfp4_fc1fc2(a, w1, sfa, sfw1, w2, sfw2, output, m, stream);
+    __nv_bfloat16* output, uint8_t* workspace, int m, cudaStream_t stream) {
+    launch_nvfp4_fc1fc2(
+        a, w1, sfa, sfw1, w2, sfw2, output, workspace, m, stream);
 }

@@ -11,7 +11,8 @@ namespace {
 
 using Launcher = void (*)(
     const uint8_t*, const uint8_t*, const uint8_t*, const uint8_t*,
-    const uint8_t*, const uint8_t*, __nv_bfloat16*, int, cudaStream_t);
+    const uint8_t*, const uint8_t*, __nv_bfloat16*, uint8_t*, int,
+    cudaStream_t);
 
 void check_fp4(const torch::Tensor& tensor, const char* name, int dimensions) {
     TORCH_CHECK(tensor.is_cuda() &&
@@ -32,7 +33,7 @@ void check_scale(const torch::Tensor& tensor, const char* name,
 torch::Tensor run_out(
     torch::Tensor a, torch::Tensor w1, torch::Tensor sfa,
     torch::Tensor sfw1, torch::Tensor w2, torch::Tensor sfw2,
-    torch::Tensor output, uint64_t address) {
+    torch::Tensor output, torch::Tensor workspace, uint64_t address) {
     check_fp4(a, "A", 2);
     check_fp4(w1, "W1", 3);
     check_fp4(w2, "W2", 3);
@@ -54,6 +55,10 @@ torch::Tensor run_out(
         output.device() == a.device(),
         "output must be contiguous CUDA BF16 [M,6144]");
     TORCH_CHECK(address != 0, "launcher must be valid");
+    TORCH_CHECK(workspace.is_cuda() && workspace.scalar_type() == torch::kUInt8 &&
+        workspace.is_contiguous() && workspace.device() == a.device() &&
+        workspace.numel() >= m * 1152 + 8,
+        "workspace must be contiguous CUDA uint8 with at least M*1152+8 bytes");
 
     c10::cuda::CUDAGuard guard(a.device());
     auto stream = c10::cuda::getCurrentCUDAStream(a.device().index());
@@ -65,6 +70,7 @@ torch::Tensor run_out(
         reinterpret_cast<const uint8_t*>(w2.data_ptr()),
         reinterpret_cast<const uint8_t*>(sfw2.data_ptr()),
         reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>()),
+        workspace.data_ptr<uint8_t>(),
         static_cast<int>(m), stream);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
@@ -73,10 +79,10 @@ torch::Tensor run_out(
 torch::Tensor run(
     torch::Tensor a, torch::Tensor w1, torch::Tensor sfa,
     torch::Tensor sfw1, torch::Tensor w2, torch::Tensor sfw2,
-    uint64_t address) {
+    torch::Tensor workspace, uint64_t address) {
     auto output = torch::empty({a.size(0), 6144},
         a.options().dtype(torch::kBFloat16));
-    return run_out(a, w1, sfa, sfw1, w2, sfw2, output, address);
+    return run_out(a, w1, sfa, sfw1, w2, sfw2, output, workspace, address);
 }
 
 }  // namespace
