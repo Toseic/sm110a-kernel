@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -13,6 +14,13 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from common import (  # noqa: E402
+    SolReport,
+    benchmark_with_stats,
+    quick_probe,
+    sol_bounds,
+)
+
 from sm110a_kernel import (  # noqa: E402
     Nvfp4Fc1Config,
     Nvfp4Fc1Fc2Config,
@@ -21,12 +29,121 @@ from sm110a_kernel import (  # noqa: E402
     compile_nvfp4_fc1fc2,
     compile_nvfp4_fc2,
     nvfp4_fc1_out,
-    nvfp4_fc1fc2_out,
     nvfp4_fc2_out,
     prepare_nvfp4_fc1_metadata,
     prepare_nvfp4_fc2_metadata,
     quantize_nvfp4_rows,
 )
+from sm110a_kernel.runner import (  # noqa: E402
+    AutotuneRunner,
+    PreparedKernel,
+    TuneOptions,
+)
+
+
+H = 6144
+INTERMEDIATE = 2048
+NVFP4_MMA_PEAK_TFLOPS = 4.0 * 250.0
+
+
+def fused_tflops(m, elapsed_ms):
+    """Two FC1 projections plus FC2: 6*M*H*I floating-point operations."""
+    flops = 6.0 * m * H * INTERMEDIATE
+    return flops / (elapsed_ms * 1.0e9)
+
+
+def format_config(config):
+    return (
+        f"buffer_i={config.buffer_i},h_split={config.h_split},"
+        f"cluster_pairs={config.cluster_pairs}"
+    )
+
+
+def compatible_configs(m, args):
+    """Return config-filtered candidates that can launch for this M."""
+    # Splitting I into multiple FC2 reductions rounds each partial sum to
+    # BF16 and is not bit-equivalent to the unfused FP32 accumulation. Keep
+    # those experimental configs addressable explicitly, but never let the
+    # correctness-preserving autotuner select them.
+    buffers = (args.buffer_i,) if args.buffer_i else (2048,)
+    h_splits = (args.h_split,) if args.h_split else (1, 2, 3, 4)
+    cluster_pairs = (
+        (args.cluster_pairs,) if args.cluster_pairs else (1, 2, 4)
+    )
+    sm_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    row_tasks = m // 256
+    candidates = []
+    for buffer_i in buffers:
+        for h_split in h_splits:
+            for pairs in cluster_pairs:
+                if h_split > 1 and (buffer_i != 2048 or pairs != 1):
+                    continue
+                config = Nvfp4Fc1Fc2Config(
+                    buffer_i=buffer_i,
+                    h_split=h_split,
+                    cluster_pairs=pairs,
+                )
+                try:
+                    config.validate()
+                except ValueError:
+                    continue
+                if h_split > 1:
+                    tasks = row_tasks * h_split
+                    if h_split == 3 and row_tasks == 4:
+                        tasks = 10
+                    if tasks > sm_count // (2 * pairs) and h_split != 2:
+                        continue
+                candidates.append(config)
+    if not candidates:
+        raise SystemExit("no compatible fused FC1+FC2 configs match the filters")
+    return tuple(candidates)
+
+
+def fused_sol_bounds(m, config):
+    """Traffic-aware SOL for the fixed H=6144, I=2048 fused pipeline."""
+    nvfp4_bytes_per_element = 0.5 + 1.0 / 16.0
+    flops = 6.0 * m * H * INTERMEDIATE
+    a_bytes = m * H * nvfp4_bytes_per_element
+    w1_bytes = 2 * INTERMEDIATE * H * nvfp4_bytes_per_element
+    w2_bytes = H * INTERMEDIATE * nvfp4_bytes_per_element
+    out_bytes = m * H * 2
+    row_tasks = math.ceil(m / 256)
+
+    # FC1 reloads A once per logical 64-column output tile. Each row task
+    # consumes the complete W1 and W2 weights across its distributed workers.
+    fc1_a_tile_reads = row_tasks * 256 * H * nvfp4_bytes_per_element * (
+        INTERMEDIATE // 64
+    )
+    tile_read_bytes = (
+        fc1_a_tile_reads
+        + row_tasks * (w1_bytes + w2_bytes)
+        + out_bytes
+    )
+    workspace_store = 0
+    streams_intermediate = (
+        config.buffer_i == INTERMEDIATE and config.cluster_pairs == 1
+    )
+    if config.h_split > 1 or streams_intermediate:
+        tasks = row_tasks * config.h_split
+        if config.h_split == 3 and row_tasks == 4:
+            tasks = 10
+        per_row_intermediate = INTERMEDIATE * nvfp4_bytes_per_element
+        workspace_store = m * per_row_intermediate
+        reloads = tasks if config.h_split > 1 else row_tasks
+        if config.h_split == 1 and row_tasks == 12:
+            reloads = 18
+        tile_read_bytes += (
+            workspace_store + reloads * 256 * per_row_intermediate
+        )
+
+    compulsory_bytes = a_bytes + w1_bytes + w2_bytes + out_bytes + workspace_store
+    return sol_bounds(
+        flops,
+        compulsory_bytes,
+        a_bytes + w1_bytes + w2_bytes,
+        tile_read_bytes,
+        mma_peak_tflops=NVFP4_MMA_PEAK_TFLOPS,
+    )
 
 
 def quantize_fc1_weight(n, k):
@@ -56,19 +173,40 @@ def main():
     parser.add_argument("--m", type=int, default=512)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=5)
+    parser.add_argument("--samples", type=int, default=3)
     parser.add_argument(
-        "--buffer-i", type=int, choices=(256, 512, 1024, 2048), default=2048
+        "--buffer-i", type=int, choices=(0, 256, 512, 1024, 2048), default=0,
+        help="I-buffer size, or 0 to autotune",
+    )
+    parser.add_argument(
+        "--h-split", type=int,
+        choices=(0, 1, 2, 3, 4), default=0,
+    )
+    parser.add_argument(
+        "--cluster-pairs", type=int, choices=(0, 1, 2, 4), default=0,
+        help="cooperating CTA pairs, or 0 to autotune",
+    )
+    parser.add_argument("--force-sweep", action="store_true")
+    parser.add_argument("--cache-path")
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--sol", action="store_true")
+    parser.add_argument(
+        "--pre-parallel-jit", dest="pre_parallel_jit", action="store_true",
+        default=True,
+    )
+    parser.add_argument(
+        "--no-pre-parallel-jit", dest="pre_parallel_jit", action="store_false"
     )
     parser.add_argument("--no-accuracy", action="store_true")
     args = parser.parse_args()
     if args.m <= 0 or args.m % 512:
         parser.error("--m must be a positive multiple of 512")
-    if args.warmup < 0 or args.iters <= 0:
+    if args.warmup < 0 or args.iters <= 0 or args.samples <= 0:
         parser.error("invalid warmup/iteration count")
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
 
-    h, intermediate = 6144, 2048
+    h, intermediate = H, INTERMEDIATE
     torch.manual_seed(1234)
     aq, sfa = quantize_nvfp4_rows(
         torch.randn((args.m, h), device="cuda", dtype=torch.bfloat16)
@@ -79,8 +217,6 @@ def main():
     )
     w2q = w2q.unsqueeze(0)
 
-    fused_config = Nvfp4Fc1Fc2Config(buffer_i=args.buffer_i)
-    fused = compile_nvfp4_fc1fc2(fused_config)
     output = torch.empty((args.m, h), device="cuda", dtype=torch.bfloat16)
 
     fc1_config = Nvfp4Fc1Config(
@@ -111,22 +247,61 @@ def main():
     reference = torch.empty_like(output)
     routing_weights = torch.ones((args.m, 1), device="cuda", dtype=torch.bfloat16)
 
-    def run_fused():
-        return nvfp4_fc1fc2_out(
-            aq, w1q, sfa, sfw1, w2q, sfw2, output, config=fused_config
-        )
+    candidates = compatible_configs(args.m, args)
 
-    def run_standalone():
-        nvfp4_fc1_out(
+    def prepare_fused(config):
+        module = compile_nvfp4_fc1fc2(config)
+        run = lambda: module.run_out(aq, w1q, sfa, sfw1, w2q, sfw2, output)
+        run()
+        torch.cuda.synchronize()
+        return PreparedKernel(config, run)
+
+    tune_options = TuneOptions(
+        warmup=args.warmup,
+        iters=args.iters,
+        samples=args.samples,
+        cache_path=args.cache_path,
+        force_sweep=args.force_sweep,
+        debug=args.debug,
+        pre_parallel_jit=args.pre_parallel_jit,
+    )
+    selection = AutotuneRunner(tune_options).resolve(
+        candidates,
+        namespace="nvfp4_fc1fc2",
+        key=("v5-streamed-tail-split", args.m, H, INTERMEDIATE),
+        prepare=prepare_fused,
+        benchmark=lambda prepared: benchmark_with_stats(
+            prepared.run, args.warmup, args.iters, args.samples
+        ),
+        probe=lambda prepared: quick_probe(prepared.run, args.iters),
+        format_candidate=format_config,
+        metric_formatter=lambda _config, stats: (
+            f"{fused_tflops(args.m, stats['median_ms']):.1f} TF/s"
+        ),
+        pre_jit=compile_nvfp4_fc1fc2,
+    )
+    fused_config = selection.candidate
+
+    def run_fused():
+        return selection.prepared.run()
+
+    def run_fc1():
+        return nvfp4_fc1_out(
             aq, w1q, sfa, sfw1, fc1_metadata,
             intermediate_packed, intermediate_scales,
             config=fc1_config,
         )
+
+    def run_fc2():
         return nvfp4_fc2_out(
             intermediate_packed, w2q, intermediate_scales, sfw2,
             fc1_metadata.routing, routing_weights, fc2_metadata, 1,
             reference, config=fc2_config,
         )
+
+    def run_standalone():
+        run_fc1()
+        return run_fc2()
 
     if not args.no_accuracy:
         run_fused()
@@ -140,12 +315,34 @@ def main():
             f"mismatches={int((output != reference).sum().item())}"
         )
 
-    fused_ms = time_ms(run_fused, args.warmup, args.iters)
-    standalone_ms = time_ms(run_standalone, args.warmup, args.iters)
-    print(f"[config] buffer_i={args.buffer_i}")
+    fused_ms = selection.stats["median_ms"]
+    standalone_stats = benchmark_with_stats(
+        run_standalone, args.warmup, args.iters, args.samples
+    )
+    standalone_ms = standalone_stats["median_ms"]
+    fc1_ms = time_ms(run_fc1, args.warmup, args.iters)
+    fc2_ms = time_ms(run_fc2, args.warmup, args.iters)
+    print(
+        f"[config] {format_config(fused_config)}; "
+        f"cache_hit={selection.cache_hit}"
+    )
     print(f"[fused] {fused_ms:.6f} ms")
     print(f"[fc1+fc2] {standalone_ms:.6f} ms")
+    print(f"[fc1] {fc1_ms:.6f} ms")
+    print(f"[fc2] {fc2_ms:.6f} ms")
+    print(
+        f"[throughput] fused={fused_tflops(args.m, fused_ms):.3f} TF/s; "
+        f"fc1+fc2={fused_tflops(args.m, standalone_ms):.3f} TF/s"
+    )
     print(f"[ratio] {standalone_ms / fused_ms:.4f}x")
+    if args.sol:
+        report = SolReport(debug=args.debug)
+        report.add(
+            fused_sol_bounds(args.m, fused_config),
+            fused_ms,
+            label=f"M={args.m} fused",
+        )
+        report.print()
 
 
 if __name__ == "__main__":
