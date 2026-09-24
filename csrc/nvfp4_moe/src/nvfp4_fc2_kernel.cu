@@ -53,6 +53,8 @@ constexpr int kSchedulerWarp = kMmaWarp + 1;
 constexpr int kBaseWarpCount = kSchedulerWarp + 1;
 constexpr int kTaskPipelineStageCount = 2;
 constexpr int kPersistentTileCount = 2;
+constexpr int kTaskPacketTileCount = 4;
+constexpr int kMinRowsPerExpertForTaskPacket = 256;
 // Each mode-2 CLC worker cluster starts with two tasks.  Once it completes
 // them it steals the work of an unstarted cluster through Cluster Launch Control.
 constexpr int kClcWorkerTileCount = 2;
@@ -456,7 +458,8 @@ template <
     int kTileK,
     int kClusterM,
     bool kPersistent,
-    bool kDynamicClc = false>
+    bool kDynamicClc = false,
+    int kTaskPacketSize = 1>
 __global__ __cluster_dims__(kClusterM, 1, 1)
 __launch_bounds__(kWarpSize * kBaseWarpCount)
 void nvfp4_fc2_fused_kernel(
@@ -497,6 +500,7 @@ void nvfp4_fc2_fused_kernel(
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
     const int worker_id = blockIdx.x / kClusterM;
     const int cluster_tiles = *task_count;
+    static_assert(kTaskPacketSize > 0);
     constexpr int kWorkerTileCount = kDynamicClc ? kClcWorkerTileCount :
         (kPersistent ? kPersistentTileCount : 1);
     const int static_first_cluster_bid = worker_id * kWorkerTileCount;
@@ -661,7 +665,8 @@ void nvfp4_fc2_fused_kernel(
                                 ? scheduler_packet_next++
                                 : cluster_tiles;
                         } else {
-                            scheduled_bid = atomicAdd(next_cluster_tile, 1);
+                            scheduled_bid =
+                                atomicAdd(next_cluster_tile, kTaskPacketSize);
                         }
                         scheduled_cluster_bids[task_pipe_stage] = scheduled_bid;
                         const int ready_addr = base_task_ready_mbar_addr +
@@ -677,7 +682,8 @@ void nvfp4_fc2_fused_kernel(
                                           task_pipe_stage * sizeof(uint64_t),
                                       scheduler_free_phase);
                     if (elect_sync()) {
-                        const int scheduled_bid = atomicAdd(next_cluster_tile, 1);
+                        const int scheduled_bid =
+                            atomicAdd(next_cluster_tile, kTaskPacketSize);
                         const int scheduled_bid_addr = static_cast<int>(
                             __cvta_generic_to_shared(
                                 scheduled_cluster_bids + task_pipe_stage));
@@ -767,11 +773,12 @@ void nvfp4_fc2_fused_kernel(
             }
         }
         const bool has_work = first_cluster_bid < cluster_tiles;
-        constexpr int kTasksPerIteration =
-            kUseTaskPipeline ? 1 : kWorkerTileCount;
+        constexpr int tasks_per_iteration = kUseTaskPipeline
+            ? (kDynamicClc ? 1 : kTaskPacketSize)
+            : kWorkerTileCount;
         const int last_cluster_bid = has_work
-                                         ? (first_cluster_bid + kTasksPerIteration < cluster_tiles
-                                                   ? first_cluster_bid + kTasksPerIteration
+                                         ? (first_cluster_bid + tasks_per_iteration < cluster_tiles
+                                                   ? first_cluster_bid + tasks_per_iteration
                                                    : cluster_tiles)
                                          : first_cluster_bid;
 
@@ -1367,14 +1374,25 @@ void launch_nvfp4_fc2_impl(
 
     const int persistent_clusters =
         (max_tasks + kPersistentTileCount - 1) / kPersistentTileCount;
-    auto kernel = nvfp4_fc2_fused_kernel<kTileM,
+    auto single_tile_kernel = nvfp4_fc2_fused_kernel<kTileM,
         kTileN,
         kTileK,
         kClusterM,
         true,
-        false>;
+        false,
+        1>;
+    auto packet_kernel = nvfp4_fc2_fused_kernel<kTileM,
+        kTileN,
+        kTileK,
+        kClusterM,
+        true,
+        false,
+        kTaskPacketTileCount>;
     if constexpr (kDynamicSmemBytes > 48 * 1024) {
-        cudaFuncSetAttribute(kernel,
+        cudaFuncSetAttribute(single_tile_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            kDynamicSmemBytes);
+        cudaFuncSetAttribute(packet_kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             kDynamicSmemBytes);
     }
@@ -1385,7 +1403,8 @@ void launch_nvfp4_fc2_impl(
     launch_config.stream = stream;
     int resident_clusters = 0;
     const cudaError_t occupancy_status =
-        cudaOccupancyMaxActiveClusters(&resident_clusters, kernel, &launch_config);
+        cudaOccupancyMaxActiveClusters(
+            &resident_clusters, single_tile_kernel, &launch_config);
     if (occupancy_status != cudaSuccess || resident_clusters <= 0) {
         int device = 0;
         int sm_count = 0;
@@ -1396,6 +1415,13 @@ void launch_nvfp4_fc2_impl(
     const int cluster_limit = max_active_clusters > 0 ? max_active_clusters : resident_clusters;
     const int launched_clusters = cluster_limit < persistent_clusters
         ? cluster_limit : persistent_clusters;
+    // Packetized scheduling wins once each expert has enough row tiles to keep
+    // the role-specialized pipeline in steady state.  Keep the compile-time
+    // single-tile specialization for short workloads so the large-M
+    // optimization adds no device-side branch or tail-granularity regression.
+    const bool use_task_packets =
+        m / experts >= kMinRowsPerExpertForTaskPacket;
+    auto kernel = use_task_packets ? packet_kernel : single_tile_kernel;
     kernel<<<kClusterM * launched_clusters, kBlockThreads, kDynamicSmemBytes, stream>>>(
         d_sfa, a_tensor_map, b_tensor_map, sfa_tensor_map, sfb_tensor_map,
         tasks, task_count,
