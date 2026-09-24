@@ -83,7 +83,7 @@ def compatible_configs(m, args):
                 caches = (
                     (0, 1, 2) if args.cache_source_rows < 0 else
                     (args.cache_source_rows,)
-                ) if args.fuse_routing else (False,)
+                ) if args.fuse_routing else (0,)
                 for cache_source_rows in caches:
                     if h_split > 1 and (buffer_i != 2048 or pairs != 1):
                         continue

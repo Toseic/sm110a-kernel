@@ -78,7 +78,7 @@ constexpr bool kGlobalSplit = kHSplit > 1;
 constexpr bool kStreamIntermediate =
     !kGlobalSplit && kClusterPairs == 1 && kBufferI == kI;
 constexpr int kFc1CompactAtoms = kStreamIntermediate ? 4 :
-    (!kGlobalSplit ? kIntermediateAtoms :
+    (!kGlobalSplit ? kIntermediateAtoms / kClusterPairs :
     (kHSplit <= 3 ? (kIntermediateAtoms + 1) / 2 :
         (kIntermediateAtoms + kHSplit - 1) / kHSplit));
 constexpr int kFc1CompactValueBytes =
@@ -92,27 +92,46 @@ constexpr int kWorkspaceBytes =
 constexpr int kFc2WorkspaceBytes = kWeightSmemBytes + kScaleStageBytes;
 constexpr int kFc1StageCount = kStreamIntermediate ? 4 :
     (kGlobalSplit ? (kHSplit >= 4 ? 4 : 3) :
-    (kBufferI >= 2048 ? 2 : (kBufferI >= 1024 ? 4 : 5)));
-
-constexpr int kFc2StageCount = (kGlobalSplit || kStreamIntermediate) ? 6 :
-    (kFc1StageCount * kWorkspaceBytes) / kFc2WorkspaceBytes;
-constexpr int kBarrierStageCount = kFc2StageCount;
+    (kBufferI >= 2048 ? (kClusterPairs > 1 ? 5 : 2) :
+        (kBufferI >= 1024 ? 4 : 5)));
 constexpr int kReduceN = 64;
 constexpr int kFinalizeSmemBytes =
     kTileM * kReduceN * sizeof(__nv_bfloat16);
+constexpr int kMaxOptInSmemBytes = 232448;
+// The FC2 mode region also hosts the finalize scratch in its tail, so the
+// FC2 ring is capped by the opt-in SMEM budget rather than by FC1 ring bytes.
+constexpr int kFc2SmemStageBudget =
+    (kMaxOptInSmemBytes - kIntermediateBytes - kFinalizeSmemBytes) /
+    kFc2WorkspaceBytes;
+constexpr int kFc2StageCount = (kGlobalSplit || kStreamIntermediate) ? 6 :
+    ((kFc1StageCount * kWorkspaceBytes) / kFc2WorkspaceBytes < kFc2SmemStageBudget ?
+        (kFc1StageCount * kWorkspaceBytes) / kFc2WorkspaceBytes :
+        kFc2SmemStageBudget);
+constexpr int kBarrierStageCount = kFc2StageCount;
 constexpr int kFc1ModeSmemBytes =
     kFc1CompactIntermediateBytes + kFc1StageCount * kWorkspaceBytes;
+// Finalize scratch lives in the FC2-mode tail: it runs only while the FC1
+// ring and the FC2 stages are dead, letting both mode regions share the
+// dynamic allocation.
 constexpr int kFc2ModeSmemBytes =
-    kIntermediateBytes + kFc2StageCount * kFc2WorkspaceBytes;
+    kIntermediateBytes + kFc2StageCount * kFc2WorkspaceBytes +
+    kFinalizeSmemBytes;
+// FC1-mode scale staging must stay clear of [0, kIntermediateBytes): the
+// allgather sweeps incoming values across that whole range while the staging
+// still holds unpublished scales. The FC2-mode tail is dead during FC1 and
+// satisfies that for every ring depth.
+constexpr int kFc1ScaleStagingOffset =
+    kFc2ModeSmemBytes - kFc1CompactScaleBytes;
 constexpr int kModeSmemBytes =
     kFc1ModeSmemBytes > kFc2ModeSmemBytes ?
         kFc1ModeSmemBytes : kFc2ModeSmemBytes;
-constexpr int kDynamicSmemBytes = kModeSmemBytes + kFinalizeSmemBytes;
+constexpr int kDynamicSmemBytes = kModeSmemBytes;
+static_assert(kFc1ScaleStagingOffset >= kFc1ModeSmemBytes);
+static_assert(kFc1ScaleStagingOffset >= kIntermediateBytes);
 constexpr int kTmemColumns = 512;
 constexpr int kAccumulatorStages = 2;
 constexpr int kScaleTmemCol = kAccumulatorStages * kTileN;
 
-constexpr int kMaxOptInSmemBytes = 232448;
 static_assert(kDynamicSmemBytes <= kMaxOptInSmemBytes);
 static_assert(kI % kBufferI == 0);
 static_assert(kBufferI % kStageK == 0);
@@ -417,17 +436,20 @@ void nvfp4_fc1fc2_kernel(
     __shared__ uint64_t pair_gather[1];
     __shared__ uint64_t pair_release[1];
     __shared__ uint64_t allgather_done[kClusterPairs];
+    __shared__ uint64_t allgather_evac[kClusterPairs];
     __shared__ int task_source_rows[kTileM];
     extern __shared__ __align__(1024) uint8_t smem[];
     uint8_t* intermediate_values = smem;
     uint8_t* intermediate_scales =
         intermediate_values + kIntermediateValueBytes;
-    uint8_t* fc1_intermediate_scales =
-        intermediate_values + kFc1CompactValueBytes;
+    // FC1-mode scale staging sits in the FC2-mode tail, outside every
+    // allgather destination range, so in-flight copies can never clobber
+    // a source region.
+    uint8_t* fc1_intermediate_scales = smem + kFc1ScaleStagingOffset;
     uint8_t* fc1_workspace = smem + kFc1CompactIntermediateBytes;
     uint8_t* fc2_workspace = smem + kIntermediateBytes;
     auto* finalize_smem = reinterpret_cast<__nv_bfloat16*>(
-        smem + kModeSmemBytes);
+        smem + kFc2ModeSmemBytes - kFinalizeSmemBytes);
     const int fc1_workspace_addr =
         static_cast<int>(__cvta_generic_to_shared(fc1_workspace));
     const int fc2_workspace_addr =
@@ -454,6 +476,8 @@ void nvfp4_fc1fc2_kernel(
         static_cast<int>(__cvta_generic_to_shared(pair_release));
     const int allgather_done_addr =
         static_cast<int>(__cvta_generic_to_shared(allgather_done));
+    const int allgather_evac_addr =
+        static_cast<int>(__cvta_generic_to_shared(allgather_evac));
 
     if (warp == kMmaWarp) {
         const int tmem_base_addr =
@@ -555,6 +579,7 @@ void nvfp4_fc1fc2_kernel(
             mbarrier_init(pair_release_addr);
             for (int pair = 0; pair < kClusterPairs; ++pair) {
                 mbarrier_init(allgather_done_addr + pair * sizeof(uint64_t));
+                mbarrier_init(allgather_evac_addr + pair * sizeof(uint64_t));
             }
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
@@ -866,14 +891,16 @@ void nvfp4_fc1fc2_kernel(
                     }
                     const int stored_i64 = kStreamIntermediate ?
                         i64 % (kFc1CompactAtoms * kMmaSteps) :
-                        (kGlobalSplit ? i64 - pair_i64_begin : i64);
+                        ((kGlobalSplit || kClusterPairs > 1) ?
+                            i64 - pair_i64_begin : i64);
                     fc1_intermediate_scales[stored_i64 * 512 +
                         scale_offset(local_row, group)] = scale_raw;
                 }
                 const int atom = i64 / kMmaSteps;
                 const int stored_atom = kStreamIntermediate ?
                     atom % kFc1CompactAtoms :
-                    (kGlobalSplit ? atom - pair_atom_begin : atom);
+                    ((kGlobalSplit || kClusterPairs > 1) ?
+                        atom - pair_atom_begin : atom);
                 const int in_atom = i64 % kMmaSteps;
 #pragma unroll
                 for (int vector = 0; vector < 2; ++vector) {
@@ -934,9 +961,22 @@ void nvfp4_fc1fc2_kernel(
                 asm volatile("bar.sync 3, 128;" ::: "memory");
             }
         }
-        pair_barrier(pair_gather_addr, pair_release_addr,
-                     pair_id * kClusterM, pair_sync_phase, tid);
-        pair_sync_phase ^= 1;
+        // With multiple pairs the allgather sweeps incoming slices through
+        // [0, kIntermediateBytes), which overlaps the FC1 ring on every CTA.
+        // That region is only dead once ALL pairs finished FC1, and the
+        // allgather's remote pushes are not ordered behind each peer's own
+        // progress — so the pre-allgather barrier must be cluster-wide. The
+        // tma-ready warp waits every tma_done/gather_done before arriving,
+        // so reaching this barrier implies all FC1 async traffic completed.
+        // Single-pair clusters already cover the whole cluster with the
+        // pair barrier.
+        if constexpr (kClusterPairs > 1) {
+            cluster_barrier();
+        } else {
+            pair_barrier(pair_gather_addr, pair_release_addr,
+                         pair_id * kClusterM, pair_sync_phase, tid);
+            pair_sync_phase ^= 1;
+        }
 
         // Small-M mode: independent clusters split both FC1-I and FC2-H.
         // They exchange the complete intermediate through a temporary region
@@ -1061,40 +1101,87 @@ void nvfp4_fc1fc2_kernel(
                 ((kBufferI / kMmaK) / kClusterPairs) * 512;
             constexpr int kGatherBytesPerPair =
                 kValueBytesPerPair + kScaleBytesPerPair;
-            if (warp == kTmaWarp && elect_sync()) {
-                for (int destination_pair = 0;
-                     destination_pair < kClusterPairs; ++destination_pair) {
-                    if (destination_pair == pair_id) continue;
-                    const int target_cta =
-                        destination_pair * kClusterM + pair_rank;
-                    mbarrier_expect_tx_on_cluster_cta(
-                        allgather_done_addr + pair_id * sizeof(uint64_t),
-                        kGatherBytesPerPair, target_cta);
+            // Two-phase evacuation protocol. The FC2 consumer reads the full
+            // intermediate layout: pair q's values at
+            // [q*kValueBytesPerPair, (q+1)*kValueBytesPerPair) and its scales
+            // at intermediate_scales + q*kScaleBytesPerPair. The FC1 epilogue
+            // instead wrote this pair's slice into the compact window
+            // [0, kValueBytesPerPair) plus the scale staging (both live
+            // inside the dead FC1 ring region after mode switch), so a
+            // nonzero pair first relays its slice compact->home on its own
+            // CTAs, waits for the relay to drain on its own barrier slot,
+            // and signals evacuation; every push aimed at a nonzero pair's
+            // window is gated on that signal. Pair 0's slice is already at
+            // home (its home IS the compact window). Cross-pair pushes then
+            // fan each pair's home values and staged scales out to every
+            // peer CTA's matching home slots. The staging sits outside
+            // [0, kIntermediateBytes), so incoming copies can never clobber
+            // an unpublished source.
+            const auto push_pair_slice = [&](int destination_pair,
+                                             bool relay) {
+                const int target_cta =
+                    destination_pair * kClusterM + pair_rank;
+                const bool self_values =
+                    destination_pair == pair_id && pair_id == 0;
+                mbarrier_expect_tx_on_cluster_cta(
+                    allgather_done_addr + pair_id * sizeof(uint64_t),
+                    self_values ? kScaleBytesPerPair : kGatherBytesPerPair,
+                    target_cta);
+                if (!self_values) {
 #pragma unroll
                     for (int atom = 0; atom < kAtomsPerPair; ++atom) {
-                        const int offset =
-                            (pair_id * kAtomsPerPair + atom) *
-                            kMatrixSmemBytes;
+                        const int source_atom = relay ? atom :
+                            pair_id * kAtomsPerPair + atom;
                         bulk_copy_to_cluster_cta(
-                            intermediate_values_addr + offset,
-                            intermediate_values_addr + offset,
+                            intermediate_values_addr +
+                                source_atom * kMatrixSmemBytes,
+                            intermediate_values_addr +
+                                (pair_id * kAtomsPerPair + atom) *
+                                    kMatrixSmemBytes,
                             kMatrixSmemBytes,
                             allgather_done_addr + pair_id * sizeof(uint64_t),
                             target_cta);
                     }
-                    const int scale_offset_bytes = pair_i64_begin * 512;
-                    bulk_copy_to_cluster_cta(
-                        intermediate_scales_addr + scale_offset_bytes,
-                        intermediate_scales_addr + scale_offset_bytes,
-                        kScaleBytesPerPair,
+                }
+                bulk_copy_to_cluster_cta(
+                    intermediate_values_addr + kFc1ScaleStagingOffset,
+                    intermediate_scales_addr +
+                        pair_id * kScaleBytesPerPair,
+                    kScaleBytesPerPair,
+                    allgather_done_addr + pair_id * sizeof(uint64_t),
+                    target_cta);
+            };
+            if (warp == kTmaWarp && elect_sync()) {
+                if (pair_id != 0) {
+                    push_pair_slice(pair_id, true);
+                    mbarrier_wait(
                         allgather_done_addr + pair_id * sizeof(uint64_t),
-                        target_cta);
+                        chunk & 1);
+                    mbarrier_arrive_on_cluster_cta(
+                        allgather_evac_addr + pair_id * sizeof(uint64_t),
+                        pair_rank);
+                }
+                for (int destination_pair = 0;
+                     destination_pair < kClusterPairs; ++destination_pair) {
+                    if (destination_pair == pair_id && pair_id != 0) continue;
+                    // Only pair 0's values push lands in a destination's
+                    // compact window ([0, kValueBytesPerPair) IS pair 0's
+                    // home); pushes from other pairs target home slots at or
+                    // above kValueBytesPerPair, which no relay reads. The
+                    // evacuation signal is delivered to pair 0's matching
+                    // CTA only, so waiting on it elsewhere would deadlock.
+                    if (pair_id == 0 && destination_pair != 0) {
+                        mbarrier_wait(
+                            allgather_evac_addr +
+                                destination_pair * sizeof(uint64_t),
+                            chunk & 1);
+                    }
+                    push_pair_slice(destination_pair, false);
                 }
             }
             if (warp == kTmaReadyWarp && elect_sync()) {
                 for (int source_pair = 0;
                      source_pair < kClusterPairs; ++source_pair) {
-                    if (source_pair == pair_id) continue;
                     mbarrier_wait(
                         allgather_done_addr +
                             source_pair * sizeof(uint64_t),
