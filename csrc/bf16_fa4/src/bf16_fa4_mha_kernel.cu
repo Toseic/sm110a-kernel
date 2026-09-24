@@ -609,6 +609,7 @@ __global__ __launch_bounds__(512, 1) void fa_mha_kernel_wg16(
     static_assert(KvStages == 2, "the K/V mainloop currently uses two stages");
     static_assert(HeadDim == 128, "the FA MHA kernel currently supports HeadDim=128 only");
 
+
     const int q_pair_count = (query_len + QSlots * TileQ - 1) / (QSlots * TileQ);
     const int task_id = blockIdx.x;
     const int bh = task_id / q_pair_count;
@@ -3308,7 +3309,7 @@ template <int TileQ, int TileKV, int QSlots, int KvStages> struct FaMhaSmemLayou
 
 // A CTA owns two independent Q tiles for one head.  K/V are shared between
 // those slots; S is transient, while each slot's unnormalized O stays in TMEM.
-template <int TileQ, int TileKV, int QSlots, int KvStages, int HeadDim>
+template <int TileQ, int TileKV, int QSlots, int KvStages, int HeadDim, bool SkipInactiveQ>
 __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_constant__ CUtensorMap q_tmap,
     const __grid_constant__ CUtensorMap k_tmap,
     const __grid_constant__ CUtensorMap v_tmap,
@@ -3329,6 +3330,10 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
     static_assert(QSlots == 2, "the FA MHA mainloop currently supports two Q slots");
     static_assert(KvStages == 2, "the K/V mainloop currently uses two stages");
     static_assert(HeadDim == 128, "the FA MHA kernel currently supports HeadDim=128 only");
+
+    // Stage s is reused every KvStages tiles. Its completion parity for tile i
+    // is (i / KvStages) & 1; deriving it avoids per-thread phase arrays in
+    // local memory on the producer and rescale paths.
 
     const int q_pair_count = (query_len + QSlots * TileQ - 1) / (QSlots * TileQ);
     const int task_id = blockIdx.x;
@@ -3445,6 +3450,10 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
         (q_pair_idx * QSlots + 0) * TileQ,
         (q_pair_idx * QSlots + 1) * TileQ,
     };
+    // The short-Q specialization has no second tile. Keep its producer,
+    // softmax, and MMA work out of the KV loop; the regular specialization
+    // retains a compile-time QSlots bound for full prefill pairs.
+    const int active_q_slots = SkipInactiveQ && q_tile_start[1] >= local_query_len ? 1 : QSlots;
     const int q_pair_end =
         q_tile_start[1] + TileQ < local_query_len ? q_tile_start[1] + TileQ : local_query_len;
     const int task_kv_tile_count = causal ? ((q_pair_end + TileKV - 1) / TileKV < kv_tile_count
@@ -3453,7 +3462,7 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
                                           : kv_tile_count;
     if (warp_idx == kQPrologueWarp && lane_idx == 0) {
         const int q_transaction_bytes = TileQ * HeadDim * sizeof(__nv_bfloat16);
-        for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
+        for (int q_slot = 0; q_slot < active_q_slots; ++q_slot) {
             const int q_mbar_addr = q_prologue_mbar_base + q_slot * sizeof(uint64_t);
             const int q_transaction_mbar_addr = q_mbar_addr & 0xFEFFFFFF;
             asm volatile(
@@ -3500,19 +3509,26 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
                                  : -1;
 
     if (rescale_warp >= 0) {
+        const int q_slot = rescale_warp / kRescaleWarpsPerGroup;
+        if constexpr (SkipInactiveQ) {
+            if (q_slot >= active_q_slots) {
+                // The TMEM release barrier still expects all eight rescale
+                // warps, even when this Q slot does no work.
+                if (lane_idx == 0) mbarrier_arrive(tmem_release_mbar_addr);
+                return;
+            }
+        }
         setmaxnreg_increase<208>();
         int epilogue_phase = 0;
         // The two four-warp groups have separate Q-tile ownership and
         // separate softmax state.  Consequently, q_slot's mma1, rescale,
         // and PV chain can advance without any rescale-side dependency on
         // the other tile.
-        const int q_slot = rescale_warp / kRescaleWarpsPerGroup;
         const int row_base = (rescale_warp % kRescaleWarpsPerGroup) * kWarpSize;
         const int row = row_base + lane_idx;
         const int q_row = q_tile_start[q_slot] + row;
         float tilel = 0.0f;
         float tilem = -__int_as_float(0x7F800000);
-        int rescale_mma1_phase[KvStages] = {};
         // The paper's threshold is log2(256) = 8.  m is stored in the
         // unscaled QK domain; its delta is multiplied by scale before
         // this ln(256) = 8 * ln(2) comparison.
@@ -3528,8 +3544,7 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
                 mbarrier_wait(previous_mma2_addr, previous_phase);
             }
             const int mma1_addr = mma1_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t);
-            mbarrier_wait(mma1_addr, rescale_mma1_phase[stage]);
-            rescale_mma1_phase[stage] ^= 1;
+            mbarrier_wait(mma1_addr, (kv_tile / KvStages) & 1);
 
             const bool valid_q_row = q_row < local_query_len;
             const int s_tmem_addr = tmem_addr + kSBankBase + q_slot * mma_tmem_columns_per_stage;
@@ -3618,30 +3633,24 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
     }
 
     // K producer: stage may be overwritten only after PV has consumed it
-    // for *both* Q slots, hence the two mma2 waits on ring reuse.
+    // for *both* Q slots, hence the two mma2 waits on ring reuse. The same
+    // lane issues begin_kv_load and the TMA copies, so no warp sync is needed.
     if (warp_idx == kKTmaWarp) {
         const bool k_leader = warp_idx == kKTmaWarp && lane_idx == 0;
-        int k_recycle_phase[QSlots][KvStages] = {};
-        bool k_slot_initialized[KvStages] = {};
         const int transaction_bytes = TileKV * HeadDim * sizeof(__nv_bfloat16);
         for (int kv_tile = 0; kv_tile < task_kv_tile_count; ++kv_tile) {
             const int stage = kv_tile % KvStages;
-            if (k_slot_initialized[stage]) {
-                if (k_leader) for (int q_slot = 0; q_slot < QSlots; ++q_slot)
+            if (kv_tile >= KvStages) {
+                if (k_leader) for (int q_slot = 0; q_slot < active_q_slots; ++q_slot)
                     mbarrier_wait(mma2_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t),
-                        k_recycle_phase[q_slot][stage]);
-                for (int q_slot = 0; q_slot < QSlots; ++q_slot)
-                    k_recycle_phase[q_slot][stage] ^= 1;
+                        ((kv_tile - KvStages) / KvStages) & 1);
             }
             const int tx_addr = (tma1_mbar_base + stage * sizeof(uint64_t)) & 0xFEFFFFFF;
             if (k_leader) begin_kv_load(tx_addr, transaction_bytes);
-            __syncwarp();
             load_kv_tile<TileKV, HeadDim>(
                 kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16),
                 &k_tmap, page_size, kv_tile, batch_idx, head_idx, heads, local_key_len,
                 block_table, block_table_stride, tx_addr, lane_idx);
-            __syncwarp();
-            k_slot_initialized[stage] = true;
         }
         return;
     }
@@ -3650,31 +3659,23 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
     // the prior PV must finish before a reused V stage is overwritten.
     if (warp_idx == kVTmaWarp) {
         const bool v_leader = warp_idx == kVTmaWarp && lane_idx == 0;
-        int v_mma1_phase[QSlots][KvStages] = {};
-        int v_recycle_phase[QSlots][KvStages] = {};
-        bool v_slot_initialized[KvStages] = {};
         const int transaction_bytes = TileKV * HeadDim * sizeof(__nv_bfloat16);
         for (int kv_tile = 0; kv_tile < task_kv_tile_count; ++kv_tile) {
             const int stage = kv_tile % KvStages;
-            if (v_leader) for (int q_slot = 0; q_slot < QSlots; ++q_slot)
+            if (v_leader) for (int q_slot = 0; q_slot < active_q_slots; ++q_slot)
                 mbarrier_wait(mma1_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t),
-                    v_mma1_phase[q_slot][stage]);
-            for (int q_slot = 0; q_slot < QSlots; ++q_slot) v_mma1_phase[q_slot][stage] ^= 1;
-            if (v_slot_initialized[stage]) {
-                if (v_leader) for (int q_slot = 0; q_slot < QSlots; ++q_slot)
+                    (kv_tile / KvStages) & 1);
+            if (kv_tile >= KvStages) {
+                if (v_leader) for (int q_slot = 0; q_slot < active_q_slots; ++q_slot)
                     mbarrier_wait(mma2_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t),
-                        v_recycle_phase[q_slot][stage]);
-                for (int q_slot = 0; q_slot < QSlots; ++q_slot) v_recycle_phase[q_slot][stage] ^= 1;
+                        ((kv_tile - KvStages) / KvStages) & 1);
             }
             const int tx_addr = (tma2_mbar_base + stage * sizeof(uint64_t)) & 0xFEFFFFFF;
             if (v_leader) begin_kv_load(tx_addr, transaction_bytes);
-            __syncwarp();
             load_kv_tile<TileKV, HeadDim>(
                 kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16),
                 &v_tmap, page_size, kv_tile, batch_idx, head_idx, heads, local_key_len,
                 block_table, block_table_stride, tx_addr, lane_idx);
-            __syncwarp();
-            v_slot_initialized[stage] = true;
         }
         return;
     }
@@ -3682,11 +3683,8 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
     // A single elected thread issues tcgen05 operations.  The asynchronous
     // engines perform the actual matrix work while producer/rescale warps run.
     if (warp_idx == kMmaWarp) {
-        int qk_tma1_phase[KvStages] = {};
-        int pv_tma2_phase[KvStages] = {};
-        int pv_rescale_phase[QSlots][KvStages] = {};
         // Q TMA completion replaces the former CTA-wide post-prologue barrier.
-        for (int q_slot = 0; q_slot < QSlots; ++q_slot) {
+        for (int q_slot = 0; q_slot < active_q_slots; ++q_slot) {
             mbarrier_wait(q_prologue_mbar_base + q_slot * sizeof(uint64_t), 0);
         }
         if (elect_sync()) {
@@ -3703,8 +3701,8 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
             // before its PV is consumed, while P1(i) is flushed at i + 1.
             for (int kv_tile = 0; kv_tile < task_kv_tile_count; ++kv_tile) {
                 const int stage = kv_tile % KvStages;
-                mbarrier_wait(tma1_mbar_base + stage * sizeof(uint64_t), qk_tma1_phase[stage]);
-                qk_tma1_phase[stage] ^= 1;
+                mbarrier_wait(tma1_mbar_base + stage * sizeof(uint64_t),
+                    (kv_tile / KvStages) & 1);
                 asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
                 const int k_addr = kv_smem_addr + stage * TileKV * HeadDim * sizeof(__nv_bfloat16);
 
@@ -3727,7 +3725,7 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
                 }
 
                 // P1(i - 1).  There is intentionally no P1 in the prologue.
-                if (kv_tile > 0) {
+                if (active_q_slots == QSlots && kv_tile > 0) {
                     const int pv_tile = kv_tile - 1;
                     const int pv_stage = pv_tile % KvStages;
                     constexpr int q_slot = 1;
@@ -3736,8 +3734,7 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
                     // until this P1 commits mma2 below.
                     const int rescale_addr =
                         rescale_mbar_base + (q_slot * KvStages + pv_stage) * sizeof(uint64_t);
-                    mbarrier_wait(rescale_addr, pv_rescale_phase[q_slot][pv_stage]);
-                    pv_rescale_phase[q_slot][pv_stage] ^= 1;
+                    mbarrier_wait(rescale_addr, (pv_tile / KvStages) & 1);
                     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
                     const int o_addr = tmem_addr + kOBankBase + q_slot * mma_tmem_columns_per_stage;
                     const int p_addr = tmem_addr + kSBankBase + q_slot * mma_tmem_columns_per_stage;
@@ -3755,7 +3752,7 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
                 }
 
                 // Q1(i).
-                {
+                if (active_q_slots == QSlots) {
                     constexpr int q_slot = 1;
                     const int s_addr = tmem_addr + kSBankBase + q_slot * mma_tmem_columns_per_stage;
                     const int q_addr =
@@ -3775,12 +3772,11 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
                 // P0(i).
                 {
                     constexpr int q_slot = 0;
-                    mbarrier_wait(tma2_mbar_base + stage * sizeof(uint64_t), pv_tma2_phase[stage]);
-                    pv_tma2_phase[stage] ^= 1;
+                    mbarrier_wait(tma2_mbar_base + stage * sizeof(uint64_t),
+                        (kv_tile / KvStages) & 1);
                     const int rescale_addr =
                         rescale_mbar_base + (q_slot * KvStages + stage) * sizeof(uint64_t);
-                    mbarrier_wait(rescale_addr, pv_rescale_phase[q_slot][stage]);
-                    pv_rescale_phase[q_slot][stage] ^= 1;
+                    mbarrier_wait(rescale_addr, (kv_tile / KvStages) & 1);
                     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
                     const int o_addr = tmem_addr + kOBankBase + q_slot * mma_tmem_columns_per_stage;
                     const int p_addr = tmem_addr + kSBankBase + q_slot * mma_tmem_columns_per_stage;
@@ -3800,15 +3796,14 @@ __global__ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(const __grid_consta
 
             // Drain P1 from the final tile; all middle iterations above retain
             // the requested Q0, P1, Q1, P0 tensor-core issue order.
-            if (task_kv_tile_count > 0) {
+            if (active_q_slots == QSlots && task_kv_tile_count > 0) {
                 const int pv_tile = task_kv_tile_count - 1;
                 const int pv_stage = pv_tile % KvStages;
                 constexpr int q_slot = 1;
                 // As above, P0(pv_tile) owns the one TMA-phase wait.
                 const int rescale_addr =
                     rescale_mbar_base + (q_slot * KvStages + pv_stage) * sizeof(uint64_t);
-                mbarrier_wait(rescale_addr, pv_rescale_phase[q_slot][pv_stage]);
-                pv_rescale_phase[q_slot][pv_stage] ^= 1;
+                mbarrier_wait(rescale_addr, (pv_tile / KvStages) & 1);
                 asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
                 const int o_addr = tmem_addr + kOBankBase + q_slot * mma_tmem_columns_per_stage;
                 const int p_addr = tmem_addr + kSBankBase + q_slot * mma_tmem_columns_per_stage;
@@ -3913,8 +3908,12 @@ cudaError_t bf16_fa4_mha_launch_impl(
             return cudaErrorInvalidConfiguration;
         }
 
+        // Avoid the short-Q branch in the hot prefill loop.
+        const auto kernel = query_len <= kTileQ
+            ? fa_mha_kernel_wg12<kTileQ, kTileKV, kQSlots, kKvStages, kHeadDim, true>
+            : fa_mha_kernel_wg12<kTileQ, kTileKV, kQSlots, kKvStages, kHeadDim, false>;
         status = cudaFuncSetAttribute(
-            fa_mha_kernel_wg12<kTileQ, kTileKV, kQSlots, kKvStages, kHeadDim>,
+            kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             static_cast<int>(smem_layout.dynamic_bytes));
         if (status != cudaSuccess) {
@@ -3923,8 +3922,7 @@ cudaError_t bf16_fa4_mha_launch_impl(
 
         const dim3 block(12 * 32);
         const dim3 grid(total_task_count);
-        fa_mha_kernel_wg12<kTileQ, kTileKV, kQSlots, kKvStages, kHeadDim>
-            <<<grid, block, smem_layout.dynamic_bytes, stream>>>(q_tmap,
+        kernel<<<grid, block, smem_layout.dynamic_bytes, stream>>>(q_tmap,
                 k_tmap,
                 v_tmap,
                 out,
