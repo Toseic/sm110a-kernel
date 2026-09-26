@@ -106,5 +106,6 @@ from .nvfp4_fc1fc2 import (
     nvfp4_fc1fc2_out,
 )
 from .moe_routing import pack_routing_metadata
+from .nccl_lsa import NcclLsaAllReduce, nccl_unique_id
 
 __all__ = [name for name in globals() if not name.startswith("_")]
