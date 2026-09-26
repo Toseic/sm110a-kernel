@@ -184,7 +184,7 @@ class SplitCudaJit(Generic[ConfigT, FacadeT]):
         ],
         variant_key: Callable[[], Hashable] = lambda: None,
         include_paths: Iterable[Path] = (),
-        binding_cflags: Iterable[str] = ("-O3", "-std=c++17"),
+        binding_cflags: Iterable[str] = ("-O3", "-std=c++20"),
         binding_ldflags: Iterable[str] = ("-lcuda",),
         kernel_ldflags: Iterable[str] = ("-lcuda",),
         cache_root_env: str = "SM110A_JIT_CACHE_DIR",

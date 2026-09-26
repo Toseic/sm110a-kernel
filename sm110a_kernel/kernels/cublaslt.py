@@ -27,7 +27,7 @@ def _load_extension():
         extra_cuda_cflags=[
             "-O3", "-lineinfo", f"-gencode=arch={compute_arch},code={cuda_arch}"
         ],
-        extra_cflags=["-O3", "-std=c++17"],
+        extra_cflags=["-O3", "-std=c++20"],
         extra_ldflags=["-lcuda", "-lcublas", "-lcublasLt"],
         verbose=False,
     )

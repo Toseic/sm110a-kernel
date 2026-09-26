@@ -28,7 +28,7 @@ def _binding():
     return load(
         name=f"sm110a_green_context_{digest}",
         sources=[str(_SOURCE)],
-        extra_cflags=["-O3", "-std=c++17"],
+        extra_cflags=["-O3", "-std=c++20"],
         extra_ldflags=["-lcuda"],
         verbose=False,
         with_cuda=True,
