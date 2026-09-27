@@ -8,11 +8,6 @@ void launch_bf16_gemm_serving(const __nv_bfloat16* d_a, const __nv_bfloat16* d_b
                       bool swap_ab, cudaStream_t stream,
                       int max_active_clusters = 0);
 
-void launch_bf16_gemm_serving_profile(const __nv_bfloat16* d_a, const __nv_bfloat16* d_b,
-                              __nv_bfloat16* d_c, int m, int n, int k,
-                              int64_t* profiler, int num_entries,
-                              bool swap_ab, cudaStream_t stream,
-                              int max_active_clusters = 0);
 
 cudaError_t initialize_bf16_gemm_serving_queue(
     sm110a::bf16_gemm_serving::ServingQueueControl* control,

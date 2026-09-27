@@ -1,11 +1,5 @@
 """Public API for the SM110A kernel collection."""
 
-from .profiler import (
-    PROFILER_WARPS_PER_BLOCK,
-    make_profiler_buffer,
-    profiler_events,
-    write_trace,
-)
 from .kernels.moe_routing import pack_routing_metadata
 from .green_context import (
     GreenContext,

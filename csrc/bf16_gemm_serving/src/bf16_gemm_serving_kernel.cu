@@ -215,7 +215,6 @@
 //     tcgen05.ld, then to global memory via 2-D/3-D TMA bulk stores.
 //   * Low-level entry points:
 //       launch_bf16_gemm_serving          – regular, unprofiled path.
-//       launch_bf16_gemm_serving_profile  – same kernel with per-stage profiler.
 //       launch_bf16_gemm_persistent_serving – long-lived ring consumer.
 //
 // Implemented execution mechanisms
@@ -252,7 +251,6 @@
 //            slot N+1.
 //   7. The finite scaffold retains a `SWAP_AB` template variant for its
 //      existing benchmark API.  Online v1 fixes SWAP_AB=false and B_nt[N,K].
-//   8. Per-stage profiler (DO_PROFILE): tag-based timing of Setup,
 //      WaitMMA, IssueTMA, WaitTMA, IssueMMA, WaitMainloop, WaitEpilogue,
 //      Epilogue via elected leaders, no impact on the unprofiled path.
 //
@@ -349,8 +347,6 @@
 //   5. Teardown
 //      ------------------------------------------------
 //      cluster barrier -> warp 0 `tcgen05.dealloc.cta_group::kClusterM`
-//      returns kTileN*2 TMEM columns. If DO_PROFILE, the elected leader
-//      flushes the profiler buffer.
 //
 // Notes
 // -----
@@ -372,7 +368,6 @@
 #include <cuda_runtime.h>
 
 #include "bf16_gemm_serving.h"
-#include "profiler.h"
 
 #ifndef SM110A_BF16_TILE_M
 #define SM110A_BF16_TILE_M 128
@@ -1149,7 +1144,6 @@ template <
     int kClusterM,
     int kEpilogueBlockN,
     bool PERSISTENT,
-    bool DO_PROFILE,
     bool SWAP_AB>
 __global__
 __cluster_dims__(kClusterM, 1, 1)
@@ -1161,8 +1155,6 @@ void bf16_gemm_serving_kernel(
     int M,
     int N,
     int K,
-    int64_t *profiler_ptr,
-    int num_entries,
     ServingQueueControl *queue_control) {
 
     using Config = KernelConfig<kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN>;
@@ -1181,14 +1173,6 @@ void bf16_gemm_serving_kernel(
     const int grid_m = M / kTileM;
     const int grid_n = N / kTileN;
     const int grid_size = grid_m * grid_n;
-
-    Profiler profiler;
-    if constexpr (DO_PROFILE) {
-        if (elect_sync()) {
-            profiler.init(num_entries, profiler_ptr, _bid * kWarpCount + warp_id);
-            profiler.start(ProfilerTag::Setup);
-        }
-    }
 
     // set up cta rank
     int cta_rank;
@@ -1270,24 +1254,13 @@ void bf16_gemm_serving_kernel(
     } else {
         __syncthreads();
     }
-    if constexpr (DO_PROFILE) {
-        if (elect_sync()) {
-            profiler.stop();
-        }
-    }
 
     const int taddr = tmem_addr[0];
 
     // tma load
     auto load = [&](const MainloopTask &task, int mma_phase, int stage_id) {
         const int mma_mbar_addr = _base_mma_mbar_addr + 8 * stage_id;
-        if constexpr (DO_PROFILE) {
-            profiler.start(ProfilerTag::WaitMMA);
-        }
-        wait_mma_slot(mma_mbar_addr, mma_phase);
-        if constexpr (DO_PROFILE) {
-            profiler.stop();
-        }
+                wait_mma_slot(mma_mbar_addr, mma_phase);
 
         const int A_smem = smem + stage_id * kPerStageSmemBytes;
         const int B_smem = A_smem + kASmemBytes;
@@ -1296,10 +1269,7 @@ void bf16_gemm_serving_kernel(
         // tma issue
         constexpr int cp_size = kASmemBytes + kBSmemBytes;
 
-        if constexpr (DO_PROFILE) {
-            profiler.start(ProfilerTag::IssueTMA);
-        }
-        // The TMA completion barrier publishes both the task metadata and
+                // The TMA completion barrier publishes both the task metadata and
         // the asynchronously copied A/B payload to the MMA consumer.
         mainloop_tasks[stage_id] = task;
         asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;" ::"r"(
@@ -1314,37 +1284,22 @@ void bf16_gemm_serving_kernel(
             task.off_n + cta_rank * (kTileN / kClusterM),
             off_k_64,
             tma_mbar_addr);
-        if constexpr (DO_PROFILE) {
-            profiler.stop();
-        }
-    };
+            };
 
     // mma compute
     auto compute =
         [&](int tma_phase, int stage_id, int epilogue_phase) -> MainloopTask {
         const int tma_mbar_addr = _base_tma_mbar_addr + 8 * stage_id;
-        if constexpr (DO_PROFILE) {
-            profiler.start(ProfilerTag::WaitTMA);
-        }
-        wait_tma(tma_mbar_addr, tma_phase);
-        if constexpr (DO_PROFILE) {
-            profiler.stop();
-        }
+                wait_tma(tma_mbar_addr, tma_phase);
 
         const MainloopTask task = mainloop_tasks[stage_id];
         if (task.kind == TaskKind::kStop) {
             return task;
         }
         if (task.iter_k == 0) {
-            if constexpr (DO_PROFILE) {
-                profiler.start(ProfilerTag::WaitEpilogue);
-            }
-            wait_epilogue(
+                        wait_epilogue(
                 _base_epilogue_mbar_addr + task.mainloop_stage * 8, epilogue_phase);
-            if constexpr (DO_PROFILE) {
-                profiler.stop();
-            }
-        }
+                    }
         const int A_smem = smem + stage_id * kPerStageSmemBytes;
         const int B_smem = A_smem + kASmemBytes;
         const int mma_mbar_addr = _base_mma_mbar_addr + 8 * stage_id;
@@ -1358,10 +1313,7 @@ void bf16_gemm_serving_kernel(
         asm volatile("tcgen05.fence::after_thread_sync;");
         const int this_taddr = taddr + task.mainloop_stage * kTileN;
 
-        if constexpr (DO_PROFILE) {
-            profiler.start(ProfilerTag::IssueMMA);
-        }
-        tcgen05_mma_f16<kClusterM>(this_taddr,
+                tcgen05_mma_f16<kClusterM>(this_taddr,
             make_desc(A_smem),
             make_desc(B_smem),
             i_desc,
@@ -1386,10 +1338,7 @@ void bf16_gemm_serving_kernel(
             "h"(cta_mask),
             "n"(kClusterM)
             : "memory");
-        if constexpr (DO_PROFILE) {
-            profiler.stop();
-        }
-        return task;
+                return task;
     };
 
     auto tmem_to_smem = [&](int mainloop_stage, int n_block, int smem_stage) {
@@ -1732,14 +1681,8 @@ void bf16_gemm_serving_kernel(
         int completion_phase = 0;
 
         while (true) {
-            if constexpr (DO_PROFILE)
-                if (elect_sync())
-                    profiler.start(ProfilerTag::WaitMainloop);
             wait_mainloop(_base_mainloop_mbar_addr + 8 * mainloop_stage, mainloop_phase);
             asm volatile("tcgen05.fence::after_thread_sync;");
-            if constexpr (DO_PROFILE)
-                if (elect_sync())
-                    profiler.stop();
             const OutputTileTask task = output_tasks[mainloop_stage];
             if (task.kind == TaskKind::kStop) {
                 break;
@@ -1748,9 +1691,6 @@ void bf16_gemm_serving_kernel(
                 mbarrier_arrive_on_cluster_cta(
                     _base_scheduler_free_mbar_addr + mainloop_stage * 8, 0);
             }
-            if constexpr (DO_PROFILE)
-                if (elect_sync())
-                    profiler.start(ProfilerTag::Epilogue);
             epilogue(mainloop_stage, task.off_m, task.off_n);
             if constexpr (PERSISTENT) {
                 if (tid == 0) {
@@ -1777,9 +1717,6 @@ void bf16_gemm_serving_kernel(
                     }
                 }
             }
-            if constexpr (DO_PROFILE)
-                if (elect_sync())
-                    profiler.stop();
             mainloop_stage = (mainloop_stage + 1) % 2;
             if (mainloop_stage == 0) {
                 mainloop_phase ^= 1;
@@ -1815,12 +1752,7 @@ void bf16_gemm_serving_kernel(
             }
         }
     }
-    if constexpr (DO_PROFILE) {
-        if (elect_sync()) {
-            profiler.flush();
-        }
     }
-}
 
 } // namespace
 
@@ -2032,7 +1964,7 @@ cudaError_t launch_bf16_gemm_persistent_serving(
     using Config = KernelConfig<kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN>;
     constexpr int kSmemBytes = Config::kDynamicSmemBytes + 256;
     auto kernel = bf16_gemm_serving_kernel<
-        kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN, true, false, false>;
+        kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN, true, false>;
     cudaError_t status = cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
     if (status != cudaSuccess) {
@@ -2045,8 +1977,6 @@ cudaError_t launch_bf16_gemm_persistent_serving(
         static_cast<int>(ring_rows),
         static_cast<int>(n),
         static_cast<int>(k),
-        nullptr,
-        0,
         control);
     return cudaGetLastError();
 }
@@ -2077,7 +2007,6 @@ template <int kTileM,
     int kTileK,
     int kClusterM,
     int kEpilogueBlockN,
-    bool DO_PROFILE,
     bool SWAP_AB>
 void launch_bf16_gemm_serving_impl(
     const __nv_bfloat16 *A_ptr,
@@ -2086,8 +2015,6 @@ void launch_bf16_gemm_serving_impl(
     int M,
     int N,
     int K,
-    int64_t *profiler_ptr,
-    int num_entries,
     int max_active_clusters,
     cudaStream_t stream) {
 
@@ -2148,7 +2075,7 @@ void launch_bf16_gemm_serving_impl(
 
     auto kernel =
         bf16_gemm_serving_kernel<
-            kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN, false, DO_PROFILE, SWAP_AB>;
+            kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN, false, SWAP_AB>;
 
     if (smem_size > 48 * 1024) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
@@ -2160,8 +2087,6 @@ void launch_bf16_gemm_serving_impl(
         M,
         N,
         K,
-        profiler_ptr,
-        num_entries,
         nullptr);
 }
 
@@ -2191,8 +2116,7 @@ void launch_bf16_gemm_serving(
             SM110A_BF16_TILE_K,
             SM110A_BF16_CLUSTER_M,
             SM110A_BF16_EPILOGUE_BLOCK_N,
-            false,
-            true>(A_ptr, B_ptr, C_ptr, M, N, K, nullptr, 0,
+            true>(A_ptr, B_ptr, C_ptr, M, N, K,
                   max_active_clusters, stream);
     } else {
         launch_bf16_gemm_serving_impl<SM110A_BF16_TILE_M,
@@ -2200,8 +2124,7 @@ void launch_bf16_gemm_serving(
             SM110A_BF16_TILE_K,
             SM110A_BF16_CLUSTER_M,
             SM110A_BF16_EPILOGUE_BLOCK_N,
-            false,
-            false>(A_ptr, B_ptr, C_ptr, M, N, K, nullptr, 0,
+            false>(A_ptr, B_ptr, C_ptr, M, N, K,
                    max_active_clusters, stream);
     }
 }
@@ -2212,46 +2135,4 @@ extern "C" void sm110a_bf16_gemm_serving_launch(
     int max_active_clusters, cudaStream_t stream) {
   launch_bf16_gemm_serving(d_a, d_b, d_c, m, n, k, swap_ab, stream,
                    max_active_clusters);
-}
-
-void launch_bf16_gemm_serving_profile(
-    const __nv_bfloat16 *A_ptr,
-    const __nv_bfloat16 *B_ptr,
-    __nv_bfloat16 *C_ptr,
-    int M,
-    int N,
-    int K,
-    int64_t *profiler_ptr,
-    int num_entries,
-    bool swap_ab,
-    cudaStream_t stream,
-    int max_active_clusters) {
-    if (max_active_clusters <= 0) {
-        int device = 0;
-        int sm_count = 0;
-        assert(cudaGetDevice(&device) == cudaSuccess);
-        assert(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount,
-                                      device) == cudaSuccess);
-        max_active_clusters = sm_count / SM110A_BF16_CLUSTER_M;
-    }
-    assert(max_active_clusters > 0);
-    if (swap_ab) {
-        launch_bf16_gemm_serving_impl<SM110A_BF16_TILE_M,
-            SM110A_BF16_TILE_N,
-            SM110A_BF16_TILE_K,
-            SM110A_BF16_CLUSTER_M,
-            SM110A_BF16_EPILOGUE_BLOCK_N,
-            true,
-            true>(A_ptr, B_ptr, C_ptr, M, N, K, profiler_ptr, num_entries,
-                  max_active_clusters, stream);
-    } else {
-        launch_bf16_gemm_serving_impl<SM110A_BF16_TILE_M,
-            SM110A_BF16_TILE_N,
-            SM110A_BF16_TILE_K,
-            SM110A_BF16_CLUSTER_M,
-            SM110A_BF16_EPILOGUE_BLOCK_N,
-            true,
-            false>(A_ptr, B_ptr, C_ptr, M, N, K, profiler_ptr, num_entries,
-                   max_active_clusters, stream);
-    }
 }

@@ -287,7 +287,7 @@ _JIT = SplitCudaJit(
     binding_sources=(_SOURCE_DIR / "bf16_gemm_serving_split_torch_binding.cpp",),
     kernel_sources=(_SOURCE_DIR / "bf16_gemm_serving_kernel.cu",),
     kernel_dependencies=(_INCLUDE_DIR / "bf16_gemm_serving.h", _INCLUDE_DIR / "bf16_gemm_serving_queue.h",
-                         _INCLUDE_DIR / "common.h", _INCLUDE_DIR / "profiler.h"),
+                         _INCLUDE_DIR / "common.h"),
     kernel_symbol="sm110a_bf16_gemm_serving_launch", config_key=lambda config: config,
     kernel_cflags=_kernel_cflags, make_facade=Bf16GemmServingModule, include_paths=(_INCLUDE_DIR,))
 

@@ -110,7 +110,6 @@
 //         immediately before each MMA to refresh the live slabs.
 //   * Two entry points:
 //       launch_nvfp4_gemm           – regular, unprofiled path.
-//       launch_nvfp4_gemm_profile   – same kernel with per-stage profiler.
 //   * SWAP_AB template variant reuses the same kernel binary for the
 //     transposed product (no second hand-written kernel); only the host-side
 //     launch swaps pointer/dimension arguments and selects the matching
@@ -172,7 +171,6 @@
 //      transposed product (no second hand-written kernel); only the host-side
 //      launch swaps pointer/dimension arguments and selects the matching
 //      C tensor-map encoder.
-//  11. Per-stage profiler (DO_PROFILE): tag-based timing of Setup,
 //      WaitMMA, IssueTMA, WaitTMA, IssueMMA, WaitMainloop, WaitEpilogue,
 //      Epilogue via elected leaders, no impact on the unprofiled path.
 //
@@ -276,8 +274,6 @@
 //   5. Teardown
 //      ------------------------------------------------
 //      cluster barrier -> warp 0 `tcgen05.dealloc.cta_group::kClusterM`
-//      returns kTmemColumnCapacity TMEM columns. If DO_PROFILE, the elected
-//      leader flushes the profiler buffer.
 //
 // Notes
 // -----
@@ -312,7 +308,6 @@
 #include <cuda_runtime.h>
 
 #include "nvfp4_gemm.h"
-#include "profiler.h"
 
 #ifndef SM110A_NVFP4_TILE_M
 #define SM110A_NVFP4_TILE_M 128
@@ -820,7 +815,6 @@ template <
     int kTileK,
     int kClusterM,
     int kEpilogueBlockN,
-    bool DO_PROFILE,
     bool SWAP_AB>
 __global__
 __cluster_dims__(kClusterM, 1, 1)
@@ -833,9 +827,7 @@ void nvfp4_gemm_kernel(
     const __grid_constant__ CUtensorMap C_tmap,
     int M,
     int N,
-    int K,
-    int64_t *profiler_ptr,
-    int num_entries) {
+    int K) {
 
     using Config = KernelConfig<kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN>;
     constexpr int kStageCount = Config::kStageCount;
@@ -862,14 +854,6 @@ void nvfp4_gemm_kernel(
     const int grid_m = M / kTileM;
     const int grid_n = N / kTileN;
     const int grid_size = grid_m * grid_n;
-
-    Profiler profiler;
-    if constexpr (DO_PROFILE) {
-        if (elect_sync()) {
-            profiler.init(num_entries, profiler_ptr, _bid * kWarpCount + warp_id);
-            profiler.start(ProfilerTag::Setup);
-        }
-    }
 
     // set up cta rank
     int cta_rank;
@@ -943,11 +927,6 @@ void nvfp4_gemm_kernel(
     } else {
         __syncthreads();
     }
-    if constexpr (DO_PROFILE) {
-        if (elect_sync()) {
-            profiler.stop();
-        }
-    }
 
     const int taddr = tmem_addr[0];
 
@@ -994,13 +973,7 @@ void nvfp4_gemm_kernel(
         }
 #endif
         const int mma_mbar_addr = _base_mma_mbar_addr + 8 * stage_id;
-        if constexpr (DO_PROFILE) {
-            profiler.start(ProfilerTag::WaitMMA);
-        }
-        wait_mma_slot(mma_mbar_addr, mma_phase);
-        if constexpr (DO_PROFILE) {
-            profiler.stop();
-        }
+                wait_mma_slot(mma_mbar_addr, mma_phase);
 
         const int A_smem = smem + stage_id * kPerStageSmemBytes;
         const int B_smem = A_smem + kASmemBytes;
@@ -1012,10 +985,7 @@ void nvfp4_gemm_kernel(
         constexpr int cp_size =
             kATmaBytes + kBTmaBytes + kSFASmemBytes + kSFBSmemBytes;
 
-        if constexpr (DO_PROFILE) {
-            profiler.start(ProfilerTag::IssueTMA);
-        }
-        asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;" ::"r"(
+                asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;" ::"r"(
                          tma_mbar_addr),
             "r"(cp_size)
             : "memory");
@@ -1062,10 +1032,7 @@ void nvfp4_gemm_kernel(
                     cta_mask);
             }
         }
-        if constexpr (DO_PROFILE) {
-            profiler.stop();
-        }
-    };
+            };
 
     // mma compute
     auto compute = [&](int iter_k,
@@ -1074,13 +1041,7 @@ void nvfp4_gemm_kernel(
                        int stage_id,
                        int off_n) {
         const int tma_mbar_addr = _base_tma_mbar_addr + 8 * stage_id;
-        if constexpr (DO_PROFILE) {
-            profiler.start(ProfilerTag::WaitTMA);
-        }
-        wait_tma(tma_mbar_addr, tma_phase);
-        if constexpr (DO_PROFILE) {
-            profiler.stop();
-        }
+                wait_tma(tma_mbar_addr, tma_phase);
 
         const int A_smem = smem + stage_id * kPerStageSmemBytes;
         const int B_smem = A_smem + kASmemBytes;
@@ -1109,10 +1070,7 @@ void nvfp4_gemm_kernel(
         constexpr int kScaleTmemBase = Config::kAccumulatorTmemCols;
         const int scale_taddr = taddr + kScaleTmemBase;
 
-        if constexpr (DO_PROFILE) {
-            profiler.start(ProfilerTag::IssueMMA);
-        }
-        auto copy_mma_scales = [&](int mma_k, int mma_scale_taddr) {
+                auto copy_mma_scales = [&](int mma_k, int mma_scale_taddr) {
             const int SFA_mma_smem = SFA_smem + mma_k * 512;
             tcgen05_cp_scale<kClusterM>(
                 mma_scale_taddr, make_scale_desc(SFA_mma_smem));
@@ -1157,10 +1115,7 @@ void nvfp4_gemm_kernel(
         }
 
         tcgen05_commit<kClusterM>(mma_mbar_addr);
-        if constexpr (DO_PROFILE) {
-            profiler.stop();
-        }
-    };
+            };
 
     auto tmem_to_smem = [&](int mainloop_stage,
                             int n_block,
@@ -1489,13 +1444,7 @@ void nvfp4_gemm_kernel(
 
         for (int bid = _bid; bid < grid_size; bid += grid_x) {
             auto [off_m, off_n] = compute_bid(bid);
-            if constexpr (DO_PROFILE) {
-                profiler.start(ProfilerTag::WaitEpilogue);
-            }
-            wait_epilogue(_base_epilogue_mbar_addr + mainloop_stage * 8, epilogue_phase);
-            if constexpr (DO_PROFILE) {
-                profiler.stop();
-            }
+                        wait_epilogue(_base_epilogue_mbar_addr + mainloop_stage * 8, epilogue_phase);
 
             for (int iter_k = 0; iter_k < K / kTileK; ++iter_k) {
                 compute(iter_k, mainloop_stage, tma_phase, tma_stage, off_n);
@@ -1520,22 +1469,10 @@ void nvfp4_gemm_kernel(
         int mainloop_phase = 0;
 
         for (int bid = _bid; bid < grid_size; bid += grid_x) {
-            if constexpr (DO_PROFILE)
-                if (elect_sync())
-                    profiler.start(ProfilerTag::WaitMainloop);
             wait_mainloop(_base_mainloop_mbar_addr + 8 * mainloop_stage, mainloop_phase);
             asm volatile("tcgen05.fence::after_thread_sync;");
-            if constexpr (DO_PROFILE)
-                if (elect_sync())
-                    profiler.stop();
             auto [off_m, off_n] = compute_bid(bid);
-            if constexpr (DO_PROFILE)
-                if (elect_sync())
-                    profiler.start(ProfilerTag::Epilogue);
             epilogue(mainloop_stage, off_m, off_n);
-            if constexpr (DO_PROFILE)
-                if (elect_sync())
-                    profiler.stop();
             mainloop_stage = (mainloop_stage + 1) % kAccumulatorStageCount;
             if (mainloop_stage == 0) {
                 mainloop_phase ^= 1;
@@ -1554,12 +1491,7 @@ void nvfp4_gemm_kernel(
             "r"(kTmemColumnCapacity),
             "n"(kClusterM));
     }
-    if constexpr (DO_PROFILE) {
-        if (elect_sync()) {
-            profiler.flush();
-        }
     }
-}
 
 } // namespace
 
@@ -1568,7 +1500,6 @@ template <int kTileM,
     int kTileK,
     int kClusterM,
     int kEpilogueBlockN,
-    bool DO_PROFILE,
     bool SWAP_AB>
 void launch_nvfp4_gemm_impl(
     const uint8_t *A_ptr,
@@ -1579,8 +1510,6 @@ void launch_nvfp4_gemm_impl(
     int M,
     int N,
     int K,
-    int64_t *profiler_ptr,
-    int num_entries,
     cudaStream_t stream) {
 
     using Config = KernelConfig<kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN>;
@@ -1638,7 +1567,7 @@ void launch_nvfp4_gemm_impl(
     int grid = kSmCount;
 
     auto kernel =
-        nvfp4_gemm_kernel<kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN, DO_PROFILE, SWAP_AB>;
+        nvfp4_gemm_kernel<kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN, SWAP_AB>;
 
     if (smem_size > 48 * 1024) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
@@ -1651,9 +1580,7 @@ void launch_nvfp4_gemm_impl(
         C_tmap,
         M,
         N,
-        K,
-        profiler_ptr,
-        num_entries);
+        K);
 }
 
 // Non-template wrappers for pre-compiled path — instantiate with the #define defaults.
@@ -1672,8 +1599,7 @@ void launch_nvfp4_gemm(
         SM110A_NVFP4_TILE_K,
         SM110A_NVFP4_CLUSTER_M,
         SM110A_NVFP4_EPILOGUE_BLOCK_N,
-        false,
-        false>(A_ptr, B_ptr, SFA_ptr, SFB_ptr, C_ptr, M, N, K, nullptr, 0, stream);
+        false>(A_ptr, B_ptr, SFA_ptr, SFB_ptr, C_ptr, M, N, K, stream);
 }
 
 extern "C" void sm110a_nvfp4_gemm_launch(
@@ -1681,26 +1607,4 @@ extern "C" void sm110a_nvfp4_gemm_launch(
     const uint8_t* sfb, __nv_bfloat16* c, int m, int n, int k,
     cudaStream_t stream) {
   launch_nvfp4_gemm(a, b, sfa, sfb, c, m, n, k, stream);
-}
-
-void launch_nvfp4_gemm_profile(
-    const uint8_t *A_ptr,
-    const uint8_t *B_ptr,
-    const uint8_t *SFA_ptr,
-    const uint8_t *SFB_ptr,
-    __nv_bfloat16 *C_ptr,
-    int M,
-    int N,
-    int K,
-    int64_t *profiler_ptr,
-    int num_entries,
-    cudaStream_t stream) {
-    launch_nvfp4_gemm_impl<SM110A_NVFP4_TILE_M,
-        SM110A_NVFP4_TILE_N,
-        SM110A_NVFP4_TILE_K,
-        SM110A_NVFP4_CLUSTER_M,
-        SM110A_NVFP4_EPILOGUE_BLOCK_N,
-        true,
-        false>(A_ptr, B_ptr, SFA_ptr, SFB_ptr, C_ptr, M, N, K,
-            profiler_ptr, num_entries, stream);
 }

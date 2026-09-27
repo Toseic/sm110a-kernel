@@ -9,9 +9,3 @@ void launch_nvfp4_gemm(const uint8_t* a, const uint8_t* b,
                        const uint8_t* sfa, const uint8_t* sfb,
                        __nv_bfloat16* c, int m, int n, int k,
                        cudaStream_t stream);
-
-void launch_nvfp4_gemm_profile(const uint8_t* a, const uint8_t* b,
-                               const uint8_t* sfa, const uint8_t* sfb,
-                               __nv_bfloat16* c, int m, int n, int k,
-                               int64_t* profiler, int num_entries,
-                               cudaStream_t stream);

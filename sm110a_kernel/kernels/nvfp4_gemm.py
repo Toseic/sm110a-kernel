@@ -74,7 +74,6 @@ _JIT = SplitCudaJit(
     kernel_dependencies=(
         _INCLUDE_DIR / "nvfp4_gemm.h",
         _INCLUDE_DIR / "common.h",
-        _INCLUDE_DIR / "profiler.h",
     ),
     kernel_symbol="sm110a_nvfp4_gemm_launch",
     config_key=lambda config: config,
