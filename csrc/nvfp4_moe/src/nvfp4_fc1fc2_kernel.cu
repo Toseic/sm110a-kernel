@@ -90,7 +90,9 @@ constexpr int kFc1CompactIntermediateBytes =
 constexpr int kWorkspaceBytes =
     kMatrixSmemBytes + kWeightSmemBytes + 2 * kScaleStageBytes;
 constexpr int kFc2WorkspaceBytes = kWeightSmemBytes + kScaleStageBytes;
-constexpr int kFc1StageCount = kStreamIntermediate ? 4 :
+// Depth 5 hides multi-pair L2 feed latency; this consumes the entire
+// FC1-mode smem slack (217088 of 225280 B), so 6 does not fit.
+constexpr int kFc1StageCount = kStreamIntermediate ? 5 :
     (kGlobalSplit ? (kHSplit >= 4 ? 4 : 3) :
     (kBufferI >= 2048 ? (kClusterPairs > 1 ? 5 : 2) :
         (kBufferI >= 1024 ? 4 : 5)));
