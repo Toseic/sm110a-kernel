@@ -147,7 +147,15 @@ struct KernelConfig {
     // Each cta_group::2 M-pair in an N cluster owns one TMEM allocation. Cap
     // the pipeline depth so every N-pair fits in the 512-column TMEM pool
     // (cluster_n=2: 256 columns per pair, cluster_n=4: 128 per pair).
-    static constexpr int kStageCount = kClusterN == 1 ? kSmemLimitedStageCount :
+    // The smem-limited count is not the throughput optimum: at the autotuned
+    // winner tactic (128x256x256, cluster 2x1, direct-gmem) the measured
+    // stage period is U-shaped in depth — ring3 41.64 ms, ring4 41.27 ms,
+    // ring5 (the smem-limited value) 43.28 ms at t32768 — so cap one below
+    // the smem limit once the limit reaches 5. DRAM-bound small batches are
+    // depth-insensitive (t2048 flat across 3/4/5).
+    static constexpr int kStageCount = kClusterN == 1 ?
+        (kSmemLimitedStageCount < 5 ? kSmemLimitedStageCount
+                                    : kSmemLimitedStageCount - 1) :
         (kClusterN == 2 ? (kSmemLimitedStageCount < 3 ? kSmemLimitedStageCount : 3) :
             (kSmemLimitedStageCount < 2 ? kSmemLimitedStageCount : 2));
     static_assert(kStageCount >= 1);
