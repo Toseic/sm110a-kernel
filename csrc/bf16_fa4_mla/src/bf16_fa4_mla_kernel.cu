@@ -316,9 +316,14 @@ struct SoftmaxUpdate {
 
 __device__ inline void mbarrier_arrive(int mbar_addr);
 
-// M=64 uses tcgen05 layout F.  One warp sees 16 logical query rows: lanes
-// 0..15 own score columns 0..31 and lanes 16..31 own columns 32..63 for
-// the same 16 rows.  The lane pairs exchange max/sum with xor-16 shuffles.
+// M=64 uses tcgen05 layout F.  In the S fragment (.16x64b) lane L owns
+// raw[j] = key 2j + odd of row (L>>2) + ((L&1) ? 8 : 0): a lane pair
+// (even, odd) holds one row's even/odd keys.  Max/exp/sum are permutation
+// invariant per row, so the softmax runs directly on this pair layout with
+// xor-2 exchanges; only the packed P store needs the canonical split
+// (lane r: keys 0..31, lane r+16: keys 32..63), reached with one 16-way
+// pack exchange plus one 16-way relocation instead of a full 64-shuffle
+// reconstruction.
 template <bool N64, bool AllScoresValid>
 __device__ __attribute__((noinline)) SoftmaxUpdate load_s_and_store_p_m64(
     int s_tmem_warp_addr,
@@ -334,94 +339,155 @@ __device__ __attribute__((noinline)) SoftmaxUpdate load_s_and_store_p_m64(
     int lane_idx) {
     constexpr int kScoresPerLane = 32;
     const int half = lane_idx >> 4;
-    const int key_begin = tile_key_begin + half * kScoresPerLane;
     const int key_hi = min(key_len - 1, mask_q_row);
-    float scores[kScoresPerLane];
     if constexpr (N64) {
         float raw[kScoresPerLane];
         tcgen05_ld_f32_x32_n64(raw, s_tmem_warp_addr);
         asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
-        // N64 .16x64b fragment: each source-lane pair (base,base+2) owns
-        // even/odd keys for one row. Reconstruct the old N32 virtual layout:
-        // lane r gets keys 0..31, lane r+16 gets keys 32..63 for row r.
-        const int row = lane_idx & 15;
-        const int src_even = row < 8 ? 4 * row : 4 * (row - 8) + 1;
-        const int raw_begin = (lane_idx >> 4) * 16;
+        const int row = (lane_idx >> 2) + ((lane_idx & 1) ? 8 : 0);
+        const bool odd = (lane_idx & 2) != 0;
+        // Running (m, l) live on canonical lane `row` (lanes 0..15).
+        const float m_run = __shfl_sync(0xFFFFFFFFU, tilem, row);
+        const float l_run = __shfl_sync(0xFFFFFFFFU, tilel, row);
+
+        // Row max across the even/odd lane pair.
+        float rmax = -__int_as_float(0x7F800000);
 #pragma unroll
-        for (int raw_i = 0; raw_i < kScoresPerLane; ++raw_i) {
-            // `raw_i` must be identical in every lane: a shuffle's source
-            // expression is evaluated by the source lane, not the receiver.
-            const float even = __shfl_sync(0xFFFFFFFFU, raw[raw_i], src_even);
-            const float odd = __shfl_sync(0xFFFFFFFFU, raw[raw_i], src_even + 2);
-            if (raw_i >= raw_begin && raw_i < raw_begin + 16) {
-                const int i = raw_i - raw_begin;
-                scores[2 * i] = even;
-                scores[2 * i + 1] = odd;
+        for (int j = 0; j < kScoresPerLane; ++j) {
+            if (AllScoresValid || key_hi >= tile_key_begin + 2 * j + odd) {
+                rmax = fmaxf(rmax, raw[j]);
             }
         }
+        rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFU, rmax, 2));
+
+        float new_m = fmaxf(m_run, rmax);
+        const bool needs_rescale = (new_m - m_run) * scale > conditional_rescale_threshold;
+        const bool warp_rescale = __any_sync(0xFFFFFFFFU, needs_rescale);
+        if (!warp_rescale) {
+            new_m = m_run;
+        }
+        const float alpha = l_run != 0.0f
+            ? exp2_approx((m_run - new_m) * scale_log2e)
+            : 0.0f;
+        const float neg_m_scale = -new_m * scale_log2e;
+        float partial_sum = 0.0f;
+#pragma unroll
+        for (int j = 0; j < kScoresPerLane; ++j) {
+            raw[j] = (AllScoresValid || key_hi >= tile_key_begin + 2 * j + odd)
+                ? exp2_approx(fmaf(raw[j], scale_log2e, neg_m_scale))
+                : 0.0f;
+            partial_sum += raw[j];
+        }
+        partial_sum += __shfl_xor_sync(0xFFFFFFFFU, partial_sum, 2);
+
+        // Co-locate each packed (even, odd) key pair in one lane: the odd
+        // lane assembles keys 0..31, the even lane keys 32..63.
+        uint32_t packed_v[kScoresPerLane / 2];
+#pragma unroll
+        for (int i = 0; i < kScoresPerLane / 2; ++i) {
+            const float mine = odd ? raw[16 + i] : raw[i];
+            const float theirs = __shfl_xor_sync(0xFFFFFFFFU, mine, 2);
+            packed_v[i] = odd ? pack_bf16x2(theirs, raw[i])
+                              : pack_bf16x2(raw[16 + i], theirs);
+        }
+
+        // Both Layout F PV atoms need the complete P row: one at datapath
+        // offset 0 and one at offset 16.  Relocate the packed halves into
+        // the canonical store split, then duplicate into both datapaths via
+        // the xor-16 pair exchange.
+        const int src_p = lane_idx < 16
+            ? (lane_idx < 8 ? 4 * lane_idx + 2 : 4 * (lane_idx - 8) + 3)
+            : ((lane_idx - 16) < 8 ? 4 * (lane_idx - 16)
+                                   : 4 * (lane_idx - 24) + 1);
+#pragma unroll
+        for (int group = 0; group < kScoresPerLane / 8; ++group) {
+            uint32_t lo[4], hi[4];
+#pragma unroll
+            for (int pair = 0; pair < 4; ++pair) {
+                const uint32_t packed =
+                    __shfl_sync(0xFFFFFFFFU, packed_v[group * 4 + pair], src_p);
+                const uint32_t other = __shfl_xor_sync(0xFFFFFFFFU, packed, 16);
+                lo[pair] = half == 0 ? packed : other;
+                hi[pair] = half == 0 ? other : packed;
+            }
+            tcgen05_st_b32_x4(lo, p_tmem_warp_addr + group * 4);
+            tcgen05_st_b32_x4(hi, p_tmem_warp_addr + 16 + group * 4);
+        }
+
+        // Hand the row's update to the canonical lanes that publish it.
+        const int src_upd =
+            (lane_idx & 15) < 8 ? 4 * (lane_idx & 15) + 2 : 4 * (lane_idx & 15) - 29;
+        SoftmaxUpdate update;
+        update.m = __shfl_sync(0xFFFFFFFFU, new_m, src_upd);
+        update.l = __shfl_sync(0xFFFFFFFFU, alpha * l_run + partial_sum, src_upd);
+        update.alpha = __shfl_sync(
+            0xFFFFFFFFU, warp_rescale ? alpha : -alpha, src_upd);
+        return update;
     } else {
+        const int key_begin = tile_key_begin + half * kScoresPerLane;
+        float scores[kScoresPerLane];
         tcgen05_ld_f32_x32(scores, s_tmem_warp_addr);
         asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
-    }
 
-    float rmax = -__int_as_float(0x7F800000);
+        float rmax = -__int_as_float(0x7F800000);
 #pragma unroll
-    for (int i = 0; i < kScoresPerLane; ++i) {
-        if constexpr (AllScoresValid) {
-            rmax = fmaxf(rmax, scores[i]);
-        } else if (key_begin + i <= key_hi) {
-            rmax = fmaxf(rmax, scores[i]);
+        for (int i = 0; i < kScoresPerLane; ++i) {
+            if constexpr (AllScoresValid) {
+                rmax = fmaxf(rmax, scores[i]);
+            } else if (key_begin + i <= key_hi) {
+                rmax = fmaxf(rmax, scores[i]);
+            }
         }
-    }
-    rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFU, rmax, 16));
+        rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFFU, rmax, 16));
 
-    float new_m = fmaxf(tilem, rmax);
-    const bool needs_rescale = (new_m - tilem) * scale > conditional_rescale_threshold;
-    const bool warp_rescale = __any_sync(0xFFFFFFFFU, needs_rescale);
-    if (!warp_rescale) {
-        new_m = tilem;
-    }
-    const float alpha = tilel != 0.0f
-        ? exp2_approx((tilem - new_m) * scale_log2e)
-        : 0.0f;
-    const float neg_m_scale = -new_m * scale_log2e;
-    float partial_sum = 0.0f;
-#pragma unroll
-    for (int i = 0; i < kScoresPerLane; ++i) {
-        if constexpr (AllScoresValid) {
-            scores[i] = exp2_approx(fmaf(scores[i], scale_log2e, neg_m_scale));
-        } else {
-            scores[i] = key_begin + i <= key_hi
-                ? exp2_approx(fmaf(scores[i], scale_log2e, neg_m_scale))
-                : 0.0f;
+        float new_m = fmaxf(tilem, rmax);
+        const bool needs_rescale = (new_m - tilem) * scale > conditional_rescale_threshold;
+        const bool warp_rescale = __any_sync(0xFFFFFFFFU, needs_rescale);
+        if (!warp_rescale) {
+            new_m = tilem;
         }
-        partial_sum += scores[i];
-    }
-
-    // Both Layout F PV atoms need the complete P row: one at datapath
-    // offset 0 and one at offset 16. Exchange the two score halves within
-    // each lane pair, then duplicate the packed BF16 row into both halves.
+        const float alpha = tilel != 0.0f
+            ? exp2_approx((tilem - new_m) * scale_log2e)
+            : 0.0f;
+        const float neg_m_scale = -new_m * scale_log2e;
+        float partial_sum = 0.0f;
 #pragma unroll
-    for (int group = 0; group < kScoresPerLane / 8; ++group) {
-        uint32_t lo[4], hi[4];
-#pragma unroll
-        for (int pair = 0; pair < 4; ++pair) {
-            const int i = group * 8 + pair * 2;
-            const uint32_t packed = pack_bf16x2(scores[i], scores[i + 1]);
-            const uint32_t other = __shfl_xor_sync(0xFFFFFFFFU, packed, 16);
-            lo[pair] = half == 0 ? packed : other;
-            hi[pair] = half == 0 ? other : packed;
+        for (int i = 0; i < kScoresPerLane; ++i) {
+            if constexpr (AllScoresValid) {
+                scores[i] = exp2_approx(fmaf(scores[i], scale_log2e, neg_m_scale));
+            } else {
+                scores[i] = key_begin + i <= key_hi
+                    ? exp2_approx(fmaf(scores[i], scale_log2e, neg_m_scale))
+                    : 0.0f;
+            }
+            partial_sum += scores[i];
         }
-        tcgen05_st_b32_x4(lo, p_tmem_warp_addr + group * 4);
-        tcgen05_st_b32_x4(hi, p_tmem_warp_addr + 16 + group * 4);
-    }
 
-    partial_sum += __shfl_xor_sync(0xFFFFFFFFU, partial_sum, 16);
-    SoftmaxUpdate update;
-    update.m = new_m;
-    update.l = alpha * tilel + partial_sum;
-    update.alpha = warp_rescale ? alpha : -alpha;
-    return update;
+        // Both Layout F PV atoms need the complete P row: one at datapath
+        // offset 0 and one at offset 16. Exchange the two score halves within
+        // each lane pair, then duplicate the packed BF16 row into both halves.
+#pragma unroll
+        for (int group = 0; group < kScoresPerLane / 8; ++group) {
+            uint32_t lo[4], hi[4];
+#pragma unroll
+            for (int pair = 0; pair < 4; ++pair) {
+                const int i = group * 8 + pair * 2;
+                const uint32_t packed = pack_bf16x2(scores[i], scores[i + 1]);
+                const uint32_t other = __shfl_xor_sync(0xFFFFFFFFU, packed, 16);
+                lo[pair] = half == 0 ? packed : other;
+                hi[pair] = half == 0 ? other : packed;
+            }
+            tcgen05_st_b32_x4(lo, p_tmem_warp_addr + group * 4);
+            tcgen05_st_b32_x4(hi, p_tmem_warp_addr + 16 + group * 4);
+        }
+
+        partial_sum += __shfl_xor_sync(0xFFFFFFFFU, partial_sum, 16);
+        SoftmaxUpdate update;
+        update.m = new_m;
+        update.l = alpha * tilel + partial_sum;
+        update.alpha = warp_rescale ? alpha : -alpha;
+        return update;
+    }
 }
 
 __device__ inline void tcgen05_commit_mbarrier(
@@ -943,6 +1009,13 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
             int p_ready_phase[KvStages] = {};
             int rescale_phase[KvStages][kPvGroupCount] = {};
 
+            // Q is loaded once per CTA and its chunk barriers are never
+            // re-armed; wait them once here instead of re-polling (already
+            // satisfied, phase literal 0) inside every per-tile d64 pass.
+            for (int d64 = 0; d64 < KChunkCount; ++d64) {
+                mbarrier_wait(q_tma_base + d64 * sizeof(uint64_t), 0);
+            }
+
             auto issue_qk = [&](int kv_tile) {
                 const int stage = kv_tile & 1;
                 if (kv_tile >= KvStages) {
@@ -953,8 +1026,6 @@ __global__ __launch_bounds__(384, 1) void fa_mla_decode_kernel_m64(
                 const int s_addr = tmem_addr + stage * kSCols;
                 const int stage_addr = kv_smem_addr + stage * StageBytes;
                 for (int d64 = 0; d64 < KChunkCount; ++d64) {
-                    mbarrier_wait(
-                        q_tma_base + d64 * sizeof(uint64_t), 0);
                     mbarrier_wait(
                         k_tma_base + (stage * KChunkCount + d64) * sizeof(uint64_t),
                         k_phase[stage][d64]);
