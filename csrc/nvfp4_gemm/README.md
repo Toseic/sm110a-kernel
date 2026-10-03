@@ -20,8 +20,9 @@ The low-level API accepts:
   `SWIZZLE_32_4_4` blocked format.
 - Output: contiguous BF16 `[M,N]`.
 
-`M` must be a multiple of 256, `N` a multiple of 128, and `K` a multiple of
-64.  `tile_n` and `tile_k` support 64, 128, and 256. `tile_n=64/128` use two
+`M` must be a multiple of `tile_m * cluster_m` (the default is 256), `N` a
+multiple of 128, and `K` a multiple of `tile_k * split_k`. `tile_n` and
+`tile_k` support 64, 128, and 256. `tile_n=64/128` use two
 TMEM accumulator stages and the remaining TMEM capacity to
 give every mainloop SMEM stage and K=64 MMA slab a distinct scale-factor slot.
 This lets each `tile_k` stage prefetch all of its scales without aliasing an
@@ -55,3 +56,13 @@ a new sweep or prewarm the cache with:
 With `--baseline cutedsl`, use `--force-sweep-ours` or
 `--force-sweep-baseline` to re-run only the local-kernel or CuTE DSL config
 sweep. `--force-sweep` remains the shorthand for both.
+
+## Split-K and small-M
+
+`Nvfp4GemmConfig(split_k=...)` supports 1, 2, 4, and 8, provided
+`cluster_m * split_k <= 8`.  Each cluster-N rank accumulates a K partition;
+the kernel reduce-scatters FP32 partial tiles through DSMEM before converting
+to BF16 and storing.  Split-K launches one cluster per output tile, while
+`split_k=1` retains the persistent path.  `cluster_m=1` supports M=128
+workloads (the small-M tile for NVFP4); mxf4nvf4 itself has an M=128 minimum,
+so NVFP4 does not expose BF16's M=64 tile variant.

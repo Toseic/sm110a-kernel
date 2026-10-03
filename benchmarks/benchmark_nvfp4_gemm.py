@@ -32,6 +32,9 @@ from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
 
 
 DEFAULT_SHAPES = (
+    # mxf4nvf4 and its blocked scale format start at M=128.  BF16's smaller
+    # M={1,4,8,16,32} sweep is intentionally inapplicable here.
+    (128, 4096, 4096),
     (256, 256, 256),
     (512, 512, 512),
     (1024, 1024, 1024),
@@ -44,19 +47,25 @@ DEFAULT_SHAPES = (
 NVFP4_MMA_PEAK_TFLOPS = 4.0 * 250.0
 
 NVFP4_GEMM_CONFIGS = tuple(
-    Nvfp4GemmConfig(
-        tile_n=tile_n,
-        tile_k=tile_k,
-        cluster_m=cluster_m,
-        epilogue_block_n=epilogue_block_n,
-        use_prefetch=use_prefetch,
-    )
+    Nvfp4GemmConfig(tile_n=tile_n, tile_k=tile_k, cluster_m=cluster_m,
+                    epilogue_block_n=epilogue_block_n, split_k=split_k,
+                    use_prefetch=use_prefetch)
     for cluster_m in (1, 2)
+    for split_k in (1, 2, 4, 8)
     for tile_n in (64, 128, 256)
     for tile_k in (64, 128, 256)
     for epilogue_block_n in (32, 64, 128)
     for use_prefetch in (False, True)
-    if tile_n % epilogue_block_n == 0
+    if tile_n % epilogue_block_n == 0 and cluster_m * split_k <= 8
+    if not (
+        # Mirror Nvfp4GemmConfig.validate without constructing invalid
+        # candidates during module import.
+        (232448 - 1024 - 256 - 2 * 128 * epilogue_block_n * 2 -
+         (128 * epilogue_block_n * 4 if split_k > 1 else 0)) //
+        (((128 * 128 + (tile_n // cluster_m) * 128 +
+           128 * (tile_k // 16) +
+           (tile_k // 64) * ((tile_n + 127) // 128) * 512 + 1023) & ~1023)) < 2
+    )
 )
 
 
@@ -70,7 +79,7 @@ def compatible_candidates(m, n, k):
         if m % (config.tile_m * config.cluster_m) == 0
         and n % config.tile_n == 0
         and n % 128 == 0
-        and k % config.tile_k == 0
+        and k % (config.tile_k * config.split_k) == 0
         # Match CuTE's pruning: rolling L2 prefetch is a tactic for large K
         # or an incomplete CTA wave, rather than a universally profitable
         # instruction stream.
@@ -86,7 +95,7 @@ def compatible_candidates(m, n, k):
 def format_candidate(config):
     return (
         f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
-        f"/c{config.cluster_m}/e{config.epilogue_block_n}"
+        f"/c{config.cluster_m}/e{config.epilogue_block_n}/sk{config.split_k}"
         f"/{'prefetch' if config.use_prefetch else 'noprefetch'}"
     )
 
@@ -288,7 +297,7 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
         )
         return AutotuneRunner(options).resolve(
             candidates,
-            namespace="nvfp4_gemm_prefetch_v1",
+            namespace="nvfp4_gemm_splitk_v1",
             key=(m, n, k),
             prepare=prepare,
             benchmark=lambda prepared: benchmark_with_stats(

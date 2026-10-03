@@ -20,19 +20,40 @@ class Nvfp4GemmConfig:
     tile_k: int = 64
     cluster_m: int = 2
     epilogue_block_n: int = 32
+    split_k: int = 1
     use_prefetch: bool = False
 
     def validate(self) -> None:
         if self.tile_m != 128:
-            raise ValueError("tile_m must be 128")
+            # mxf4nvf4 has an M=128 instruction shape.  Small-M workloads
+            # use the one-CTA M=128 tile; unlike BF16, it has no M=64 form.
+            raise ValueError("tile_m must be 128 for NVFP4 mxf4nvf4")
         if self.cluster_m not in (1, 2):
             raise ValueError("cluster_m must be 1 or 2")
+        if self.split_k not in (1, 2, 4, 8) or self.cluster_m * self.split_k > 8:
+            raise ValueError("split_k must be 1, 2, 4, or 8 and cluster_m * split_k <= 8")
         if self.tile_n not in (64, 128, 256):
             raise ValueError("tile_n must be 64, 128, or 256")
         if self.tile_k not in (64, 128, 256):
             raise ValueError("tile_k must be 64, 128, or 256")
         if self.epilogue_block_n not in (32, 64, 128) or self.tile_n % self.epilogue_block_n:
             raise ValueError("epilogue_block_n must be 32, 64, or 128")
+        # Keep this in sync with KernelConfig.  Split-K reserves one FP32
+        # epilogue block for DSMEM partial reduction, and every configuration
+        # must still leave room for two mainloop stages.
+        per_stage_payload = (
+            self.tile_m * 128
+            + (self.tile_n // self.cluster_m) * 128
+            + self.tile_m * (self.tile_k // 16)
+            + (self.tile_k // 64) * ((self.tile_n + 127) // 128) * 512
+        )
+        per_stage_smem = (per_stage_payload + 1023) & ~1023
+        epilogue_smem = 2 * self.tile_m * self.epilogue_block_n * 2
+        reduction_smem = (
+            self.tile_m * self.epilogue_block_n * 4 if self.split_k > 1 else 0
+        )
+        if (232448 - 1024 - 256 - epilogue_smem - reduction_smem) // per_stage_smem < 2:
+            raise ValueError("configuration leaves room for fewer than two mainloop stages")
         if not isinstance(self.use_prefetch, bool):
             raise TypeError("use_prefetch must be a bool")
 
@@ -43,6 +64,7 @@ def _kernel_cflags(config: Nvfp4GemmConfig, _variant) -> tuple[str, ...]:
         for name, value in (
             ("TILE_M", config.tile_m), ("TILE_N", config.tile_n),
             ("TILE_K", config.tile_k), ("CLUSTER_M", config.cluster_m),
+            ("SPLIT_K", config.split_k),
             ("EPILOGUE_BLOCK_N", config.epilogue_block_n),
             ("USE_TMA_PREFETCH", int(config.use_prefetch)),
         )
@@ -57,13 +79,25 @@ class Nvfp4GemmModule:
 
     def _args(self):
         c = self._config
-        return self._launcher, c.tile_m, c.tile_n, c.tile_k, c.cluster_m
+        return self._launcher, c.tile_m, c.tile_n, c.tile_k, c.cluster_m, c.split_k
 
     def nvfp4_gemm(self, a, b, sfa, sfb):
         return self._binding.nvfp4_gemm(a, b, sfa, sfb, *self._args())
 
     def nvfp4_gemm_out(self, a, b, sfa, sfb, out):
         return self._binding.nvfp4_gemm_out(a, b, sfa, sfb, out, *self._args())
+
+
+def _default_config(a, b) -> Nvfp4GemmConfig:
+    """Pick compatible one-CTA/narrow tiles for the smallest legal shapes."""
+    if getattr(a, "ndim", None) != 2 or getattr(b, "ndim", None) != 2:
+        return Nvfp4GemmConfig()
+    k = a.size(1) * 2
+    return Nvfp4GemmConfig(
+        cluster_m=1 if a.size(0) % 256 else 2,
+        tile_n=256 if b.size(0) % 256 == 0 else 128,
+        tile_k=256 if k % 256 == 0 else (128 if k % 128 == 0 else 64),
+    )
 
 
 _JIT = SplitCudaJit(
@@ -174,8 +208,8 @@ def quantize_nvfp4_gemm(a, b):
 
 
 def nvfp4_gemm(a, b, sfa, sfb, config: Nvfp4GemmConfig | None = None):
-    return compile_nvfp4_gemm(config).nvfp4_gemm(a, b, sfa, sfb)
+    return compile_nvfp4_gemm(config or _default_config(a, b)).nvfp4_gemm(a, b, sfa, sfb)
 
 
 def nvfp4_gemm_out(a, b, sfa, sfb, out, config: Nvfp4GemmConfig | None = None):
-    return compile_nvfp4_gemm(config).nvfp4_gemm_out(a, b, sfa, sfb, out)
+    return compile_nvfp4_gemm(config or _default_config(a, b)).nvfp4_gemm_out(a, b, sfa, sfb, out)

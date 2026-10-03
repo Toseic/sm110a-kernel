@@ -36,10 +36,12 @@ void check_scale(const torch::Tensor& tensor, const char* name,
 void check_inputs(const torch::Tensor& a, const torch::Tensor& b,
                   const torch::Tensor& sfa, const torch::Tensor& sfb,
                   int64_t tile_m, int64_t tile_n, int64_t tile_k,
-                  int64_t cluster_m) {
+                  int64_t cluster_m, int64_t split_k) {
   check_fp4(a, "A");
   check_fp4(b, "B");
-  TORCH_CHECK(tile_m > 0 && tile_n > 0 && tile_k > 0 && cluster_m > 0,
+  TORCH_CHECK(tile_m > 0 && tile_n > 0 && tile_k > 0 && cluster_m > 0 &&
+              (split_k == 1 || split_k == 2 || split_k == 4 || split_k == 8) &&
+              cluster_m * split_k <= 8,
               "invalid NVFP4 GEMM configuration");
   TORCH_CHECK(a.device() == b.device(), "A and B must be on the same device");
   const int64_t m = a.size(0);
@@ -52,7 +54,7 @@ void check_inputs(const torch::Tensor& a, const torch::Tensor& b,
   TORCH_CHECK(n % tile_n == 0, "N must be a multiple of ", tile_n);
   TORCH_CHECK(n % 128 == 0,
               "N must be a multiple of 128 for blocked NVFP4 scales");
-  TORCH_CHECK(k % tile_k == 0, "K must be a multiple of ", tile_k);
+  TORCH_CHECK(k % (tile_k * split_k) == 0, "K must be a multiple of ", tile_k * split_k);
   check_scale(sfa, "SFA", m * (k / 16), a.device());
   check_scale(sfb, "SFB", n * (k / 16), a.device());
 }
@@ -71,9 +73,10 @@ void check_output(const torch::Tensor& out, int64_t m, int64_t n,
 torch::Tensor run_out(torch::Tensor a, torch::Tensor b, torch::Tensor sfa,
                       torch::Tensor sfb, torch::Tensor out,
                       uint64_t launcher_address, int64_t tile_m,
-                      int64_t tile_n, int64_t tile_k, int64_t cluster_m) {
+                      int64_t tile_n, int64_t tile_k, int64_t cluster_m,
+                      int64_t split_k) {
   TORCH_CHECK(launcher_address != 0, "NVFP4 GEMM launcher is null");
-  check_inputs(a, b, sfa, sfb, tile_m, tile_n, tile_k, cluster_m);
+  check_inputs(a, b, sfa, sfb, tile_m, tile_n, tile_k, cluster_m, split_k);
   check_output(out, a.size(0), b.size(0), a.device());
   c10::cuda::CUDAGuard device_guard(a.device());
   const auto launcher = reinterpret_cast<Nvfp4GemmLauncher>(
@@ -94,19 +97,19 @@ torch::Tensor nvfp4_gemm_out(torch::Tensor a, torch::Tensor b,
                              torch::Tensor sfa, torch::Tensor sfb,
                              torch::Tensor out, uint64_t launcher,
                              int64_t tile_m, int64_t tile_n, int64_t tile_k,
-                             int64_t cluster_m) {
+                             int64_t cluster_m, int64_t split_k) {
   return run_out(a, b, sfa, sfb, out, launcher, tile_m, tile_n, tile_k,
-                 cluster_m);
+                 cluster_m, split_k);
 }
 
 torch::Tensor nvfp4_gemm(torch::Tensor a, torch::Tensor b,
                          torch::Tensor sfa, torch::Tensor sfb,
                          uint64_t launcher, int64_t tile_m, int64_t tile_n,
-                         int64_t tile_k, int64_t cluster_m) {
+                         int64_t tile_k, int64_t cluster_m, int64_t split_k) {
   auto out = torch::empty({a.size(0), b.size(0)},
                           a.options().dtype(torch::kBFloat16));
   return run_out(a, b, sfa, sfb, out, launcher, tile_m, tile_n, tile_k,
-                 cluster_m);
+                 cluster_m, split_k);
 }
 
 }  // namespace
@@ -115,4 +118,3 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("nvfp4_gemm", &nvfp4_gemm);
   m.def("nvfp4_gemm_out", &nvfp4_gemm_out);
 }
-

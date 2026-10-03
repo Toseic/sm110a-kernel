@@ -324,6 +324,9 @@
 #ifndef SM110A_NVFP4_EPILOGUE_BLOCK_N
 #define SM110A_NVFP4_EPILOGUE_BLOCK_N 32
 #endif
+#ifndef SM110A_NVFP4_SPLIT_K
+#define SM110A_NVFP4_SPLIT_K 1
+#endif
 #ifndef SM110A_NVFP4_USE_TMA_PREFETCH
 #define SM110A_NVFP4_USE_TMA_PREFETCH 0
 #endif
@@ -353,9 +356,11 @@ constexpr int kMacroSwizzleM = 8;
 constexpr int kMacroSwizzleN = 8;
 constexpr bool kMacroSwizzleMFast = true;
 
-template <int kTileM, int kTileN, int kTileK, int kClusterM, int kEpilogueBlockN>
+template <int kTileM, int kTileN, int kTileK, int kClusterM, int kEpilogueBlockN, int kSplitK>
 struct KernelConfig {
     static_assert(kClusterM == 1 || kClusterM == 2);
+    static_assert((kSplitK == 1 || kSplitK == 2 || kSplitK == 4 || kSplitK == 8) &&
+                  kClusterM * kSplitK <= 8);
     static_assert(kTileM == 128);
     static_assert(kTileN == 64 || kTileN == 128 || kTileN == 256);
     static_assert(kTileK == 64 || kTileK == 128 || kTileK == 256);
@@ -385,11 +390,13 @@ struct KernelConfig {
     static constexpr int kEpilogueStageBytes =
         kTileM * kEpilogueBlockN * static_cast<int>(sizeof(nv_bfloat16));
     static constexpr int kEpilogueSmemBytes = kEpilogueStageCount * kEpilogueStageBytes;
+    static constexpr int kReductionSmemBytes =
+        kSplitK == 1 ? 0 : kTileM * kEpilogueBlockN * sizeof(float);
     // Cap the ring at six stages, while reducing it for wider K tiles so the
     // mainloop and epilogue remain within Blackwell's per-CTA SMEM budget.
     static constexpr int kSmemLimitedStageCount =
         (kMaxOptInSmemBytes - kStaticBarrierSmemBytes -
-         kMbarrierSmemBytes - kEpilogueSmemBytes) /
+         kMbarrierSmemBytes - kEpilogueSmemBytes - kReductionSmemBytes) /
         kPerStageSmemBytes;
     static constexpr int kStageCount = kSmemLimitedStageCount < 6 ? kSmemLimitedStageCount : 6;
     static_assert(kStageCount >= 2);
@@ -418,7 +425,8 @@ struct KernelConfig {
                   (kAccumulatorOverlapCols == 16 &&
                    kEpilogueBlockN >= kAccumulatorOverlapCols));
     static constexpr int kMainloopSmemBytes = kStageCount * kPerStageSmemBytes;
-    static constexpr int kDynamicSmemBytes = kMainloopSmemBytes + kEpilogueSmemBytes;
+    static constexpr int kDynamicSmemBytes =
+        kMainloopSmemBytes + kEpilogueSmemBytes + kReductionSmemBytes;
     static_assert(kStaticBarrierSmemBytes + kDynamicSmemBytes +
                       kMbarrierSmemBytes <=
                   kMaxOptInSmemBytes);
@@ -640,19 +648,27 @@ __device__ inline void tcgen05_mma_nvf4(
     }
 }
 
-template <int kClusterM>
-__device__ inline void tcgen05_commit(int mbar_addr) {
+template <int kClusterM, int kSplitK = 1>
+__device__ inline void tcgen05_commit(int mbar_addr, int split_rank = 0) {
     if constexpr (kClusterM == 1) {
         asm volatile("tcgen05.commit.cta_group::1."
                      "mbarrier::arrive::one.shared::cluster.b64 [%0];" ::
                          "r"(mbar_addr)
             : "memory");
     } else {
-        constexpr int16_t cta_mask = (1 << kClusterM) - 1;
-        asm volatile("tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster."
-                     "multicast::cluster.b64 [%0], %1;" ::
-                         "r"(mbar_addr), "h"(cta_mask)
-            : "memory");
+        if constexpr (kSplitK == 1) {
+            constexpr int16_t cta_mask = (1 << kClusterM) - 1;
+            asm volatile("tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster."
+                         "multicast::cluster.b64 [%0], %1;" ::
+                             "r"(mbar_addr), "h"(cta_mask)
+                : "memory");
+        } else {
+            const int16_t cta_mask = ((1 << kClusterM) - 1) << (split_rank * kClusterM);
+            asm volatile("tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster."
+                         "multicast::cluster.b64 [%0], %1;" ::
+                             "r"(mbar_addr), "h"(cta_mask)
+                : "memory");
+        }
     }
 }
 
@@ -815,9 +831,10 @@ template <
     int kTileK,
     int kClusterM,
     int kEpilogueBlockN,
+    int kSplitK,
     bool SWAP_AB>
 __global__
-__cluster_dims__(kClusterM, 1, 1)
+__cluster_dims__(kClusterM, kSplitK, 1)
 __launch_bounds__(kBlockThreads)
 void nvfp4_gemm_kernel(
     const __grid_constant__ CUtensorMap A_tmap,
@@ -829,7 +846,7 @@ void nvfp4_gemm_kernel(
     int N,
     int K) {
 
-    using Config = KernelConfig<kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN>;
+    using Config = KernelConfig<kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN, kSplitK>;
     constexpr int kStageCount = Config::kStageCount;
     constexpr int kATmaBytes = Config::kATmaBytes;
     constexpr int kBTmaBytes = Config::kBTmaBytes;
@@ -847,8 +864,6 @@ void nvfp4_gemm_kernel(
     constexpr int kPerStageSmemBytes = Config::kPerStageSmemBytes;
 
     const int tid = threadIdx.x;
-    const int _bid = blockIdx.x;
-    const int grid_x = gridDim.x;
     const int warp_id = tid / kWarpSize;
 
     const int grid_m = M / kTileM;
@@ -858,11 +873,17 @@ void nvfp4_gemm_kernel(
     // set up cta rank
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
+    const int m_rank = cta_rank % kClusterM;
+    const int split_rank = cta_rank / kClusterM;
+    const int _bid = blockIdx.x;
+    const int grid_x = gridDim.x;
 
     // set up smem
     extern __shared__ __align__(1024) char _smem_ptr[];
     const int smem = static_cast<int>(__cvta_generic_to_shared(_smem_ptr));
     nv_bfloat16 *epilogue_smem = reinterpret_cast<nv_bfloat16 *>(_smem_ptr + kMainloopSmemBytes);
+    float *reduction_smem = reinterpret_cast<float *>(
+        _smem_ptr + kMainloopSmemBytes + Config::kEpilogueSmemBytes);
 
     constexpr int kClusterTileM = kClusterM * kTileM;
     constexpr uint32_t i_desc =
@@ -932,7 +953,7 @@ void nvfp4_gemm_kernel(
         }
     }
 
-    if constexpr (kClusterM > 1) {
+    if constexpr (kClusterM * kSplitK > 1) {
         asm volatile("barrier.cluster.arrive.release.aligned;");
         asm volatile("barrier.cluster.wait.acquire.aligned;");
     } else {
@@ -946,12 +967,12 @@ void nvfp4_gemm_kernel(
     // corresponding regular TMA transfer remains responsible for SMEM
     // visibility and mbarrier completion.
     auto prefetch = [&](int iter_k, int off_m, int off_n) {
-        const int off_k = iter_k * kTileK;
-        const int off_k_64 = iter_k * kMmaStepsPerStage;
+        const int off_k = (split_rank * (K / (kSplitK * kTileK)) + iter_k) * kTileK;
+        const int off_k_64 = (split_rank * (K / (kSplitK * kTileK)) + iter_k) * kMmaStepsPerStage;
         tma_3d_prefetch_l2(&A_tmap, off_k, off_m, 0);
         tma_3d_prefetch_l2(&B_tmap,
             off_k,
-            off_n + cta_rank * (kTileN / kClusterM),
+            off_n + m_rank * (kTileN / kClusterM),
             0);
         tma_4d_prefetch_l2(&SFA_tmap,
             0,
@@ -965,7 +986,7 @@ void nvfp4_gemm_kernel(
             if constexpr (kClusterM == 1) {
                 tma_4d_prefetch_l2(&SFB_tmap,
                     0, 0, off_k_64, off_n / 128 + scale_tile);
-            } else if (cta_rank == 0) {
+            } else if (m_rank == 0) {
                 tma_4d_prefetch_l2(&SFB_tmap,
                     0, 0, off_k_64, off_n / 128 + scale_tile);
             }
@@ -990,7 +1011,9 @@ void nvfp4_gemm_kernel(
         const int B_smem = A_smem + kASmemBytes;
         const int SFA_smem = B_smem + kBSmemBytes;
         const int SFB_smem = SFA_smem + kSFASmemBytes;
-        const int tma_mbar_addr = (_base_tma_mbar_addr + 8 * stage_id) & 0xFEFFFFFF;
+        const int tma_mbar_addr = kClusterM == 1
+            ? _base_tma_mbar_addr + 8 * stage_id
+            : (_base_tma_mbar_addr + 8 * stage_id) & 0xFEFFFFFF;
 
         // tma issue
         constexpr int cp_size =
@@ -1000,13 +1023,13 @@ void nvfp4_gemm_kernel(
                          tma_mbar_addr),
             "r"(cp_size)
             : "memory");
-        const int off_k = iter_k * kTileK;
-        const int off_k_64 = iter_k * kMmaStepsPerStage;
+        const int off_k = (split_rank * (K / (kSplitK * kTileK)) + iter_k) * kTileK;
+        const int off_k_64 = (split_rank * (K / (kSplitK * kTileK)) + iter_k) * kMmaStepsPerStage;
         tma_3d_gmem2smem<kClusterM>(A_smem, &A_tmap, off_k, off_m, 0, tma_mbar_addr);
         tma_3d_gmem2smem<kClusterM>(B_smem,
             &B_tmap,
             off_k,
-            off_n + cta_rank * (kTileN / kClusterM),
+            off_n + m_rank * (kTileN / kClusterM),
             0,
             tma_mbar_addr);
         // The scale tensor map spans all K=64 slabs in this TileK.  SFA is
@@ -1031,8 +1054,8 @@ void nvfp4_gemm_kernel(
                     off_k_64,
                     off_n / 128 + scale_tile,
                     tma_mbar_addr);
-            } else if (cta_rank == 0) {
-                constexpr int16_t cta_mask = (1 << kClusterM) - 1;
+            } else if (m_rank == 0) {
+                const int16_t cta_mask = ((1 << kClusterM) - 1) << (split_rank * kClusterM);
                 tma_4d_gmem2smem_multicast<kClusterM>(SFB_tile_smem,
                     &SFB_tmap,
                     0,
@@ -1125,7 +1148,7 @@ void nvfp4_gemm_kernel(
                 iter_k != 0 || mma_k != 0);
         }
 
-        tcgen05_commit<kClusterM>(mma_mbar_addr);
+        tcgen05_commit<kClusterM, kSplitK>(mma_mbar_addr, split_rank);
             };
 
     auto tmem_to_smem = [&](int mainloop_stage,
@@ -1137,7 +1160,7 @@ void nvfp4_gemm_kernel(
 
         for (int n = n_group_begin; n < n_group_end; n++) {
             float tmp[8];
-            const int row = cta_rank * 128 + warp_id * 32;
+            const int row = m_rank * 128 + warp_id * 32;
             const int col =
                 mainloop_stage * kAccumulatorStageStride +
                 n_block * kEpilogueBlockN + n * 8;
@@ -1437,17 +1460,17 @@ void nvfp4_gemm_kernel(
                 // Prime a full pipeline-distance window.  The rolling issue
                 // below visits every later K tile exactly once.
                 for (int iter_k = 0;
-                     iter_k < min(kPrefetchDistance, k_tile_count);
+                     iter_k < min(kPrefetchDistance, k_tile_count / kSplitK);
                      ++iter_k) {
                     prefetch(iter_k, off_m, off_n);
                 }
             }
 
-            for (int iter_k = 0; iter_k < k_tile_count; ++iter_k) {
+            for (int iter_k = 0; iter_k < k_tile_count / kSplitK; ++iter_k) {
                 load(iter_k, mma_phase, mma_stage, off_m, off_n);
                 if constexpr (kPrefetchTmaData) {
                     const int future_k = iter_k + kPrefetchDistance;
-                    if (future_k < k_tile_count) {
+                    if (future_k < k_tile_count / kSplitK) {
                         prefetch(future_k, off_m, off_n);
                     }
                 }
@@ -1460,7 +1483,7 @@ void nvfp4_gemm_kernel(
     }
 
     // mma warp
-    if (cta_rank == 0 && warp_id == 5 && elect_sync()) {
+    if (m_rank == 0 && warp_id == 5 && elect_sync()) {
         int tma_phase = 0;
         int tma_stage = 0;
 
@@ -1483,7 +1506,7 @@ void nvfp4_gemm_kernel(
                 }
             }
 
-            for (int iter_k = 0; iter_k < K / kTileK; ++iter_k) {
+            for (int iter_k = 0; iter_k < K / (kSplitK * kTileK); ++iter_k) {
                 compute(iter_k, mainloop_stage, tma_phase, tma_stage, off_n);
                 tma_stage = (tma_stage + 1) % kStageCount;
                 if (tma_stage == 0) {
@@ -1491,7 +1514,8 @@ void nvfp4_gemm_kernel(
                 }
             }
 
-            tcgen05_commit<kClusterM>(_base_mainloop_mbar_addr + 8 * mainloop_stage);
+            tcgen05_commit<kClusterM, kSplitK>(
+                _base_mainloop_mbar_addr + 8 * mainloop_stage, split_rank);
 
             mainloop_stage = (mainloop_stage + 1) % kAccumulatorStageCount;
             if (mainloop_stage == 0) {
@@ -1501,8 +1525,92 @@ void nvfp4_gemm_kernel(
         }
     }
 
-    // epilogue
-    if (warp_id < 4) {
+    // Split-K publishes FP32 partials in each CTA's shared memory.  Cluster-N
+    // ranks reduce different M-row ranges through DSMEM and own their stores.
+    if constexpr (kSplitK > 1) {
+        static_assert(!SWAP_AB, "split-K and swap_ab are mutually exclusive");
+        static_assert(kTileM % kSplitK == 0);
+        constexpr int kRowsPerSplit = kTileM / kSplitK;
+        constexpr int kBlocks = kTileN / kEpilogueBlockN;
+        constexpr int kVectorsPerRow = kEpilogueBlockN / 8;
+        constexpr int kOutputVectors = (kRowsPerSplit * kEpilogueBlockN) / 8;
+        const auto [off_m, off_n] = compute_bid(_bid);
+        uint64_t cache_policy = 0;
+        if (tid == 0) cache_policy = make_epilogue_cache_policy();
+        if (warp_id < 4) {
+            wait_mainloop(_base_mainloop_mbar_addr, 0);
+            asm volatile("tcgen05.fence::after_thread_sync;");
+        }
+        for (int n_block = 0; n_block < kBlocks; ++n_block) {
+            const int smem_stage = n_block % kEpilogueStageCount;
+            if (n_block >= kEpilogueStageCount) {
+                if (tid == 0) asm volatile("cp.async.bulk.wait_group.read 1;" ::: "memory");
+                __syncthreads();
+            }
+            if (warp_id < 4) {
+                const int row = warp_id * 32 + (tid & 31);
+                for (int n = 0; n < kEpilogueBlockN / 8; ++n) {
+                    float tmp[8];
+                    const int addr = taddr + ((m_rank * kTileM + warp_id * 32) << 16) +
+                                     n_block * kEpilogueBlockN + n * 8;
+                    asm volatile("tcgen05.ld.sync.aligned.32x32b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                        : "=f"(tmp[0]), "=f"(tmp[1]), "=f"(tmp[2]), "=f"(tmp[3]),
+                          "=f"(tmp[4]), "=f"(tmp[5]), "=f"(tmp[6]), "=f"(tmp[7]) : "r"(addr));
+                    asm volatile("tcgen05.wait::ld.sync.aligned;");
+                    for (int i = 0; i < 8; ++i)
+                        reduction_smem[row * kEpilogueBlockN + n * 8 + i] = tmp[i];
+                }
+            }
+            asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+            asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+            nv_bfloat16 *out_smem = epilogue_smem + smem_stage * kTileM * kEpilogueBlockN;
+            for (int vector = tid; vector < kOutputVectors; vector += kBlockThreads) {
+                const int local_row = vector / kVectorsPerRow;
+                const int col = (vector % kVectorsPerRow) * 8;
+                const int source_elem = (split_rank * kRowsPerSplit + local_row) *
+                                        kEpilogueBlockN + col;
+                const int local_addr = static_cast<int>(__cvta_generic_to_shared(
+                    reduction_smem + source_elem));
+                float sum[8] = {};
+                for (int s = 0; s < kSplitK; ++s) {
+                    int remote_addr;
+                    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;"
+                        : "=r"(remote_addr) : "r"(local_addr), "r"(s * kClusterM + m_rank));
+                    const int remote_addr_hi = remote_addr + 4 * static_cast<int>(sizeof(float));
+                    float value[8];
+                    asm volatile("ld.shared::cluster.v4.f32 {%0, %1, %2, %3}, [%8];\n\t"
+                                 "ld.shared::cluster.v4.f32 {%4, %5, %6, %7}, [%9];"
+                        : "=f"(value[0]), "=f"(value[1]), "=f"(value[2]), "=f"(value[3]),
+                          "=f"(value[4]), "=f"(value[5]), "=f"(value[6]), "=f"(value[7])
+                        : "r"(remote_addr), "r"(remote_addr_hi) : "memory");
+                    #pragma unroll
+                    for (int i = 0; i < 8; ++i) sum[i] += value[i];
+                }
+                const int swizzled_vector = (vector & ~7) + ((vector & 7) ^ ((vector >> 3) & 3));
+                nv_bfloat162 out[4];
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) out[i] = __float22bfloat162_rn({sum[2*i], sum[2*i+1]});
+                reinterpret_cast<int4 *>(out_smem + swizzled_vector * 8)[0] =
+                    reinterpret_cast<int4 *>(out)[0];
+            }
+            __syncthreads();
+            if (tid == 0) {
+                const int stage_smem = static_cast<int>(__cvta_generic_to_shared(out_smem));
+                if constexpr (kEpilogueBlockN == 32)
+                    tma_2d_smem2gmem(cache_policy, stage_smem, &C_tmap,
+                        off_n + n_block * kEpilogueBlockN, off_m + split_rank * kRowsPerSplit);
+                else
+                    tma_3d_smem2gmem(cache_policy, stage_smem, &C_tmap, 0,
+                        (off_n + n_block * kEpilogueBlockN) / 32,
+                        off_m + split_rank * kRowsPerSplit);
+            }
+            asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+            asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+        }
+        if (tid == 0) asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+        __syncthreads();
+    // Normal persistent epilogue.
+    } else if (warp_id < 4) {
         int mainloop_stage = 0;
         int mainloop_phase = 0;
 
@@ -1518,7 +1626,7 @@ void nvfp4_gemm_kernel(
         }
     }
 
-    if constexpr (kClusterM > 1) {
+    if constexpr (kClusterM * kSplitK > 1) {
         asm volatile("barrier.cluster.arrive.release.aligned;");
         asm volatile("barrier.cluster.wait.acquire.aligned;");
     } else {
@@ -1538,6 +1646,7 @@ template <int kTileM,
     int kTileK,
     int kClusterM,
     int kEpilogueBlockN,
+    int kSplitK,
     bool SWAP_AB>
 void launch_nvfp4_gemm_impl(
     const uint8_t *A_ptr,
@@ -1550,7 +1659,7 @@ void launch_nvfp4_gemm_impl(
     int K,
     cudaStream_t stream) {
 
-    using Config = KernelConfig<kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN>;
+    using Config = KernelConfig<kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN, kSplitK>;
     constexpr int kStageCount = Config::kStageCount;
     constexpr int kDynamicSmemBytes = Config::kDynamicSmemBytes;
 
@@ -1573,7 +1682,7 @@ void launch_nvfp4_gemm_impl(
     assert(M % (kClusterM * kTileM) == 0);
     assert(N % kTileN == 0);
     assert(N % 128 == 0);
-    assert(K % kTileK == 0);
+    assert(K % (kTileK * kSplitK) == 0);
 
     init_fp4_tmap(&A_tmap,
         A_ptr,
@@ -1595,17 +1704,19 @@ void launch_nvfp4_gemm_impl(
     if constexpr (SWAP_AB) {
         init_3D_output_tmap(&C_tmap, C_ptr, logic_M, logic_N, kEpilogueBlockN, kTileM);
     } else if constexpr (kEpilogueBlockN == 32) {
-        init_2D_output_tmap(&C_tmap, C_ptr, logic_M, logic_N, kTileM, kEpilogueBlockN);
+        init_2D_output_tmap(&C_tmap, C_ptr, logic_M, logic_N,
+                            kTileM / kSplitK, kEpilogueBlockN);
     } else {
-        init_3D_output_tmap(&C_tmap, C_ptr, logic_M, logic_N, kTileM, kEpilogueBlockN);
+        init_3D_output_tmap(&C_tmap, C_ptr, logic_M, logic_N,
+                            kTileM / kSplitK, kEpilogueBlockN);
     }
 
     const int smem_size = kDynamicSmemBytes + kMbarrierSmemBytes;
 
-    int grid = kSmCount;
+    dim3 grid(kSplitK == 1 ? kSmCount : (M / kTileM) * (N / kTileN), kSplitK, 1);
 
     auto kernel =
-        nvfp4_gemm_kernel<kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN, SWAP_AB>;
+        nvfp4_gemm_kernel<kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN, kSplitK, SWAP_AB>;
 
     if (smem_size > 48 * 1024) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
@@ -1637,6 +1748,7 @@ void launch_nvfp4_gemm(
         SM110A_NVFP4_TILE_K,
         SM110A_NVFP4_CLUSTER_M,
         SM110A_NVFP4_EPILOGUE_BLOCK_N,
+        SM110A_NVFP4_SPLIT_K,
         false>(A_ptr, B_ptr, SFA_ptr, SFB_ptr, C_ptr, M, N, K, stream);
 }
 
