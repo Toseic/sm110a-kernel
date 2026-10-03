@@ -13,7 +13,7 @@ if str(ROOT) not in sys.path:
 
 from common import benchmark_with_stats, tflops_from_ms
 from sm110a_kernel import (
-    Fp8Mxfp4GemmConfig, fp8mxfp4_gemm_out, fp8mxfp4_gemm_reference,
+    Fp8Mxfp4GemmConfig, compile_fp8mxfp4_gemm, fp8mxfp4_gemm_reference,
     from_blocked_fp8mxfp4_scales, quantize_fp8mxfp4_gemm,
 )
 
@@ -182,7 +182,8 @@ def main():
         x8, w4, sfb = quantize_fp8mxfp4_gemm(x, w, compact_b_gmem=compact_b_gmem)
         out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
         config = config_for(m, n, k, compact_b_gmem)
-        run = lambda: fp8mxfp4_gemm_out(x8, w4, sfb, out, config=config)
+        module = compile_fp8mxfp4_gemm(config)
+        run = lambda: module.fp8mxfp4_gemm_out(x8, w4, sfb, out)
         run(); torch.cuda.synchronize()
         stats = benchmark_with_stats(run, a.warmup, a.iters, a.samples)
         baseline_out = None

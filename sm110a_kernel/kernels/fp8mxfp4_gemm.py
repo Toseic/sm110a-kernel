@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
@@ -135,5 +136,25 @@ def dequantize_fp8mxfp4_weights(packed, sfb, rows:int, k:int):
     return (values.view(rows,k//32,32)*scale.unsqueeze(-1)).reshape(rows,k)
 def fp8mxfp4_gemm_reference(a,b,sfb): return (a.float() @ dequantize_fp8mxfp4_weights(b,sfb,b.size(0),a.size(1)).t()).to(__import__('torch').bfloat16)
 def _default(a,b): return Fp8Mxfp4GemmConfig(cluster_m=1 if a.size(0)%256 else 2,tile_n=256 if b.size(0)%256==0 else 128,tile_k=128 if a.size(1)%128==0 else 64,compact_b_gmem=b.size(1)==a.size(1)//2)
-def fp8mxfp4_gemm(a,b,sfb,config=None): return compile_fp8mxfp4_gemm(config or _default(a,b)).fp8mxfp4_gemm(a,b,sfb)
-def fp8mxfp4_gemm_out(a,b,sfb,out,config=None): return compile_fp8mxfp4_gemm(config or _default(a,b)).fp8mxfp4_gemm_out(a,b,sfb,out)
+
+
+@lru_cache(maxsize=None)
+def _compiled_facade(config: Fp8Mxfp4GemmConfig) -> Fp8Mxfp4GemmModule:
+    """Resolve a convenience-API configuration once per process.
+
+    ``SplitCudaJit.compile`` deliberately checks environment-selected variants
+    on every call.  That is appropriate for explicit compilation, but calling
+    it between tiny kernel launches leaves visible host-side gaps in the CUDA
+    stream.  The convenience APIs are a steady-state execution path, so hold
+    their already-resolved facade here.  Call ``compile_fp8mxfp4_gemm``
+    explicitly when selecting a new JIT/environment variant at runtime.
+    """
+    return compile_fp8mxfp4_gemm(config)
+
+
+def fp8mxfp4_gemm(a,b,sfb,config=None):
+    return _compiled_facade(config or _default(a,b)).fp8mxfp4_gemm(a,b,sfb)
+
+
+def fp8mxfp4_gemm_out(a,b,sfb,out,config=None):
+    return _compiled_facade(config or _default(a,b)).fp8mxfp4_gemm_out(a,b,sfb,out)
