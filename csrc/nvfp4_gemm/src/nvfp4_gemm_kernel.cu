@@ -883,6 +883,10 @@ void nvfp4_gemm_kernel(
     __shared__ uint64_t mma_mbars[kStageCount];
     __shared__ uint64_t mainlooop_mbars[kAccumulatorStageCount];
     __shared__ uint64_t epilogue_mbars[kAccumulatorStageCount];
+    // Each CTA writes its overlap epoch to CTA rank 0 through DSMEM.  The
+    // MMA issuer can then poll a local, cluster-complete dependency token.
+    __shared__ volatile unsigned int overlap_ready[kClusterM][kAccumulatorStageCount];
+    __shared__ unsigned int overlap_epoch_local[kAccumulatorStageCount];
     const int _base_tma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(tma_mbars));
     const int _base_mma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(mma_mbars));
     const int _base_mainloop_mbar_addr =
@@ -898,6 +902,13 @@ void nvfp4_gemm_kernel(
         for (int s = 0; s < kAccumulatorStageCount; ++s) {
             mbarrier_init(_base_mainloop_mbar_addr + 8 * s, 1);
             mbarrier_init(_base_epilogue_mbar_addr + 8 * s, 4 * kClusterM);
+            overlap_epoch_local[s] = 0;
+            if (cta_rank == 0) {
+                #pragma unroll
+                for (int rank = 0; rank < kClusterM; ++rank) {
+                    overlap_ready[rank][s] = 0;
+                }
+            }
         }
 
         asm volatile("fence.mbarrier_init.release.cluster;");
@@ -1205,7 +1216,18 @@ void nvfp4_gemm_kernel(
                 0,
                 overlap_group_begin,
                 overlap_group_end);
-            release_tmem();
+            asm volatile("bar.sync 1, 128;" ::: "memory");
+            if (tid == 0) {
+                const unsigned int epoch = ++overlap_epoch_local[mainloop_stage];
+                const int local_addr = static_cast<int>(__cvta_generic_to_shared(
+                    const_cast<unsigned int *>(
+                        &overlap_ready[cta_rank][mainloop_stage])));
+                int rank_zero_addr;
+                asm volatile("mapa.shared::cluster.u32 %0, %1, %2;"
+                             : "=r"(rank_zero_addr) : "r"(local_addr), "r"(0));
+                asm volatile("st.shared::cluster.u32 [%0], %1;" ::
+                             "r"(rank_zero_addr), "r"(epoch) : "memory");
+            }
             tmem_to_smem(mainloop_stage, overlap_block, 0, 0, overlap_group_begin);
             tmem_to_smem(mainloop_stage,
                 overlap_block,
@@ -1264,6 +1286,9 @@ void nvfp4_gemm_kernel(
                     tmem_to_smem(
                         mainloop_stage, next_block, next_stage, 0, n_group_num);
                     asm volatile("bar.sync 1, 128;" ::: "memory");
+                    if (block_idx + 2 == n_block_num) {
+                        release_tmem();
+                    }
                 }
             }
 
@@ -1441,10 +1466,22 @@ void nvfp4_gemm_kernel(
 
         int mainloop_stage = 0;
         int epilogue_phase = 1;
+        unsigned int overlap_epoch[kAccumulatorStageCount] = {};
+        bool first_output_tile = true;
 
         for (int bid = _bid; bid < grid_size; bid += grid_x) {
             auto [off_m, off_n] = compute_bid(bid);
-                        wait_epilogue(_base_epilogue_mbar_addr + mainloop_stage * 8, epilogue_phase);
+            wait_epilogue(_base_epilogue_mbar_addr + mainloop_stage * 8, epilogue_phase);
+            if constexpr (kAccumulatorOverlapCols != 0) {
+                if (!first_output_tile) {
+                    const int previous_stage = 1 - mainloop_stage;
+                    const unsigned int target = ++overlap_epoch[previous_stage];
+                    #pragma unroll
+                    for (int rank = 0; rank < kClusterM; ++rank) {
+                        while (overlap_ready[rank][previous_stage] < target) {}
+                    }
+                }
+            }
 
             for (int iter_k = 0; iter_k < K / kTileK; ++iter_k) {
                 compute(iter_k, mainloop_stage, tma_phase, tma_stage, off_n);
@@ -1460,6 +1497,7 @@ void nvfp4_gemm_kernel(
             if (mainloop_stage == 0) {
                 epilogue_phase ^= 1;
             }
+            first_output_tile = false;
         }
     }
 
