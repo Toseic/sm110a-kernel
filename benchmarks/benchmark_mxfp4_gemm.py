@@ -24,11 +24,13 @@ from common import (
 from sm110a_kernel import (
     Mxfp4GemmConfig,
     compile_mxfp4_gemm,
+    from_blocked_mxfp4_scales,
     mxfp4_gemm_out,
     mxfp4_gemm_reference,
     quantize_mxfp4_gemm,
 )
 from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
+from deepgemm_baseline import mxfp4_nt as deepgemm_mxfp4_nt
 
 
 DEFAULT_SHAPES = (
@@ -142,7 +144,7 @@ class Mxfp4GemmBenchmark(BenchmarkBase):
         parser.add_argument("--no-accuracy", action="store_true")
         parser.add_argument("--seed", type=int, default=1234)
         parser.add_argument(
-            "--baseline", choices=("dequant-bf16",), default="dequant-bf16",
+            "--baseline", choices=("dequant-bf16", "deepgemm"), default="dequant-bf16",
             help="reference implementation to benchmark",
         )
         parser.add_argument(
@@ -183,7 +185,10 @@ class Mxfp4GemmBenchmark(BenchmarkBase):
             ("Baseline(ms)", 14), ("Baseline TF/s", 15),
             ("Speedup", 10), ("MaxDiff", 12), ("BestConfig", 24),
         ), debug=args.debug)
-        print("[baseline] FP32 dequantize + BF16 GEMM reference (PyTorch has no MXFP4 _scaled_mm path)")
+        if args.baseline == "deepgemm":
+            print("[baseline] locally patched DeepGEMM FP4xFP4 NT GEMM")
+        else:
+            print("[baseline] FP32 dequantize + BF16 GEMM reference (PyTorch has no MXFP4 _scaled_mm path)")
         print("[runner] config selection is cached per workload and CUDA environment")
         table.print_header()
         sol_report = SolReport(debug=args.debug) if args.sol else None
@@ -193,7 +198,14 @@ class Mxfp4GemmBenchmark(BenchmarkBase):
             aq, bq, sfa, sfb = quantize_mxfp4_gemm(a, b)
             out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
             ref = mxfp4_gemm_reference(aq, bq, sfa, sfb)
-            baseline_fn = lambda: mxfp4_gemm_reference(aq, bq, sfa, sfb)
+            baseline_out = torch.empty_like(out)
+            baseline_fn = (
+                deepgemm_mxfp4_nt(
+                    aq, bq, sfa, sfb, baseline_out,
+                    from_blocked_scales=from_blocked_mxfp4_scales,
+                ) if args.baseline == "deepgemm" else
+                lambda: mxfp4_gemm_reference(aq, bq, sfa, sfb)
+            )
             baseline_stats = benchmark_with_stats(
                 baseline_fn, args.warmup, args.iters, args.samples,
                 cold_l2_flush=args._cold_l2_flush,
@@ -205,12 +217,20 @@ class Mxfp4GemmBenchmark(BenchmarkBase):
             max_diff = 0.0
             if not args.no_accuracy:
                 selection.prepared.run()
-                ref = baseline_fn()
+                if args.baseline == "deepgemm":
+                    baseline_fn()
+                else:
+                    ref = baseline_fn()
                 torch.cuda.synchronize()
                 max_diff = (out.float() - ref.float()).abs().max().item()
                 if not torch.equal(out, ref):
                     raise AssertionError(
                         f"MXFP4 mismatch for {m}x{n}x{k}: max diff {max_diff}"
+                    )
+                if args.baseline == "deepgemm" and not torch.equal(baseline_out, ref):
+                    baseline_diff = (baseline_out.float() - ref.float()).abs().max().item()
+                    raise AssertionError(
+                        f"DeepGEMM MXFP4 mismatch for {m}x{n}x{k}: max diff {baseline_diff}"
                     )
             kms = kernel_stats["median_ms"]
             bms = baseline_stats["median_ms"]

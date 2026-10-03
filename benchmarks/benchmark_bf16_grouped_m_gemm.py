@@ -25,6 +25,7 @@ from sm110a_kernel import (
     prepare_grouped_m_metadata,
 )
 from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
+from deepgemm_baseline import bf16_grouped_nt as deepgemm_bf16_grouped_nt
 
 '''
 roofline analysis:
@@ -82,6 +83,37 @@ def make_workload(tokens_per_expert, b):
     out_kernel = torch.empty((valid_m, n), device="cuda", dtype=torch.bfloat16)
     out_baseline = torch.empty((valid_m, n), device="cuda", dtype=torch.bfloat16)
     return a, layout, out_kernel, out_baseline
+
+
+def make_deepgemm_workload(a, layout, b, tokens_per_expert):
+    """Pad each contiguous expert segment for DeepGEMM's grouped contract.
+
+    DeepGEMM requires its per-expert rows to be 128-aligned; the native
+    benchmark deliberately stores the same segments compactly.  This packing
+    is setup work, outside the timed region, just as the native metadata is.
+    """
+    experts, n, k = b.shape
+    padded_tokens = math.ceil(tokens_per_expert / 128) * 128
+    padded_a = torch.zeros(
+        (experts * padded_tokens, k), device=a.device, dtype=a.dtype
+    )
+    padded_layout = torch.full(
+        (experts * padded_tokens,), -1, device=a.device, dtype=torch.int32
+    )
+    padded_a = padded_a.view(experts, padded_tokens, k)
+    padded_a[:, :tokens_per_expert].copy_(a.view(experts, tokens_per_expert, k))
+    padded_layout = padded_layout.view(experts, padded_tokens)
+    padded_layout[:, :tokens_per_expert] = torch.arange(
+        experts, device=a.device, dtype=torch.int32
+    ).unsqueeze(1)
+    padded_out = torch.empty(
+        (experts * padded_tokens, n), device=a.device, dtype=a.dtype
+    )
+
+    def valid_output():
+        return padded_out.view(experts, padded_tokens, n)[:, :tokens_per_expert].reshape(-1, n)
+
+    return padded_a.reshape(-1, k), padded_layout.reshape(-1), padded_out, valid_output
 
 
 def run_grouped_baseline(a, b, tokens_per_expert, out):
@@ -275,6 +307,10 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
             help="print per-config performance after the benchmark",
         )
         self.add_torch_blas_arg(parser)
+        parser.add_argument(
+            "--baseline", choices=("torch", "deepgemm"), default="torch",
+            help="reference implementation to benchmark",
+        )
         self.add_cache_args(parser)
         self.add_pre_parallel_jit_arg(parser)
         self.add_sol_arg(parser)
@@ -299,6 +335,8 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
 
         actual_blas = self.configure_torch_blas(args.torch_blas)
         print(f"[torch] preferred BLAS backend: {actual_blas}")
+        if args.baseline == "deepgemm":
+            print("[baseline] locally patched DeepGEMM contiguous grouped-M BF16 GEMM")
         print(
             f"[workload] experts={EXPERTS} n={N} k={K} "
             f"tokens_per_expert={tokens_per_expert_values}"
@@ -311,12 +349,19 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
             a, layout, out_kernel, out_baseline = make_workload(
                 tokens_per_expert, b
             )
-            baseline_stats = benchmark_grouped_baseline(
-                a,
-                b,
-                tokens_per_expert,
-                out_baseline,
-                args,
+            if args.baseline == "deepgemm":
+                deep_a, deep_layout, deep_out, deep_valid_output = make_deepgemm_workload(
+                    a, layout, b, tokens_per_expert
+                )
+                baseline = deepgemm_bf16_grouped_nt(deep_a, b, deep_out, deep_layout)
+            else:
+                deep_valid_output = lambda: out_baseline
+                baseline = lambda: run_grouped_baseline(
+                    a, b, tokens_per_expert, out_baseline
+                )
+            baseline_stats = benchmark_with_stats(
+                baseline, args.warmup, args.iters, args.samples,
+                cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             )
             selection = self.resolve_grouped_kernel(a, b, layout, out_kernel, args)
             kernel_stats = selection.stats
@@ -332,8 +377,8 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
             diff = 0.0
             if args.check:
                 selection.prepared.run()
-                run_grouped_baseline(a, b, tokens_per_expert, out_baseline)
-                diff = max_valid_abs_diff(out_baseline, out_kernel)
+                baseline()
+                diff = max_valid_abs_diff(deep_valid_output(), out_kernel)
             self.make_result_table().print_row(
                 *print_result(
                     tokens_per_expert,

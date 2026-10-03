@@ -31,6 +31,7 @@ from sm110a_kernel import (
     cublaslt_gemm_out_batched,
 )
 from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
+from deepgemm_baseline import bf16_nt as deepgemm_bf16_nt
 
 
 DEFAULT_SHAPES = [
@@ -184,7 +185,7 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
     default_shapes = DEFAULT_SHAPES
 
     def baseline_choices(self):
-        return ("torch", "cublaslt", "cutedsl")
+        return ("torch", "cublaslt", "cutedsl", "deepgemm")
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -254,6 +255,9 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
         if args.baseline == "cutedsl":
             print("[baseline] CuTE DSL persistent BF16 GEMM (autotuned)")
             return "CuTE DSL"
+        if args.baseline == "deepgemm":
+            print("[baseline] locally patched DeepGEMM BF16 NT GEMM")
+            return "DeepGEMM"
         baseline_name = super().emit_runtime_banner(args, actual_blas)
         print(
             "[runner] config selection is cached per workload and CUDA environment"
@@ -343,6 +347,16 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
                 args.samples,
                 cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             )
+        elif args.baseline == "deepgemm":
+            baseline_name = "DeepGEMM"
+            baseline_fn = deepgemm_bf16_nt(a, b_kernel, out_baseline)
+            baseline_stats = benchmark_with_stats(
+                baseline_fn,
+                args.warmup,
+                args.iters,
+                args.samples,
+                cold_l2_flush=getattr(args, "_cold_l2_flush", None),
+            )
         else:
             raise SystemExit(f"unsupported --baseline value: {args.baseline}")
 
@@ -359,6 +373,8 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
                 baseline_fn()
             elif args.baseline == "cublaslt":
                 cublaslt_gemm_out(a, b, out_baseline, workspace)
+            elif args.baseline == "deepgemm":
+                baseline_fn()
             else:
                 cute_dsl_runner.run()
             max_abs_diff = (

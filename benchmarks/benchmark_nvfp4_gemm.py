@@ -29,6 +29,7 @@ from sm110a_kernel import (
     quantize_nvfp4_gemm,
 )
 from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
+from deepgemm_baseline import nvfp4_nt as deepgemm_nvfp4_nt
 
 
 DEFAULT_SHAPES = (
@@ -139,7 +140,7 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
         parser.add_argument("--no-accuracy", action="store_true")
         parser.add_argument("--seed", type=int, default=1234)
         parser.add_argument(
-            "--baseline", choices=("torch", "cutedsl"), default="torch",
+            "--baseline", choices=("torch", "cutedsl", "deepgemm"), default="torch",
             help="reference implementation to benchmark",
         )
         parser.add_argument(
@@ -215,6 +216,8 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
         ), debug=args.debug)
         if args.baseline == "cutedsl":
             print("[baseline] CuTE DSL persistent NVFP4 GEMM (autotuned)")
+        elif args.baseline == "deepgemm":
+            print("[baseline] locally patched DeepGEMM cuBLASLt NVFP4 GEMM")
         else:
             print("[baseline] torch._scaled_mm NVFP4")
         print("[runner] config selection is cached per workload and CUDA environment")
@@ -239,6 +242,8 @@ class Nvfp4GemmBenchmark(BenchmarkBase):
                     cutedsl_nvmmh_max_tactics=args.cutedsl_nvmmh_max_tactics,
                 ))
                 baseline_fn = cute_dsl_runner.run
+            elif args.baseline == "deepgemm":
+                baseline_fn = deepgemm_nvfp4_nt(aq, bq, sfa, sfb, ref)
             else:
                 baseline_fn = lambda: torch._scaled_mm(
                     aq, bq.t(), sfa, sfb, out_dtype=torch.bfloat16, out=ref
