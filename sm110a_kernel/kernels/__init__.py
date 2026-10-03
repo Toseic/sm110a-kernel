@@ -74,6 +74,13 @@ from .mxfp4_gemm import (
     quantize_mxfp4_rows,
     to_blocked_mxfp4_scales,
 )
+from .fp8mxfp4_gemm import (
+    Fp8Mxfp4GemmConfig, compile_fp8mxfp4_gemm,
+    compile_fp8mxfp4_gemm_configs, fp8mxfp4_gemm, fp8mxfp4_gemm_out,
+    fp8mxfp4_gemm_reference, quantize_fp8mxfp4_gemm,
+    quantize_fp8mxfp4_weights, to_blocked_fp8mxfp4_scales,
+    from_blocked_fp8mxfp4_scales,
+)
 from .fc1_block_interleaved_swiglu import (
     Fc1BlockInterleavedSwiGLUConfig,
     Fc1Metadata,

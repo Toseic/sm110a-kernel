@@ -23,6 +23,10 @@ from .kernels.mxfp4_gemm import (
     mxfp4_gemm,
     mxfp4_gemm_out,
 )
+from .kernels.fp8mxfp4_gemm import (
+    Fp8Mxfp4GemmConfig, compile_fp8mxfp4_gemm,
+    compile_fp8mxfp4_gemm_configs, fp8mxfp4_gemm, fp8mxfp4_gemm_out,
+)
 from .kernels.fc1_block_interleaved_swiglu import (
     Fc1BlockInterleavedSwiGLUConfig,
     Fc1Metadata,
