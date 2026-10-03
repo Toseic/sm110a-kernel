@@ -74,7 +74,8 @@ class B300Sim:
             return requested_mode
         # All current NVFP4 entry points include this in their filename.  Keep
         # an explicit override for future mixed-precision benchmarks.
-        return "nvfp4" if "nvfp4" in Path(sys.argv[0]).stem.lower() else "bf16"
+        benchmark_name = Path(sys.argv[0]).stem.lower()
+        return "nvfp4" if ("nvfp4" in benchmark_name or "mxfp4" in benchmark_name) else "bf16"
 
     @staticmethod
     def _read(path):

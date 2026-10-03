@@ -74,6 +74,19 @@ from .kernels.nvfp4_gemm import (
     quantize_nvfp4_rows,
     to_blocked_nvfp4_scales,
 )
+from .kernels.mxfp4_gemm import (
+    Mxfp4GemmConfig,
+    compile_mxfp4_gemm,
+    compile_mxfp4_gemm_configs,
+    dequantize_mxfp4_rows,
+    from_blocked_mxfp4_scales,
+    mxfp4_gemm,
+    mxfp4_gemm_out,
+    mxfp4_gemm_reference,
+    quantize_mxfp4_gemm,
+    quantize_mxfp4_rows,
+    to_blocked_mxfp4_scales,
+)
 from .kernels.cublaslt import (
     cublaslt_gemm,
     cublaslt_gemm_out,

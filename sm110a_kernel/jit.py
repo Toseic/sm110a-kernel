@@ -16,6 +16,13 @@ from .kernels.nvfp4_gemm import (
     nvfp4_gemm,
     nvfp4_gemm_out,
 )
+from .kernels.mxfp4_gemm import (
+    Mxfp4GemmConfig,
+    compile_mxfp4_gemm,
+    compile_mxfp4_gemm_configs,
+    mxfp4_gemm,
+    mxfp4_gemm_out,
+)
 from .kernels.fc1_block_interleaved_swiglu import (
     Fc1BlockInterleavedSwiGLUConfig,
     Fc1Metadata,
