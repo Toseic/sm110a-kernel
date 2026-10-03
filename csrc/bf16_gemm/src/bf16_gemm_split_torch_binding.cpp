@@ -21,46 +21,49 @@ void check_tensor(const torch::Tensor& tensor, const char* name) {
 }
 
 void check_config(int64_t tile_m, int64_t tile_n, int64_t tile_k,
-                  int64_t cluster_m, int64_t max_active_clusters) {
+                  int64_t cluster_m, int64_t split_k, int64_t max_active_clusters) {
   TORCH_CHECK(tile_m > 0 && tile_n > 0 && tile_k > 0 && cluster_m > 0 &&
-                  max_active_clusters > 0,
+                  (split_k == 1 || split_k == 2 || split_k == 4 || split_k == 8) &&
+                  cluster_m * split_k <= 8 && max_active_clusters > 0,
               "invalid BF16 GEMM configuration");
 }
 
 void check_inputs(const torch::Tensor& a, const torch::Tensor& b,
                   int64_t tile_m, int64_t tile_n, int64_t tile_k,
-                  int64_t cluster_m, int64_t max_active_clusters, bool swap_ab) {
+                  int64_t cluster_m, int64_t split_k, int64_t max_active_clusters, bool swap_ab) {
   check_tensor(a, "A");
   check_tensor(b, "B");
-  check_config(tile_m, tile_n, tile_k, cluster_m, max_active_clusters);
+  check_config(tile_m, tile_n, tile_k, cluster_m, split_k, max_active_clusters);
   TORCH_CHECK(a.dim() == 2 && b.dim() == 2, "A and B must be 2D");
   TORCH_CHECK(a.device() == b.device(), "A and B must be on the same device");
   TORCH_CHECK(a.size(1) == b.size(0), "Inner dimensions must match");
   const int64_t physical_m = swap_ab ? b.size(1) : a.size(0);
   const int64_t physical_n = swap_ab ? a.size(0) : b.size(1);
-  TORCH_CHECK(physical_m % (tile_m * cluster_m) == 0,
+  TORCH_CHECK(physical_m % (tile_m * cluster_m) == 0 ||
+                  (cluster_m == 1 && physical_m > 0 && physical_m < tile_m),
               swap_ab ? "N" : "M", " is incompatible with the kernel tile");
   TORCH_CHECK(physical_n % tile_n == 0,
               swap_ab ? "M" : "N", " is incompatible with the kernel tile");
-  TORCH_CHECK(a.size(1) % tile_k == 0, "K is incompatible with the kernel tile");
+  TORCH_CHECK(a.size(1) % (tile_k * split_k) == 0, "K is incompatible with split-K and the kernel tile");
 }
 
 void check_inputs_nt(const torch::Tensor& a, const torch::Tensor& b_nt,
                      int64_t tile_m, int64_t tile_n, int64_t tile_k,
-                     int64_t cluster_m, int64_t max_active_clusters, bool swap_ab) {
+                     int64_t cluster_m, int64_t split_k, int64_t max_active_clusters, bool swap_ab) {
   check_tensor(a, "A");
   check_tensor(b_nt, "B_nt");
-  check_config(tile_m, tile_n, tile_k, cluster_m, max_active_clusters);
+  check_config(tile_m, tile_n, tile_k, cluster_m, split_k, max_active_clusters);
   TORCH_CHECK(a.dim() == 2 && b_nt.dim() == 2, "A and B_nt must be 2D");
   TORCH_CHECK(a.device() == b_nt.device(), "A and B_nt must be on the same device");
   TORCH_CHECK(a.size(1) == b_nt.size(1), "Inner dimensions must match");
   const int64_t physical_m = swap_ab ? b_nt.size(0) : a.size(0);
   const int64_t physical_n = swap_ab ? a.size(0) : b_nt.size(0);
-  TORCH_CHECK(physical_m % (tile_m * cluster_m) == 0,
+  TORCH_CHECK(physical_m % (tile_m * cluster_m) == 0 ||
+                  (cluster_m == 1 && physical_m > 0 && physical_m < tile_m),
               swap_ab ? "N" : "M", " is incompatible with the kernel tile");
   TORCH_CHECK(physical_n % tile_n == 0,
               swap_ab ? "M" : "N", " is incompatible with the kernel tile");
-  TORCH_CHECK(a.size(1) % tile_k == 0, "K is incompatible with the kernel tile");
+  TORCH_CHECK(a.size(1) % (tile_k * split_k) == 0, "K is incompatible with split-K and the kernel tile");
 }
 
 void check_output(const torch::Tensor& out, int64_t m, int64_t n,
@@ -72,15 +75,17 @@ void check_output(const torch::Tensor& out, int64_t m, int64_t n,
 
 torch::Tensor run_out(torch::Tensor a, torch::Tensor b, torch::Tensor out,
                       uint64_t launcher_address, int64_t tile_m,
-                      int64_t tile_n, int64_t tile_k, int64_t cluster_m,
+                      int64_t tile_n, int64_t tile_k, int64_t cluster_m, int64_t split_k,
                       int64_t max_active_clusters, bool swap_ab, bool b_is_nt) {
   TORCH_CHECK(launcher_address != 0, "BF16 GEMM launcher is null");
+  TORCH_CHECK(split_k == 1 || !swap_ab,
+              "split_k > 1 does not support swap_ab=True");
   if (b_is_nt) {
-    check_inputs_nt(a, b, tile_m, tile_n, tile_k, cluster_m,
+    check_inputs_nt(a, b, tile_m, tile_n, tile_k, cluster_m, split_k,
                     max_active_clusters, swap_ab);
     check_output(out, a.size(0), b.size(0), a.device());
   } else {
-    check_inputs(a, b, tile_m, tile_n, tile_k, cluster_m,
+    check_inputs(a, b, tile_m, tile_n, tile_k, cluster_m, split_k,
                  max_active_clusters, swap_ab);
     check_output(out, a.size(0), b.size(1), a.device());
   }
@@ -99,28 +104,28 @@ torch::Tensor run_out(torch::Tensor a, torch::Tensor b, torch::Tensor out,
 }
 
 torch::Tensor bf16_gemm(torch::Tensor a, torch::Tensor b, uint64_t launcher,
-                        int64_t tm, int64_t tn, int64_t tk, int64_t cm,
+                        int64_t tm, int64_t tn, int64_t tk, int64_t cm, int64_t sk,
                         int64_t max_active_clusters, bool swap) {
   auto out = torch::empty({a.size(0), b.size(1)}, a.options());
-  return run_out(a, b, out, launcher, tm, tn, tk, cm, max_active_clusters, swap, false);
+  return run_out(a, b, out, launcher, tm, tn, tk, cm, sk, max_active_clusters, swap, false);
 }
 torch::Tensor bf16_gemm_out(torch::Tensor a, torch::Tensor b, torch::Tensor out,
                             uint64_t launcher, int64_t tm, int64_t tn,
-                            int64_t tk, int64_t cm, int64_t max_active_clusters,
+                            int64_t tk, int64_t cm, int64_t sk, int64_t max_active_clusters,
                             bool swap) {
-  return run_out(a, b, out, launcher, tm, tn, tk, cm, max_active_clusters, swap, false);
+  return run_out(a, b, out, launcher, tm, tn, tk, cm, sk, max_active_clusters, swap, false);
 }
 torch::Tensor bf16_gemm_nt(torch::Tensor a, torch::Tensor b, uint64_t launcher,
-                           int64_t tm, int64_t tn, int64_t tk, int64_t cm,
+                           int64_t tm, int64_t tn, int64_t tk, int64_t cm, int64_t sk,
                            int64_t max_active_clusters, bool swap) {
   auto out = torch::empty({a.size(0), b.size(0)}, a.options());
-  return run_out(a, b, out, launcher, tm, tn, tk, cm, max_active_clusters, swap, true);
+  return run_out(a, b, out, launcher, tm, tn, tk, cm, sk, max_active_clusters, swap, true);
 }
 torch::Tensor bf16_gemm_nt_out(torch::Tensor a, torch::Tensor b, torch::Tensor out,
                                uint64_t launcher, int64_t tm, int64_t tn,
-                               int64_t tk, int64_t cm, int64_t max_active_clusters,
+                               int64_t tk, int64_t cm, int64_t sk, int64_t max_active_clusters,
                                bool swap) {
-  return run_out(a, b, out, launcher, tm, tn, tk, cm, max_active_clusters, swap, true);
+  return run_out(a, b, out, launcher, tm, tn, tk, cm, sk, max_active_clusters, swap, true);
 }
 
 }  // namespace

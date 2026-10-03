@@ -10,7 +10,6 @@
 
 namespace {
 
-constexpr int kBlockM = 128;
 constexpr int kBlockN = 256;
 constexpr int kBlockK = 64;
 constexpr std::size_t kDefaultCublasLtWorkspaceBytes = 32ull * 1024ull * 1024ull;
@@ -43,11 +42,7 @@ void check_inputs(const torch::Tensor& a, const torch::Tensor& b) {
               b.size(0),
               "x",
               b.size(1));
-  TORCH_CHECK(a.size(0) % kBlockM == 0,
-              "M must be a multiple of ",
-              kBlockM,
-              ", got ",
-              a.size(0));
+  TORCH_CHECK(a.size(0) > 0, "M must be positive, got ", a.size(0));
   TORCH_CHECK(b.size(1) % kBlockN == 0,
               "N must be a multiple of ",
               kBlockN,

@@ -20,12 +20,17 @@ class Bf16GemmConfig:
     tile_k: int = 128
     cluster_m: int = 2
     epilogue_block_n: int = 32
+    split_k: int = 1
 
     def validate(self) -> None:
-        if self.tile_m != 128:
-            raise ValueError("tile_m must be 128 for the current four-warp mainloop")
+        if self.tile_m not in (64, 128):
+            raise ValueError("tile_m must be 64 or 128")
         if self.cluster_m not in (1, 2):
             raise ValueError("cluster_m must be 1 or 2")
+        if self.tile_m == 64 and self.cluster_m != 1:
+            raise ValueError("tile_m=64 requires cluster_m=1")
+        if self.split_k not in (1, 2, 4, 8) or self.cluster_m * self.split_k > 8:
+            raise ValueError("split_k must be 1, 2, 4, or 8 and cluster_m * split_k <= 8")
         if self.tile_n <= 0:
             raise ValueError("tile_n must be positive")
         if self.epilogue_block_n not in (32, 64, 128):
@@ -38,14 +43,16 @@ class Bf16GemmConfig:
             raise ValueError("tile_k must be a positive multiple of 64")
         epilogue_smem = 2 * self.tile_m * self.epilogue_block_n * 2
         mainloop_stage_smem = (self.tile_m + self.tile_n // self.cluster_m) * self.tile_k * 2
-        if (227 * 1024 - epilogue_smem) // mainloop_stage_smem < 2:
+        reduction_smem = self.tile_m * self.epilogue_block_n * 4 if self.split_k > 1 else 0
+        if (227 * 1024 - epilogue_smem - reduction_smem) // mainloop_stage_smem < 2:
             raise ValueError("configuration leaves room for fewer than two mainloop stages")
 
 
 def _default_config(a, b) -> Bf16GemmConfig:
     if a.ndim != 2 or b.ndim != 2:
         return Bf16GemmConfig()
-    return Bf16GemmConfig(cluster_m=1 if a.size(0) <= 128 else 2)
+    tile_m = 64 if a.size(0) <= 64 else 128
+    return Bf16GemmConfig(tile_m=tile_m, cluster_m=1 if a.size(0) <= tile_m else 2)
 
 
 class Bf16GemmModule:
@@ -57,10 +64,10 @@ class Bf16GemmModule:
         if max_active_clusters is None:
             import torch
             sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-            max_active_clusters = sm_count // c.cluster_m
+            max_active_clusters = sm_count // (c.cluster_m * c.split_k)
         if max_active_clusters <= 0:
             raise ValueError("max_active_clusters must be positive")
-        return (self._launcher, c.tile_m, c.tile_n, c.tile_k, c.cluster_m,
+        return (self._launcher, c.tile_m, c.tile_n, c.tile_k, c.cluster_m, c.split_k,
                 int(max_active_clusters))
 
     def bf16_gemm(self, a, b, swap_ab=False, max_active_clusters=None):
@@ -77,6 +84,7 @@ def _kernel_cflags(config, _variant):
     return tuple(f"-DSM110A_BF16_{name}={value}" for name, value in (
         ("TILE_M", config.tile_m), ("TILE_N", config.tile_n),
         ("TILE_K", config.tile_k), ("CLUSTER_M", config.cluster_m),
+        ("SPLIT_K", config.split_k),
         ("EPILOGUE_BLOCK_N", config.epilogue_block_n)))
 
 
@@ -120,5 +128,5 @@ def bf16_gemm_out(a, b, out, config=None, swap_ab=False, max_active_clusters=Non
 
 def bf16_gemm_nt_out(a, b_nt, out, config=None, swap_ab=False, max_active_clusters=None):
     """Compute ``a @ b_nt.T`` for a contiguous, pretransposed ``b_nt(N, K)``."""
-    return compile_bf16_gemm(config).bf16_gemm_nt_out(
+    return compile_bf16_gemm(config or _default_config(a, b_nt)).bf16_gemm_nt_out(
         a, b_nt, out, swap_ab, max_active_clusters)

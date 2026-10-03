@@ -39,6 +39,10 @@ the autotuned CuTE DSL baseline, `--force-sweep-ours` and
 
 This runs a small `512 x 512 x 512` accuracy check first, then the default
 performance sweep.
+The default sweep includes `M=1, 4, 8, 16, 32` at `N=K=4096`. These shapes
+run directly with `cluster_m=1`; TMA fills rows beyond the logical M with zero
+and suppresses out-of-bounds output stores. Pass `--m 1` (or another listed M)
+to run just that default shape.
 
 Disable the built-in accuracy phase:
 
@@ -125,7 +129,7 @@ baseline.
 
 ## Persistent-cluster limit
 
-The BF16 GEMM entry points accept `max_active_clusters`. They launch
+For `split_k=1`, the BF16 GEMM entry points accept `max_active_clusters`. They launch
 `max_active_clusters * config.cluster_m` CTAs. Leaving it as `None` uses the
 tensor device's SM count divided by `config.cluster_m`, preserving the former
 one-CTA-per-SM launch size.
@@ -136,6 +140,34 @@ bf16_gemm_nt_out(a, b_nt, out, config=config, max_active_clusters=4)
 
 The benchmark exposes the same control as `--max-active-clusters`; `0` selects
 the device-derived default.
+
+## Split-K
+
+Set `split_k` on `Bf16GemmConfig` to `1`, `2`, `4`, or `8`. The product
+`cluster_m * split_k` must be at most `8`; `split_k=8` therefore requires
+`cluster_m=1`. For `split_k > 1`, `swap_ab` must be `False`, and `K` must be
+divisible by `tile_k * split_k`. The cluster shape is `(cluster_m, split_k, 1)`: each
+cluster-N rank computes one K partition, then the CTAs exchange FP32 partial
+tiles through distributed shared memory. Each rank reduces and stores a
+different group of output rows, converting to BF16 after reduction.
+
+```python
+from sm110a_kernel import Bf16GemmConfig, bf16_gemm_nt_out
+
+config = Bf16GemmConfig(cluster_m=1, split_k=8)
+bf16_gemm_nt_out(a, b_nt, out, config=config)
+```
+
+The split-K path launches one cluster per output tile. `max_active_clusters`
+continues to control only the persistent `split_k=1` path.
+The benchmark autotuner considers compatible split-K configurations and
+`swap_ab` only with `split_k=1`.
+
+## Tile-M
+
+`Bf16GemmConfig.tile_m` supports `64` and `128`. `tile_m=64` uses the
+Blackwell non-`.ws` M=64 tensor-memory layout and requires `cluster_m=1`;
+the autotuner considers both tile sizes where the workload is compatible.
 
 ## Contents
 

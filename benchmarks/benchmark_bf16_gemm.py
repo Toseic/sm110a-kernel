@@ -34,6 +34,11 @@ from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
 
 
 DEFAULT_SHAPES = [
+    (1, 4096, 4096),
+    (4, 4096, 4096),
+    (8, 4096, 4096),
+    (16, 4096, 4096),
+    (32, 4096, 4096),
     (256, 256, 256),
     (512, 512, 512),
     (1024, 1024, 1024),
@@ -46,35 +51,44 @@ DEFAULT_SHAPES = [
 ]
 ACCURACY_SHAPE = (512, 512, 512)
 CUBLASLT_WORKSPACE_BYTES = 32 * 1024 * 1024
-BF16_GEMM_CONFIGS = tuple(
-    Bf16GemmConfig(
-        tile_m=128,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        cluster_m=cluster_m,
-        epilogue_block_n=epilogue_block_n,
-    )
-    for tile_n in (128, 256)
-    for tile_k in (64, 128)
-    for cluster_m in (1, 2)
-    for epilogue_block_n in (32, 64, 128)
-    if tile_n % epilogue_block_n == 0
-    and (
-        227 * 1024 - 2 * 128 * epilogue_block_n * 2
-    ) // ((128 + tile_n // cluster_m) * tile_k * 2) >= 2
-)
+def _bf16_gemm_configs():
+    for tile_m in (64, 128):
+        for tile_n in (128, 256):
+            for tile_k in (64, 128):
+                for cluster_m in (1, 2):
+                    for epilogue_block_n in (32, 64, 128):
+                        if tile_n % epilogue_block_n:
+                            continue
+                        for split_k in (1, 2, 4, 8):
+                            config = Bf16GemmConfig(
+                                tile_m=tile_m,
+                                tile_n=tile_n,
+                                tile_k=tile_k,
+                                cluster_m=cluster_m,
+                                epilogue_block_n=epilogue_block_n,
+                                split_k=split_k,
+                            )
+                            try:
+                                config.validate()
+                            except ValueError:
+                                continue
+                            yield config
+
+
+BF16_GEMM_CONFIGS = tuple(_bf16_gemm_configs())
 
 
 def compatible_candidates(m, n, k):
     return tuple(
         (config, swap_ab)
         for config in BF16_GEMM_CONFIGS
-        for swap_ab in (False, True)
-        if k % config.tile_k == 0
+        for swap_ab in ((False, True) if config.split_k == 1 else (False,))
+        if k % (config.tile_k * config.split_k) == 0
         and (
             (
                 not swap_ab
-                and m % (config.tile_m * config.cluster_m) == 0
+                and (m % (config.tile_m * config.cluster_m) == 0
+                     or (config.cluster_m == 1 and 0 < m < config.tile_m))
                 and n % config.tile_n == 0
             )
             or (
@@ -92,6 +106,7 @@ def format_candidate(candidate):
         f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
         f"/c{config.cluster_m}"
         f"/e{config.epilogue_block_n}"
+        f"/sk{config.split_k}"
         f"/{'swap' if swap_ab else 'noswap'}"
     )
 
@@ -258,7 +273,7 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
                 (f"{baseline_name} TF/s", 16),
                 (f"{baseline_name}Speedup", 14),
                 ("Diff", 12),
-                ("BestConfig", 28),
+                ("BestConfig", 40),
             )
         )
 
@@ -382,7 +397,7 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
             candidates,
             # B is now prepacked as (N, K), so prior selections measured the
             # incorrect B interpretation and must not be reused.
-            namespace="bf16_gemm_nt_v3",
+            namespace="bf16_gemm_nt_v5",
             key=(m, n, k, args.max_active_clusters), prepare=prepare,
             benchmark=lambda prepared: benchmark_with_stats(
                 prepared.run, args.warmup, args.iters, args.samples,
