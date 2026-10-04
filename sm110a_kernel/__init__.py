@@ -17,6 +17,12 @@ from .kernels.bf16_gemm import (
     compile_bf16_gemm_configs,
     get_bf16_gemm_module,
 )
+from .kernels.bf16tofp8_quant import (
+    Bf16ToFp8QuantModule,
+    bf16tofp8_quant,
+    bf16tofp8_quant_out,
+    compile_bf16tofp8_quant,
+)
 from .kernels.bf16_gemm_serving import (
     Bf16GemmPersistentServingQueue,
     Bf16GemmServingConfig,
