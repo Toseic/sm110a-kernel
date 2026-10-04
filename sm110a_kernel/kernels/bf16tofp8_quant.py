@@ -32,6 +32,7 @@ _JIT = SplitCudaJit(
     kernel_symbol="sm110a_bf16tofp8_quant_launch",
     config_key=lambda _config: 128,
     kernel_cflags=lambda _config, _variant: (),
+    kernel_ldflags=("-lcuda",),
     make_facade=Bf16ToFp8QuantModule,
     include_paths=(_INCLUDE_DIR,),
 )

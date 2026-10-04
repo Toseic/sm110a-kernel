@@ -1,210 +1,256 @@
+#include <algorithm>
 #include <cassert>
+#include <cstdint>
+#include <cuda.h>
 #include <cudaTypedefs.h>
 #include <cuda_fp8.h>
+#include <cuda_runtime.h>
 
 #include "bf16tofp8_quant.h"
 
 namespace {
 
-// TileLang-compatible work decomposition: 32 rows by one 128-value K block.
-// Eight threads cooperate on one row; each contributes a contiguous 16-value
-// segment.  Thus every 128-thread CTA owns 32 scales and 4096 FP8 values.
-constexpr int kThreads = 128;
-constexpr int kRowsPerCta = 32;
-constexpr int kThreadsPerRow = 8;
-constexpr int kValuesPerThread = 16;
-constexpr int kBlockSize = 128;
+constexpr int kRows = 32;
+constexpr int kBlock = 128;
+constexpr int kBlocksPerStore = 2;
+constexpr int kComputeWarps = 4;
+constexpr int kLoadWarp = 4;
+constexpr int kStoreWarp = 5;
+constexpr int kThreads = 32 * (kStoreWarp + 1);
+constexpr int kLanesPerRow = 4;
+constexpr int kValuesPerLane = kBlock / kLanesPerRow;
+constexpr int kInputBytes = kRows * kBlock * sizeof(__nv_bfloat16);
+constexpr int kOutputBytes = kRows * kBlock * kBlocksPerStore * sizeof(uint8_t);
+constexpr int kStageBytes = kInputBytes + kOutputBytes;
+constexpr int kBarrierCount = 4;
 constexpr float kE4M3Max = 448.0f;
+static_assert(kRows == kComputeWarps * 32 / kLanesPerRow);
 
-union SharedStorage {
-    __nv_bfloat16 input[kRowsPerCta * kBlockSize];
-    uint8_t output[kRowsPerCta * kBlockSize];
-};
-
-__device__ __forceinline__ float reduce_row_max(
-    float value) {
-#pragma unroll
-    for (int offset = kThreadsPerRow / 2; offset != 0; offset >>= 1) {
-        value = fmaxf(value, __shfl_down_sync(0xffffffff, value, offset, kThreadsPerRow));
-    }
-    return value;
+__device__ __forceinline__ void wait_barrier(int address, int phase) {
+    constexpr uint32_t kSuspendTicks = 0x989680;
+    asm volatile("{\n\t"
+                 ".reg .pred done;\n\t"
+                 "WAIT:\n\t"
+                 "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 "
+                 "done, [%0], %1, %2;\n\t"
+                 "@done bra.uni COMPLETE;\n\t"
+                 "bra.uni WAIT;\n\t"
+                 "COMPLETE:\n\t"
+                 "}" :: "r"(address), "r"(phase), "r"(kSuspendTicks) : "memory");
 }
 
 __device__ __forceinline__ uint32_t fp8x4(
-    float x0,
-    float x1,
-    float x2,
-    float x3,
-    float scale) {
-    const float4 scaled = make_float4(x0 / scale, x1 / scale, x2 / scale, x3 / scale);
-    return __nv_fp8x4_e4m3(scaled).__x;
+    float x0, float x1, float x2, float x3, float scale) {
+    return __nv_fp8x4_e4m3(make_float4(
+        x0 / scale, x1 / scale, x2 / scale, x3 / scale)).__x;
 }
 
 __global__ __launch_bounds__(kThreads)
-void bf16tofp8_quant_kernel(const __nv_bfloat16* __restrict__ input,
-                            uint8_t* __restrict__ output,
-                            uint8_t* __restrict__ scales, int tokens, int d) {
-    alignas(16) __shared__ SharedStorage storage;
+void bf16tofp8_quant_kernel(const __grid_constant__ CUtensorMap input_map,
+                            const __grid_constant__ CUtensorMap output_map,
+                            uint8_t* __restrict__ scales,
+                            int tokens, int d, int tiles, int stages) {
+    // Stage barriers: input ready/free, output ready/free. Loader and storer
+    // each own a TMA warp; four other warps convert 32 rows per tile.
+    extern __shared__ __align__(128) uint8_t shared[];
     const int tid = threadIdx.x;
-    const int row_group = tid / kThreadsPerRow; // [0, 15]
-    const int row_lane = tid % kThreadsPerRow;  // 16 K-values per lane
-    const int row0 = blockIdx.x * kRowsPerCta + row_group;
-    const int row1 = row0 + kRowsPerCta / 2;
-    const int k_block = blockIdx.y;
-    const int k_offset = k_block * kBlockSize + row_lane * kValuesPerThread;
-    const bool row0_valid = row0 < tokens;
-    const bool row1_valid = row1 < tokens;
-
-    // Four 16-byte vector loads per thread: two 16-BF16 fragments, one for
-    // each of its rows.  Invalid tail rows are explicitly zero-filled.
-    uint4 input_vectors[4];
-    if (row0_valid) {
-        const uint4 *src =
-            reinterpret_cast<const uint4 *>(input + static_cast<size_t>(row0) * d + k_offset);
-        input_vectors[0] = src[0];
-        input_vectors[1] = src[1];
-    } else {
-        input_vectors[0] = make_uint4(0, 0, 0, 0);
-        input_vectors[1] = make_uint4(0, 0, 0, 0);
+    if (tid < stages * kBarrierCount) {
+        const int stage = tid % stages;
+        const int group = tid / stages;
+        uint64_t* barriers = reinterpret_cast<uint64_t*>(shared + stages * kStageBytes);
+        const int address = static_cast<int>(__cvta_generic_to_shared(
+            barriers + group * stages + stage));
+        asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::
+                     "r"(address), "r"((group == 1 || group == 2) ? kComputeWarps : 1));
     }
-    if (row1_valid) {
-        const uint4 *src =
-            reinterpret_cast<const uint4 *>(input + static_cast<size_t>(row1) * d + k_offset);
-        input_vectors[2] = src[0];
-        input_vectors[3] = src[1];
-    } else {
-        input_vectors[2] = make_uint4(0, 0, 0, 0);
-        input_vectors[3] = make_uint4(0, 0, 0, 0);
-    }
-
-    auto *input_u4 = reinterpret_cast<uint4 *>(storage.input);
-    constexpr int kU4PerRow = kBlockSize * sizeof(__nv_bfloat16) / sizeof(uint4);
-    const int row_u4_offset = row_lane * kValuesPerThread * sizeof(__nv_bfloat16) / sizeof(uint4);
-    input_u4[row_group * kU4PerRow + row_u4_offset] = input_vectors[0];
-    input_u4[row_group * kU4PerRow + row_u4_offset + 1] = input_vectors[1];
-    input_u4[(row_group + kRowsPerCta / 2) * kU4PerRow + row_u4_offset] = input_vectors[2];
-    input_u4[(row_group + kRowsPerCta / 2) * kU4PerRow + row_u4_offset + 1] = input_vectors[3];
     __syncthreads();
 
-    // Reload the two fragments into registers before reusing the 8KB shared
-    // allocation as the 4KB FP8 output staging buffer.
-    __nv_bfloat16 values[2][kValuesPerThread];
-    const auto *input_fragment0 =
-        storage.input + row_group * kBlockSize + row_lane * kValuesPerThread;
-    const auto *input_fragment1 = input_fragment0 + (kRowsPerCta / 2) * kBlockSize;
-    reinterpret_cast<uint4 *>(values[0])[0] = reinterpret_cast<const uint4 *>(input_fragment0)[0];
-    reinterpret_cast<uint4 *>(values[0])[1] = reinterpret_cast<const uint4 *>(input_fragment0)[1];
-    reinterpret_cast<uint4 *>(values[1])[0] = reinterpret_cast<const uint4 *>(input_fragment1)[0];
-    reinterpret_cast<uint4 *>(values[1])[1] = reinterpret_cast<const uint4 *>(input_fragment1)[1];
-
-    float amax0 = 0.0f;
-    float amax1 = 0.0f;
+    const int k_blocks = d / kBlock;
+    const int k_groups = (k_blocks + kBlocksPerStore - 1) / kBlocksPerStore;
+    const int iterations = (tiles - blockIdx.x + gridDim.x - 1) / gridDim.x;
+    if (tid == kLoadWarp * 32) {
+        const int data0 = static_cast<int>(__cvta_generic_to_shared(shared));
+        const int ready0 = data0 + stages * kStageBytes;
+        const int free0 = ready0 + stages * static_cast<int>(sizeof(uint64_t));
+        for (int iteration = 0; iteration < iterations; ++iteration) {
+            const int tile = blockIdx.x + iteration * gridDim.x;
 #pragma unroll
-    for (int i = 0; i < kValuesPerThread; ++i) {
-        amax0 = fmaxf(amax0, fabsf(__bfloat162float(values[0][i])));
-        amax1 = fmaxf(amax1, fabsf(__bfloat162float(values[1][i])));
-    }
-    amax0 = reduce_row_max(amax0);
-    amax1 = reduce_row_max(amax1);
-
-    float scale0 = 1.0f;
-    float scale1 = 1.0f;
-    if (row_lane == 0) {
-        const __nv_fp8_e8m0 e8m0_0(amax0 / kE4M3Max);
-        const __nv_fp8_e8m0 e8m0_1(amax1 / kE4M3Max);
-        if (row0_valid) {
-            scales[static_cast<size_t>(row0) * (d / kBlockSize) + k_block] = e8m0_0.__x;
+            for (int part = 0; part < kBlocksPerStore; ++part) {
+                const int sub_iteration = iteration * kBlocksPerStore + part;
+                const int stage = sub_iteration % stages;
+                if (sub_iteration >= stages) {
+                    wait_barrier(free0 + stage * sizeof(uint64_t),
+                                 ((sub_iteration - stages) / stages) & 1);
+                }
+                const int ready = ready0 + stage * sizeof(uint64_t);
+                asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 "
+                             "_, [%0], %1;" :: "r"(ready), "r"(kInputBytes) : "memory");
+                asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global."
+                             "mbarrier::complete_tx::bytes "
+                             "[%0], [%1, {%2, %3}], [%4];" ::
+                             "r"(data0 + stage * kStageBytes), "l"(&input_map),
+                             "r"(((tile % k_groups) * kBlocksPerStore + part) * kBlock),
+                             "r"((tile / k_groups) * kRows),
+                             "r"(ready) : "memory");
+            }
         }
-        if (row1_valid) {
-            scales[static_cast<size_t>(row1) * (d / kBlockSize) + k_block] = e8m0_1.__x;
+    } else if (tid == kStoreWarp * 32) {
+        const int data0 = static_cast<int>(__cvta_generic_to_shared(shared));
+        const int output_ready0 = data0 + stages * kStageBytes +
+            2 * stages * static_cast<int>(sizeof(uint64_t));
+        const int output_free0 = output_ready0 +
+            stages * static_cast<int>(sizeof(uint64_t));
+        for (int iteration = 0; iteration < iterations; ++iteration) {
+            const int stage = iteration % stages;
+            wait_barrier(output_ready0 + stage * sizeof(uint64_t),
+                         (iteration / stages) & 1);
+            const int tile = blockIdx.x + iteration * gridDim.x;
+            asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group "
+                         "[%0, {%1, %2}], [%3];" ::
+                         "l"(&output_map),
+                         "r"((tile % k_groups) * kBlocksPerStore * kBlock),
+                         "r"((tile / k_groups) * kRows),
+                         "r"(data0 + stage * kStageBytes + kInputBytes) : "memory");
+            asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+            asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
+            asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];" ::
+                         "r"(output_free0 + stage * static_cast<int>(sizeof(uint64_t)))
+                         : "memory");
         }
-        scale0 = ldexpf(1.0f, static_cast<int>(e8m0_0.__x) - 127);
-        scale1 = ldexpf(1.0f, static_cast<int>(e8m0_1.__x) - 127);
-    }
-    scale0 = __shfl_sync(0xffffffff, scale0, 0, kThreadsPerRow);
-    scale1 = __shfl_sync(0xffffffff, scale1, 0, kThreadsPerRow);
-
-    // The FP8 staging layout is row-major, so each 8-thread row group writes
-    // and then globally stores a contiguous 128-byte row tile in 16-byte chunks.
-    auto *output_u4 = reinterpret_cast<uint4 *>(storage.output);
-    constexpr int kOutputU4PerRow = kBlockSize / sizeof(uint4);
-    const int output_u4_offset = row_lane;
-    uint4 packed0, packed1;
-    packed0.x = fp8x4(__bfloat162float(values[0][0]),
-        __bfloat162float(values[0][1]),
-        __bfloat162float(values[0][2]),
-        __bfloat162float(values[0][3]),
-        scale0);
-    packed0.y = fp8x4(__bfloat162float(values[0][4]),
-        __bfloat162float(values[0][5]),
-        __bfloat162float(values[0][6]),
-        __bfloat162float(values[0][7]),
-        scale0);
-    packed0.z = fp8x4(__bfloat162float(values[0][8]),
-        __bfloat162float(values[0][9]),
-        __bfloat162float(values[0][10]),
-        __bfloat162float(values[0][11]),
-        scale0);
-    packed0.w = fp8x4(__bfloat162float(values[0][12]),
-        __bfloat162float(values[0][13]),
-        __bfloat162float(values[0][14]),
-        __bfloat162float(values[0][15]),
-        scale0);
-    packed1.x = fp8x4(__bfloat162float(values[1][0]),
-        __bfloat162float(values[1][1]),
-        __bfloat162float(values[1][2]),
-        __bfloat162float(values[1][3]),
-        scale1);
-    packed1.y = fp8x4(__bfloat162float(values[1][4]),
-        __bfloat162float(values[1][5]),
-        __bfloat162float(values[1][6]),
-        __bfloat162float(values[1][7]),
-        scale1);
-    packed1.z = fp8x4(__bfloat162float(values[1][8]),
-        __bfloat162float(values[1][9]),
-        __bfloat162float(values[1][10]),
-        __bfloat162float(values[1][11]),
-        scale1);
-    packed1.w = fp8x4(__bfloat162float(values[1][12]),
-        __bfloat162float(values[1][13]),
-        __bfloat162float(values[1][14]),
-        __bfloat162float(values[1][15]),
-        scale1);
-    output_u4[row_group * kOutputU4PerRow + output_u4_offset] = packed0;
-    output_u4[(row_group + kRowsPerCta / 2) * kOutputU4PerRow + output_u4_offset] = packed1;
-    __syncthreads();
-
-    if (row0_valid) {
-        uint4 *dst = reinterpret_cast<uint4 *>(output + static_cast<size_t>(row0) * d +
-                                               k_block * kBlockSize + row_lane * kValuesPerThread);
-        dst[0] = output_u4[row_group * kOutputU4PerRow + output_u4_offset];
-    }
-    if (row1_valid) {
-        uint4 *dst = reinterpret_cast<uint4 *>(output + static_cast<size_t>(row1) * d +
-                                               k_block * kBlockSize + row_lane * kValuesPerThread);
-        dst[0] = output_u4[(row_group + kRowsPerCta / 2) * kOutputU4PerRow + output_u4_offset];
+        asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+    } else if (tid < kComputeWarps * 32) {
+        const int lane = tid % kLanesPerRow;
+        const int row_in_tile = tid / kLanesPerRow;
+        const int data0 = static_cast<int>(__cvta_generic_to_shared(shared));
+        const int ready0 = data0 + stages * kStageBytes;
+        const int input_free0 = ready0 + stages * static_cast<int>(sizeof(uint64_t));
+        const int output_ready0 = input_free0 + stages * static_cast<int>(sizeof(uint64_t));
+        const int output_free0 = output_ready0 + stages * static_cast<int>(sizeof(uint64_t));
+        for (int iteration = 0; iteration < iterations; ++iteration) {
+            const int output_stage = iteration % stages;
+            if (iteration >= stages) {
+                wait_barrier(output_free0 + output_stage * sizeof(uint64_t),
+                             ((iteration - stages) / stages) & 1);
+            }
+            const int tile = blockIdx.x + iteration * gridDim.x;
+            const int row = (tile / k_groups) * kRows + row_in_tile;
+#pragma unroll
+            for (int part = 0; part < kBlocksPerStore; ++part) {
+                const int sub_iteration = iteration * kBlocksPerStore + part;
+                const int input_stage = sub_iteration % stages;
+                wait_barrier(ready0 + input_stage * sizeof(uint64_t),
+                             (sub_iteration / stages) & 1);
+                const int k_tile = (tile % k_groups) * kBlocksPerStore + part;
+                const __nv_bfloat16* src = reinterpret_cast<const __nv_bfloat16*>(
+                    shared + input_stage * kStageBytes) + row_in_tile * kBlock +
+                    lane * kValuesPerLane;
+                __nv_bfloat16 values[kValuesPerLane];
+#pragma unroll
+                for (int i = 0; i < kValuesPerLane / 8; ++i) {
+                    reinterpret_cast<uint4*>(values)[i] =
+                        reinterpret_cast<const uint4*>(src)[i];
+                }
+                __syncwarp();
+                if ((tid & 31) == 0) {
+                    asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];" ::
+                                 "r"(input_free0 + input_stage * static_cast<int>(sizeof(uint64_t)))
+                                 : "memory");
+                }
+                float amax = 0.0f;
+#pragma unroll
+                for (int i = 0; i < kValuesPerLane; ++i) {
+                    amax = fmaxf(amax, fabsf(__bfloat162float(values[i])));
+                }
+#pragma unroll
+                for (int offset = kLanesPerRow / 2; offset; offset >>= 1) {
+                    amax = fmaxf(amax, __shfl_down_sync(0xffffffff, amax,
+                                                        offset, kLanesPerRow));
+                }
+                float scale = 1.0f;
+                if (lane == 0) {
+                    const __nv_fp8_e8m0 e8m0(amax / kE4M3Max);
+                    if (row < tokens && k_tile < k_blocks) {
+                        scales[static_cast<size_t>(row) * k_blocks + k_tile] = e8m0.__x;
+                    }
+                    scale = ldexpf(1.0f, static_cast<int>(e8m0.__x) - 127);
+                }
+                scale = __shfl_sync(0xffffffff, scale, 0, kLanesPerRow);
+                uint4 packed[kValuesPerLane / 16];
+                uint32_t* words = reinterpret_cast<uint32_t*>(packed);
+#pragma unroll
+                for (int i = 0; i < kValuesPerLane; i += 4) {
+                    words[i / 4] = fp8x4(
+                        __bfloat162float(values[i]),
+                        __bfloat162float(values[i + 1]),
+                        __bfloat162float(values[i + 2]),
+                        __bfloat162float(values[i + 3]), scale);
+                }
+                uint4* dst = reinterpret_cast<uint4*>(shared +
+                    output_stage * kStageBytes + kInputBytes +
+                    row_in_tile * kBlock * kBlocksPerStore +
+                    part * kBlock + lane * kValuesPerLane);
+#pragma unroll
+                for (int i = 0; i < kValuesPerLane / 16; ++i) {
+                    dst[i] = packed[i];
+                }
+            }
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            __syncwarp();
+            if ((tid & 31) == 0) {
+                asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];" ::
+                             "r"(output_ready0 + output_stage * static_cast<int>(sizeof(uint64_t)))
+                             : "memory");
+            }
+        }
     }
 }
 
-} // namespace
+}  // namespace
 
-void launch_bf16tofp8_quant(
-    const __nv_bfloat16 *input,
-    uint8_t *output,
-    uint8_t *scales,
-    int tokens,
-    int d,
-    cudaStream_t stream) {
-    const dim3 grid((tokens + kRowsPerCta - 1) / kRowsPerCta, d / kBlockSize);
-    bf16tofp8_quant_kernel<<<grid, kThreads, 0, stream>>>(input, output, scales, tokens, d);
+void launch_bf16tofp8_quant(const __nv_bfloat16* input, uint8_t* output,
+                            uint8_t* scales, int tokens, int d,
+                            cudaStream_t stream) {
+    CUtensorMap input_map;
+    const uint64_t dimensions[2] = {static_cast<uint64_t>(d),
+                                     static_cast<uint64_t>(tokens)};
+    const uint64_t strides[1] = {static_cast<uint64_t>(d) * sizeof(__nv_bfloat16)};
+    const uint32_t box[2] = {kBlock, kRows};
+    const uint32_t element_strides[2] = {1, 1};
+    const CUresult result = cuTensorMapEncodeTiled(
+        &input_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2,
+        const_cast<__nv_bfloat16*>(input), dimensions, strides, box,
+        element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    assert(result == CUDA_SUCCESS);
+    CUtensorMap output_map;
+    const uint64_t output_strides[1] = {static_cast<uint64_t>(d)};
+    const uint32_t output_box[2] = {kBlock * kBlocksPerStore, kRows};
+    const CUresult output_result = cuTensorMapEncodeTiled(
+        &output_map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2,
+        output, dimensions, output_strides, output_box,
+        element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    assert(output_result == CUDA_SUCCESS);
+    int device, sms, max_shared;
+    cudaGetDevice(&device);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+    cudaDeviceGetAttribute(&max_shared, cudaDevAttrMaxSharedMemoryPerBlock, device);
+    const int k_groups = (d / kBlock + kBlocksPerStore - 1) / kBlocksPerStore;
+    const int tiles = ((tokens + kRows - 1) / kRows) * k_groups;
+    const int ctas = std::min(tiles, sms);
+    const int max_stages = max_shared /
+        (kStageBytes + kBarrierCount * sizeof(uint64_t));
+    const int stages = std::min(max_stages, (tiles + ctas - 1) / ctas);
+    const int shared_bytes = stages *
+        (kStageBytes + kBarrierCount * sizeof(uint64_t));
+    bf16tofp8_quant_kernel<<<ctas, kThreads, shared_bytes, stream>>>(
+        input_map, output_map, scales, tokens, d, tiles, stages);
 }
 
 extern "C" void sm110a_bf16tofp8_quant_launch(
-    const __nv_bfloat16 *input,
-    uint8_t *output,
-    uint8_t *scales,
-    int tokens,
-    int d,
-    cudaStream_t stream) {
+    const __nv_bfloat16* input, uint8_t* output, uint8_t* scales,
+    int tokens, int d, cudaStream_t stream) {
     launch_bf16tofp8_quant(input, output, scales, tokens, d, stream);
 }
