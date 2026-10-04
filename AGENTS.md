@@ -30,6 +30,10 @@ Pass benchmark arguments directly to the benchmark script:
 
 Add new benchmarks as `benchmarks/benchmark_<name>.py`.
 
+Unless the user explicitly requests otherwise, kernel benchmarks must measure
+the cold-L2-cache case only. Do not use warm-L2 results for default performance
+comparisons.
+
 When investigating a pipeline, fix the workload and kernel configuration so
 autotuning and routing distribution do not obscure an injected delay.
 
