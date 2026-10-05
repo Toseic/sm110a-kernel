@@ -14,6 +14,14 @@ from .bf16_gemm import (
     compile_bf16_gemm_configs,
     get_bf16_gemm_module,
 )
+from .bf16tofp4_quant import (
+    Bf16ToFp4QuantModule,
+    bf16tofp4_quant,
+    bf16tofp4_quant_dequant,
+    bf16tofp4_quant_dequant_out,
+    bf16tofp4_quant_out,
+    compile_bf16tofp4_quant,
+)
 from .bf16tofp8_quant import (
     Bf16ToFp8QuantModule,
     bf16tofp8_quant,
