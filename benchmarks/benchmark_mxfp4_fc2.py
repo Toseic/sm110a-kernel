@@ -60,18 +60,16 @@ ROUTER_POWERLAW_ALPHA = 0.8
 NVFP4_MMA_PEAK_TFLOPS = 4.0 * 250.0
 MXFP4_W4A8_MMA_PEAK_TFLOPS = 2.0 * 250.0
 
-# cluster_m=2 is excluded from the default sweep: the shared grouped-M
-# 2-CTA path produces incorrect rank-1 results once expert buckets exceed 128
-# rows.  The failure reproduces on the unmodified master NVFP4 FC2 kernel
-# (clean JIT cache), so it predates this port; pass --cluster-m 2 explicitly
-# to experiment with it.
+# Task metadata carries the cluster-M tile geometry and is prepared for each
+# candidate below.  Keep both cluster shapes in the normal sweep.
 MXFP4_FC2_CONFIGS = tuple(
     Mxfp4Fc2Config(
         tile_k=128,
         epilogue_tile_n=epilogue_tile_n,
-        cluster_m=1,
+        cluster_m=cluster_m,
     )
     for epilogue_tile_n in (32, 64)
+    for cluster_m in (1, 2)
 )
 
 # NVFP4 parity reference candidates (tile_n=256 persistent family).
@@ -298,31 +296,32 @@ class Mxfp4Fc2Benchmark(BenchmarkBase):
             out = torch.empty((tokens, args.n), device="cuda", dtype=torch.bfloat16)
             nv_out = torch.empty_like(out)
             m = tokens * args.topk
-            metadata = prepare_mxfp4_fc2_metadata(
-                grouped_layout, args.experts, args.n)
-            nv_metadata = prepare_nvfp4_fc2_metadata(
-                grouped_layout, args.experts, args.n)
-
-            def build_mxfp4(config):
-                return lambda: mxfp4_fc2_out(
+            # FC2 task packets are parameterized by cluster_m as well.  Build
+            # them with the candidate rather than using default cluster-1
+            # metadata for the cluster-2 NVFP4 parity candidates.
+            def prepare_mxfp4(config):
+                metadata = prepare_mxfp4_fc2_metadata(
+                    grouped_layout, args.experts, args.n, config=config)
+                run = lambda: mxfp4_fc2_out(
                     aq, bq, sfa, sfb, routing, routing_weights,
                     metadata, args.topk, out, config=config)
+                # The fused epilogue scatter-adds into the destination.
+                # Start each tactic from zero without timing the memset.
+                out.zero_()
+                run()
+                torch.cuda.synchronize()
+                return PreparedKernel(config, run)
 
-            def build_nvfp4(config):
-                return lambda: nvfp4_fc2_out(
+            def prepare_nvfp4(config):
+                metadata = prepare_nvfp4_fc2_metadata(
+                    grouped_layout, args.experts, args.n, config=config)
+                run = lambda: nvfp4_fc2_out(
                     nv_aq, nv_bq, nv_sfa, nv_sfb, routing, routing_weights,
-                    nv_metadata, args.topk, nv_out, config=config)
-
-            def prepare_and_run(build, out_buffer):
-                def prepare(config):
-                    run = build(config)
-                    # The fused epilogue scatter-adds into the destination.
-                    # Start each tactic from zero without timing the memset.
-                    out_buffer.zero_()
-                    run()
-                    torch.cuda.synchronize()
-                    return PreparedKernel(config, run)
-                return prepare
+                    metadata, args.topk, nv_out, config=config)
+                nv_out.zero_()
+                run()
+                torch.cuda.synchronize()
+                return PreparedKernel(config, run)
 
             options = self.make_tune_options(args, role="ours",
                                              pre_parallel_jit=args.pre_parallel_jit)
@@ -332,7 +331,7 @@ class Mxfp4Fc2Benchmark(BenchmarkBase):
                 mxfp4_candidates(args),
                 namespace="mxfp4_fc2",
                 key=("v1-w4a8", tokens, args.experts, args.topk, args.n, args.k),
-                prepare=prepare_and_run(build_mxfp4, out),
+                prepare=prepare_mxfp4,
                 benchmark=lambda prepared: benchmark_with_stats(
                     prepared.run, args.warmup, args.iters, args.samples,
                     cold_l2_flush=args._cold_l2_flush),
@@ -347,7 +346,7 @@ class Mxfp4Fc2Benchmark(BenchmarkBase):
                 NVFP4_FC2_PARITY_CONFIGS,
                 namespace="nvfp4_fc2",
                 key=("mxfp4-parity", tokens, args.experts, args.topk, args.n, args.k),
-                prepare=prepare_and_run(build_nvfp4, nv_out),
+                prepare=prepare_nvfp4,
                 benchmark=lambda prepared: benchmark_with_stats(
                     prepared.run, args.warmup, args.iters, args.samples,
                     cold_l2_flush=args._cold_l2_flush),

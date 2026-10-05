@@ -354,21 +354,37 @@ class Mxfp4Fc1Benchmark(BenchmarkBase):
             nv_out_scale = torch.empty((m * (args.n // 16),), device="cuda",
                                        dtype=torch.float8_e4m3fn)
 
-            metadata = prepare_mxfp4_fc1_metadata(
-                router, args.topk, 2 * args.n)
-            nv_metadata = prepare_nvfp4_fc1_metadata(
-                router, args.topk, 2 * args.n)
             routed_m = m
 
-            def build_mxfp4(config):
-                return lambda: mxfp4_fc1_out(
+            # The task list includes cluster_m in its tile geometry.  In
+            # particular, a cluster_m=2 kernel cannot consume metadata built
+            # for cluster_m=1: at larger routed-M sizes it reads past the task
+            # list.  Keep each runner's metadata paired with the exact JIT
+            # configuration it prepares.
+            mxfp4_metadata = {}
+            nvfp4_metadata = {}
+
+            def prepare_mxfp4(config):
+                metadata = prepare_mxfp4_fc1_metadata(
+                    router, args.topk, 2 * args.n, config=config)
+                run = lambda: mxfp4_fc1_out(
                     aq, bq, sfa, sfb, metadata, out, out_scale,
                     swiglu_limit=args.swiglu_limit, config=config)
+                run()
+                torch.cuda.synchronize()
+                mxfp4_metadata[config] = metadata
+                return PreparedKernel(config, run)
 
-            def build_nvfp4(config):
-                return lambda: nvfp4_fc1_out(
-                    nv_aq, nv_bq, nv_sfa, nv_sfb, nv_metadata, nv_out,
+            def prepare_nvfp4(config):
+                metadata = prepare_nvfp4_fc1_metadata(
+                    router, args.topk, 2 * args.n, config=config)
+                run = lambda: nvfp4_fc1_out(
+                    nv_aq, nv_bq, nv_sfa, nv_sfb, metadata, nv_out,
                     nv_out_scale, config=config)
+                run()
+                torch.cuda.synchronize()
+                nvfp4_metadata[config] = metadata
+                return PreparedKernel(config, run)
 
             options = self.make_tune_options(args, role="ours",
                                              pre_parallel_jit=args.pre_parallel_jit)
@@ -378,10 +394,7 @@ class Mxfp4Fc1Benchmark(BenchmarkBase):
                 mxfp4_candidates(args),
                 namespace="mxfp4_fc1",
                 key=("v1-w4a8", tokens, args.experts, args.topk, args.n, args.k),
-                prepare=lambda config: (lambda run: (
-                    run(), torch.cuda.synchronize(),
-                    PreparedKernel(config, run))[2])(
-                    build_mxfp4(config)),
+                prepare=prepare_mxfp4,
                 benchmark=lambda prepared: benchmark_with_stats(
                     prepared.run, args.warmup, args.iters, args.samples,
                     cold_l2_flush=args._cold_l2_flush),
@@ -396,10 +409,7 @@ class Mxfp4Fc1Benchmark(BenchmarkBase):
                 nv_candidates,
                 namespace="nvfp4_fc1",
                 key=("mxfp4-parity", tokens, args.experts, args.topk, args.n, args.k),
-                prepare=lambda config: (lambda run: (
-                    run(), torch.cuda.synchronize(),
-                    PreparedKernel(config, run))[2])(
-                    build_nvfp4(config)),
+                prepare=prepare_nvfp4,
                 benchmark=lambda prepared: benchmark_with_stats(
                     prepared.run, args.warmup, args.iters, args.samples,
                     cold_l2_flush=args._cold_l2_flush),
@@ -416,7 +426,8 @@ class Mxfp4Fc1Benchmark(BenchmarkBase):
                 ours_selection.prepared.run()
                 torch.cuda.synchronize()
                 ref, ref_scale_raw = mxfp4_fc1_reference(
-                    aq, sfa128, bq, sfb, metadata, args.experts, args.n, args.k,
+                    aq, sfa128, bq, sfb, mxfp4_metadata[ours_selection.candidate],
+                    args.experts, args.n, args.k,
                     args.swiglu_limit)
                 close, max_diff = mxfp4_fc1_outputs_close(
                     out, out_scale, ref, ref_scale_raw, m, args.n)

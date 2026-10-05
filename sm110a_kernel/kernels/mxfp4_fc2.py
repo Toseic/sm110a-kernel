@@ -25,9 +25,8 @@ class Mxfp4Fc2Config:
     tile_n: int = 256
     tile_k: int = 128
     epilogue_tile_n: int = 32
-    # Keep cluster_m=1 for correctness-sensitive use: the shared grouped-M
-    # 2-CTA path miscomputes rank-1 rows once expert buckets exceed 128 rows
-    # (reproduces on master's NVFP4 FC2, so it predates this port).
+    # The task metadata is specialized for the cluster shape.  The benchmark
+    # prepares it per candidate, so both one- and two-CTA paths are valid.
     cluster_m: int = 1
     reduce_tile_n: int = 64
     macro_swizzle_n_major: bool = True
@@ -236,4 +235,3 @@ def from_blocked_mxfp4_scales(scales, rows: int, k: int):
         rows // 128, k // 128, 128, 4)
     return blocks.permute(0, 2, 1, 3).reshape(rows, k // 32).view(
         torch.float8_e8m0fnu).contiguous()
-
