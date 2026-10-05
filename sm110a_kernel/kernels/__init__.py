@@ -20,6 +20,12 @@ from .bf16tofp8_quant import (
     bf16tofp8_quant_out,
     compile_bf16tofp8_quant,
 )
+from .bf16tonvfp4_quant import (
+    Bf16ToNvfp4QuantModule,
+    bf16tonvfp4_quant,
+    bf16tonvfp4_quant_out,
+    compile_bf16tonvfp4_quant,
+)
 from .bf16_gemm_serving import (
     Bf16GemmPersistentServingQueue,
     Bf16GemmServingConfig,
