@@ -406,6 +406,15 @@ class BenchmarkBase:
             default=True,
             help="do not evict L2 before each timed kernel invocation",
         )
+        parser.add_argument(
+            "--clean-l2",
+            dest="clean_l2",
+            action="store_true",
+            default=False,
+            help="flush L2 with reads instead of writes, leaving the "
+            "eviction-buffer lines clean (no writeback tax on the timed "
+            "kernel; default flush dirties L2)",
+        )
 
     def validate_timing_args(self, args, *, allow_zero_warmup=False):
         if allow_zero_warmup:
@@ -464,18 +473,28 @@ class BenchmarkBase:
             return
 
         # Writing more than the cache capacity evicts data touched by the
-        # preceding warmup. Keep the tensor alive for the benchmark lifetime.
+        # preceding warmup and leaves the resident lines dirty, so the timed
+        # kernel pays writebacks for every line it allocates. --clean-l2
+        # flushes with a read instead: lines stay clean and evictions are
+        # free, which approximates a cold cache without the writeback tax.
+        # Keep the tensor alive for the benchmark lifetime.
         self._cold_l2_buffer = torch.empty(
             (2 * l2_bytes,), device="cuda", dtype=torch.uint8
         )
 
+        clean_l2 = getattr(args, "clean_l2", False)
+
         def flush_l2():
-            self._cold_l2_buffer.zero_()
+            if clean_l2:
+                self._cold_l2_buffer.max()
+            else:
+                self._cold_l2_buffer.zero_()
 
         args._cold_l2_flush = flush_l2
+        mode = "clean read-flush" if clean_l2 else "dirty write-flush"
         print(
-            "[cache] cold L2: enabled "
-            f"({2 * l2_bytes / 2**20:.0f} MiB eviction buffer)"
+            f"[cache] cold L2: enabled ({mode}, "
+            f"{2 * l2_bytes / 2**20:.0f} MiB eviction buffer)"
         )
 
     def run(self):
