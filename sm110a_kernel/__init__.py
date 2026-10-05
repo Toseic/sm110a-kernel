@@ -29,6 +29,12 @@ from .kernels.bf16tonvfp4_quant import (
     bf16tonvfp4_quant_out,
     compile_bf16tonvfp4_quant,
 )
+from .kernels.fp8_act_quant import (
+    Fp8ActQuantModule,
+    compile_fp8_act_quant,
+    fp8_act_quant,
+    fp8_act_quant_out,
+)
 from .kernels.bf16_gemm_serving import (
     Bf16GemmPersistentServingQueue,
     Bf16GemmServingConfig,
