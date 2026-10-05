@@ -178,6 +178,16 @@ from .kernels.nvfp4_fc1fc2 import (
     nvfp4_fc1fc2_out,
     nvfp4_fc1fc2_routed_out,
 )
+from .kernels.mxfp4_fc1 import (
+    Mxfp4Fc1Config, Mxfp4Fc1Metadata, compile_mxfp4_fc1,
+    compile_mxfp4_fc1_configs, prepare_mxfp4_fc1_metadata, mxfp4_fc1,
+    mxfp4_fc1_out, quantize_mxfp4_fc1_weights,
+)
+from .kernels.mxfp4_fc2 import (
+    Mxfp4Fc2Config, Mxfp4Fc2Metadata, compile_mxfp4_fc2,
+    compile_mxfp4_fc2_configs, prepare_mxfp4_fc2_metadata, mxfp4_fc2,
+    mxfp4_fc2_out, to_blocked_mxfp4_sfa,
+)
 from .kernels.nccl_lsa import NcclLsaAllReduce, nccl_unique_id
 _RUNNER_EXPORTS = {"AutotuneRunner", "PreparedKernel", "Selection", "TuneOptions"}
 _CUTEDSL_EXPORTS = {

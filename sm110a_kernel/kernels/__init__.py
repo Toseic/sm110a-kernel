@@ -152,6 +152,16 @@ from .nvfp4_fc1fc2 import (
     nvfp4_fc1fc2_out,
 )
 from .moe_routing import pack_routing_metadata
+from .mxfp4_fc1 import (
+    Mxfp4Fc1Config, Mxfp4Fc1Metadata, compile_mxfp4_fc1, compile_mxfp4_fc1_configs,
+    prepare_mxfp4_fc1_metadata, mxfp4_fc1, mxfp4_fc1_out,
+    quantize_mxfp4_fc1_weights,
+)
+from .mxfp4_fc2 import (
+    Mxfp4Fc2Config, Mxfp4Fc2Metadata, compile_mxfp4_fc2,
+    compile_mxfp4_fc2_configs, prepare_mxfp4_fc2_metadata, mxfp4_fc2,
+    mxfp4_fc2_out, to_blocked_mxfp4_sfa,
+)
 from .nccl_lsa import NcclLsaAllReduce, nccl_unique_id
 
 __all__ = [name for name in globals() if not name.startswith("_")]
