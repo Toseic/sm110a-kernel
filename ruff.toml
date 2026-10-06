@@ -1,5 +1,8 @@
 target-version = "py310"
 line-length = 88
+# Enforce extend-exclude even for directly-passed files and stdin, so the
+# pre-commit hook skips baselinedir/models.
+force-exclude = true
 extend-exclude = ["baselinedir", ".claude", "models"]
 
 [lint]
