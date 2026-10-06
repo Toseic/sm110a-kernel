@@ -35,3 +35,37 @@ The benchmark uses cold L2 by default, following the repository policy.
 selected index, plus Q, output, indices, and sink traffic. It does not model
 extra index loads issued by the gather warps or cache reuse from repeated
 indices.
+
+## Prefill
+
+`src/bf16_fa4_sparse_mla_prefill_kernel.cu` is a separate 16-warp prefill
+kernel. Each CTA handles one query token and all 64 heads. Four warps gather
+that token's indexed KV rows; the remaining warp groups issue MMA, softmax,
+and the output epilogue. Query tokens run as independent CTAs because their
+index lists may differ.
+
+Inputs are contiguous Q/output `[B,64,Q,512]`, KV `[B,Q,512]`, int32 indices
+`[B,Q,K]`, and FP32 sink `[64]`. Q and KV must have the same original sequence
+length. An index outside `[0,Q)` is ignored. The
+caller supplies the selected positions for each token, including any desired
+causal restriction; the kernel does not infer token positions from cache rows.
+
+```python
+from sm110a_kernel import bf16_fa4_sparse_mla_prefill_out
+
+bf16_fa4_sparse_mla_prefill_out(q, kv, indices, sink, out)
+```
+
+```bash
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_bf16_fa4_sparse_mla_prefill_h64.py
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_bf16_fa4_sparse_mla_prefill_h64.py \
+  --single --batch 1 --q-len 1024 --selected-len 640 --sol
+```
+
+By default the prefill benchmark sweeps Q=KV lengths 1024, 2048, and 4096
+at batch 1, then length 1024 at batch 4. `--single` uses the requested
+batch and Q=KV length. Each query selects only from its causal KV prefix; slots
+beyond the available prefix are padded with -1. It checks a PyTorch reference
+and measures cold L2 by default. `--sol` reports an idealized bound using one KV read per valid
+selection, with compulsory KV bytes counted once per distinct cache row in
+each batch. It omits repeated index loads by the gather warps.

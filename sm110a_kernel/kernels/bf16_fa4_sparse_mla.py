@@ -37,9 +37,25 @@ _JIT = SplitCudaJit(
     make_facade=Bf16Fa4SparseMlaModule,
 )
 
+_PREFILL_JIT = SplitCudaJit(
+    name="sm110a_bf16_fa4_sparse_mla_prefill_h64",
+    root=_ROOT,
+    binding_sources=(_SOURCE_DIR / "bf16_fa4_sparse_mla_prefill_torch_binding.cpp",),
+    kernel_sources=(_SOURCE_DIR / "bf16_fa4_sparse_mla_prefill_kernel.cu",),
+    kernel_dependencies=(),
+    kernel_symbol="sm110a_bf16_fa4_sparse_mla_prefill_launch",
+    config_key=lambda config: config,
+    kernel_cflags=lambda _config, _variant: (),
+    make_facade=Bf16Fa4SparseMlaModule,
+)
+
 
 def compile_bf16_fa4_sparse_mla():
     return _JIT.compile(None)
+
+
+def compile_bf16_fa4_sparse_mla_prefill():
+    return _PREFILL_JIT.compile(None)
 
 
 def _resolve_scale(scale):
@@ -65,5 +81,19 @@ def bf16_fa4_sparse_mla(q, kv, indices, sink, *, scale=None):
 def bf16_fa4_sparse_mla_out(q, kv, indices, sink, out, *, scale=None):
     """Write H=64 sparse MLA decode output to contiguous BHSD ``out``."""
     return compile_bf16_fa4_sparse_mla().sparse_mla_out(
+        q, kv, indices, sink, out, _resolve_scale(scale)
+    )
+
+
+def bf16_fa4_sparse_mla_prefill(q, kv, indices, sink, *, scale=None):
+    """Return H=64 prefill output for Q [B,64,Q,512], KV [B,Q,512], indices [B,Q,K]."""
+    return compile_bf16_fa4_sparse_mla_prefill().sparse_mla(
+        q, kv, indices, sink, _resolve_scale(scale)
+    )
+
+
+def bf16_fa4_sparse_mla_prefill_out(q, kv, indices, sink, out, *, scale=None):
+    """Write H=64 sparse MLA prefill output to contiguous BHSD ``out``."""
+    return compile_bf16_fa4_sparse_mla_prefill().sparse_mla_out(
         q, kv, indices, sink, out, _resolve_scale(scale)
     )

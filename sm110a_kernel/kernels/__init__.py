@@ -35,6 +35,14 @@ from .bf16_fa4_mqa import (
     compile_bf16_fa4_mqa_configs,
     get_bf16_fa4_mqa_module,
 )
+from .bf16_fa4_sparse_mla import (
+    bf16_fa4_sparse_mla,
+    bf16_fa4_sparse_mla_out,
+    bf16_fa4_sparse_mla_prefill,
+    bf16_fa4_sparse_mla_prefill_out,
+    compile_bf16_fa4_sparse_mla,
+    compile_bf16_fa4_sparse_mla_prefill,
+)
 from .bf16_gemm import (
     Bf16GemmConfig,
     bf16_gemm,
