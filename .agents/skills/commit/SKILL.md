@@ -22,6 +22,16 @@ If the working tree contains unrelated themes, split them into separate commits 
 5. Use concise commit messages that describe the resulting change, not the mechanical edit.
 6. Do not rewrite, drop, or revert user changes unless the user explicitly asked for that.
 
+## Python files: ruff is mandatory
+
+Every commit containing `.py` files must pass ruff. A `pre-commit` hook (`.githooks/pre-commit`, activated via `core.hooksPath`) checks the **staged** content with `ruff check` and `ruff format --check` and blocks the commit on failure. Before staging `.py` files:
+
+1. Run `ruff check --fix <files>` and `ruff format <files>` on exactly the files you intend to commit — never on the whole repo or on `baselinedir/` (vendored baseline code is excluded from ruff and must never be formatted).
+2. Review the resulting diff: `ruff check --fix` can change annotations (`UP`) and drop imports (`F401`), so confirm nothing load-bearing was removed.
+3. Stage the fixed files. Never auto-format in the hook direction (the hook is check-only by design, so unstaged edits in `MM` files stay untouched).
+
+If the hook fails, fix the reported issues and re-stage; do not pass `--no-verify` unless the user explicitly asks. Config lives in `ruff.toml` at the repo root.
+
 ## Guardrails
 
 - Respect explicit user instructions over this default workflow.

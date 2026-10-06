@@ -1,0 +1,23 @@
+target-version = "py310"
+line-length = 88
+extend-exclude = ["baselinedir", ".claude"]
+
+[lint]
+select = [
+    "E4",  # pycodestyle errors
+    "E7",  # pycodestyle (statement-level)
+    "E9",  # pycodestyle (runtime/syntax errors)
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes (undefined names, unused imports, f-string issues)
+    "I",   # isort (import sorting)
+    "UP",  # pyupgrade (modernize syntax/annotations)
+]
+ignore = [
+    "E402",  # module import not at top: sys.path setup pattern in scripts
+    "E701",  # compact single-line if/else is established style here
+    "E702",
+    "E731",  # lambda assignment in bench/tuning code
+]
+
+[lint.isort]
+known-first-party = ["sm110a_kernel", "common"]

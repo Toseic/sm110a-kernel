@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Ruff (lint + format check) on staged Python files. Blocks the commit on
+# failure. Checks the STAGED content (git show :path), never the working
+# tree, so unstaged edits are not judged or pulled into the commit.
+set -uo pipefail
+
+if ! command -v ruff >/dev/null 2>&1; then
+    echo "pre-commit: ruff not found on PATH (pip install ruff)" >&2
+    exit 1
+fi
+
+fail=0
+while IFS= read -r -d '' f; do
+    if ! out=$(git show ":$f" | ruff format --check --stdin-filename "$f" - 2>&1); then
+        echo "ruff format would reformat (staged content): $f"
+        fail=1
+    fi
+    if ! out=$(git show ":$f" | ruff check --stdin-filename "$f" - 2>&1); then
+        echo "$out" | sed 's/^/  /'
+        fail=1
+    fi
+done < <(git diff --cached --name-only -z --diff-filter=ACMR -- '*.py')
+
+if [ "$fail" -ne 0 ]; then
+    echo ""
+    echo "pre-commit: ruff failed on staged Python files."
+    echo "Fix with 'ruff format <files>' and 'ruff check --fix <files>', re-stage, then commit."
+    echo "(Skip once with --no-verify if truly necessary.)"
+    exit 1
+fi
+
+exit 0
