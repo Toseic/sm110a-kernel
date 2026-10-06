@@ -28,7 +28,6 @@ from sm110a_kernel import (
 )
 from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
 
-
 DEFAULT_EXPERTS = 256
 DEFAULT_H = 6144
 DEFAULT_I = 2048
@@ -66,18 +65,23 @@ def fc2_sol_bounds(router_scores, topk, h, i, config):
     a_bytes = 2 * m * i
     b_bytes = 2 * active_experts * h * i
     out_bytes = 2 * tokens * h
-    m_tiles = torch.div(
-        expert_rows + config.cluster_m * config.tile_m - 1,
-        config.cluster_m * config.tile_m,
-        rounding_mode="floor",
-    ).sum().item()
+    m_tiles = (
+        torch.div(
+            expert_rows + config.cluster_m * config.tile_m - 1,
+            config.cluster_m * config.tile_m,
+            rounding_mode="floor",
+        )
+        .sum()
+        .item()
+    )
     task_count = m_tiles * (h // config.tile_n)
-    tile_read_bytes = 2 * task_count * (
-        config.cluster_m * config.tile_m + config.tile_n
-    ) * i
+    tile_read_bytes = (
+        2 * task_count * (config.cluster_m * config.tile_m + config.tile_n) * i
+    )
     # Fused FC2 reads its BF16 FC1 rows and directly reduces into the finalized output.
-    return sol_bounds(flops, a_bytes + b_bytes + out_bytes,
-                      a_bytes + b_bytes, tile_read_bytes)
+    return sol_bounds(
+        flops, a_bytes + b_bytes + out_bytes, a_bytes + b_bytes, tile_read_bytes
+    )
 
 
 def format_candidate(config):
@@ -85,48 +89,75 @@ def format_candidate(config):
 
 
 def compatible_candidates(h, i, args):
-    candidates = tuple(config for config in FC2_CONFIGS if h % config.tile_n == 0 and i % config.tile_k == 0)
+    candidates = tuple(
+        config
+        for config in FC2_CONFIGS
+        if h % config.tile_n == 0 and i % config.tile_k == 0
+    )
     if args.tile_n is not None:
-        candidates = tuple(config for config in candidates if config.tile_n == args.tile_n)
+        candidates = tuple(
+            config for config in candidates if config.tile_n == args.tile_n
+        )
     if args.tile_k is not None:
-        candidates = tuple(config for config in candidates if config.tile_k == args.tile_k)
+        candidates = tuple(
+            config for config in candidates if config.tile_k == args.tile_k
+        )
     if args.cluster_m is not None:
-        candidates = tuple(config for config in candidates if config.cluster_m == args.cluster_m)
+        candidates = tuple(
+            config for config in candidates if config.cluster_m == args.cluster_m
+        )
     return candidates
 
 
 def make_fc1_layout(tokens, experts, topk, i):
-    router_scores = torch.empty((tokens, experts), device="cuda", dtype=torch.bfloat16).uniform_(-1.0, 1.0)
+    router_scores = torch.empty(
+        (tokens, experts), device="cuda", dtype=torch.bfloat16
+    ).uniform_(-1.0, 1.0)
     topk_result = torch.topk(router_scores.float(), topk, dim=1)
     selected = topk_result.indices.reshape(-1)
     # Select the top-k experts and normalize their logits, so each token's
     # selected-expert routing weights sum to one.
-    routing_weights = torch.softmax(topk_result.values, dim=1).to(torch.bfloat16).contiguous()
+    routing_weights = (
+        torch.softmax(topk_result.values, dim=1).to(torch.bfloat16).contiguous()
+    )
     grouped_order = torch.argsort(selected, stable=True)
     routing = pack_routing_metadata(selected, experts)
     # FC2 consumes expert-grouped rows.  Their values are synthetic benchmark
     # inputs, so generate that final layout directly instead of holding an
     # unordered tensor plus a full index-select result.
-    fc1 = torch.empty(
-        (tokens * topk, i), device="cuda", dtype=torch.bfloat16
-    ).uniform_(-1.0, 1.0)
-    return (fc1, routing, routing_weights,
-            router_scores, selected, grouped_order)
+    fc1 = torch.empty((tokens * topk, i), device="cuda", dtype=torch.bfloat16).uniform_(
+        -1.0, 1.0
+    )
+    return (fc1, routing, routing_weights, router_scores, selected, grouped_order)
 
 
 def prepare_fc2_metadata(routing, weights, fc1, config):
     experts, h, _ = weights.shape
     grouped_layout = routing.narrow(0, 2 * experts, fc1.size(0))
     grouped_config = GroupedMConfig(
-        tile_m=config.tile_m, tile_n=config.tile_n, tile_k=config.tile_k,
-        epilogue_tile_n=config.epilogue_tile_n, cluster_m=config.cluster_m,
-        mode=1)
+        tile_m=config.tile_m,
+        tile_n=config.tile_n,
+        tile_k=config.tile_k,
+        epilogue_tile_n=config.epilogue_tile_n,
+        cluster_m=config.cluster_m,
+        mode=1,
+    )
     return prepare_grouped_m_metadata(grouped_layout, experts, h, grouped_config)
 
 
-def run_fc2(fc1, weights, routing_weights, routing, grouped_metadata, topk, out, config):
+def run_fc2(
+    fc1, weights, routing_weights, routing, grouped_metadata, topk, out, config
+):
     fc2_finalize_with_routing_out(
-        fc1, weights, topk, routing_weights, routing, grouped_metadata, out, config=config)
+        fc1,
+        weights,
+        topk,
+        routing_weights,
+        routing,
+        grouped_metadata,
+        out,
+        config=config,
+    )
 
 
 def benchmark_fc2(fc1, weights, routing_weights, routing, topk, out, config, args):
@@ -134,21 +165,30 @@ def benchmark_fc2(fc1, weights, routing_weights, routing, topk, out, config, arg
     run_fc2(fc1, weights, routing_weights, routing, grouped_metadata, topk, out, config)
     torch.cuda.synchronize()
     return benchmark_with_stats(
-        lambda: run_fc2(fc1, weights, routing_weights, routing, grouped_metadata, topk, out, config),
-        args.warmup, args.iters, args.samples, cold_l2_flush=args._cold_l2_flush,
+        lambda: run_fc2(
+            fc1, weights, routing_weights, routing, grouped_metadata, topk, out, config
+        ),
+        args.warmup,
+        args.iters,
+        args.samples,
+        cold_l2_flush=args._cold_l2_flush,
     )
 
 
 def probe_fc2(fc1, weights, routing_weights, routing, topk, out, config, args):
     grouped_metadata = prepare_fc2_metadata(routing, weights, fc1, config)
     return quick_probe(
-        lambda: run_fc2(fc1, weights, routing_weights, routing, grouped_metadata, topk, out, config),
+        lambda: run_fc2(
+            fc1, weights, routing_weights, routing, grouped_metadata, topk, out, config
+        ),
         args.iters,
         cold_l2_flush=args._cold_l2_flush,
     )
 
 
-def reference_fc2(fc1, weights, routing_weights, selected, grouped_order, tokens, topk, h):
+def reference_fc2(
+    fc1, weights, routing_weights, selected, grouped_order, tokens, topk, h
+):
     grouped_experts = selected.index_select(0, grouped_order)
     grouped = torch.empty((fc1.size(0), h), device="cuda", dtype=torch.bfloat16)
     for expert in range(weights.size(0)):
@@ -194,11 +234,20 @@ class Fc2FinalizeBenchmark(BenchmarkBase):
         return args
 
     def make_result_table(self):
-        return self.make_table_printer((
-            ("Tokens", 8), ("M", 10), ("TopK", 8), ("E", 8),
-            ("H", 8), ("I", 8), ("KernelMed(ms)", 16),
-            ("E2E TF/s", 16), ("MaxDiff", 12), ("BestConfig", 42),
-        ))
+        return self.make_table_printer(
+            (
+                ("Tokens", 8),
+                ("M", 10),
+                ("TopK", 8),
+                ("E", 8),
+                ("H", 8),
+                ("I", 8),
+                ("KernelMed(ms)", 16),
+                ("E2E TF/s", 16),
+                ("MaxDiff", 12),
+                ("BestConfig", 42),
+            )
+        )
 
     def run_with_args(self, args):
         torch.manual_seed(args.seed)
@@ -206,20 +255,34 @@ class Fc2FinalizeBenchmark(BenchmarkBase):
         candidates = compatible_candidates(args.h, args.i, args)
         if not candidates:
             raise SystemExit("no compatible FC2 configs match the requested filters")
-        print(f"[config] experts={args.experts} h={args.h} i={args.i} topk={args.topk} tokens={tokens_values}")
+        print(
+            f"[config] experts={args.experts} h={args.h} i={args.i} topk={args.topk} tokens={tokens_values}"
+        )
         print("[runner] resolving and caching the best compatible config")
         table = self.make_result_table()
         table.print_header()
         sol_report = SolReport(debug=args.debug) if args.sol else None
-        weights = torch.empty((args.experts, args.h, args.i), device="cuda", dtype=torch.bfloat16).uniform_(-1.0, 1.0)
+        weights = torch.empty(
+            (args.experts, args.h, args.i), device="cuda", dtype=torch.bfloat16
+        ).uniform_(-1.0, 1.0)
         for tokens in tokens_values:
-            fc1, routing, routing_weights, router_scores, selected, grouped_order = make_fc1_layout(
-                tokens, args.experts, args.topk, args.i
+            fc1, routing, routing_weights, router_scores, selected, grouped_order = (
+                make_fc1_layout(tokens, args.experts, args.topk, args.i)
             )
             out = torch.empty((tokens, args.h), device="cuda", dtype=torch.bfloat16)
+
             def prepare(config):
                 metadata = prepare_fc2_metadata(routing, weights, fc1, config)
-                run = lambda: run_fc2(fc1, weights, routing_weights, routing, metadata, args.topk, out, config)
+                run = lambda: run_fc2(
+                    fc1,
+                    weights,
+                    routing_weights,
+                    routing,
+                    metadata,
+                    args.topk,
+                    out,
+                    config,
+                )
                 run()
                 torch.cuda.synchronize()
                 return PreparedKernel(config, run)
@@ -233,11 +296,16 @@ class Fc2FinalizeBenchmark(BenchmarkBase):
                 candidates,
                 prepare=prepare,
                 benchmark=lambda prepared: benchmark_with_stats(
-                    prepared.run, args.warmup, args.iters, args.samples,
+                    prepared.run,
+                    args.warmup,
+                    args.iters,
+                    args.samples,
                     cold_l2_flush=args._cold_l2_flush,
                 ),
                 probe=lambda prepared: quick_probe(
-                    prepared.run, args.iters, cold_l2_flush=args._cold_l2_flush,
+                    prepared.run,
+                    args.iters,
+                    cold_l2_flush=args._cold_l2_flush,
                 ),
                 format_candidate=format_candidate,
                 namespace="fc2_finalize",
@@ -255,25 +323,48 @@ class Fc2FinalizeBenchmark(BenchmarkBase):
                         )
                     ),
                 ),
-                metric_formatter=lambda _config, result: f"{fc2_tflops(tokens, args.topk, args.h, args.i, result['median_ms']):.1f} TF/s",
+                metric_formatter=lambda _config, result: (
+                    f"{fc2_tflops(tokens, args.topk, args.h, args.i, result['median_ms']):.1f} TF/s"
+                ),
             )
             best_config, stats = selection.candidate, selection.stats
             max_abs_diff = 0.0
             if args.check:
                 selection.prepared.run()
-                reference = reference_fc2(fc1, weights, routing_weights, selected, grouped_order, tokens, args.topk, args.h)
+                reference = reference_fc2(
+                    fc1,
+                    weights,
+                    routing_weights,
+                    selected,
+                    grouped_order,
+                    tokens,
+                    args.topk,
+                    args.h,
+                )
                 torch.cuda.synchronize()
                 max_abs_diff = (out.float() - reference.float()).abs().max().item()
-                if not torch.allclose(out.float(), reference.float(), atol=args.atol, rtol=args.rtol):
+                if not torch.allclose(
+                    out.float(), reference.float(), atol=args.atol, rtol=args.rtol
+                ):
                     raise SystemExit(f"[check] FAIL max_abs_diff={max_abs_diff:.6f}")
                 print(f"[check tokens={tokens}] PASS max_abs_diff={max_abs_diff:.6f}")
-            table.print_row(tokens, tokens * args.topk, args.topk, args.experts, args.h, args.i,
-                            f"{stats['median_ms']:.4f}",
-                            f"{fc2_tflops(tokens, args.topk, args.h, args.i, stats['median_ms']):.3f}",
-                            f"{max_abs_diff:.6f}", format_candidate(best_config))
+            table.print_row(
+                tokens,
+                tokens * args.topk,
+                args.topk,
+                args.experts,
+                args.h,
+                args.i,
+                f"{stats['median_ms']:.4f}",
+                f"{fc2_tflops(tokens, args.topk, args.h, args.i, stats['median_ms']):.3f}",
+                f"{max_abs_diff:.6f}",
+                format_candidate(best_config),
+            )
             if args.sol:
                 sol_report.add(
-                    fc2_sol_bounds(router_scores, args.topk, args.h, args.i, best_config),
+                    fc2_sol_bounds(
+                        router_scores, args.topk, args.h, args.i, best_config
+                    ),
                     stats["median_ms"],
                     label=f"FC2 grouped GEMM + finalize (tokens={tokens})",
                 )

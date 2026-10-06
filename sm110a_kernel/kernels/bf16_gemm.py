@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
 
 from ..jit_runtime import SplitCudaJit
 
@@ -30,7 +30,9 @@ class Bf16GemmConfig:
         if self.tile_m == 64 and self.cluster_m != 1:
             raise ValueError("tile_m=64 requires cluster_m=1")
         if self.split_k not in (1, 2, 4, 8) or self.cluster_m * self.split_k > 8:
-            raise ValueError("split_k must be 1, 2, 4, or 8 and cluster_m * split_k <= 8")
+            raise ValueError(
+                "split_k must be 1, 2, 4, or 8 and cluster_m * split_k <= 8"
+            )
         if self.tile_n <= 0:
             raise ValueError("tile_n must be positive")
         if self.epilogue_block_n not in (32, 64, 128):
@@ -42,10 +44,16 @@ class Bf16GemmConfig:
         if self.tile_k <= 0 or self.tile_k % 64:
             raise ValueError("tile_k must be a positive multiple of 64")
         epilogue_smem = 2 * self.tile_m * self.epilogue_block_n * 2
-        mainloop_stage_smem = (self.tile_m + self.tile_n // self.cluster_m) * self.tile_k * 2
-        reduction_smem = self.tile_m * self.epilogue_block_n * 4 if self.split_k > 1 else 0
+        mainloop_stage_smem = (
+            (self.tile_m + self.tile_n // self.cluster_m) * self.tile_k * 2
+        )
+        reduction_smem = (
+            self.tile_m * self.epilogue_block_n * 4 if self.split_k > 1 else 0
+        )
         if (227 * 1024 - epilogue_smem - reduction_smem) // mainloop_stage_smem < 2:
-            raise ValueError("configuration leaves room for fewer than two mainloop stages")
+            raise ValueError(
+                "configuration leaves room for fewer than two mainloop stages"
+            )
 
 
 def _default_config(a, b) -> Bf16GemmConfig:
@@ -57,47 +65,85 @@ def _default_config(a, b) -> Bf16GemmConfig:
 
 class Bf16GemmModule:
     def __init__(self, binding, library, config: Bf16GemmConfig):
-        self._binding, self._launcher, self._config = binding, library.entry_address, config
+        self._binding, self._launcher, self._config = (
+            binding,
+            library.entry_address,
+            config,
+        )
 
     def _args(self, device, max_active_clusters=None):
         c = self._config
         if max_active_clusters is None:
             import torch
+
             sm_count = torch.cuda.get_device_properties(device).multi_processor_count
             max_active_clusters = sm_count // (c.cluster_m * c.split_k)
         if max_active_clusters <= 0:
             raise ValueError("max_active_clusters must be positive")
-        return (self._launcher, c.tile_m, c.tile_n, c.tile_k, c.cluster_m, c.split_k,
-                int(max_active_clusters))
+        return (
+            self._launcher,
+            c.tile_m,
+            c.tile_n,
+            c.tile_k,
+            c.cluster_m,
+            c.split_k,
+            int(max_active_clusters),
+        )
 
     def bf16_gemm(self, a, b, swap_ab=False, max_active_clusters=None):
-        return self._binding.bf16_gemm(a, b, *self._args(a.device, max_active_clusters), swap_ab)
+        return self._binding.bf16_gemm(
+            a, b, *self._args(a.device, max_active_clusters), swap_ab
+        )
+
     def bf16_gemm_out(self, a, b, out, swap_ab=False, max_active_clusters=None):
-        return self._binding.bf16_gemm_out(a, b, out, *self._args(a.device, max_active_clusters), swap_ab)
+        return self._binding.bf16_gemm_out(
+            a, b, out, *self._args(a.device, max_active_clusters), swap_ab
+        )
+
     def bf16_gemm_nt(self, a, b_nt, swap_ab=False, max_active_clusters=None):
-        return self._binding.bf16_gemm_nt(a, b_nt, *self._args(a.device, max_active_clusters), swap_ab)
+        return self._binding.bf16_gemm_nt(
+            a, b_nt, *self._args(a.device, max_active_clusters), swap_ab
+        )
+
     def bf16_gemm_nt_out(self, a, b_nt, out, swap_ab=False, max_active_clusters=None):
-        return self._binding.bf16_gemm_nt_out(a, b_nt, out, *self._args(a.device, max_active_clusters), swap_ab)
+        return self._binding.bf16_gemm_nt_out(
+            a, b_nt, out, *self._args(a.device, max_active_clusters), swap_ab
+        )
 
 
 def _kernel_cflags(config, _variant):
-    return tuple(f"-DSM110A_BF16_{name}={value}" for name, value in (
-        ("TILE_M", config.tile_m), ("TILE_N", config.tile_n),
-        ("TILE_K", config.tile_k), ("CLUSTER_M", config.cluster_m),
-        ("SPLIT_K", config.split_k),
-        ("EPILOGUE_BLOCK_N", config.epilogue_block_n)))
+    return tuple(
+        f"-DSM110A_BF16_{name}={value}"
+        for name, value in (
+            ("TILE_M", config.tile_m),
+            ("TILE_N", config.tile_n),
+            ("TILE_K", config.tile_k),
+            ("CLUSTER_M", config.cluster_m),
+            ("SPLIT_K", config.split_k),
+            ("EPILOGUE_BLOCK_N", config.epilogue_block_n),
+        )
+    )
 
 
 _JIT = SplitCudaJit(
-    name="sm110a_bf16_gemm", root=_ROOT,
+    name="sm110a_bf16_gemm",
+    root=_ROOT,
     binding_sources=(_SOURCE_DIR / "bf16_gemm_split_torch_binding.cpp",),
     kernel_sources=(_SOURCE_DIR / "bf16_gemm_kernel.cu",),
-    kernel_dependencies=(_INCLUDE_DIR / "bf16_gemm.h", _INCLUDE_DIR / "common.h", _SOURCE_DIR / "bf16_gemm_pipeline_delay.cuh"),
-    kernel_symbol="sm110a_bf16_gemm_launch", config_key=lambda config: config,
-    kernel_cflags=_kernel_cflags, make_facade=Bf16GemmModule, include_paths=(_INCLUDE_DIR,))
+    kernel_dependencies=(
+        _INCLUDE_DIR / "bf16_gemm.h",
+        _INCLUDE_DIR / "common.h",
+        _SOURCE_DIR / "bf16_gemm_pipeline_delay.cuh",
+    ),
+    kernel_symbol="sm110a_bf16_gemm_launch",
+    config_key=lambda config: config,
+    kernel_cflags=_kernel_cflags,
+    make_facade=Bf16GemmModule,
+    include_paths=(_INCLUDE_DIR,),
+)
 
 
-def compile_bf16_gemm(config: Optional[Bf16GemmConfig] = None) -> Bf16GemmModule:
+def compile_bf16_gemm(config: Bf16GemmConfig | None = None) -> Bf16GemmModule:
     config = config or Bf16GemmConfig()
     if not isinstance(config, Bf16GemmConfig):
         raise TypeError("config must be a Bf16GemmConfig")
@@ -119,14 +165,21 @@ def get_bf16_gemm_module(a, b, config=None):
 
 
 def bf16_gemm(a, b, config=None, swap_ab=False, max_active_clusters=None):
-    return get_bf16_gemm_module(a, b, config).bf16_gemm(a, b, swap_ab, max_active_clusters)
+    return get_bf16_gemm_module(a, b, config).bf16_gemm(
+        a, b, swap_ab, max_active_clusters
+    )
 
 
 def bf16_gemm_out(a, b, out, config=None, swap_ab=False, max_active_clusters=None):
-    return get_bf16_gemm_module(a, b, config).bf16_gemm_out(a, b, out, swap_ab, max_active_clusters)
+    return get_bf16_gemm_module(a, b, config).bf16_gemm_out(
+        a, b, out, swap_ab, max_active_clusters
+    )
 
 
-def bf16_gemm_nt_out(a, b_nt, out, config=None, swap_ab=False, max_active_clusters=None):
+def bf16_gemm_nt_out(
+    a, b_nt, out, config=None, swap_ab=False, max_active_clusters=None
+):
     """Compute ``a @ b_nt.T`` for a contiguous, pretransposed ``b_nt(N, K)``."""
     return compile_bf16_gemm(config or _default_config(a, b_nt)).bf16_gemm_nt_out(
-        a, b_nt, out, swap_ab, max_active_clusters)
+        a, b_nt, out, swap_ab, max_active_clusters
+    )

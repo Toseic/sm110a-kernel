@@ -21,7 +21,13 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from common import BenchmarkBase, SolReport, TablePrinter, benchmark_with_stats, sol_bounds
+from common import (
+    BenchmarkBase,
+    SolReport,
+    TablePrinter,
+    benchmark_with_stats,
+    sol_bounds,
+)
 from sm110a_kernel import (
     Bf16Fa4MhaConfig,
     Bf16Fa4MhaTactic,
@@ -41,9 +47,12 @@ def load_official_fa4():
     try:
         from flash_attn.cute.interface import _flash_attn_fwd
     except ImportError as exc:
-        raise SystemExit('install the FA4 baseline with: pip install "flash-attn-4[cu13]"') from exc
+        raise SystemExit(
+            'install the FA4 baseline with: pip install "flash-attn-4[cu13]"'
+        ) from exc
     warnings.filterwarnings(
-        "ignore", message=r"Argument aux_data .*cannot be converted to a JitArgument.*",
+        "ignore",
+        message=r"Argument aux_data .*cannot be converted to a JitArgument.*",
         category=UserWarning,
     )
     try:
@@ -56,11 +65,15 @@ def load_official_fa4():
 def load_trtllm_gen():
     capability = torch.cuda.get_device_capability()
     if capability not in TRTLLM_GEN_SUPPORTED_CAPABILITIES:
-        raise SystemExit(f"TRTLLM-Gen FMHA does not support SM{capability[0]}{capability[1]}")
+        raise SystemExit(
+            f"TRTLLM-Gen FMHA does not support SM{capability[0]}{capability[1]}"
+        )
     try:
         from flashinfer.prefill import trtllm_ragged_attention_deepseek
     except ImportError as exc:
-        raise SystemExit('install the TRTLLM-Gen baseline with: pip install "flashinfer-python[cu13]>=0.6.18"') from exc
+        raise SystemExit(
+            'install the TRTLLM-Gen baseline with: pip install "flashinfer-python[cu13]>=0.6.18"'
+        ) from exc
     try:
         label = version("flashinfer-python")
     except PackageNotFoundError:
@@ -103,13 +116,21 @@ def attention_sol_bounds(case, q_lengths, kv_lengths, packed_q, page_size):
         for q_start in range(0, q_len, 256):
             visible_kv = min(q_start + 256, kv_len) if case.causal else kv_len
             kv_tiles = math.ceil(visible_kv / 128)
-            tile_read_bytes += 2 * kv_tiles * 128 * case.heads * case.head_dim * element_bytes
-    flops = 4 * case.heads * case.head_dim * sum(
-        valid_scores(q_len, kv_len, case.causal)
-        for q_len, kv_len in zip(q_lengths, kv_lengths)
+            tile_read_bytes += (
+                2 * kv_tiles * 128 * case.heads * case.head_dim * element_bytes
+            )
+    flops = (
+        4
+        * case.heads
+        * case.head_dim
+        * sum(
+            valid_scores(q_len, kv_len, case.causal)
+            for q_len, kv_len in zip(q_lengths, kv_lengths)
+        )
     )
-    return sol_bounds(flops, q_bytes + kv_bytes + output_bytes,
-                      q_bytes + kv_bytes, tile_read_bytes)
+    return sol_bounds(
+        flops, q_bytes + kv_bytes + output_bytes, q_bytes + kv_bytes, tile_read_bytes
+    )
 
 
 def reference_attention(q, k, v, *, causal, scale):
@@ -118,8 +139,13 @@ def reference_attention(q, k, v, *, causal, scale):
     pieces = []
     for start in range(0, q.size(1), 64):
         end = min(start + 64, q.size(1))
-        scores = torch.matmul(q[:, start:end].float().transpose(1, 2),
-                              kf.transpose(1, 2).transpose(-2, -1)) * scale
+        scores = (
+            torch.matmul(
+                q[:, start:end].float().transpose(1, 2),
+                kf.transpose(1, 2).transpose(-2, -1),
+            )
+            * scale
+        )
         if causal:
             rows = torch.arange(start, end, device=q.device)
             cols = torch.arange(k.size(1), device=q.device)
@@ -138,21 +164,43 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
         parser.add_argument("--q-len", type=int, default=1024)
         parser.add_argument("--kv-len", type=int, default=1024)
         parser.add_argument("--head-dim", type=int, default=128)
-        parser.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE,
-                            help="KV page size; must divide 128 (default: 128)")
+        parser.add_argument(
+            "--page-size",
+            type=int,
+            default=DEFAULT_PAGE_SIZE,
+            help="KV page size; must divide 128 (default: 128)",
+        )
         parser.add_argument("--causal", action="store_true")
-        parser.add_argument("--batched-q", action="store_true",
-                            help="pack prefill Q as [sum_q, heads, dim]")
-        parser.add_argument("--q-lengths", type=str, default=None,
-                            help="comma-separated per-batch Q lengths for --single --batched-q")
-        parser.add_argument("--kv-lengths", type=str, default=None,
-                            help="comma-separated per-batch KV lengths for --single")
+        parser.add_argument(
+            "--batched-q",
+            action="store_true",
+            help="pack prefill Q as [sum_q, heads, dim]",
+        )
+        parser.add_argument(
+            "--q-lengths",
+            type=str,
+            default=None,
+            help="comma-separated per-batch Q lengths for --single --batched-q",
+        )
+        parser.add_argument(
+            "--kv-lengths",
+            type=str,
+            default=None,
+            help="comma-separated per-batch KV lengths for --single",
+        )
         parser.add_argument("--scale", type=float, default=None)
         parser.add_argument("--baseline", choices=("fa4", "trtllm-gen"), default="fa4")
-        parser.add_argument("--tactic", choices=("auto", "16warp", "12warp"), default="auto",
-                            help="CTA schedule; auto benchmarks and caches compatible schedules")
-        parser.add_argument("--no-accuracy", action="store_true",
-                            help="skip the additional FP32 check; baseline comparison remains enabled")
+        parser.add_argument(
+            "--tactic",
+            choices=("auto", "16warp", "12warp"),
+            default="auto",
+            help="CTA schedule; auto benchmarks and caches compatible schedules",
+        )
+        parser.add_argument(
+            "--no-accuracy",
+            action="store_true",
+            help="skip the additional FP32 check; baseline comparison remains enabled",
+        )
         parser.add_argument("--atol", type=float, default=2e-2)
         parser.add_argument("--rtol", type=float, default=2e-2)
         parser.add_argument("--debug", action="store_true")
@@ -162,10 +210,18 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
         return parser
 
     def validate_args(self, args):
-        if (min(args.batch, args.heads, args.q_len, args.kv_len, args.page_size) <= 0 or
-                args.head_dim != 128 or args.page_size > 128 or 128 % args.page_size):
-            raise SystemExit("dimensions must be positive, head_dim must be 128, and page_size must divide 128")
-        if args.scale is not None and (not math.isfinite(args.scale) or args.scale <= 0):
+        if (
+            min(args.batch, args.heads, args.q_len, args.kv_len, args.page_size) <= 0
+            or args.head_dim != 128
+            or args.page_size > 128
+            or 128 % args.page_size
+        ):
+            raise SystemExit(
+                "dimensions must be positive, head_dim must be 128, and page_size must divide 128"
+            )
+        if args.scale is not None and (
+            not math.isfinite(args.scale) or args.scale <= 0
+        ):
             raise SystemExit("--scale must be finite and positive")
         self.validate_timing_args(args, allow_zero_warmup=True)
         for name, maximum in (("q_lengths", args.q_len), ("kv_lengths", args.kv_len)):
@@ -173,14 +229,22 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
             if raw is None:
                 continue
             if not args.single or (name == "q_lengths" and not args.batched_q):
-                raise SystemExit(f"--{name.replace('_', '-')} requires --single" +
-                                 (" --batched-q" if name == "q_lengths" else ""))
+                raise SystemExit(
+                    f"--{name.replace('_', '-')} requires --single"
+                    + (" --batched-q" if name == "q_lengths" else "")
+                )
             try:
                 lengths = tuple(int(value) for value in raw.split(","))
             except ValueError as exc:
-                raise SystemExit(f"--{name.replace('_', '-')} must contain integers") from exc
-            if len(lengths) != args.batch or any(length < 1 or length > maximum for length in lengths):
-                raise SystemExit(f"--{name.replace('_', '-')} needs {args.batch} values in [1, {maximum}]")
+                raise SystemExit(
+                    f"--{name.replace('_', '-')} must contain integers"
+                ) from exc
+            if len(lengths) != args.batch or any(
+                length < 1 or length > maximum for length in lengths
+            ):
+                raise SystemExit(
+                    f"--{name.replace('_', '-')} needs {args.batch} values in [1, {maximum}]"
+                )
             setattr(args, name, lengths)
         if args.batched_q and args.single and args.q_len == 1:
             raise SystemExit("--batched-q is intended for prefill (q_len > 1)")
@@ -188,19 +252,37 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
 
     def cases(self, args):
         if args.single:
-            yield AttentionCase("single", args.batch, args.heads, args.q_len,
-                                args.kv_len, args.head_dim, args.causal)
+            yield AttentionCase(
+                "single",
+                args.batch,
+                args.heads,
+                args.q_len,
+                args.kv_len,
+                args.head_dim,
+                args.causal,
+            )
             return
         for length in PREFILL_LENGTHS:
             yield AttentionCase("prefill", 1, 32, length, length, 128, True)
         for length in BATCHED_PREFILL_LENGTHS:
             rng = random.Random(self.seed + length)
-            lengths = [length] + [rng.randint(length // 2, length - 1)
-                                  for _ in range(BATCHED_PREFILL_BATCH - 1)]
+            lengths = [length] + [
+                rng.randint(length // 2, length - 1)
+                for _ in range(BATCHED_PREFILL_BATCH - 1)
+            ]
             rng.shuffle(lengths)
-            yield AttentionCase("batched", BATCHED_PREFILL_BATCH, 32,
-                                length, length, 128, True,
-                                tuple(lengths), tuple(lengths), True)
+            yield AttentionCase(
+                "batched",
+                BATCHED_PREFILL_BATCH,
+                32,
+                length,
+                length,
+                128,
+                True,
+                tuple(lengths),
+                tuple(lengths),
+                True,
+            )
         if args.batched_q:
             return
         for batch in DECODE_BATCH_SIZES:
@@ -210,10 +292,14 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
         q_lengths = case.q_lengths or args.q_lengths or (case.q_len,) * case.batch
         kv_lengths = case.kv_lengths or args.kv_lengths or (case.kv_len,) * case.batch
         packed_q = case.packed_q or args.batched_q
-        if case.causal and any(q_len != kv_len for q_len, kv_len in zip(q_lengths, kv_lengths)):
-            raise SystemExit("causal baseline alignment differs when Q and KV lengths differ; "
-                             "use matching per-batch lengths or non-causal attention")
-        scale = args.scale if args.scale is not None else case.head_dim ** -0.5
+        if case.causal and any(
+            q_len != kv_len for q_len, kv_len in zip(q_lengths, kv_lengths)
+        ):
+            raise SystemExit(
+                "causal baseline alignment differs when Q and KV lengths differ; "
+                "use matching per-batch lengths or non-causal attention"
+            )
+        scale = args.scale if args.scale is not None else case.head_dim**-0.5
         shape_q = (case.batch, case.q_len, case.heads, case.head_dim)
         shape_kv = (case.batch, case.kv_len, case.heads, case.head_dim)
         q = torch.empty(shape_q, device="cuda", dtype=torch.bfloat16).uniform_(-1, 1)
@@ -226,6 +312,7 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
         padded = pages_per_batch * page_size - case.kv_len
         permutation = torch.randperm(case.batch * pages_per_batch, device="cuda")
         block_table = permutation.reshape(case.batch, pages_per_batch).to(torch.int32)
+
         def make_pages(tensor, *, fa4_layout=False):
             logical = F.pad(tensor, (0, 0, 0, 0, 0, padded)).view(
                 case.batch, pages_per_batch, page_size, case.heads, case.head_dim
@@ -233,12 +320,15 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
             if fa4_layout:
                 logical = logical.reshape(-1, page_size, case.heads, case.head_dim)
             else:
-                logical = logical.permute(0, 1, 3, 2, 4).contiguous().view(
-                    -1, case.heads, page_size, case.head_dim
+                logical = (
+                    logical.permute(0, 1, 3, 2, 4)
+                    .contiguous()
+                    .view(-1, case.heads, page_size, case.head_dim)
                 )
             physical = torch.empty_like(logical)
             physical.index_copy_(0, permutation, logical)
             return physical
+
         k_pages, v_pages = make_pages(k), make_pages(v)
         kv_seqlens = torch.tensor(kv_lengths, device="cuda", dtype=torch.int32)
 
@@ -247,39 +337,73 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
             for length in q_lengths:
                 offsets.append(offsets[-1] + length)
             cu_seqlens_q = torch.tensor(offsets, device="cuda", dtype=torch.int32)
-            q_input = torch.cat([q[b, :length] for b, length in enumerate(q_lengths)], dim=0)
+            q_input = torch.cat(
+                [q[b, :length] for b, length in enumerate(q_lengths)], dim=0
+            )
         else:
             cu_seqlens_q = None
             q_input = q.permute(0, 2, 1, 3).contiguous()
         out = torch.empty_like(q_input)
+
         def make_kernel_run(tactic):
             module = compile_bf16_fa4_mha(Bf16Fa4MhaConfig(tactic=tactic))
+
             def run():
                 module.fa_mha_out(
-                q_input, k_pages, v_pages, out, causal=case.causal, scale=scale,
-                block_table=block_table, cu_seqlens_q=cu_seqlens_q,
-                kv_seqlens=kv_seqlens, max_q_len=case.q_len, max_kv_len=case.kv_len,
+                    q_input,
+                    k_pages,
+                    v_pages,
+                    out,
+                    causal=case.causal,
+                    scale=scale,
+                    block_table=block_table,
+                    cu_seqlens_q=cu_seqlens_q,
+                    kv_seqlens=kv_seqlens,
+                    max_q_len=case.q_len,
+                    max_kv_len=case.kv_len,
                 )
+
             return run
 
         if args.baseline == "fa4":
-            fa4_k_pages, fa4_v_pages = make_pages(k, fa4_layout=True), make_pages(v, fa4_layout=True)
+            fa4_k_pages, fa4_v_pages = (
+                make_pages(k, fa4_layout=True),
+                make_pages(v, fa4_layout=True),
+            )
             fa4_q = q_input if packed_q else q
             baseline_out = torch.empty_like(fa4_q)
+
             def run_baseline():
                 self._baseline(
-                    fa4_q, fa4_k_pages, fa4_v_pages, page_table=block_table,
-                    cu_seqlens_q=cu_seqlens_q, seqused_k=kv_seqlens,
-                    max_seqlen_q=case.q_len, max_seqlen_k=case.kv_len,
-                    softmax_scale=scale, causal=case.causal, out=baseline_out,
+                    fa4_q,
+                    fa4_k_pages,
+                    fa4_v_pages,
+                    page_table=block_table,
+                    cu_seqlens_q=cu_seqlens_q,
+                    seqused_k=kv_seqlens,
+                    max_seqlen_q=case.q_len,
+                    max_seqlen_k=case.kv_len,
+                    softmax_scale=scale,
+                    causal=case.causal,
+                    out=baseline_out,
                 )
+
             def baseline_batch(b, q_len):
-                return (baseline_out[offsets[b]:offsets[b + 1]]
-                        if packed_q else baseline_out[b, :q_len])
+                return (
+                    baseline_out[offsets[b] : offsets[b + 1]]
+                    if packed_q
+                    else baseline_out[b, :q_len]
+                )
         else:
-            q_base = torch.cat([q[b, :length] for b, length in enumerate(q_lengths)], dim=0)
-            k_base = torch.cat([k[b, :length] for b, length in enumerate(kv_lengths)], dim=0)
-            v_base = torch.cat([v[b, :length] for b, length in enumerate(kv_lengths)], dim=0)
+            q_base = torch.cat(
+                [q[b, :length] for b, length in enumerate(q_lengths)], dim=0
+            )
+            k_base = torch.cat(
+                [k[b, :length] for b, length in enumerate(kv_lengths)], dim=0
+            )
+            v_base = torch.cat(
+                [v[b, :length] for b, length in enumerate(kv_lengths)], dim=0
+            )
             baseline_out = torch.empty_like(q_base)
             q_offsets = [0]
             kv_offsets = [0]
@@ -289,42 +413,88 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
             q_cu = torch.tensor(q_offsets, device="cuda", dtype=torch.int32)
             kv_cu = torch.tensor(kv_offsets, device="cuda", dtype=torch.int32)
             workspace = torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8)
+
             def run_baseline():
                 self._baseline(
-                    q_base, k_base, v_base, workspace_buffer=workspace,
-                    seq_lens=kv_seqlens, max_q_len=case.q_len, max_kv_len=case.kv_len,
-                    bmm1_scale=scale, bmm2_scale=1.0, o_sf_scale=1.0,
-                    batch_size=case.batch, window_left=-1, cum_seq_lens_q=q_cu,
-                    cum_seq_lens_kv=kv_cu, enable_pdl=False, is_causal=case.causal,
-                    return_lse=False, out=baseline_out, backend="trtllm-gen",
+                    q_base,
+                    k_base,
+                    v_base,
+                    workspace_buffer=workspace,
+                    seq_lens=kv_seqlens,
+                    max_q_len=case.q_len,
+                    max_kv_len=case.kv_len,
+                    bmm1_scale=scale,
+                    bmm2_scale=1.0,
+                    o_sf_scale=1.0,
+                    batch_size=case.batch,
+                    window_left=-1,
+                    cum_seq_lens_q=q_cu,
+                    cum_seq_lens_kv=kv_cu,
+                    enable_pdl=False,
+                    is_causal=case.causal,
+                    return_lse=False,
+                    out=baseline_out,
+                    backend="trtllm-gen",
                     skip_all_rows_active_check=True,
                 )
+
             def baseline_batch(b, q_len):
-                return baseline_out[q_offsets[b]:q_offsets[b + 1]]
+                return baseline_out[q_offsets[b] : q_offsets[b + 1]]
 
         if args.tactic == "auto":
             # The 16-warp epilogue cannot directly store packed Q tails and
             # dispatches to 12-warp internally, so sweep only the real tactic.
-            candidates = (Bf16Fa4MhaConfig(tactic=Bf16Fa4MhaTactic.WARP_12),) if packed_q else (
-                Bf16Fa4MhaConfig(tactic=Bf16Fa4MhaTactic.WARP_12),
-                Bf16Fa4MhaConfig(tactic=Bf16Fa4MhaTactic.WARP_16),
+            candidates = (
+                (Bf16Fa4MhaConfig(tactic=Bf16Fa4MhaTactic.WARP_12),)
+                if packed_q
+                else (
+                    Bf16Fa4MhaConfig(tactic=Bf16Fa4MhaTactic.WARP_12),
+                    Bf16Fa4MhaConfig(tactic=Bf16Fa4MhaTactic.WARP_16),
+                )
             )
-            selection = AutotuneRunner(self.make_tune_options(args, role="ours")).resolve(
+            selection = AutotuneRunner(
+                self.make_tune_options(args, role="ours")
+            ).resolve(
                 candidates,
                 namespace="bf16_fa4_mha",
-                key=("v1", case.batch, case.heads, case.q_len, case.kv_len, case.head_dim,
-                     args.page_size, case.causal, packed_q, q_lengths, kv_lengths),
-                prepare=lambda config: PreparedKernel(config, make_kernel_run(config.tactic)),
+                key=(
+                    "v1",
+                    case.batch,
+                    case.heads,
+                    case.q_len,
+                    case.kv_len,
+                    case.head_dim,
+                    args.page_size,
+                    case.causal,
+                    packed_q,
+                    q_lengths,
+                    kv_lengths,
+                ),
+                prepare=lambda config: PreparedKernel(
+                    config, make_kernel_run(config.tactic)
+                ),
                 benchmark=lambda prepared: benchmark_with_stats(
-                    prepared.run, args.warmup, args.iters, args.samples,
-                    cold_l2_flush=args._cold_l2_flush),
+                    prepared.run,
+                    args.warmup,
+                    args.iters,
+                    args.samples,
+                    cold_l2_flush=args._cold_l2_flush,
+                ),
                 probe=None,
-                format_candidate=lambda config: "12warp" if config.tactic == Bf16Fa4MhaTactic.WARP_12 else "16warp",
+                format_candidate=lambda config: (
+                    "12warp" if config.tactic == Bf16Fa4MhaTactic.WARP_12 else "16warp"
+                ),
             )
-            run_kernel, selected_tactic = selection.prepared.run, selection.candidate.tactic
+            run_kernel, selected_tactic = (
+                selection.prepared.run,
+                selection.candidate.tactic,
+            )
         else:
-            selected_tactic = (Bf16Fa4MhaTactic.WARP_12 if args.tactic == "12warp"
-                               else Bf16Fa4MhaTactic.WARP_16)
+            selected_tactic = (
+                Bf16Fa4MhaTactic.WARP_12
+                if args.tactic == "12warp"
+                else Bf16Fa4MhaTactic.WARP_16
+            )
             run_kernel = make_kernel_run(selected_tactic)
 
         run_kernel()
@@ -332,28 +502,66 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
         torch.cuda.synchronize()
         max_diff = 0.0
         for b, (q_len, kv_len) in enumerate(zip(q_lengths, kv_lengths)):
-            actual = (out[int(cu_seqlens_q[b]):int(cu_seqlens_q[b + 1])]
-                      if packed_q else out[b, :, :q_len].transpose(0, 1))
+            actual = (
+                out[int(cu_seqlens_q[b]) : int(cu_seqlens_q[b + 1])]
+                if packed_q
+                else out[b, :, :q_len].transpose(0, 1)
+            )
             expected = baseline_batch(b, q_len)
             torch.testing.assert_close(actual, expected, atol=args.atol, rtol=args.rtol)
-            max_diff = max(max_diff, (actual.float() - expected.float()).abs().max().item())
+            max_diff = max(
+                max_diff, (actual.float() - expected.float()).abs().max().item()
+            )
             if args.single and not args.no_accuracy:
-                reference = reference_attention(q[b:b + 1, :q_len], k[b:b + 1, :kv_len],
-                                                v[b:b + 1, :kv_len], causal=case.causal,
-                                                scale=scale)[0]
-                torch.testing.assert_close(actual, reference, atol=args.atol, rtol=args.rtol)
-                torch.testing.assert_close(expected, reference, atol=args.atol, rtol=args.rtol)
-        flops = 4 * case.heads * case.head_dim * sum(
-            valid_scores(q_len, kv_len, case.causal)
-            for q_len, kv_len in zip(q_lengths, kv_lengths)
+                reference = reference_attention(
+                    q[b : b + 1, :q_len],
+                    k[b : b + 1, :kv_len],
+                    v[b : b + 1, :kv_len],
+                    causal=case.causal,
+                    scale=scale,
+                )[0]
+                torch.testing.assert_close(
+                    actual, reference, atol=args.atol, rtol=args.rtol
+                )
+                torch.testing.assert_close(
+                    expected, reference, atol=args.atol, rtol=args.rtol
+                )
+        flops = (
+            4
+            * case.heads
+            * case.head_dim
+            * sum(
+                valid_scores(q_len, kv_len, case.causal)
+                for q_len, kv_len in zip(q_lengths, kv_lengths)
+            )
         )
-        kernel_stats = benchmark_with_stats(run_kernel, args.warmup, args.iters, args.samples,
-                                            cold_l2_flush=args._cold_l2_flush)
-        baseline_stats = benchmark_with_stats(run_baseline, args.warmup, args.iters, args.samples,
-                                              cold_l2_flush=args._cold_l2_flush)
-        bounds = attention_sol_bounds(case, q_lengths, kv_lengths, packed_q, args.page_size) if args.sol else None
-        return (kernel_stats["median_ms"], baseline_stats["median_ms"],
-                max_diff, flops, bounds, selected_tactic)
+        kernel_stats = benchmark_with_stats(
+            run_kernel,
+            args.warmup,
+            args.iters,
+            args.samples,
+            cold_l2_flush=args._cold_l2_flush,
+        )
+        baseline_stats = benchmark_with_stats(
+            run_baseline,
+            args.warmup,
+            args.iters,
+            args.samples,
+            cold_l2_flush=args._cold_l2_flush,
+        )
+        bounds = (
+            attention_sol_bounds(case, q_lengths, kv_lengths, packed_q, args.page_size)
+            if args.sol
+            else None
+        )
+        return (
+            kernel_stats["median_ms"],
+            baseline_stats["median_ms"],
+            max_diff,
+            flops,
+            bounds,
+            selected_tactic,
+        )
 
     def run_with_args(self, args):
         if args.baseline == "fa4":
@@ -363,30 +571,59 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
             self._baseline, label = load_trtllm_gen()
             baseline_name = "TRTLLM-Gen"
         print(f"[baseline] {baseline_name} {label}")
-        print(f"[layout] shuffled {args.page_size}-token KV pages" +
-              ("; packed Q (12warp epilogue)" if args.batched_q else ""))
-        columns = (("mode", 9), ("shape [B,H,Q,KV,D]", 24), ("mask", 10),
-                   ("tactic", 10), ("Kernel ms", 13), ("Kernel TF/s", 14),
-                   (f"{baseline_name} ms", 16), (f"vs {baseline_name}", 16), ("Diff", 12))
+        print(
+            f"[layout] shuffled {args.page_size}-token KV pages"
+            + ("; packed Q (12warp epilogue)" if args.batched_q else "")
+        )
+        columns = (
+            ("mode", 9),
+            ("shape [B,H,Q,KV,D]", 24),
+            ("mask", 10),
+            ("tactic", 10),
+            ("Kernel ms", 13),
+            ("Kernel TF/s", 14),
+            (f"{baseline_name} ms", 16),
+            (f"vs {baseline_name}", 16),
+            ("Diff", 12),
+        )
         table = TablePrinter(columns, debug=args.debug)
         table.print_header()
         sol_report = SolReport(debug=args.debug) if args.sol else None
         for case in self.cases(args):
-            kernel_ms, baseline_ms, diff, flops, bounds, selected_tactic = self.run_case(case, args)
-            table.print_row(case.name,
+            kernel_ms, baseline_ms, diff, flops, bounds, selected_tactic = (
+                self.run_case(case, args)
+            )
+            table.print_row(
+                case.name,
                 f"{case.batch}x{case.heads}x{case.q_len}x{case.kv_len}x{case.head_dim}",
                 "causal" if case.causal else "noncausal",
                 "12warp" if selected_tactic == Bf16Fa4MhaTactic.WARP_12 else "16warp",
-                f"{kernel_ms:.4f}", f"{flops / (kernel_ms * 1e9):.3f}",
-                f"{baseline_ms:.4f}", f"{baseline_ms / kernel_ms:.3f}x", f"{diff:.6g}")
+                f"{kernel_ms:.4f}",
+                f"{flops / (kernel_ms * 1e9):.3f}",
+                f"{baseline_ms:.4f}",
+                f"{baseline_ms / kernel_ms:.3f}x",
+                f"{diff:.6g}",
+            )
             if sol_report:
-                q_lengths = case.q_lengths or args.q_lengths or (case.q_len,) * case.batch
-                kv_lengths = case.kv_lengths or args.kv_lengths or (case.kv_len,) * case.batch
-                q_symbol = "≤" if any(length < case.q_len for length in q_lengths) else "="
-                kv_symbol = "≤" if any(length < case.kv_len for length in kv_lengths) else "="
-                sol_report.add(bounds, kernel_ms, label=f"MHA {case.name} "
+                q_lengths = (
+                    case.q_lengths or args.q_lengths or (case.q_len,) * case.batch
+                )
+                kv_lengths = (
+                    case.kv_lengths or args.kv_lengths or (case.kv_len,) * case.batch
+                )
+                q_symbol = (
+                    "≤" if any(length < case.q_len for length in q_lengths) else "="
+                )
+                kv_symbol = (
+                    "≤" if any(length < case.kv_len for length in kv_lengths) else "="
+                )
+                sol_report.add(
+                    bounds,
+                    kernel_ms,
+                    label=f"MHA {case.name} "
                     f"B={case.batch} H={case.heads} "
-                    f"Q{q_symbol}{case.q_len} KV{kv_symbol}{case.kv_len}")
+                    f"Q{q_symbol}{case.q_len} KV{kv_symbol}{case.kv_len}",
+                )
         if sol_report:
             sol_report.print()
 

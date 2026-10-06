@@ -19,10 +19,10 @@ if str(ROOT) not in sys.path:
 
 from common import (
     BenchmarkBase,
+    SolReport,
     TablePrinter,
     benchmark_with_stats,
     sol_bounds,
-    SolReport,
 )
 from sm110a_kernel import bf16_fa4_mla_out
 
@@ -93,14 +93,18 @@ class Bf16Fa4MlaBenchmark(BenchmarkBase):
         parser.add_argument("--scale", type=float, default=1 / math.sqrt(D_KV + D_rope))
         parser.add_argument("--no-accuracy", action="store_true")
         parser.add_argument(
-            "--impl", choices=("1cta", "2cta"), default="1cta",
+            "--impl",
+            choices=("1cta", "2cta"),
+            default="1cta",
             help="MLA kernel implementation to benchmark (default: 1cta)",
         )
         parser.add_argument("--atol", type=float, default=2e-2)
         parser.add_argument("--rtol", type=float, default=2e-2)
         self.add_timing_args(parser, warmup=5, iters=20, samples=7)
         self.add_sol_arg(parser)
-        parser.add_argument("--debug", action="store_true", help="print benchmark records line by line")
+        parser.add_argument(
+            "--debug", action="store_true", help="print benchmark records line by line"
+        )
         return parser
 
     def validate_args(self, args):
@@ -113,7 +117,9 @@ class Bf16Fa4MlaBenchmark(BenchmarkBase):
 
     def run_with_args(self, args):
         torch.manual_seed(0)
-        print(f"[config] MLA decode: {args.impl}, QK M64N64, PV M64N128, D=512, 12 warps")
+        print(
+            f"[config] MLA decode: {args.impl}, QK M64N64, PV M64N128, D=512, 12 warps"
+        )
         columns = (
             ("B", 6),
             ("S", 8),
@@ -124,13 +130,17 @@ class Bf16Fa4MlaBenchmark(BenchmarkBase):
         table = TablePrinter(columns, debug=args.debug)
         table.print_header()
         sol_report = SolReport(debug=args.debug) if args.sol else None
-        for batch in ((args.batch,) if args.single else (32, 64, 128)):
+        for batch in (args.batch,) if args.single else (32, 64, 128):
             q, k, v = make_inputs(batch, args.kv_len)
             out = torch.empty((batch, H, 1, D_KV), device=q.device, dtype=q.dtype)
 
             def kernel():
                 return bf16_fa4_mla_out(
-                    q, k, v, out, scale=args.scale,
+                    q,
+                    k,
+                    v,
+                    out,
+                    scale=args.scale,
                     implementation=args.impl,
                 )
 
@@ -141,19 +151,28 @@ class Bf16Fa4MlaBenchmark(BenchmarkBase):
                 ref = reference_attention(q, k, v, args.scale)
                 torch.testing.assert_close(out, ref, atol=args.atol, rtol=args.rtol)
                 diff = f"{(out.float() - ref.float()).abs().max().item():.6g}"
-            stats = benchmark_with_stats(kernel, args.warmup, args.iters, args.samples,
-                                         cold_l2_flush=args._cold_l2_flush)
+            stats = benchmark_with_stats(
+                kernel,
+                args.warmup,
+                args.iters,
+                args.samples,
+                cold_l2_flush=args._cold_l2_flush,
+            )
             # Useful FLOPs; the two CTAs partition H and compute full D.
             flops = 2 * batch * H * args.kv_len * (D_KV + D_rope + D_KV)
             ms = stats["median_ms"]
-            values = (batch, args.kv_len, f"{ms:.4f}", f"{flops / (ms * 1e9):.3f}", diff)
+            values = (
+                batch,
+                args.kv_len,
+                f"{ms:.4f}",
+                f"{flops / (ms * 1e9):.3f}",
+                diff,
+            )
             if sol_report:
                 bounds = mla_sol_bounds(batch, args.kv_len)
             table.print_row(*values)
             if sol_report:
-                sol_report.add(
-                    bounds, ms, label=f"MLA B={batch}, S={args.kv_len}"
-                )
+                sol_report.add(bounds, ms, label=f"MLA B={batch}, S={args.kv_len}")
 
         if sol_report:
             sol_report.print()

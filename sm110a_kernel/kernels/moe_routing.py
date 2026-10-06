@@ -11,8 +11,13 @@ import torch
 
 def pack_routing_metadata(selected_experts: torch.Tensor, experts: int) -> torch.Tensor:
     """Pack stable expert grouping metadata from token-major assignments."""
-    if selected_experts.ndim != 1 or selected_experts.dtype not in (torch.int32, torch.int64):
-        raise ValueError("selected_experts must be a 1D torch.int32 or torch.int64 tensor")
+    if selected_experts.ndim != 1 or selected_experts.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
+        raise ValueError(
+            "selected_experts must be a 1D torch.int32 or torch.int64 tensor"
+        )
     if experts <= 0:
         raise ValueError("experts must be positive")
     selected = selected_experts.to(dtype=torch.int32)
@@ -22,5 +27,8 @@ def pack_routing_metadata(selected_experts: torch.Tensor, experts: int) -> torch
     grouped_layout = selected.index_select(0, grouped_assignments)
     assignment_to_grouped = torch.empty_like(grouped_assignments)
     assignment_to_grouped[grouped_assignments] = torch.arange(
-        selected.numel(), device=selected.device, dtype=torch.int32)
-    return torch.cat((counts, offsets, grouped_layout, grouped_assignments, assignment_to_grouped))
+        selected.numel(), device=selected.device, dtype=torch.int32
+    )
+    return torch.cat(
+        (counts, offsets, grouped_layout, grouped_assignments, assignment_to_grouped)
+    )

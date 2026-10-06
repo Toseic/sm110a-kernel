@@ -1,4 +1,5 @@
 """Autotuned TensorRT-LLM CuTE DSL NVFP4 FC1 baseline with fused gather."""
+
 from __future__ import annotations
 
 import statistics
@@ -9,7 +10,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
-from typing import Optional
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -198,7 +198,10 @@ def _launch_fc1(
 
 def _measure(run, iters, cold_l2_flush):
     if cold_l2_flush is None:
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start, end = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
         start.record()
         for _ in range(iters):
             run()
@@ -263,9 +266,8 @@ class CuteDslNvfp4Fc1Runner:
         state: torch.Tensor,
     ):
         if not all(
-            t.is_cuda for t in (
-                a, b, sfa, sfb, out, out_scale, source_rows, tasks, state
-            )
+            t.is_cuda
+            for t in (a, b, sfa, sfb, out, out_scale, source_rows, tasks, state)
         ):
             raise ValueError("all CuTE DSL NVFP4 FC1 tensors must be CUDA tensors")
         if a.dtype != torch.float4_e2m1fn_x2 or b.dtype != torch.float4_e2m1fn_x2:
@@ -278,10 +280,13 @@ class CuteDslNvfp4Fc1Runner:
             raise ValueError("expected E4M3 output scales")
         if a.ndim != 2 or b.ndim != 3 or out.ndim != 2:
             raise ValueError(
-                "expected a[tokens,K/2], b[experts,2*N,K/2], "
-                "out[permuted_m,N/2]"
+                "expected a[tokens,K/2], b[experts,2*N,K/2], out[permuted_m,N/2]"
             )
-        if source_rows.dtype != torch.int32 or tasks.dtype != torch.int32 or state.dtype != torch.int32:
+        if (
+            source_rows.dtype != torch.int32
+            or tasks.dtype != torch.int32
+            or state.dtype != torch.int32
+        ):
             raise ValueError("metadata tensors must be int32")
 
         self.tokens, packed_k = a.shape
@@ -323,18 +328,20 @@ class CuteDslNvfp4Fc1Runner:
         if self.num_tasks < 0 or tasks.numel() < self.num_tasks * 5:
             raise ValueError("tasks tensor is too small for the declared task count")
         task_rows = tasks.reshape(-1, 5)[: self.num_tasks].cpu().tolist()
-        native_ranges = tuple(sorted(
-            (row_start, row_count, expert)
-            for row_start, row_count, tile_row, expert, tile_n in task_rows
-            if (
-                tile_row == 0
-                and tile_n == 0
-                and row_count > 0
-                and 0 <= expert < self.experts
-                and 0 <= row_start < self.logical_m
-                and row_start + row_count <= self.logical_m
+        native_ranges = tuple(
+            sorted(
+                (row_start, row_count, expert)
+                for row_start, row_count, tile_row, expert, tile_n in task_rows
+                if (
+                    tile_row == 0
+                    and tile_n == 0
+                    and row_count > 0
+                    and 0 <= expert < self.experts
+                    and 0 <= row_start < self.logical_m
+                    and row_start + row_count <= self.logical_m
+                )
             )
-        ))
+        )
         if not native_ranges:
             raise ValueError("native FC1 metadata contains no expert ranges")
         expected_row_start = 0
@@ -345,9 +352,7 @@ class CuteDslNvfp4Fc1Runner:
                 )
             expected_row_start += row_count
         if expected_row_start != self.logical_m:
-            raise ValueError(
-                "native FC1 expert ranges do not cover every routed row"
-            )
+            raise ValueError("native FC1 expert ranges do not cover every routed row")
 
         # Pad groups to 256 rows.  The token mapping uses -1 for these entries,
         # which the gather kernel predicates away; no routed activation is
@@ -359,26 +364,34 @@ class CuteDslNvfp4Fc1Runner:
         padded_start = 0
         for row_start, row_count, expert in native_ranges:
             padding = (-row_count) % 256
-            rows = source_rows[row_start:row_start + row_count]
+            rows = source_rows[row_start : row_start + row_count]
             if padding:
-                rows = torch.cat((rows, torch.full(
-                    (padding,), -1, device=rows.device, dtype=rows.dtype)))
+                rows = torch.cat(
+                    (
+                        rows,
+                        torch.full(
+                            (padding,), -1, device=rows.device, dtype=rows.dtype
+                        ),
+                    )
+                )
             padded_source_chunks.append(rows)
             valid_padded_chunks.append(
                 torch.arange(
-                    padded_start, padded_start + row_count,
-                    device=source_rows.device, dtype=torch.long,
+                    padded_start,
+                    padded_start + row_count,
+                    device=source_rows.device,
+                    dtype=torch.long,
                 )
             )
             valid_output_chunks.append(
                 torch.arange(
-                    row_start, row_start + row_count,
-                    device=source_rows.device, dtype=torch.long,
+                    row_start,
+                    row_start + row_count,
+                    device=source_rows.device,
+                    dtype=torch.long,
                 )
             )
-            padded_ranges.append((
-                padded_start, row_count + padding, expert, row_count
-            ))
+            padded_ranges.append((padded_start, row_count + padding, expert, row_count))
             padded_start += row_count + padding
         padded_source_rows = torch.cat(padded_source_chunks)
         self._valid_padded_rows = torch.cat(valid_padded_chunks)
@@ -396,9 +409,7 @@ class CuteDslNvfp4Fc1Runner:
         )
 
         sfa_logical_2d = from_blocked_nvfp4_scales(sfa, self.tokens, self.k)
-        sfb_logical_2d = from_blocked_nvfp4_scales(
-            sfb, self.experts * self.n, self.k
-        )
+        sfb_logical_2d = from_blocked_nvfp4_scales(sfb, self.experts * self.n, self.k)
 
         self.a_storage = a
         self.sfa_storage = sfa_logical_2d.contiguous()
@@ -413,9 +424,13 @@ class CuteDslNvfp4Fc1Runner:
         b_bytes = b.view(torch.uint8).reshape(
             self.experts, swiglu_blocks, 2, 64, self.k // 2
         )
-        self.b_storage = b_bytes[:, :, (1, 0)].reshape_as(
-            b.view(torch.uint8)
-        ).contiguous().view(torch.float4_e2m1fn_x2).reshape_as(b)
+        self.b_storage = (
+            b_bytes[:, :, (1, 0)]
+            .reshape_as(b.view(torch.uint8))
+            .contiguous()
+            .view(torch.float4_e2m1fn_x2)
+            .reshape_as(b)
+        )
         sfb_cute_logical_2d = sfb_logical_2d.reshape(
             self.experts, swiglu_blocks, 2, 64, self.k // 16
         )[:, :, (1, 0)].reshape_as(sfb_logical_2d)
@@ -424,7 +439,8 @@ class CuteDslNvfp4Fc1Runner:
             (self.m, self.n // 4), device=out.device, dtype=out.dtype
         )
         self.out_scale_storage = torch.empty(
-            (self.m * (self.n // 32),), device=out.device,
+            (self.m * (self.n // 32),),
+            device=out.device,
             dtype=torch.float8_e4m3fn,
         )
 
@@ -433,13 +449,15 @@ class CuteDslNvfp4Fc1Runner:
         self.norm_const = torch.ones((1,), device=a.device, dtype=torch.float32)
 
         self.stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-        self.selection: Optional[Selection] = None
+        self.selection: Selection | None = None
 
     def _cute_tile_metadata(self, config: CuteDslNvfp4Fc1Config):
         """Return gather kernel's per-M-tile expert and valid-row metadata."""
         cta_m = config.mma_tile_m
         if self.m % cta_m:
-            raise ValueError(f"permuted M={self.m} must be divisible by CuTE CTA M={cta_m}")
+            raise ValueError(
+                f"permuted M={self.m} must be divisible by CuTE CTA M={cta_m}"
+            )
 
         tile_experts, tile_mn_limits = [], []
         for start, count, expert, valid_count in self._expert_ranges:
@@ -488,7 +506,9 @@ class CuteDslNvfp4Fc1Runner:
         return tuple(valid)
 
     def _compile(self, config: CuteDslNvfp4Fc1Config):
-        tile_expert_idx, tile_mn_limits, num_non_exiting = self._cute_tile_metadata(config)
+        tile_expert_idx, tile_mn_limits, num_non_exiting = self._cute_tile_metadata(
+            config
+        )
         gemm = BlockScaledContiguousGatherGroupedGemmKernel(
             sf_vec_size=16,
             mma_tiler_mn=(config.mma_tile_m, config.mma_tile_n),
@@ -503,53 +523,88 @@ class CuteDslNvfp4Fc1Runner:
         )
 
         a_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.Float4E2M1FN, self.a_storage.data_ptr(),
-            cutlass.cute.AddressSpace.gmem, assumed_align=32)
+            cutlass.Float4E2M1FN,
+            self.a_storage.data_ptr(),
+            cutlass.cute.AddressSpace.gmem,
+            assumed_align=32,
+        )
         b_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.Float4E2M1FN, self.b_storage.data_ptr(),
-            cutlass.cute.AddressSpace.gmem, assumed_align=32)
+            cutlass.Float4E2M1FN,
+            self.b_storage.data_ptr(),
+            cutlass.cute.AddressSpace.gmem,
+            assumed_align=32,
+        )
         a_sf_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.Float8E4M3FN, self.sfa_storage.data_ptr(),
-            cutlass.cute.AddressSpace.gmem, assumed_align=16)
+            cutlass.Float8E4M3FN,
+            self.sfa_storage.data_ptr(),
+            cutlass.cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
         b_sf_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.Float8E4M3FN, self.sfb_storage.data_ptr(),
-            cutlass.cute.AddressSpace.gmem, assumed_align=16)
+            cutlass.Float8E4M3FN,
+            self.sfb_storage.data_ptr(),
+            cutlass.cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
         c_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.Float4E2M1FN, self.out_storage.data_ptr(),
-            cutlass.cute.AddressSpace.gmem, assumed_align=16)
+            cutlass.Float4E2M1FN,
+            self.out_storage.data_ptr(),
+            cutlass.cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
         c_sf_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.Float8E4M3FN, self.out_scale_storage.data_ptr(),
-            cutlass.cute.AddressSpace.gmem, assumed_align=16)
+            cutlass.Float8E4M3FN,
+            self.out_scale_storage.data_ptr(),
+            cutlass.cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
         norm_const_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.Float32, self.norm_const.data_ptr(),
-            cutlass.cute.AddressSpace.gmem)
+            cutlass.Float32, self.norm_const.data_ptr(), cutlass.cute.AddressSpace.gmem
+        )
         alpha_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.Float32, self.alpha.data_ptr(),
-            cutlass.cute.AddressSpace.gmem)
+            cutlass.Float32, self.alpha.data_ptr(), cutlass.cute.AddressSpace.gmem
+        )
         tile_expert_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.Int32, tile_expert_idx.data_ptr(),
-            cutlass.cute.AddressSpace.gmem)
+            cutlass.Int32, tile_expert_idx.data_ptr(), cutlass.cute.AddressSpace.gmem
+        )
         tile_mn_limit_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.Int32, tile_mn_limits.data_ptr(),
-            cutlass.cute.AddressSpace.gmem)
+            cutlass.Int32, tile_mn_limits.data_ptr(), cutlass.cute.AddressSpace.gmem
+        )
         token_mapping_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.Int32, self.token_id_mapping.data_ptr(),
-            cutlass.cute.AddressSpace.gmem)
+            cutlass.Int32,
+            self.token_id_mapping.data_ptr(),
+            cutlass.cute.AddressSpace.gmem,
+        )
         num_tiles_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.Int32, num_non_exiting.data_ptr(),
-            cutlass.cute.AddressSpace.gmem)
+            cutlass.Int32, num_non_exiting.data_ptr(), cutlass.cute.AddressSpace.gmem
+        )
 
         compile_args = [
-            a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr,
-            norm_const_ptr, alpha_ptr,
-            tile_expert_ptr, tile_mn_limit_ptr, token_mapping_ptr, num_tiles_ptr,
-            self.tokens, self.m, self.n, self.k, self.experts,
+            a_ptr,
+            b_ptr,
+            a_sf_ptr,
+            b_sf_ptr,
+            c_ptr,
+            c_sf_ptr,
+            norm_const_ptr,
+            alpha_ptr,
+            tile_expert_ptr,
+            tile_mn_limit_ptr,
+            token_mapping_ptr,
+            num_tiles_ptr,
+            self.tokens,
+            self.m,
+            self.n,
+            self.k,
+            self.experts,
         ]
 
         fake_stream = make_fake_stream()
         with _suppress_cutlass_pointer_deprecation():
             return cute.compile(
-                _launch_fc1, gemm, *compile_args,
+                _launch_fc1,
+                gemm,
+                *compile_args,
                 tile_size=config.mma_tile_m,
                 scaling_vector_size=16,
                 max_active_clusters=max_active_clusters,
@@ -559,54 +614,89 @@ class CuteDslNvfp4Fc1Runner:
 
     def _prepare(self, config: CuteDslNvfp4Fc1Config):
         compiled = self._compile(config)
-        tile_expert_idx, tile_mn_limits, num_non_exiting = self._cute_tile_metadata(config)
+        tile_expert_idx, tile_mn_limits, num_non_exiting = self._cute_tile_metadata(
+            config
+        )
 
         a_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.Float4E2M1FN, self.a_storage.data_ptr(),
-            cutlass.cute.AddressSpace.gmem, assumed_align=32)
+            cutlass.Float4E2M1FN,
+            self.a_storage.data_ptr(),
+            cutlass.cute.AddressSpace.gmem,
+            assumed_align=32,
+        )
         b_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.Float4E2M1FN, self.b_storage.data_ptr(),
-            cutlass.cute.AddressSpace.gmem, assumed_align=32)
+            cutlass.Float4E2M1FN,
+            self.b_storage.data_ptr(),
+            cutlass.cute.AddressSpace.gmem,
+            assumed_align=32,
+        )
         a_sf_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.Float8E4M3FN, self.sfa_storage.data_ptr(),
-            cutlass.cute.AddressSpace.gmem, assumed_align=16)
+            cutlass.Float8E4M3FN,
+            self.sfa_storage.data_ptr(),
+            cutlass.cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
         b_sf_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.Float8E4M3FN, self.sfb_storage.data_ptr(),
-            cutlass.cute.AddressSpace.gmem, assumed_align=16)
+            cutlass.Float8E4M3FN,
+            self.sfb_storage.data_ptr(),
+            cutlass.cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
         c_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.Float4E2M1FN, self.out_storage.data_ptr(),
-            cutlass.cute.AddressSpace.gmem, assumed_align=16)
+            cutlass.Float4E2M1FN,
+            self.out_storage.data_ptr(),
+            cutlass.cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
         c_sf_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.Float8E4M3FN, self.out_scale_storage.data_ptr(),
-            cutlass.cute.AddressSpace.gmem, assumed_align=16)
+            cutlass.Float8E4M3FN,
+            self.out_scale_storage.data_ptr(),
+            cutlass.cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
         norm_const_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.Float32, self.norm_const.data_ptr(),
-            cutlass.cute.AddressSpace.gmem)
+            cutlass.Float32, self.norm_const.data_ptr(), cutlass.cute.AddressSpace.gmem
+        )
         alpha_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.Float32, self.alpha.data_ptr(),
-            cutlass.cute.AddressSpace.gmem)
+            cutlass.Float32, self.alpha.data_ptr(), cutlass.cute.AddressSpace.gmem
+        )
         tile_expert_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.Int32, tile_expert_idx.data_ptr(),
-            cutlass.cute.AddressSpace.gmem)
+            cutlass.Int32, tile_expert_idx.data_ptr(), cutlass.cute.AddressSpace.gmem
+        )
         tile_mn_limit_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.Int32, tile_mn_limits.data_ptr(),
-            cutlass.cute.AddressSpace.gmem)
+            cutlass.Int32, tile_mn_limits.data_ptr(), cutlass.cute.AddressSpace.gmem
+        )
         token_mapping_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.Int32, self.token_id_mapping.data_ptr(),
-            cutlass.cute.AddressSpace.gmem)
+            cutlass.Int32,
+            self.token_id_mapping.data_ptr(),
+            cutlass.cute.AddressSpace.gmem,
+        )
         num_tiles_ptr = cutlass.cute.runtime.make_ptr(
-            cutlass.Int32, num_non_exiting.data_ptr(),
-            cutlass.cute.AddressSpace.gmem)
+            cutlass.Int32, num_non_exiting.data_ptr(), cutlass.cute.AddressSpace.gmem
+        )
 
         def run_kernel():
             # Keep metadata tensors alive for the lifetime of this closure:
             # ``compiled`` only receives their raw device pointers.
             _ = tile_expert_idx, tile_mn_limits, num_non_exiting
             compiled(
-                a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr,
-                norm_const_ptr, alpha_ptr,
-                tile_expert_ptr, tile_mn_limit_ptr, token_mapping_ptr, num_tiles_ptr,
-                self.tokens, self.m, self.n, self.k, self.experts,
+                a_ptr,
+                b_ptr,
+                a_sf_ptr,
+                b_sf_ptr,
+                c_ptr,
+                c_sf_ptr,
+                norm_const_ptr,
+                alpha_ptr,
+                tile_expert_ptr,
+                tile_mn_limit_ptr,
+                token_mapping_ptr,
+                num_tiles_ptr,
+                self.tokens,
+                self.m,
+                self.n,
+                self.k,
+                self.experts,
                 stream=self.stream,
             )
 
@@ -619,14 +709,13 @@ class CuteDslNvfp4Fc1Runner:
         self.out_target.view(torch.uint8).index_copy_(
             0,
             self._valid_output_rows,
-            self.out_storage.view(torch.uint8).index_select(
-                0, self._valid_padded_rows
-            ),
+            self.out_storage.view(torch.uint8).index_select(0, self._valid_padded_rows),
         )
         from sm110a_kernel.kernels.nvfp4_gemm import (
             from_blocked_nvfp4_scales,
             to_blocked_nvfp4_scales,
         )
+
         logical_scales = from_blocked_nvfp4_scales(
             self.out_scale_storage, self.m, self.n // 2
         ).index_select(0, self._valid_padded_rows)
@@ -647,8 +736,14 @@ class CuteDslNvfp4Fc1Runner:
             # v7 enables fused NVFP4 output quantization and measures the CuTE
             # launch alone.  The output scatter is an
             # independent PyTorch kernel and must not influence tactic choice.
-            key=("v7-gather64-fp4-pure", self.tokens, self.experts, self.m,
-                 self.n // 2, self.k),
+            key=(
+                "v7-gather64-fp4-pure",
+                self.tokens,
+                self.experts,
+                self.m,
+                self.n // 2,
+                self.k,
+            ),
             prepare=self._prepare,
             benchmark=lambda prepared: _stats(prepared.run, options),
             probe=lambda prepared: _quick_probe(prepared.run, options),

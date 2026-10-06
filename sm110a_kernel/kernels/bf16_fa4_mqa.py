@@ -7,9 +7,9 @@ The CUDA implementation uses the 16-warp tactic exclusively and always folds
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
 
 from ..jit_runtime import SplitCudaJit
 
@@ -30,9 +30,7 @@ class Bf16Fa4MqaModule:
         self._config = config
 
     def fa_mqa(self, q, k, v, causal=False, scale=1.0):
-        return self._binding.fa_mqa(
-            q, k, v, self._launcher, bool(causal), scale
-        )
+        return self._binding.fa_mqa(q, k, v, self._launcher, bool(causal), scale)
 
     def fa_mqa_out(self, q, k, v, out, causal=False, scale=1.0):
         return self._binding.fa_mqa_out(
@@ -58,7 +56,7 @@ _JIT = SplitCudaJit(
 
 
 def compile_bf16_fa4_mqa(
-    config: Optional[Bf16Fa4MqaConfig] = None,
+    config: Bf16Fa4MqaConfig | None = None,
 ) -> Bf16Fa4MqaModule:
     config = config or Bf16Fa4MqaConfig()
     if not isinstance(config, Bf16Fa4MqaConfig):
@@ -67,9 +65,7 @@ def compile_bf16_fa4_mqa(
     return _JIT.compile(config)
 
 
-def compile_bf16_fa4_mqa_configs(
-    configs: Iterable[Bf16Fa4MqaConfig], max_workers=None
-):
+def compile_bf16_fa4_mqa_configs(configs: Iterable[Bf16Fa4MqaConfig], max_workers=None):
     configs = tuple(configs)
     for config in configs:
         if not isinstance(config, Bf16Fa4MqaConfig):
@@ -78,7 +74,7 @@ def compile_bf16_fa4_mqa_configs(
     return _JIT.compile_many(configs, max_workers)
 
 
-def get_bf16_fa4_mqa_module(config: Optional[Bf16Fa4MqaConfig] = None):
+def get_bf16_fa4_mqa_module(config: Bf16Fa4MqaConfig | None = None):
     return compile_bf16_fa4_mqa(config)
 
 
@@ -98,9 +94,7 @@ def bf16_fa4_mqa(q, k, v, *, causal=False, scale=None):
     )
 
 
-def bf16_fa4_mqa_out(
-    q, k, v, out, *, causal=False, scale=None
-):
+def bf16_fa4_mqa_out(q, k, v, out, *, causal=False, scale=None):
     """Write BF16 MQA output with the fixed 32-head packed implementation."""
     return compile_bf16_fa4_mqa().fa_mqa_out(
         q, k, v, out, bool(causal), _resolve_scale(q, scale)

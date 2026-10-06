@@ -11,9 +11,9 @@ kernel consumes.
 from __future__ import annotations
 
 import ctypes
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
 
 from ..jit_runtime import SplitCudaJit
 
@@ -80,7 +80,6 @@ def quantize_mxfp4_fc1_weights(gate, up):
         raise ValueError("n must be divisible by 64 and k by 32")
     bq = None
     sfb_parts = []
-    scale_numel = None
     for expert in range(experts):
         b_expert = torch.stack(
             (gate[expert].view(n // 64, 64, k), up[expert].view(n // 64, 64, k)),
@@ -89,15 +88,17 @@ def quantize_mxfp4_fc1_weights(gate, up):
         bq_expert, sfb_expert = quantize_fp8mxfp4_weights(b_expert)
         if bq is None:
             bq = torch.empty(
-                (experts, 2 * n, k // 2), device=gate.device,
-                dtype=torch.float4_e2m1fn_x2
+                (experts, 2 * n, k // 2),
+                device=gate.device,
+                dtype=torch.float4_e2m1fn_x2,
             )
-            scale_numel = sfb_expert.numel()
         bq[expert].copy_(bq_expert.view(torch.float4_e2m1fn_x2))
         sfb_parts.append(sfb_expert.reshape(-1))
         del b_expert, bq_expert
-    sfb = torch.cat(sfb_parts) if experts else torch.empty(
-        (0,), device=gate.device, dtype=torch.float8_e8m0fnu
+    sfb = (
+        torch.cat(sfb_parts)
+        if experts
+        else torch.empty((0,), device=gate.device, dtype=torch.float8_e8m0fnu)
     )
     return bq, sfb
 
@@ -119,71 +120,127 @@ class Mxfp4Fc1Module:
             raise TypeError("router_scores must be a 2D BF16 tensor")
         tokens, experts = router_scores.shape
         if tokens % 128 or topk <= 0 or topk > experts:
-            raise ValueError("tokens must be divisible by 128 and topk must be in [1, experts]")
+            raise ValueError(
+                "tokens must be divisible by 128 and topk must be in [1, experts]"
+            )
         # ``n`` is the physical (gate+up interleaved) output width, matching
         # the NVFP4 FC1 metadata convention.
         if n <= 0 or n % (self.config.tile_n * self.config.cluster_n):
             raise ValueError("N is incompatible with the MXFP4 FC1 config")
 
         routing, source_rows, tasks, state = self._binding.prepare_mxfp4_fc1_routing(
-            router_scores, topk, n, self.config.tile_m, self.config.tile_n,
-            self.config.cluster_m, self._routing_address)
+            router_scores,
+            topk,
+            n,
+            self.config.tile_m,
+            self.config.tile_n,
+            self.config.cluster_m,
+            self._routing_address,
+        )
         return Mxfp4Fc1Metadata(routing, source_rows, tasks, state)
 
     def _max_active_clusters(self, device, value):
         if value is None:
             import torch
+
             value = torch.cuda.get_device_properties(device).multi_processor_count // (
-                self.config.cluster_m * self.config.cluster_n)
+                self.config.cluster_m * self.config.cluster_n
+            )
         if value <= 0:
             raise ValueError("max_active_clusters must be positive")
         return int(value)
 
-    def mxfp4_fc1_out(self, a, b, sfa, sfb, metadata: Mxfp4Fc1Metadata, out, out_scale,
-                      swiglu_limit: float = 0.0, max_active_clusters=None):
+    def mxfp4_fc1_out(
+        self,
+        a,
+        b,
+        sfa,
+        sfb,
+        metadata: Mxfp4Fc1Metadata,
+        out,
+        out_scale,
+        swiglu_limit: float = 0.0,
+        max_active_clusters=None,
+    ):
         return self._binding.mxfp4_fc1_out(
-            a, b, sfa, sfb, metadata.source_rows, metadata.tasks, metadata.state,
-            out, out_scale, float(swiglu_limit), self._address,
-            self._max_active_clusters(a.device, max_active_clusters))
+            a,
+            b,
+            sfa,
+            sfb,
+            metadata.source_rows,
+            metadata.tasks,
+            metadata.state,
+            out,
+            out_scale,
+            float(swiglu_limit),
+            self._address,
+            self._max_active_clusters(a.device, max_active_clusters),
+        )
 
-    def mxfp4_fc1(self, a, b, sfa, sfb, metadata: Mxfp4Fc1Metadata,
-                  swiglu_limit: float = 0.0, max_active_clusters=None):
+    def mxfp4_fc1(
+        self,
+        a,
+        b,
+        sfa,
+        sfb,
+        metadata: Mxfp4Fc1Metadata,
+        swiglu_limit: float = 0.0,
+        max_active_clusters=None,
+    ):
         import torch
+
         m = metadata.source_rows.numel()
         logical_n = b.size(1) // 2
-        out = torch.empty(
-            (m, logical_n), device=a.device,
-            dtype=torch.float8_e4m3fn)
+        out = torch.empty((m, logical_n), device=a.device, dtype=torch.float8_e4m3fn)
         out_scale = torch.empty(
-            (m * (logical_n // 32) * 4,), device=a.device,
-            dtype=torch.float8_e8m0fnu)
+            (m * (logical_n // 32) * 4,), device=a.device, dtype=torch.float8_e8m0fnu
+        )
         self.mxfp4_fc1_out(
-            a, b, sfa, sfb, metadata, out, out_scale, swiglu_limit,
-            max_active_clusters)
+            a, b, sfa, sfb, metadata, out, out_scale, swiglu_limit, max_active_clusters
+        )
         return out, out_scale
 
 
 def _flags(config: Mxfp4Fc1Config, variant):
-    return tuple(f"-DSM110A_MXFP4_FC1_{key}={value}" for key, value in (
-        ("TILE_M", config.tile_m), ("TILE_N", config.tile_n),
-        ("TILE_K", config.tile_k), ("EPILOGUE_TILE_N", config.epilogue_tile_n),
-        ("CLUSTER_M", config.cluster_m), ("CLUSTER_N", config.cluster_n),
-        ("DIRECT_GMEM", int(config.direct_gmem)),
-        ("MACRO_SWIZZLE_N_MAJOR", int(config.macro_swizzle_n_major))))
+    return tuple(
+        f"-DSM110A_MXFP4_FC1_{key}={value}"
+        for key, value in (
+            ("TILE_M", config.tile_m),
+            ("TILE_N", config.tile_n),
+            ("TILE_K", config.tile_k),
+            ("EPILOGUE_TILE_N", config.epilogue_tile_n),
+            ("CLUSTER_M", config.cluster_m),
+            ("CLUSTER_N", config.cluster_n),
+            ("DIRECT_GMEM", int(config.direct_gmem)),
+            ("MACRO_SWIZZLE_N_MAJOR", int(config.macro_swizzle_n_major)),
+        )
+    )
 
 
 _JIT = SplitCudaJit(
-    name="sm110a_mxfp4_fc1", root=_ROOT,
+    name="sm110a_mxfp4_fc1",
+    root=_ROOT,
     binding_sources=(_SRC / "mxfp4_fc1_torch_binding.cpp",),
-    kernel_sources=(_SRC / "mxfp4_fc1_kernel.cu", _SRC / "mxfp4_fc1_metadata.cu",
-                    _SRC / "mxfp4_fc1_routing.cu"),
-    kernel_dependencies=(_INC / "mxfp4_moe_fc1.h", _INC / "common.h", _SRC / "mxfp4_fc1_pipeline_delay.cuh"),
-    kernel_symbol="sm110a_mxfp4_fc1_launch", config_key=lambda config: config,
-    kernel_cflags=_flags, kernel_ldflags=("-lcuda",),
-    make_facade=Mxfp4Fc1Module, include_paths=(_INC,))
+    kernel_sources=(
+        _SRC / "mxfp4_fc1_kernel.cu",
+        _SRC / "mxfp4_fc1_metadata.cu",
+        _SRC / "mxfp4_fc1_routing.cu",
+    ),
+    kernel_dependencies=(
+        _INC / "mxfp4_moe_fc1.h",
+        _INC / "common.h",
+        _SRC / "mxfp4_fc1_pipeline_delay.cuh",
+    ),
+    kernel_symbol="sm110a_mxfp4_fc1_launch",
+    config_key=lambda config: config,
+    kernel_cflags=_flags,
+    kernel_ldflags=("-lcuda",),
+    make_facade=Mxfp4Fc1Module,
+    include_paths=(_INC,),
+)
 
 
-def compile_mxfp4_fc1(config: Optional[Mxfp4Fc1Config] = None):
+def compile_mxfp4_fc1(config: Mxfp4Fc1Config | None = None):
     config = config or Mxfp4Fc1Config()
     if not isinstance(config, Mxfp4Fc1Config):
         raise TypeError("config must be an Mxfp4Fc1Config")
@@ -204,13 +261,26 @@ def prepare_mxfp4_fc1_metadata(router_scores, topk, n, config=None):
     return compile_mxfp4_fc1(config).prepare_metadata(router_scores, topk, n)
 
 
-def mxfp4_fc1(a, b, sfa, sfb, metadata, swiglu_limit=0.0, config=None,
-              max_active_clusters=None):
+def mxfp4_fc1(
+    a, b, sfa, sfb, metadata, swiglu_limit=0.0, config=None, max_active_clusters=None
+):
     return compile_mxfp4_fc1(config).mxfp4_fc1(
-        a, b, sfa, sfb, metadata, swiglu_limit, max_active_clusters)
+        a, b, sfa, sfb, metadata, swiglu_limit, max_active_clusters
+    )
 
 
-def mxfp4_fc1_out(a, b, sfa, sfb, metadata, out, out_scale, swiglu_limit=0.0,
-                  config=None, max_active_clusters=None):
+def mxfp4_fc1_out(
+    a,
+    b,
+    sfa,
+    sfb,
+    metadata,
+    out,
+    out_scale,
+    swiglu_limit=0.0,
+    config=None,
+    max_active_clusters=None,
+):
     return compile_mxfp4_fc1(config).mxfp4_fc1_out(
-        a, b, sfa, sfb, metadata, out, out_scale, swiglu_limit, max_active_clusters)
+        a, b, sfa, sfb, metadata, out, out_scale, swiglu_limit, max_active_clusters
+    )

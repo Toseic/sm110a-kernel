@@ -1,8 +1,9 @@
 import pytest
 
-
 torch = pytest.importorskip("torch")
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA is required"
+)
 
 
 def test_create_exact_sm_green_context_and_torch_stream():
@@ -16,9 +17,7 @@ def test_create_exact_sm_green_context_and_torch_stream():
     if sm_count < info["min_sm_partition_size"]:
         pytest.skip("device does not expose an SM partition at its alignment")
     requested_counts = (
-        (sm_count, sm_count)
-        if info["sm_count"] >= 2 * sm_count
-        else (sm_count,)
+        (sm_count, sm_count) if info["sm_count"] >= 2 * sm_count else (sm_count,)
     )
     contexts = create_green_contexts(requested_counts)
     try:

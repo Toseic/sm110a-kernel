@@ -14,7 +14,6 @@ if str(ROOT) not in sys.path:
 
 from common import (
     BenchmarkBase,
-    TablePrinter,
     benchmark_with_stats,
     quick_probe,
     tflops_from_ms,
@@ -27,7 +26,6 @@ from sm110a_kernel import (
     quantize_fp8_gemm,
 )
 from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
-
 
 DEFAULT_SHAPES = (
     (128, 4096, 4096),
@@ -47,19 +45,19 @@ def load_deepgemm():
     """Load the locally patched DeepGEMM build used as an SM110 baseline."""
     global _DEEPGEMM_MODULE
     if _DEEPGEMM_MODULE is None:
-        source_root = ROOT / 'baselinedir/DeepGEMM'
+        source_root = ROOT / "baselinedir/DeepGEMM"
         if not source_root.is_dir():
             raise RuntimeError(
-                f'DeepGEMM baseline is unavailable: expected {source_root}; '
-                'clone and build the local DeepGEMM baseline first'
+                f"DeepGEMM baseline is unavailable: expected {source_root}; "
+                "clone and build the local DeepGEMM baseline first"
             )
         sys.path.insert(0, str(source_root))
         try:
             import deep_gemm
         except ImportError as exc:
             raise RuntimeError(
-                'the DeepGEMM baseline requires its local extension; run '
-                f'{source_root}/develop.sh first'
+                "the DeepGEMM baseline requires its local extension; run "
+                f"{source_root}/develop.sh first"
             ) from exc
         _DEEPGEMM_MODULE = deep_gemm
     return _DEEPGEMM_MODULE
@@ -78,7 +76,7 @@ def deepgemm_fp8_baseline(a8, b8, sfa, sfb, out):
     n = b8.size(0)
     if k % 128:
         raise RuntimeError(
-            f'the DeepGEMM FP8 x FP8 baseline requires K divisible by 128; got K={k}'
+            f"the DeepGEMM FP8 x FP8 baseline requires K divisible by 128; got K={k}"
         )
     sfa_logical = from_blocked_fp8_scales(sfa, m, k).float()
     sfb_logical = from_blocked_fp8_scales(sfb, n, k).float()
@@ -87,8 +85,11 @@ def deepgemm_fp8_baseline(a8, b8, sfa, sfb, out):
 
     def run():
         deep_gemm.fp8_fp4_gemm_nt(
-            (a8, sfa), (b8, sfb), out,
-            recipe_a=(1, 32), recipe_b=(1, 32),
+            (a8, sfa),
+            (b8, sfb),
+            out,
+            recipe_a=(1, 32),
+            recipe_b=(1, 32),
         )
 
     return run
@@ -98,8 +99,11 @@ def deepgemm_fp8_baseline(a8, b8, sfa, sfb, out):
 # during module import.
 FP8_GEMM_CONFIGS = tuple(
     Fp8GemmConfig(
-        tile_n=tile_n, tile_k=tile_k, cluster_m=cluster_m,
-        epilogue_block_n=epilogue_block_n, split_k=split_k,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        cluster_m=cluster_m,
+        epilogue_block_n=epilogue_block_n,
+        split_k=split_k,
         use_prefetch=use_prefetch,
     )
     for cluster_m in (1, 2)
@@ -111,10 +115,24 @@ FP8_GEMM_CONFIGS = tuple(
     if tile_n % epilogue_block_n == 0 and cluster_m * split_k <= 8
     if not (
         # Two-mainloop-stage SMEM check from Fp8GemmConfig.validate.
-        (232448 - 1024 - 256 - 2 * 128 * epilogue_block_n * 2 -
-         (128 * epilogue_block_n * 4 if split_k > 1 else 0)) //
-        (((128 * 128 + (tile_n // cluster_m) * 128 + 128 * (tile_k // 8) +
-           (tile_k // 32) * ((tile_n + 127) // 128) * 512 + 1023) & ~1023)) < 2
+        (
+            232448
+            - 1024
+            - 256
+            - 2 * 128 * epilogue_block_n * 2
+            - (128 * epilogue_block_n * 4 if split_k > 1 else 0)
+        )
+        // (
+            (
+                128 * 128
+                + (tile_n // cluster_m) * 128
+                + 128 * (tile_k // 8)
+                + (tile_k // 32) * ((tile_n + 127) // 128) * 512
+                + 1023
+            )
+            & ~1023
+        )
+        < 2
     )
 )
 
@@ -131,12 +149,17 @@ def compatible_candidates(m, n, k):
         and k % (config.tile_k * config.split_k) == 0
         # Rolling L2 prefetch is a tactic for large K or an incomplete CTA
         # wave, rather than a universally profitable instruction stream.
-        and (not config.use_prefetch or
-             k >= 8192 or
-             0.5 < (
-                 math.ceil(m / (config.tile_m * config.cluster_m)) *
-                 math.ceil(n / config.tile_n) / sm_count
-             ) < 1.0)
+        and (
+            not config.use_prefetch
+            or k >= 8192
+            or 0.5
+            < (
+                math.ceil(m / (config.tile_m * config.cluster_m))
+                * math.ceil(n / config.tile_n)
+                / sm_count
+            )
+            < 1.0
+        )
     )
 
 
@@ -166,13 +189,15 @@ class Fp8GemmBenchmark(BenchmarkBase):
             help="optional baseline: locally patched DeepGEMM",
         )
         parser.add_argument(
-            "--debug", action="store_true",
+            "--debug",
+            action="store_true",
             help="print per-config runner probe and timing details",
         )
         self.add_cache_args(parser)
         self.add_pre_parallel_jit_arg(parser)
         parser.add_argument(
-            "--cache-path", default=None,
+            "--cache-path",
+            default=None,
             help="autotune cache path (default: profiles/autotune_cache.json)",
         )
         return parser
@@ -185,18 +210,14 @@ class Fp8GemmBenchmark(BenchmarkBase):
         shapes = ((args.m, args.n, args.k),) if chosen else DEFAULT_SHAPES
         for m, n, k in shapes:
             if m % 128 or n % 128 or k % 64:
-                raise SystemExit(
-                    "M and N must be multiples of 128, and K of 64"
-                )
+                raise SystemExit("M and N must be multiples of 128, and K of 64")
         args.shapes = shapes
         return args
 
     def resolve_kernel(self, a8, b8, sfa, sfb, out, m, n, k, args):
         candidates = compatible_candidates(m, n, k)
         if not candidates:
-            raise RuntimeError(
-                f"no FP8 GEMM config supports M={m}, N={n}, K={k}"
-            )
+            raise RuntimeError(f"no FP8 GEMM config supports M={m}, N={n}, K={k}")
 
         def prepare(config):
             module = compile_fp8_gemm(config)
@@ -241,17 +262,27 @@ class Fp8GemmBenchmark(BenchmarkBase):
         print("[runner] config selection is cached per workload and CUDA environment")
         if args.baseline != "none":
             columns = (
-                ("M", 8), ("N", 8), ("K", 8),
-                ("Kernel(ms)", 14), ("Kernel TF/s", 14),
-                ("Baseline(ms)", 14), ("Baseline TF/s", 14),
-                ("Speedup", 10), ("MaxDiff", 12), ("BaselineDiff", 14),
+                ("M", 8),
+                ("N", 8),
+                ("K", 8),
+                ("Kernel(ms)", 14),
+                ("Kernel TF/s", 14),
+                ("Baseline(ms)", 14),
+                ("Baseline TF/s", 14),
+                ("Speedup", 10),
+                ("MaxDiff", 12),
+                ("BaselineDiff", 14),
                 ("BestConfig", 44),
             )
         else:
             columns = (
-                ("M", 8), ("N", 8), ("K", 8),
-                ("Kernel(ms)", 14), ("Kernel TF/s", 14),
-                ("MaxDiff", 12), ("BestConfig", 44),
+                ("M", 8),
+                ("N", 8),
+                ("K", 8),
+                ("Kernel(ms)", 14),
+                ("Kernel TF/s", 14),
+                ("MaxDiff", 12),
+                ("BestConfig", 44),
             )
         table = self.make_table_printer(columns, debug=args.debug)
         table.print_header()
@@ -267,11 +298,22 @@ class Fp8GemmBenchmark(BenchmarkBase):
                 baseline_out = torch.empty_like(out)
                 baseline_run = deepgemm_fp8_baseline(a8, b8, sfa, sfb, baseline_out)
                 baseline_stats = benchmark_with_stats(
-                    baseline_run, args.warmup, args.iters, args.samples,
+                    baseline_run,
+                    args.warmup,
+                    args.iters,
+                    args.samples,
                     cold_l2_flush=args._cold_l2_flush,
                 )
             selection = self.resolve_kernel(
-                a8, b8, sfa, sfb, out, m, n, k, args,
+                a8,
+                b8,
+                sfa,
+                sfb,
+                out,
+                m,
+                n,
+                k,
+                args,
             )
             kernel_stats = selection.stats
             max_diff = 0.0
@@ -286,11 +328,13 @@ class Fp8GemmBenchmark(BenchmarkBase):
                 # rounding (up to one bf16 ULP, 2^-9 relative).  rtol covers
                 # that; real defects are O(1) relative.
                 scaled_atol = max(args.atol, 1e-6 * ref.float().abs().max().item())
-                if not torch.allclose(out.float(), ref.float(),
-                                      atol=scaled_atol, rtol=args.rtol):
+                if not torch.allclose(
+                    out.float(), ref.float(), atol=scaled_atol, rtol=args.rtol
+                ):
                     raise AssertionError(
                         f"mismatch {m}x{n}x{k}: max_diff={max_diff:.6g} "
-                        f"scaled_atol={scaled_atol:.6g}")
+                        f"scaled_atol={scaled_atol:.6g}"
+                    )
                 if baseline_run is not None:
                     baseline_run()
                     torch.cuda.synchronize()
@@ -300,15 +344,27 @@ class Fp8GemmBenchmark(BenchmarkBase):
             kms = kernel_stats["median_ms"]
             if baseline_run is None:
                 table.print_row(
-                    m, n, k, f"{kms:.4f}", f"{tflops_from_ms(m,n,k,kms):.2f}",
-                    f"{max_diff:.6f}", format_candidate(selection.candidate),
+                    m,
+                    n,
+                    k,
+                    f"{kms:.4f}",
+                    f"{tflops_from_ms(m, n, k, kms):.2f}",
+                    f"{max_diff:.6f}",
+                    format_candidate(selection.candidate),
                 )
             else:
                 bms = baseline_stats["median_ms"]
                 table.print_row(
-                    m, n, k, f"{kms:.4f}", f"{tflops_from_ms(m,n,k,kms):.2f}",
-                    f"{bms:.4f}", f"{tflops_from_ms(m,n,k,bms):.2f}",
-                    f"{bms/kms:.2f}x", f"{max_diff:.6f}", f"{baseline_diff:.6f}",
+                    m,
+                    n,
+                    k,
+                    f"{kms:.4f}",
+                    f"{tflops_from_ms(m, n, k, kms):.2f}",
+                    f"{bms:.4f}",
+                    f"{tflops_from_ms(m, n, k, bms):.2f}",
+                    f"{bms / kms:.2f}x",
+                    f"{max_diff:.6f}",
+                    f"{baseline_diff:.6f}",
                     format_candidate(selection.candidate),
                 )
 

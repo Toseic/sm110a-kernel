@@ -14,14 +14,13 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from common import B300Sim, BenchmarkBase
 from sm110a_kernel import (
     Bf16GemmServingConfig,
     compile_bf16_gemm_serving,
     create_green_contexts,
     sm_resource_info,
 )
-from common import B300Sim, BenchmarkBase
-
 
 SERVING_SMS = 16
 PRODUCER_SMS = 2
@@ -35,9 +34,10 @@ def create_serving_contexts():
     partitions = (SERVING_SMS, PRODUCER_SMS, CONSUMER_SMS)
     info = sm_resource_info()
     alignment = info["sm_coscheduled_alignment"]
-    if (sum(partitions) > info["sm_count"] or
-            any(count < info["min_sm_partition_size"] or count % alignment
-                for count in partitions)):
+    if sum(partitions) > info["sm_count"] or any(
+        count < info["min_sm_partition_size"] or count % alignment
+        for count in partitions
+    ):
         raise RuntimeError(
             "benchmark requires valid 16-SM serving, 2-SM producer, and "
             f"2-SM consumer Green Contexts; device info is {info}"
@@ -55,9 +55,7 @@ def release_green_resources(contexts):
 
 
 def run_prepublished_case(module, groups, b_nt, *, slots, clusters, bypass=False):
-    queue = module.create_queue(
-        b_nt, slot_count=slots, max_active_clusters=clusters
-    )
+    queue = module.create_queue(b_nt, slot_count=slots, max_active_clusters=clusters)
     for rows in groups:
         queue.test_publish(rows, flush=rows.shape[0] != M, bypass=bypass)
     queue.request_drain()
@@ -100,9 +98,7 @@ def run_persistent_serving_tests():
             module, groups, b_nt, slots=slots, clusters=clusters, bypass=bypass
         )
         max_abs_diff = (
-            check_outputs(groups, outputs, b_nt)
-            if not bypass
-            else float("nan")
+            check_outputs(groups, outputs, b_nt) if not bypass else float("nan")
         )
         expected_work = len(groups) * (n // 256)
         dispatch_head = int(queue.control[256:264].view(torch.int64).item())
@@ -115,7 +111,8 @@ def run_persistent_serving_tests():
         if lifecycle != [3, clusters, clusters]:
             raise AssertionError(f"{name}: invalid lifecycle {lifecycle}")
         diff_text = (
-            f"max_diff={max_abs_diff:.3f}" if not bypass
+            f"max_diff={max_abs_diff:.3f}"
+            if not bypass
             else "outputs unchecked (bypass)"
         )
         print(
@@ -165,8 +162,11 @@ def run_persistent_serving_tests():
         dispatch_head = int(queue.control[256:264].view(torch.int64).item())
         recycle_head = int(queue.control[384:392].view(torch.int64).item())
         expected_work = len(groups) * (N // 256)
-        if (state_word != len(groups) << 16 or dispatch_head != expected_work or
-                recycle_head != len(groups)):
+        if (
+            state_word != len(groups) << 16
+            or dispatch_head != expected_work
+            or recycle_head != len(groups)
+        ):
             raise AssertionError(
                 "online-wrap: invalid final queue state "
                 f"state={state_word}, dispatch={dispatch_head}, recycle={recycle_head}"
@@ -225,16 +225,12 @@ def run_producer_speed_sweep(args):
         torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
         for _ in range(args.groups)
     ]
-    references = (
-        [group @ b_nt.T for group in rows] if not args.bypass_io else []
-    )
+    references = [group @ b_nt.T for group in rows] if not args.bypass_io else []
     torch.cuda.synchronize()
 
     # Force CUDA module/function/TMA setup before all 20 SMs are assigned to
     # Green Contexts. This prepublished compute is outside measurement.
-    warmup_queue = module.create_queue(
-        b_nt, slot_count=2, max_active_clusters=1
-    )
+    warmup_queue = module.create_queue(b_nt, slot_count=2, max_active_clusters=1)
     warmup_queue.test_publish(rows[0])
     warmup_queue.request_drain()
     warmup_queue.start()
@@ -271,7 +267,7 @@ def run_producer_speed_sweep(args):
     try:
         warm_gpu_clocks(b_nt)
         clock_hz = measure_sm_clock_hz()
-        print(f"[clock] calibrated SM clock during pacing: {clock_hz/1.0e6:.0f} MHz")
+        print(f"[clock] calibrated SM clock during pacing: {clock_hz / 1.0e6:.0f} MHz")
         print("[serving] producer arrival-rate sweep")
         print("[resources] serving=16 SM (8 clusters), producer=2 SM, consumer=2 SM")
         print(
@@ -294,14 +290,13 @@ def run_producer_speed_sweep(args):
             delay_cycles = round(delay_us * clock_hz / 1.0e6)
             started = time.perf_counter()
             completions = [
-                torch.cuda.Event(enable_timing=True)
-                for _ in range(args.groups)
+                torch.cuda.Event(enable_timing=True) for _ in range(args.groups)
             ]
             with torch.cuda.stream(producer_stream):
                 for group in range(args.groups):
                     queue.test_publish(
-                        rows[group], delay_cycles=delay_cycles,
-                        bypass=args.bypass_io)
+                        rows[group], delay_cycles=delay_cycles, bypass=args.bypass_io
+                    )
                 queue.request_drain()
             with torch.cuda.stream(consumer_stream):
                 for group in range(args.groups):
@@ -320,26 +315,21 @@ def run_producer_speed_sweep(args):
                     for output, reference in zip(outputs, references)
                 )
                 for output, reference in zip(outputs, references):
-                    torch.testing.assert_close(
-                        output, reference, rtol=2e-2, atol=1.0)
+                    torch.testing.assert_close(output, reference, rtol=2e-2, atol=1.0)
             groups_per_second = args.groups * 1000.0 / elapsed_ms
             intervals_ms = [
                 completions[index - 1].elapsed_time(completions[index])
                 for index in range(1, args.groups)
             ]
-            steady_intervals = intervals_ms[len(intervals_ms) // 4:]
+            steady_intervals = intervals_ms[len(intervals_ms) // 4 :]
             steady_groups_per_second = (
                 1000.0 * len(steady_intervals) / sum(steady_intervals)
             )
             throughputs.append(steady_groups_per_second)
             steady_latency_ms = sum(steady_intervals) / len(steady_intervals)
-            steady_tflops = (
-                2.0 * M * N * K * steady_groups_per_second / 1.0e12
-            )
+            steady_tflops = 2.0 * M * N * K * steady_groups_per_second / 1.0e12
             target = "unlimited" if delay_us == 0 else f"{1.0e6 / delay_us:.1f}"
-            diff_text = (
-                "n/a (bypass)" if args.bypass_io else f"{max_abs_diff:.3f}"
-            )
+            diff_text = "n/a (bypass)" if args.bypass_io else f"{max_abs_diff:.3f}"
             print(
                 f"{delay_us:<14.1f}{target:<18}{groups_per_second:<17.1f}"
                 f"{steady_groups_per_second:<17.1f}{steady_latency_ms:<17.4f}"
@@ -361,7 +351,8 @@ def parse_args():
     parser = argparse.ArgumentParser()
     BenchmarkBase.add_b300_sim_args(parser)
     parser.add_argument(
-        "--test", action="store_true",
+        "--test",
+        action="store_true",
         help="run persistent serving correctness tests instead of timing",
     )
     parser.add_argument("--seed", type=int, default=1234)
@@ -373,9 +364,10 @@ def parse_args():
         help="comma-separated producer pacing delays in microseconds",
     )
     parser.add_argument(
-        "--bypass-io", action="store_true",
+        "--bypass-io",
+        action="store_true",
         help="producer/consumer skip A/C-ring payload copies; measures the "
-             "queue and serving kernel without test I/O overhead",
+        "queue and serving kernel without test I/O overhead",
     )
     args = parser.parse_args()
     if args.groups <= 0 or args.capacity <= 0:
@@ -385,8 +377,12 @@ def parse_args():
             float(value) for value in args.producer_delays_us.split(",")
         )
     except ValueError as exc:
-        raise SystemExit("--producer-delays-us must be comma-separated numbers") from exc
-    if not args.producer_delays_us or any(value < 0 for value in args.producer_delays_us):
+        raise SystemExit(
+            "--producer-delays-us must be comma-separated numbers"
+        ) from exc
+    if not args.producer_delays_us or any(
+        value < 0 for value in args.producer_delays_us
+    ):
         raise SystemExit("producer delays must be non-negative")
     return args
 

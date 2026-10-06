@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import ctypes
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
 
 from ..jit_runtime import SplitCudaJit
 
@@ -33,13 +33,17 @@ class GroupedMConfig:
             raise ValueError("epilogue_tile_n must be 32, 64, or 128")
         granularity = 8 * self.cluster_m
         if self.tile_n < granularity or self.tile_n > 256 or self.tile_n % granularity:
-            raise ValueError(f"tile_n must be at most 256 and a positive multiple of {granularity} for cluster_m={self.cluster_m}")
+            raise ValueError(
+                f"tile_n must be at most 256 and a positive multiple of {granularity} for cluster_m={self.cluster_m}"
+            )
         if self.tile_n % self.epilogue_tile_n:
             raise ValueError("tile_n must be divisible by epilogue_tile_n")
         if self.tile_k <= 0 or self.tile_k % 64:
             raise ValueError("tile_k must be a positive multiple of 64")
         if self.mode not in (0, 1, 2):
-            raise ValueError("mode must be 0 (non-persistent), 1 (persistent), or 2 (CLC)")
+            raise ValueError(
+                "mode must be 0 (non-persistent), 1 (persistent), or 2 (CLC)"
+            )
 
 
 @dataclass(frozen=True)
@@ -69,21 +73,47 @@ class GroupedMModule:
 
     def prepare_metadata(self, grouped_layout, experts, n, swap_ab=False):
         offsets, counts, tasks, state = self._binding.prepare_grouped_m_metadata(
-            grouped_layout, experts, n, self._metadata_launcher_address,
-            self._config.tile_m, self._config.tile_n, self._config.cluster_m, swap_ab)
+            grouped_layout,
+            experts,
+            n,
+            self._metadata_launcher_address,
+            self._config.tile_m,
+            self._config.tile_n,
+            self._config.cluster_m,
+            swap_ab,
+        )
         return GroupedMMetadata(offsets, counts, tasks, state)
 
     def bf16_grouped_m_gemm(self, a, b, metadata: GroupedMMetadata, swap_ab=False):
         return self._binding.bf16_grouped_m_gemm(
-            a, b, metadata.tasks, metadata.state, self._launcher_address,
-            self._config.tile_m, self._config.tile_n, self._config.tile_k,
-            self._config.cluster_m, swap_ab)
+            a,
+            b,
+            metadata.tasks,
+            metadata.state,
+            self._launcher_address,
+            self._config.tile_m,
+            self._config.tile_n,
+            self._config.tile_k,
+            self._config.cluster_m,
+            swap_ab,
+        )
 
-    def bf16_grouped_m_gemm_out(self, a, b, metadata: GroupedMMetadata, out, swap_ab=False):
+    def bf16_grouped_m_gemm_out(
+        self, a, b, metadata: GroupedMMetadata, out, swap_ab=False
+    ):
         return self._binding.bf16_grouped_m_gemm_out(
-            a, b, metadata.tasks, metadata.state, out, self._launcher_address,
-            self._config.tile_m, self._config.tile_n, self._config.tile_k,
-            self._config.cluster_m, swap_ab)
+            a,
+            b,
+            metadata.tasks,
+            metadata.state,
+            out,
+            self._launcher_address,
+            self._config.tile_m,
+            self._config.tile_n,
+            self._config.tile_k,
+            self._config.cluster_m,
+            swap_ab,
+        )
 
 
 def _kernel_cflags(config: GroupedMConfig, variant):
@@ -102,8 +132,14 @@ _JIT = SplitCudaJit(
     name="sm110a_grouped_m",
     root=_ROOT,
     binding_sources=(_SOURCE_DIR / "bf16_grouped_m_gemm_torch_binding.cpp",),
-    kernel_sources=(_SOURCE_DIR / "bf16_grouped_m_gemm_kernel.cu", _SOURCE_DIR / "bf16_grouped_m_gemm_metadata.cu"),
-    kernel_dependencies=(_INCLUDE_DIR / "bf16_grouped_m_gemm.h", _INCLUDE_DIR / "common.h"),
+    kernel_sources=(
+        _SOURCE_DIR / "bf16_grouped_m_gemm_kernel.cu",
+        _SOURCE_DIR / "bf16_grouped_m_gemm_metadata.cu",
+    ),
+    kernel_dependencies=(
+        _INCLUDE_DIR / "bf16_grouped_m_gemm.h",
+        _INCLUDE_DIR / "common.h",
+    ),
     kernel_symbol="sm110a_bf16_grouped_m_gemm_launch",
     config_key=lambda config: config,
     kernel_cflags=_kernel_cflags,
@@ -112,7 +148,7 @@ _JIT = SplitCudaJit(
 )
 
 
-def compile_bf16_grouped_m_gemm(config: Optional[GroupedMConfig] = None):
+def compile_bf16_grouped_m_gemm(config: GroupedMConfig | None = None):
     config = config or GroupedMConfig()
     if not isinstance(config, GroupedMConfig):
         raise TypeError("config must be a GroupedMConfig")
@@ -120,7 +156,9 @@ def compile_bf16_grouped_m_gemm(config: Optional[GroupedMConfig] = None):
     return _JIT.compile(config)
 
 
-def compile_bf16_grouped_m_gemm_configs(configs: Iterable[GroupedMConfig], max_workers=None):
+def compile_bf16_grouped_m_gemm_configs(
+    configs: Iterable[GroupedMConfig], max_workers=None
+):
     configs = tuple(configs)
     if not configs:
         return ()
@@ -141,8 +179,12 @@ def prepare_grouped_m_metadata(grouped_layout, experts, n, config=None, swap_ab=
 
 
 def bf16_grouped_m_gemm(a, b, metadata, config=None, swap_ab=False):
-    return get_bf16_grouped_m_gemm_module(a, b, config).bf16_grouped_m_gemm(a, b, metadata, swap_ab)
+    return get_bf16_grouped_m_gemm_module(a, b, config).bf16_grouped_m_gemm(
+        a, b, metadata, swap_ab
+    )
 
 
 def bf16_grouped_m_gemm_out(a, b, metadata, out, config=None, swap_ab=False):
-    return get_bf16_grouped_m_gemm_module(a, b, config).bf16_grouped_m_gemm_out(a, b, metadata, out, swap_ab)
+    return get_bf16_grouped_m_gemm_module(a, b, config).bf16_grouped_m_gemm_out(
+        a, b, metadata, out, swap_ab
+    )

@@ -1,6 +1,6 @@
 target-version = "py310"
 line-length = 88
-extend-exclude = ["baselinedir", ".claude"]
+extend-exclude = ["baselinedir", ".claude", "models"]
 
 [lint]
 select = [
@@ -21,3 +21,7 @@ ignore = [
 
 [lint.isort]
 known-first-party = ["sm110a_kernel", "common"]
+
+[lint.per-file-ignores]
+# Package roots re-export the public API via a dynamically built __all__.
+"**/__init__.py" = ["F401"]

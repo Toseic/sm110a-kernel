@@ -21,7 +21,6 @@ from common import (  # noqa: E402
     quick_probe,
     sol_bounds,
 )
-
 from sm110a_kernel import (  # noqa: E402
     Nvfp4Fc1Config,
     Nvfp4Fc1Fc2Config,
@@ -40,7 +39,6 @@ from sm110a_kernel.runner import (  # noqa: E402
     PreparedKernel,
     TuneOptions,
 )
-
 
 H = 6144
 INTERMEDIATE = 2048
@@ -71,19 +69,24 @@ def compatible_configs(m, args):
     # correctness-preserving autotuner select them.
     buffers = (args.buffer_i,) if args.buffer_i else (2048,)
     h_splits = (args.h_split,) if args.h_split else (1, 2, 3, 4)
-    cluster_pairs = (
-        (args.cluster_pairs,) if args.cluster_pairs else (1, 2, 4)
-    )
-    sm_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    cluster_pairs = (args.cluster_pairs,) if args.cluster_pairs else (1, 2, 4)
+    sm_count = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
     row_tasks = getattr(args, "_row_task_count", m // 256)
     candidates = []
     for buffer_i in buffers:
         for h_split in h_splits:
             for pairs in cluster_pairs:
                 caches = (
-                    (0, 1, 2) if args.cache_source_rows < 0 else
-                    (args.cache_source_rows,)
-                ) if args.fuse_routing else (0,)
+                    (
+                        (0, 1, 2)
+                        if args.cache_source_rows < 0
+                        else (args.cache_source_rows,)
+                    )
+                    if args.fuse_routing
+                    else (0,)
+                )
                 for cache_source_rows in caches:
                     if h_split > 1 and (buffer_i != 2048 or pairs != 1):
                         continue
@@ -102,7 +105,7 @@ def compatible_configs(m, args):
                         tasks = row_tasks * h_split
                         if h_split == 3 and row_tasks == 4:
                             tasks = 10
-                        if (tasks > sm_count // (2 * pairs) and h_split != 2):
+                        if tasks > sm_count // (2 * pairs) and h_split != 2:
                             continue
                     candidates.append(config)
     if not candidates:
@@ -123,18 +126,12 @@ def fused_sol_bounds(m, config, *, tokens=None, experts=1, row_tasks=None):
 
     # FC1 reloads A once per logical 64-column output tile. Each row task
     # consumes the complete W1 and W2 weights across its distributed workers.
-    fc1_a_tile_reads = row_tasks * 256 * H * nvfp4_bytes_per_element * (
-        INTERMEDIATE // 64
+    fc1_a_tile_reads = (
+        row_tasks * 256 * H * nvfp4_bytes_per_element * (INTERMEDIATE // 64)
     )
-    tile_read_bytes = (
-        fc1_a_tile_reads
-        + row_tasks * (w1_bytes + w2_bytes)
-        + out_bytes
-    )
+    tile_read_bytes = fc1_a_tile_reads + row_tasks * (w1_bytes + w2_bytes) + out_bytes
     workspace_store = 0
-    streams_intermediate = (
-        config.buffer_i == INTERMEDIATE and config.cluster_pairs == 1
-    )
+    streams_intermediate = config.buffer_i == INTERMEDIATE and config.cluster_pairs == 1
     if config.h_split > 1 or streams_intermediate:
         tasks = row_tasks * config.h_split
         if config.h_split == 3 and row_tasks == 4:
@@ -144,9 +141,7 @@ def fused_sol_bounds(m, config, *, tokens=None, experts=1, row_tasks=None):
         reloads = tasks if config.h_split > 1 else row_tasks
         if config.h_split == 1 and row_tasks == 12:
             reloads = 18
-        tile_read_bytes += (
-            workspace_store + reloads * 256 * per_row_intermediate
-        )
+        tile_read_bytes += workspace_store + reloads * 256 * per_row_intermediate
 
     compulsory_bytes = a_bytes + w1_bytes + w2_bytes + out_bytes + workspace_store
     return sol_bounds(
@@ -176,15 +171,11 @@ def quantize_expert_weights(experts, h, intermediate):
             torch.randn((h, intermediate), device="cuda", dtype=torch.bfloat16)
         )
         if w1q is None:
-            w1q = torch.empty(
-                (experts, *w1.shape[1:]), device="cuda", dtype=w1.dtype
-            )
+            w1q = torch.empty((experts, *w1.shape[1:]), device="cuda", dtype=w1.dtype)
             sfw1_all = torch.empty(
                 experts * sfw1.numel(), device="cuda", dtype=sfw1.dtype
             )
-            w2q = torch.empty(
-                (experts, *w2.shape), device="cuda", dtype=w2.dtype
-            )
+            w2q = torch.empty((experts, *w2.shape), device="cuda", dtype=w2.dtype)
             sfw2_all = torch.empty(
                 experts * sfw2.numel(), device="cuda", dtype=sfw2.dtype
             )
@@ -213,26 +204,41 @@ def main():
     parser.add_argument("--m", type=int, default=512)
     parser.add_argument("--fuse-routing", action="store_true")
     parser.add_argument(
-        "--cache-source-rows", type=int, choices=(-1, 0, 1, 2), default=-1,
+        "--cache-source-rows",
+        type=int,
+        choices=(-1, 0, 1, 2),
+        default=-1,
         help="source-row cache mode: -1 autotune, 0 none, 1 SFA, 2 A+SFA",
     )
-    parser.add_argument("--tokens", type=int, default=0,
-                        help="token count in routed mode; 0 derives it from M/topk")
+    parser.add_argument(
+        "--tokens",
+        type=int,
+        default=0,
+        help="token count in routed mode; 0 derives it from M/topk",
+    )
     parser.add_argument("--experts", type=int, default=2)
     parser.add_argument("--topk", type=int, default=2)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=5)
     parser.add_argument("--samples", type=int, default=3)
     parser.add_argument(
-        "--buffer-i", type=int, choices=(0, 256, 512, 1024, 2048), default=0,
+        "--buffer-i",
+        type=int,
+        choices=(0, 256, 512, 1024, 2048),
+        default=0,
         help="I-buffer size, or 0 to autotune",
     )
     parser.add_argument(
-        "--h-split", type=int,
-        choices=(0, 1, 2, 3, 4), default=0,
+        "--h-split",
+        type=int,
+        choices=(0, 1, 2, 3, 4),
+        default=0,
     )
     parser.add_argument(
-        "--cluster-pairs", type=int, choices=(0, 1, 2, 4), default=0,
+        "--cluster-pairs",
+        type=int,
+        choices=(0, 1, 2, 4),
+        default=0,
         help="cooperating CTA pairs, or 0 to autotune",
     )
     parser.add_argument("--force-sweep", action="store_true")
@@ -240,7 +246,9 @@ def main():
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--sol", action="store_true")
     parser.add_argument(
-        "--pre-parallel-jit", dest="pre_parallel_jit", action="store_true",
+        "--pre-parallel-jit",
+        dest="pre_parallel_jit",
+        action="store_true",
         default=True,
     )
     parser.add_argument(
@@ -278,30 +286,37 @@ def main():
     aq, sfa = quantize_nvfp4_rows(
         torch.randn((tokens, h), device="cuda", dtype=torch.bfloat16)
     )
-    w1q, sfw1, w2q, sfw2 = quantize_expert_weights(
-        experts, h, intermediate
-    )
+    w1q, sfw1, w2q, sfw2 = quantize_expert_weights(experts, h, intermediate)
 
     output = torch.empty((tokens, h), device="cuda", dtype=torch.bfloat16)
 
     fc1_config = Nvfp4Fc1Config(
-        tile_n=128, tile_k=256, epilogue_tile_n=128,
-        cluster_m=2, direct_gmem=True,
+        tile_n=128,
+        tile_k=256,
+        epilogue_tile_n=128,
+        cluster_m=2,
+        direct_gmem=True,
     )
     fc2_config = Nvfp4Fc2Config(
-        tile_n=128, tile_k=256, epilogue_tile_n=64, cluster_m=2,
+        tile_n=128,
+        tile_k=256,
+        epilogue_tile_n=64,
+        cluster_m=2,
     )
     compile_nvfp4_fc1(fc1_config)
     compile_nvfp4_fc2(fc2_config)
     if args.fuse_routing:
         router = powerlaw_router_scores(
-            tokens, experts, ROUTER_POWERLAW_ALPHA,
-            device="cuda", dtype=torch.bfloat16,
+            tokens,
+            experts,
+            ROUTER_POWERLAW_ALPHA,
+            device="cuda",
+            dtype=torch.bfloat16,
         )
         topk_result = torch.topk(router.float(), topk, dim=1)
-        routing_weights = torch.softmax(topk_result.values, dim=1).to(
-            torch.bfloat16
-        ).contiguous()
+        routing_weights = (
+            torch.softmax(topk_result.values, dim=1).to(torch.bfloat16).contiguous()
+        )
         expert_counts = torch.bincount(
             topk_result.indices.reshape(-1), minlength=experts
         )
@@ -310,24 +325,22 @@ def main():
         )
     else:
         router = torch.ones((args.m, 1), device="cuda", dtype=torch.bfloat16)
-        routing_weights = torch.ones(
-            (args.m, 1), device="cuda", dtype=torch.bfloat16
-        )
+        routing_weights = torch.ones((args.m, 1), device="cuda", dtype=torch.bfloat16)
         row_task_count = args.m // 256
     args._row_task_count = row_task_count
     fc1_metadata = prepare_nvfp4_fc1_metadata(
         router, topk, 2 * intermediate, fc1_config
     )
     grouped_layout = fc1_metadata.routing.narrow(0, 2 * experts, args.m)
-    fc2_metadata = prepare_nvfp4_fc2_metadata(
-        grouped_layout, experts, h, fc2_config
-    )
+    fc2_metadata = prepare_nvfp4_fc2_metadata(grouped_layout, experts, h, fc2_config)
     intermediate_packed = torch.empty(
-        (args.m, intermediate // 2), device="cuda",
+        (args.m, intermediate // 2),
+        device="cuda",
         dtype=torch.float4_e2m1fn_x2,
     )
     intermediate_scales = torch.empty(
-        (args.m * (intermediate // 16),), device="cuda",
+        (args.m * (intermediate // 16),),
+        device="cuda",
         dtype=torch.float8_e4m3fn,
     )
     reference = torch.empty_like(output)
@@ -338,13 +351,19 @@ def main():
         module = compile_nvfp4_fc1fc2(config)
         if args.fuse_routing:
             run = lambda: module.run_routed_out(
-                aq, w1q, sfa, sfw1, w2q, sfw2, fc1_metadata,
-                routing_weights, topk, output,
+                aq,
+                w1q,
+                sfa,
+                sfw1,
+                w2q,
+                sfw2,
+                fc1_metadata,
+                routing_weights,
+                topk,
+                output,
             )
         else:
-            run = lambda: module.run_out(
-                aq, w1q, sfa, sfw1, w2q, sfw2, output
-            )
+            run = lambda: module.run_out(aq, w1q, sfa, sfw1, w2q, sfw2, output)
         run()
         torch.cuda.synchronize()
         return PreparedKernel(config, run)
@@ -361,8 +380,16 @@ def main():
     selection = AutotuneRunner(tune_options).resolve(
         candidates,
         namespace="nvfp4_fc1fc2",
-        key=("v6-routing-fusion", args.m, H, INTERMEDIATE,
-             experts, topk, row_task_count, args.fuse_routing),
+        key=(
+            "v6-routing-fusion",
+            args.m,
+            H,
+            INTERMEDIATE,
+            experts,
+            topk,
+            row_task_count,
+            args.fuse_routing,
+        ),
         prepare=prepare_fused,
         benchmark=lambda prepared: benchmark_with_stats(
             prepared.run, args.warmup, args.iters, args.samples
@@ -381,16 +408,28 @@ def main():
 
     def run_fc1():
         return nvfp4_fc1_out(
-            aq, w1q, sfa, sfw1, fc1_metadata,
-            intermediate_packed, intermediate_scales,
+            aq,
+            w1q,
+            sfa,
+            sfw1,
+            fc1_metadata,
+            intermediate_packed,
+            intermediate_scales,
             config=fc1_config,
         )
 
     def run_fc2():
         return nvfp4_fc2_out(
-            intermediate_packed, w2q, intermediate_scales, sfw2,
-            fc1_metadata.routing, routing_weights, fc2_metadata, topk,
-            reference, config=fc2_config,
+            intermediate_packed,
+            w2q,
+            intermediate_scales,
+            sfw2,
+            fc1_metadata.routing,
+            routing_weights,
+            fc2_metadata,
+            topk,
+            reference,
+            config=fc2_config,
         )
 
     def run_standalone():
@@ -446,10 +485,7 @@ def main():
     standalone_ms = standalone_stats["median_ms"]
     fc1_ms = time_ms(run_fc1, args.warmup, args.iters)
     fc2_ms = time_ms(run_fc2, args.warmup, args.iters)
-    print(
-        f"[config] {format_config(fused_config)}; "
-        f"cache_hit={selection.cache_hit}"
-    )
+    print(f"[config] {format_config(fused_config)}; cache_hit={selection.cache_hit}")
     print(
         f"[workload] tokens={tokens}; M={args.m}; experts={experts}; "
         f"topk={topk}; input={'token-major' if args.fuse_routing else 'grouped'}; "
@@ -468,7 +504,10 @@ def main():
         report = SolReport(debug=args.debug)
         report.add(
             fused_sol_bounds(
-                args.m, fused_config, tokens=tokens, experts=experts,
+                args.m,
+                fused_config,
+                tokens=tokens,
+                experts=experts,
                 row_tasks=row_task_count,
             ),
             fused_ms,

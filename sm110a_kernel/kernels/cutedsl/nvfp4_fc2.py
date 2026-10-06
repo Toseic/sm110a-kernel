@@ -5,13 +5,13 @@ This directly calls TRT-LLM's
 GEMM with token-major routing reduction fused into the epilogue), mirroring the
 FC1 CuTE DSL baseline wiring.
 """
+
 from __future__ import annotations
 
 import statistics
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import Optional
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -20,7 +20,6 @@ import torch
 from cutlass.cute.runtime import make_fake_stream, make_ptr
 
 from ...runner import AutotuneRunner, PreparedKernel, Selection, TuneOptions
-
 from ._baseline_loader import install_baseline_packages
 
 install_baseline_packages()
@@ -90,7 +89,10 @@ def format_config(config: CuteDslNvfp4Fc2Config) -> str:
 
 def _measure(run, iters, cold_l2_flush):
     if cold_l2_flush is None:
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start, end = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
         start.record()
         for _ in range(iters):
             run()
@@ -100,7 +102,10 @@ def _measure(run, iters, cold_l2_flush):
     events = []
     for _ in range(iters):
         cold_l2_flush()
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start, end = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
         start.record()
         run()
         end.record()
@@ -207,7 +212,9 @@ class CuteDslNvfp4Fc2Runner:
         # ranges on the host once; only these ranges are needed to build CuTE
         # tile metadata and to pad A/SFA for this kernel.
         layout_cpu = self._grouped_layout.cpu()
-        counts = torch.bincount(layout_cpu.to(torch.long), minlength=self.experts).tolist()
+        counts = torch.bincount(
+            layout_cpu.to(torch.long), minlength=self.experts
+        ).tolist()
         native_ranges = []
         src_start = 0
         for expert, count in enumerate(counts):
@@ -259,20 +266,19 @@ class CuteDslNvfp4Fc2Runner:
         self._permuted_idx_to_expanded_idx = torch.cat(chunks_perm).contiguous()
         self.sfb_storage = sfb.contiguous()
         self.b_storage = b.contiguous()
-        self.alpha = torch.ones(
-            (self.experts,), device=a.device, dtype=torch.float32
-        )
+        self.alpha = torch.ones((self.experts,), device=a.device, dtype=torch.float32)
         self.token_final_scales = routing_weights.float().contiguous()
         self.out = out
 
         self.stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         self._max_active_clusters = {
-            config.cluster_m * config.cluster_n: cutlass.utils.HardwareInfo().get_max_active_clusters(
+            config.cluster_m
+            * config.cluster_n: cutlass.utils.HardwareInfo().get_max_active_clusters(
                 config.cluster_m * config.cluster_n
             )
             for config in DEFAULT_CONFIGS
         }
-        self.selection: Optional[Selection[CuteDslNvfp4Fc2Config]] = None
+        self.selection: Selection[CuteDslNvfp4Fc2Config] | None = None
 
     def _cute_tile_metadata(self, config: CuteDslNvfp4Fc2Config):
         """Return per-MMA-tile expert and valid-row metadata."""
@@ -436,7 +442,12 @@ class CuteDslNvfp4Fc2Runner:
                 stream=make_fake_stream(),
                 options="--opt-level 2",
             )
-        return compiled, tile_idx_to_group_idx, tile_idx_to_mn_limit, num_non_exiting_tiles
+        return (
+            compiled,
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            num_non_exiting_tiles,
+        )
 
     def _prepare(self, config: CuteDslNvfp4Fc2Config):
         compiled, tile_idx_to_group_idx, tile_idx_to_mn_limit, num_non_exiting_tiles = (
@@ -589,9 +600,7 @@ def cute_dsl_nvfp4_fc2_out(
     options: TuneOptions | None = None,
 ):
     """Autotune then write the fused finalize FC2 result to ``out``."""
-    runner = CuteDslNvfp4Fc2Runner(
-        a, b, sfa, sfb, routing, routing_weights, out, topk
-    )
+    runner = CuteDslNvfp4Fc2Runner(a, b, sfa, sfb, routing, routing_weights, out, topk)
     runner.autotune(options)
     out.zero_()
     runner.run()

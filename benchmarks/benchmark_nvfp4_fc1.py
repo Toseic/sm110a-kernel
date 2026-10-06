@@ -2,9 +2,9 @@
 """Runner-backed config and token sweep for fused-permute NVFP4 SwiGLU FC1."""
 
 import argparse
-from dataclasses import replace
 import math
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -18,8 +18,8 @@ from common import (
     SolReport,
     TablePrinter,
     benchmark_with_stats,
-    quick_probe,
     powerlaw_router_scores,
+    quick_probe,
     sol_bounds,
     tflops_from_ms,
 )
@@ -27,13 +27,12 @@ from sm110a_kernel import (
     CuteDslNvfp4Fc1Runner,
     Nvfp4Fc1Config,
     compile_nvfp4_fc1,
+    from_blocked_nvfp4_scales,
     nvfp4_fc1_out,
     prepare_nvfp4_fc1_metadata,
     quantize_nvfp4_rows,
-    from_blocked_nvfp4_scales,
 )
 from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
-
 
 DEFAULT_EXPERTS = 256
 DEFAULT_N = 2048
@@ -81,8 +80,11 @@ def format_candidate(config):
 
 def compatible_candidates(n, k):
     return tuple(
-        config for config in NVFP4_FC1_CONFIGS
-        if n % (config.tile_n * config.cluster_n) == 0 and n % 128 == 0 and k % config.tile_k == 0
+        config
+        for config in NVFP4_FC1_CONFIGS
+        if n % (config.tile_n * config.cluster_n) == 0
+        and n % 128 == 0
+        and k % config.tile_k == 0
     )
 
 
@@ -130,7 +132,8 @@ def nvfp4_fc1_sol_bounds(router_scores, topk, n, k, config):
     m = selected.numel()
     m_tasks = sum(
         math.ceil(rows / (config.cluster_m * config.tile_m))
-        for rows in expert_rows.tolist() if rows
+        for rows in expert_rows.tolist()
+        if rows
     )
     task_count = m_tasks * ((2 * n) // (config.tile_n * config.cluster_n))
 
@@ -164,7 +167,8 @@ def dequantize_nvfp4_rows(packed, scales, rows, logical_n):
     codes = torch.stack((raw & 0xF, raw >> 4), dim=-1).reshape(rows, logical_n)
     magnitudes = torch.tensor(
         (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0),
-        device=packed.device, dtype=torch.float32,
+        device=packed.device,
+        dtype=torch.float32,
     )
     values = magnitudes[(codes & 7).long()]
     values = torch.where((codes & 8) != 0, -values, values)
@@ -173,8 +177,14 @@ def dequantize_nvfp4_rows(packed, scales, rows, logical_n):
 
 
 def nvfp4_outputs_close(
-    actual_packed, actual_scales, expected_packed, expected_scales,
-    rows, logical_n, atol, rtol,
+    actual_packed,
+    actual_scales,
+    expected_packed,
+    expected_scales,
+    rows,
+    logical_n,
+    atol,
+    rtol,
 ):
     """Compare quantized outputs without rejecting sparse midpoint ties.
 
@@ -184,12 +194,8 @@ def nvfp4_outputs_close(
     the fallback accepts only byte-identical E4M3 scales and a very sparse set
     of same-sign, adjacent E2M1 magnitude codes.
     """
-    actual = dequantize_nvfp4_rows(
-        actual_packed, actual_scales, rows, logical_n
-    )
-    expected = dequantize_nvfp4_rows(
-        expected_packed, expected_scales, rows, logical_n
-    )
+    actual = dequantize_nvfp4_rows(actual_packed, actual_scales, rows, logical_n)
+    expected = dequantize_nvfp4_rows(expected_packed, expected_scales, rows, logical_n)
     max_diff = (actual - expected).abs().max().item()
     if not torch.equal(
         actual_scales.view(torch.uint8), expected_scales.view(torch.uint8)
@@ -200,9 +206,7 @@ def nvfp4_outputs_close(
 
     def unpack_codes(packed):
         raw = packed.view(torch.uint8).reshape(rows, logical_n // 2)
-        return torch.stack((raw & 0xF, raw >> 4), dim=-1).reshape(
-            rows, logical_n
-        )
+        return torch.stack((raw & 0xF, raw >> 4), dim=-1).reshape(rows, logical_n)
 
     actual_codes = unpack_codes(actual_packed)
     expected_codes = unpack_codes(expected_packed)
@@ -227,9 +231,7 @@ def nvfp4_outputs_close(
     expected_mag = expected_bad & 7
     both_zero = (actual_mag == 0) & (expected_mag == 0)
     same_sign = ((actual_bad ^ expected_bad) & 8) == 0
-    adjacent = (
-        actual_mag.to(torch.int16) - expected_mag.to(torch.int16)
-    ).abs() <= 1
+    adjacent = (actual_mag.to(torch.int16) - expected_mag.to(torch.int16)).abs() <= 1
     acceptable = (both_zero | same_sign) & adjacent
     return bool(acceptable.all().item()), max_diff, mismatch_count
 
@@ -269,7 +271,11 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
         parser.add_argument("--n", type=int, default=DEFAULT_N)
         parser.add_argument("--k", type=int, default=DEFAULT_K)
         parser.add_argument(
-            "--token", "--tokens", dest="token", type=int, default=0,
+            "--token",
+            "--tokens",
+            dest="token",
+            type=int,
+            default=0,
             help="run one token count; default runs the standard token sweep",
         )
         self.add_timing_args(parser, warmup=2, iters=5, samples=3)
@@ -287,7 +293,8 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
         parser.add_argument("--cluster-m", type=int, choices=(1, 2))
         parser.add_argument("--cluster-n", type=int, choices=(1,))
         parser.add_argument(
-            "--extended-tuning", action="store_true",
+            "--extended-tuning",
+            action="store_true",
             help="also tune macro traversal",
         )
         parser.add_argument(
@@ -296,11 +303,14 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
             help="only tune direct-GMEM epilogue candidates",
         )
         parser.add_argument(
-            "--tma-epilogue", action="store_true",
+            "--tma-epilogue",
+            action="store_true",
             help="only tune shared-memory/TMA epilogue candidates",
         )
         parser.add_argument(
-            "--baseline", choices=("cutedsl",), default="cutedsl",
+            "--baseline",
+            choices=("cutedsl",),
+            default="cutedsl",
             help="TRT-LLM CuTE DSL reference implementation",
         )
         parser.add_argument(
@@ -317,7 +327,9 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
     def validate_args(self, args):
         self.validate_timing_args(args, allow_zero_warmup=True)
         if args.experts <= 0 or args.topk <= 0 or args.topk > args.experts:
-            raise SystemExit("experts must be positive and topk must be in [1, experts]")
+            raise SystemExit(
+                "experts must be positive and topk must be in [1, experts]"
+            )
         if args.n <= 0 or args.n % 128 or args.k <= 0 or args.k % 64:
             raise SystemExit("N must be a positive multiple of 128 and K of 64")
         if args.token < 0:
@@ -365,7 +377,14 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
             # v12 hoists the block-scale reciprocal in the NVFP4 epilogue.
             # That changes the relative ranking of direct-GMEM and TMA-store
             # candidates, so do not reuse selections made by the older path.
-            key=("v12-fp4-output-recip", aq.size(0), args.experts, args.topk, args.n, args.k),
+            key=(
+                "v12-fp4-output-recip",
+                aq.size(0),
+                args.experts,
+                args.topk,
+                args.n,
+                args.k,
+            ),
             prepare=prepare_for_runner,
             benchmark=lambda prepared: benchmark_with_stats(
                 prepared.run,
@@ -395,17 +414,13 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
         first, consistent with the NVFP4 GEMM benchmark.
         """
         config = selected_candidates(2 * args.n, args.k, args)[0]
-        return prepare_nvfp4_fc1_metadata(
-            router, args.topk, 2 * args.n, config=config
-        )
+        return prepare_nvfp4_fc1_metadata(router, args.topk, 2 * args.n, config=config)
 
     def run_with_args(self, args):
         torch.manual_seed(args.seed)
         # Retain weights only in NVFP4 form.  Quantizing a single expert at a
         # time caps the FP32 quantization workspace independently of E.
-        bq, sfb = make_quantized_interleaved_weights(
-            args.experts, args.n, args.k
-        )
+        bq, sfb = make_quantized_interleaved_weights(args.experts, args.n, args.k)
 
         print(
             f"[config] experts={args.experts} topk={args.topk} "
@@ -414,30 +429,48 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
         )
         print("[runner] config selection cached by tokens/experts/topk/N/K")
         print("[baseline] TRT-LLM CuTE DSL fused-gather NVFP4 FC1 (autotuned)")
-        table = TablePrinter((
-            ("Tokens", 9), ("M", 10), ("TopK", 7), ("E", 6),
-            ("N", 8), ("K", 8), ("Kernel(ms)", 14), ("Kernel TF/s", 15),
-            ("Baseline(ms)", 14), ("Baseline TF/s", 15),
-            ("Speedup", 10), ("MaxDiff", 12), ("AdjTies", 10),
-            ("Cache", 8), ("BestConfig", 34),
-        ), debug=args.debug)
+        table = TablePrinter(
+            (
+                ("Tokens", 9),
+                ("M", 10),
+                ("TopK", 7),
+                ("E", 6),
+                ("N", 8),
+                ("K", 8),
+                ("Kernel(ms)", 14),
+                ("Kernel TF/s", 15),
+                ("Baseline(ms)", 14),
+                ("Baseline TF/s", 15),
+                ("Speedup", 10),
+                ("MaxDiff", 12),
+                ("AdjTies", 10),
+                ("Cache", 8),
+                ("BestConfig", 34),
+            ),
+            debug=args.debug,
+        )
         table.print_header()
         sol_report = SolReport(debug=args.debug) if args.sol else None
 
         for tokens in args.token_values:
             a = torch.randn((tokens, args.k), device="cuda", dtype=torch.bfloat16)
             router = powerlaw_router_scores(
-                tokens, args.experts, ROUTER_POWERLAW_ALPHA,
-                device="cuda", dtype=torch.bfloat16,
+                tokens,
+                args.experts,
+                ROUTER_POWERLAW_ALPHA,
+                device="cuda",
+                dtype=torch.bfloat16,
             )
             aq, sfa = quantize_nvfp4_rows(a)
             del a
             out = torch.empty(
-                (tokens * args.topk, args.n // 2), device="cuda",
+                (tokens * args.topk, args.n // 2),
+                device="cuda",
                 dtype=torch.float4_e2m1fn_x2,
             )
             out_scale = torch.empty(
-                (tokens * args.topk * (args.n // 16),), device="cuda",
+                (tokens * args.topk * (args.n // 16),),
+                device="cuda",
                 dtype=torch.float8_e4m3fn,
             )
 
@@ -448,22 +481,33 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
             baseline_out_scale = torch.empty_like(out_scale)
             baseline_metadata = self.prepare_baseline_metadata(router, args)
             baseline_runner = CuteDslNvfp4Fc1Runner(
-                aq, bq, sfa, sfb, baseline_out, baseline_out_scale,
+                aq,
+                bq,
+                sfa,
+                sfb,
+                baseline_out,
+                baseline_out_scale,
                 baseline_metadata.source_rows,
                 baseline_metadata.tasks,
                 baseline_metadata.state,
             )
-            baseline_runner.autotune(self.make_tune_options(
-                args, role="baseline",
-                pre_parallel_jit=args.cutedsl_pre_parallel_jit,
-            ))
+            baseline_runner.autotune(
+                self.make_tune_options(
+                    args,
+                    role="baseline",
+                    pre_parallel_jit=args.cutedsl_pre_parallel_jit,
+                )
+            )
             # Time only the CuTE fused gather/GEMM/SwiGLU/quantize launch. The
             # runner's normal ``run`` additionally launches PyTorch kernels to
             # restore padded rows, which are outside the kernel measurement.
             baseline_fn = baseline_runner.run_kernel
 
             baseline_stats = benchmark_with_stats(
-                baseline_fn, args.warmup, args.iters, args.samples,
+                baseline_fn,
+                args.warmup,
+                args.iters,
+                args.samples,
                 cold_l2_flush=args._cold_l2_flush,
             )
 
@@ -480,12 +524,19 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
                 baseline_runner.run()
                 torch.cuda.synchronize()
                 close, max_diff, code_mismatches = nvfp4_outputs_close(
-                    out, out_scale, baseline_out, baseline_out_scale,
-                    tokens * args.topk, args.n, args.atol, args.rtol,
+                    out,
+                    out_scale,
+                    baseline_out,
+                    baseline_out_scale,
+                    tokens * args.topk,
+                    args.n,
+                    args.atol,
+                    args.rtol,
                 )
                 if not close:
                     scale_detail = (
-                        "scale mismatch" if code_mismatches < 0
+                        "scale mismatch"
+                        if code_mismatches < 0
                         else f"code mismatches {code_mismatches}"
                     )
                     raise AssertionError(
@@ -496,7 +547,12 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
             baseline_ms = baseline_stats["median_ms"]
             routed_m = tokens * args.topk
             table.print_row(
-                tokens, routed_m, args.topk, args.experts, args.n, args.k,
+                tokens,
+                routed_m,
+                args.topk,
+                args.experts,
+                args.n,
+                args.k,
                 f"{kernel_ms:.4f}",
                 f"{fc1_tflops_from_ms(routed_m, args.n, args.k, kernel_ms):.2f}",
                 f"{baseline_ms:.4f}",

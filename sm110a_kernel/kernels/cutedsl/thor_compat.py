@@ -35,15 +35,15 @@ def apply_thor_mma_compat_patch() -> tuple[str, ...]:
     # CUTLASS versions name the wrapper differently.  NVFP4 uses
     # MmaMXF4NVF4Op in the currently pinned version; BlockScaledMmaOp keeps
     # this compatible with adjacent releases.
-    for module, names in (
-        (mma, ("MmaMXF4NVF4Op", "BlockScaledMmaOp")),
-    ):
+    for module, names in ((mma, ("MmaMXF4NVF4Op", "BlockScaledMmaOp")),):
         for name in names:
             op = getattr(module, name, None)
             if op is None:
                 continue
             admissible_archs = list(op.admissible_archs)
-            missing_archs = [arch for arch in thor_archs if arch not in admissible_archs]
+            missing_archs = [
+                arch for arch in thor_archs if arch not in admissible_archs
+            ]
             if missing_archs:
                 op.admissible_archs = admissible_archs + missing_archs
                 patched.append(name)
@@ -65,9 +65,8 @@ def apply_thor_mma_compat_patch() -> tuple[str, ...]:
     # and bypass only that guard on Thor.  Cp4x32x128bOp is used to transfer
     # NVFP4 scale factors in the persistent GEMM main loop.
     s2t_copy_base = getattr(copy, "_S2TCopyBase", None)
-    if (
-        s2t_copy_base is not None
-        and not hasattr(s2t_copy_base, "_sm110a_original_post_init")
+    if s2t_copy_base is not None and not hasattr(
+        s2t_copy_base, "_sm110a_original_post_init"
     ):
         original_post_init = s2t_copy_base.__post_init__
 

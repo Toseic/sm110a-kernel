@@ -1,4 +1,5 @@
 """Autotuned TensorRT-LLM CuTE DSL NVFP4 contiguous grouped-M GEMM baseline."""
+
 from __future__ import annotations
 
 import statistics
@@ -13,7 +14,6 @@ import torch
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from ...runner import AutotuneRunner, PreparedKernel, Selection, TuneOptions
-
 from ._baseline_loader import install_baseline_packages
 
 install_baseline_packages()
@@ -52,9 +52,7 @@ class CuteDslNvfp4GroupedMGemmConfig:
 
 
 DEFAULT_CONFIGS = tuple(
-    CuteDslNvfp4GroupedMGemmConfig(
-        tile_m, tile_n, cluster_m, cluster_n, raster_along_m
-    )
+    CuteDslNvfp4GroupedMGemmConfig(tile_m, tile_n, cluster_m, cluster_n, raster_along_m)
     for tile_m in (128, 256)
     for tile_n in (64, 128, 192, 256)
     for cluster_m in (1, 2, 4)
@@ -87,14 +85,25 @@ def _launch(
     stream: cuda.CUstream,
 ):
     gemm_op(
-        a, b, c, sfa, sfb, tile_idx_to_group_idx, num_non_exiting_tiles,
-        alpha, max_active_clusters, stream,
+        a,
+        b,
+        c,
+        sfa,
+        sfb,
+        tile_idx_to_group_idx,
+        num_non_exiting_tiles,
+        alpha,
+        max_active_clusters,
+        stream,
     )
 
 
 def _measure(run, iters, cold_l2_flush):
     if cold_l2_flush is None:
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start, end = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
         start.record()
         for _ in range(iters):
             run()
@@ -104,7 +113,10 @@ def _measure(run, iters, cold_l2_flush):
     events = []
     for _ in range(iters):
         cold_l2_flush()
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start, end = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
         start.record()
         run()
         end.record()
@@ -117,8 +129,15 @@ def _stats(run, options):
     for _ in range(options.warmup):
         run()
     torch.cuda.synchronize()
-    samples = sorted(_measure(run, options.iters, options.cold_l2_flush) for _ in range(options.samples))
-    return {"min_ms": samples[0], "median_ms": statistics.median(samples), "max_ms": samples[-1]}
+    samples = sorted(
+        _measure(run, options.iters, options.cold_l2_flush)
+        for _ in range(options.samples)
+    )
+    return {
+        "min_ms": samples[0],
+        "median_ms": statistics.median(samples),
+        "max_ms": samples[-1],
+    }
 
 
 def _quick_probe(run, options):
@@ -138,7 +157,9 @@ class CuteDslNvfp4GroupedMGemmRunner:
 
     def __init__(self, a, b, sfa, sfb, out, tokens_per_expert: int):
         if not all(t.is_cuda for t in (a, b, sfa, sfb, out)):
-            raise ValueError("all CuTE DSL NVFP4 grouped GEMM tensors must be CUDA tensors")
+            raise ValueError(
+                "all CuTE DSL NVFP4 grouped GEMM tensors must be CUDA tensors"
+            )
         if a.dtype != torch.float4_e2m1fn_x2 or b.dtype != torch.float4_e2m1fn_x2:
             raise ValueError("a and b must be packed torch.float4_e2m1fn_x2 tensors")
         if sfa.dtype != torch.float8_e4m3fn or sfb.dtype != torch.float8_e4m3fn:
@@ -155,7 +176,9 @@ class CuteDslNvfp4GroupedMGemmRunner:
         self.k = packed_k * 2
         self.tokens_per_expert = int(tokens_per_expert)
         if packed_k != packed_k_b or self.m != self.experts * self.tokens_per_expert:
-            raise ValueError("A rows must be contiguous equal-sized expert groups matching B")
+            raise ValueError(
+                "A rows must be contiguous equal-sized expert groups matching B"
+            )
         if out.shape != (self.m, self.n):
             raise ValueError("out must have shape [M, N]")
         if self.n % 128 or self.k % 64:
@@ -163,7 +186,9 @@ class CuteDslNvfp4GroupedMGemmRunner:
         expected_sfa = self.m * self.k // 16
         expected_sfb = self.experts * self.n * self.k // 16
         if sfa.numel() != expected_sfa or sfb.numel() != expected_sfb:
-            raise ValueError("scale tensor sizes are incompatible with the packed operands")
+            raise ValueError(
+                "scale tensor sizes are incompatible with the packed operands"
+            )
 
         # The TRT-LLM kernel's logical tensors are A[M,K,1], B[N,K,E], and
         # C[M,N,1].  These are zero-copy views over our packed operands; B's
@@ -172,11 +197,11 @@ class CuteDslNvfp4GroupedMGemmRunner:
             (*a.shape, 1), (*a.stride(), a.numel())
         )
         self.b_storage = b.permute(1, 2, 0)
-        self.c_storage = out.as_strided(
-            (*out.shape, 1), (*out.stride(), out.numel())
-        )
+        self.c_storage = out.as_strided((*out.shape, 1), (*out.stride(), out.numel()))
         self.sfa_storage, self.sfb_storage = sfa.contiguous(), sfb.contiguous()
-        self.alpha_storage = torch.ones((self.experts,), device=a.device, dtype=torch.float32)
+        self.alpha_storage = torch.ones(
+            (self.experts,), device=a.device, dtype=torch.float32
+        )
         self.a = from_dlpack(self.a_storage, assumed_align=16)
         self.b = from_dlpack(self.b_storage, assumed_align=16)
         self.c = from_dlpack(self.c_storage, assumed_align=16)
@@ -184,8 +209,12 @@ class CuteDslNvfp4GroupedMGemmRunner:
         self.sfb = from_dlpack(self.sfb_storage, assumed_align=16)
         self.alpha = from_dlpack(self.alpha_storage).mark_layout_dynamic()
         for tensor in (self.a, self.b):
-            tensor.mark_compact_shape_dynamic(mode=1, stride_order=(2, 0, 1), divisibility=2)
-        self.c.mark_compact_shape_dynamic(mode=1, stride_order=(2, 0, 1), divisibility=1)
+            tensor.mark_compact_shape_dynamic(
+                mode=1, stride_order=(2, 0, 1), divisibility=2
+            )
+        self.c.mark_compact_shape_dynamic(
+            mode=1, stride_order=(2, 0, 1), divisibility=1
+        )
         # CuTe compilation can safely run in the runner's parallel JIT pool,
         # but CUDA allocation/context initialization cannot.  Build the small
         # per-tile-size mapping tensors on the caller thread once and retain
@@ -208,7 +237,8 @@ class CuteDslNvfp4GroupedMGemmRunner:
                 from_dlpack(valid_tiles_storage).mark_layout_dynamic(),
             )
         self._max_active_clusters = {
-            config.cluster_m * config.cluster_n: cutlass.utils.HardwareInfo().get_max_active_clusters(
+            config.cluster_m
+            * config.cluster_n: cutlass.utils.HardwareInfo().get_max_active_clusters(
                 config.cluster_m * config.cluster_n
             )
             for config in DEFAULT_CONFIGS
@@ -225,10 +255,19 @@ class CuteDslNvfp4GroupedMGemmRunner:
             if self.tokens_per_expert % config.mma_tile_m:
                 continue
             if not Sm100BlockScaledContiguousGroupedGemmKernel.can_implement(
-                cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, 16,
-                cutlass.BFloat16, (config.mma_tile_m, config.mma_tile_n),
-                (config.cluster_m, config.cluster_n), self.m, self.n, self.k,
-                self.experts, "k", "k", "n",
+                cutlass.Float4E2M1FN,
+                cutlass.Float8E4M3FN,
+                16,
+                cutlass.BFloat16,
+                (config.mma_tile_m, config.mma_tile_n),
+                (config.cluster_m, config.cluster_n),
+                self.m,
+                self.n,
+                self.k,
+                self.experts,
+                "k",
+                "k",
+                "n",
             ):
                 continue
             compatible.append(config)
@@ -249,23 +288,42 @@ class CuteDslNvfp4GroupedMGemmRunner:
     def _compile(self, config):
         tile_idx_to_group_idx, num_non_exiting_tiles = self._metadata(config)
         gemm = Sm100BlockScaledContiguousGroupedGemmKernel(
-            16, (config.mma_tile_m, config.mma_tile_n),
-            (config.cluster_m, config.cluster_n), config.raster_along_m,
+            16,
+            (config.mma_tile_m, config.mma_tile_n),
+            (config.cluster_m, config.cluster_n),
+            config.raster_along_m,
         )
         active_clusters = self._max_active_clusters[config.cluster_m * config.cluster_n]
         with _suppress_cutlass_pointer_deprecation():
             compiled = cute.compile(
-                _launch, gemm, self.a, self.b, self.c, self.sfa, self.sfb,
-                tile_idx_to_group_idx, num_non_exiting_tiles, self.alpha,
-                active_clusters, make_fake_stream(), options="--opt-level 2",
+                _launch,
+                gemm,
+                self.a,
+                self.b,
+                self.c,
+                self.sfa,
+                self.sfb,
+                tile_idx_to_group_idx,
+                num_non_exiting_tiles,
+                self.alpha,
+                active_clusters,
+                make_fake_stream(),
+                options="--opt-level 2",
             )
         return compiled, tile_idx_to_group_idx, num_non_exiting_tiles
 
     def _prepare(self, config):
         compiled, tile_idx_to_group_idx, num_non_exiting_tiles = self._compile(config)
         run = lambda: compiled(
-            self.a, self.b, self.c, self.sfa, self.sfb, tile_idx_to_group_idx,
-            num_non_exiting_tiles, self.alpha, self.stream,
+            self.a,
+            self.b,
+            self.c,
+            self.sfa,
+            self.sfb,
+            tile_idx_to_group_idx,
+            num_non_exiting_tiles,
+            self.alpha,
+            self.stream,
         )
         run()
         torch.cuda.synchronize()
@@ -315,7 +373,13 @@ class CuteDslNvfp4GroupedMGemmRunner:
 
 
 def cute_dsl_nvfp4_grouped_m_gemm_out(
-    a, b, sfa, sfb, out, tokens_per_expert: int, options: TuneOptions | None = None,
+    a,
+    b,
+    sfa,
+    sfb,
+    out,
+    tokens_per_expert: int,
+    options: TuneOptions | None = None,
 ):
     """Autotune then write the contiguous grouped NVFP4 GEMM result to ``out``."""
     runner = CuteDslNvfp4GroupedMGemmRunner(a, b, sfa, sfb, out, tokens_per_expert)

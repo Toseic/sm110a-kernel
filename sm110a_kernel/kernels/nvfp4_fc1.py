@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import ctypes
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
 
 from ..jit_runtime import SplitCudaJit
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SRC = _ROOT / "csrc/nvfp4_moe/src"
 _INC = _ROOT / "include"
+
 
 @dataclass(frozen=True)
 class Nvfp4Fc1Config:
@@ -71,67 +72,118 @@ class Nvfp4Fc1Module:
             raise TypeError("router_scores must be a 2D BF16 tensor")
         tokens, experts = router_scores.shape
         if tokens % 128 or topk <= 0 or topk > experts:
-            raise ValueError("tokens must be divisible by 128 and topk must be in [1, experts]")
+            raise ValueError(
+                "tokens must be divisible by 128 and topk must be in [1, experts]"
+            )
         if n <= 0 or n % (self.config.tile_n * self.config.cluster_n):
             raise ValueError("N is incompatible with the NVFP4 FC1 config")
 
         routing, source_rows, tasks, state = self._binding.prepare_nvfp4_fc1_routing(
-            router_scores, topk, n, self.config.tile_m, self.config.tile_n,
-            self.config.cluster_m, self._routing_address)
+            router_scores,
+            topk,
+            n,
+            self.config.tile_m,
+            self.config.tile_n,
+            self.config.cluster_m,
+            self._routing_address,
+        )
         return Nvfp4Fc1Metadata(routing, source_rows, tasks, state)
 
     def _max_active_clusters(self, device, value):
         if value is None:
             import torch
+
             value = torch.cuda.get_device_properties(device).multi_processor_count // (
-                self.config.cluster_m * self.config.cluster_n)
+                self.config.cluster_m * self.config.cluster_n
+            )
         if value <= 0:
             raise ValueError("max_active_clusters must be positive")
         return int(value)
 
-    def nvfp4_fc1_out(self, a, b, sfa, sfb, metadata: Nvfp4Fc1Metadata, out, out_scale,
-                      max_active_clusters=None):
+    def nvfp4_fc1_out(
+        self,
+        a,
+        b,
+        sfa,
+        sfb,
+        metadata: Nvfp4Fc1Metadata,
+        out,
+        out_scale,
+        max_active_clusters=None,
+    ):
         return self._binding.nvfp4_fc1_out(
-            a, b, sfa, sfb, metadata.source_rows, metadata.tasks, metadata.state,
-            out, out_scale, self._address,
-            self._max_active_clusters(a.device, max_active_clusters))
+            a,
+            b,
+            sfa,
+            sfb,
+            metadata.source_rows,
+            metadata.tasks,
+            metadata.state,
+            out,
+            out_scale,
+            self._address,
+            self._max_active_clusters(a.device, max_active_clusters),
+        )
 
-    def nvfp4_fc1(self, a, b, sfa, sfb, metadata: Nvfp4Fc1Metadata, max_active_clusters=None):
+    def nvfp4_fc1(
+        self, a, b, sfa, sfb, metadata: Nvfp4Fc1Metadata, max_active_clusters=None
+    ):
         import torch
+
         m = metadata.source_rows.numel()
         logical_n = b.size(1) // 2
         out = torch.empty(
-            (m, logical_n // 2), device=a.device,
-            dtype=torch.float4_e2m1fn_x2)
+            (m, logical_n // 2), device=a.device, dtype=torch.float4_e2m1fn_x2
+        )
         out_scale = torch.empty(
-            (m * (logical_n // 16),), device=a.device,
-            dtype=torch.float8_e4m3fn)
+            (m * (logical_n // 16),), device=a.device, dtype=torch.float8_e4m3fn
+        )
         self.nvfp4_fc1_out(
-            a, b, sfa, sfb, metadata, out, out_scale, max_active_clusters)
+            a, b, sfa, sfb, metadata, out, out_scale, max_active_clusters
+        )
         return out, out_scale
 
 
 def _flags(config: Nvfp4Fc1Config, variant):
-    return tuple(f"-DSM110A_NVFP4_FC1_{key}={value}" for key, value in (
-        ("TILE_M", config.tile_m), ("TILE_N", config.tile_n),
-        ("TILE_K", config.tile_k), ("EPILOGUE_TILE_N", config.epilogue_tile_n),
-        ("NUM_C_STAGE", config.num_c_stage),
-        ("CLUSTER_M", config.cluster_m), ("CLUSTER_N", config.cluster_n),
-        ("DIRECT_GMEM", int(config.direct_gmem)),
-        ("MACRO_SWIZZLE_N_MAJOR", int(config.macro_swizzle_n_major))))
+    return tuple(
+        f"-DSM110A_NVFP4_FC1_{key}={value}"
+        for key, value in (
+            ("TILE_M", config.tile_m),
+            ("TILE_N", config.tile_n),
+            ("TILE_K", config.tile_k),
+            ("EPILOGUE_TILE_N", config.epilogue_tile_n),
+            ("NUM_C_STAGE", config.num_c_stage),
+            ("CLUSTER_M", config.cluster_m),
+            ("CLUSTER_N", config.cluster_n),
+            ("DIRECT_GMEM", int(config.direct_gmem)),
+            ("MACRO_SWIZZLE_N_MAJOR", int(config.macro_swizzle_n_major)),
+        )
+    )
 
 
 _JIT = SplitCudaJit(
-    name="sm110a_nvfp4_fc1", root=_ROOT,
+    name="sm110a_nvfp4_fc1",
+    root=_ROOT,
     binding_sources=(_SRC / "nvfp4_fc1_torch_binding.cpp",),
-    kernel_sources=(_SRC / "nvfp4_fc1_kernel.cu", _SRC / "nvfp4_fc1_metadata.cu",
-                    _SRC / "nvfp4_fc1_routing.cu"),
-    kernel_dependencies=(_INC / "nvfp4_moe_fc1.h", _INC / "common.h", _SRC / "nvfp4_fc1_pipeline_delay.cuh"),
-    kernel_symbol="sm110a_nvfp4_fc1_launch", config_key=lambda config: config,
-    kernel_cflags=_flags, make_facade=Nvfp4Fc1Module, include_paths=(_INC,))
+    kernel_sources=(
+        _SRC / "nvfp4_fc1_kernel.cu",
+        _SRC / "nvfp4_fc1_metadata.cu",
+        _SRC / "nvfp4_fc1_routing.cu",
+    ),
+    kernel_dependencies=(
+        _INC / "nvfp4_moe_fc1.h",
+        _INC / "common.h",
+        _SRC / "nvfp4_fc1_pipeline_delay.cuh",
+    ),
+    kernel_symbol="sm110a_nvfp4_fc1_launch",
+    config_key=lambda config: config,
+    kernel_cflags=_flags,
+    make_facade=Nvfp4Fc1Module,
+    include_paths=(_INC,),
+)
 
 
-def compile_nvfp4_fc1(config: Optional[Nvfp4Fc1Config] = None):
+def compile_nvfp4_fc1(config: Nvfp4Fc1Config | None = None):
     config = config or Nvfp4Fc1Config()
     if not isinstance(config, Nvfp4Fc1Config):
         raise TypeError("config must be an Nvfp4Fc1Config")
@@ -153,10 +205,14 @@ def prepare_nvfp4_fc1_metadata(router_scores, topk, n, config=None):
 
 
 def nvfp4_fc1(a, b, sfa, sfb, metadata, config=None, max_active_clusters=None):
-    return compile_nvfp4_fc1(config).nvfp4_fc1(a, b, sfa, sfb, metadata, max_active_clusters)
+    return compile_nvfp4_fc1(config).nvfp4_fc1(
+        a, b, sfa, sfb, metadata, max_active_clusters
+    )
 
 
-def nvfp4_fc1_out(a, b, sfa, sfb, metadata, out, out_scale, config=None,
-                  max_active_clusters=None):
+def nvfp4_fc1_out(
+    a, b, sfa, sfb, metadata, out, out_scale, config=None, max_active_clusters=None
+):
     return compile_nvfp4_fc1(config).nvfp4_fc1_out(
-        a, b, sfa, sfb, metadata, out, out_scale, max_active_clusters)
+        a, b, sfa, sfb, metadata, out, out_scale, max_active_clusters
+    )

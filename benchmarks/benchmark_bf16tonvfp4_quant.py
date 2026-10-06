@@ -24,7 +24,6 @@ from sm110a_kernel import (
     quantize_nvfp4_rows,
 )
 
-
 TOKENS = (128, 256, 512, 1024, 2048, 4096, 8192)
 DIMS = (4096, 7168)
 ROW_MULTIPLE = 128
@@ -59,7 +58,8 @@ class QuantBenchmark(BenchmarkBase):
         if not args.d or any(d <= 0 or d % 64 for d in args.d):
             raise SystemExit("--d values must be positive multiples of 64")
         if not args.tokens or any(
-                tokens <= 0 or tokens % ROW_MULTIPLE for tokens in args.tokens):
+            tokens <= 0 or tokens % ROW_MULTIPLE for tokens in args.tokens
+        ):
             raise SystemExit("--tokens values must be positive multiples of 128")
         self.validate_timing_args(args, allow_zero_warmup=True)
 
@@ -67,51 +67,78 @@ class QuantBenchmark(BenchmarkBase):
         compile_bf16tonvfp4_quant()
 
     def run_with_args(self, args):
-        print("tokens       d  ours(ms)  torch(ms)  torch/ours    ours GB/s"
-              "  torch GB/s  mismatch(packed,scales)")
+        print(
+            "tokens       d  ours(ms)  torch(ms)  torch/ours    ours GB/s"
+            "  torch GB/s  mismatch(packed,scales)"
+        )
         sol_report = SolReport() if args.sol else None
         for d in args.d:
             for tokens in args.tokens:
-                input = torch.randn((tokens, d), device="cuda",
-                                    dtype=torch.bfloat16)
-                packed = torch.empty((tokens, d // 2), device="cuda",
-                                     dtype=torch.float4_e2m1fn_x2)
-                scales = torch.empty(tokens * d // BLOCK_SIZE, device="cuda",
-                                     dtype=torch.float8_e4m3fn)
+                input = torch.randn((tokens, d), device="cuda", dtype=torch.bfloat16)
+                packed = torch.empty(
+                    (tokens, d // 2), device="cuda", dtype=torch.float4_e2m1fn_x2
+                )
+                scales = torch.empty(
+                    tokens * d // BLOCK_SIZE, device="cuda", dtype=torch.float8_e4m3fn
+                )
                 stats = benchmark_with_stats(
-                    lambda: bf16tonvfp4_quant_out(input, packed, scales),
-                    args.warmup, args.iters, args.samples,
-                    cold_l2_flush=args._cold_l2_flush)
+                    lambda: bf16tonvfp4_quant_out(input, packed, scales),  # noqa: F821
+                    args.warmup,
+                    args.iters,
+                    args.samples,
+                    cold_l2_flush=args._cold_l2_flush,
+                )
                 torch_stats = benchmark_with_stats(
-                    lambda: quantize_nvfp4_rows(input), args.warmup,
-                    args.iters, args.samples,
-                    cold_l2_flush=args._cold_l2_flush)
+                    lambda: quantize_nvfp4_rows(input),  # noqa: F821
+                    args.warmup,
+                    args.iters,
+                    args.samples,
+                    cold_l2_flush=args._cold_l2_flush,
+                )
                 if args.no_accuracy:
                     mismatches = "-"
                 else:
                     expected_packed, expected_scales = quantize_nvfp4_rows(input)
                     mismatches = (
-                        int((packed.view(torch.uint8) !=
-                             expected_packed.view(torch.uint8)).sum().item()),
-                        int((scales.view(torch.uint8) !=
-                             expected_scales.view(torch.uint8)).sum().item()),
+                        int(
+                            (
+                                packed.view(torch.uint8)
+                                != expected_packed.view(torch.uint8)
+                            )
+                            .sum()
+                            .item()
+                        ),
+                        int(
+                            (
+                                scales.view(torch.uint8)
+                                != expected_scales.view(torch.uint8)
+                            )
+                            .sum()
+                            .item()
+                        ),
                     )
                 # Input read + packed nibble write + one scale byte per 16
                 # inputs.
                 bytes_moved = tokens * d * (2 + 0.5 + 1 / BLOCK_SIZE)
                 gbps = bytes_moved / (stats["median_ms"] * 1e-3) / 1e9
                 torch_gbps = bytes_moved / (torch_stats["median_ms"] * 1e-3) / 1e9
-                print(f"{tokens:6d}  {d:5d}  {stats['median_ms']:8.4f}"
-                      f"  {torch_stats['median_ms']:8.4f}"
-                      f"  {torch_stats['median_ms'] / stats['median_ms']:9.2f}"
-                      f"  {gbps:10.2f}  {torch_gbps:9.2f}"
-                      f"  {str(mismatches):>25}")
+                print(
+                    f"{tokens:6d}  {d:5d}  {stats['median_ms']:8.4f}"
+                    f"  {torch_stats['median_ms']:8.4f}"
+                    f"  {torch_stats['median_ms'] / stats['median_ms']:9.2f}"
+                    f"  {gbps:10.2f}  {torch_gbps:9.2f}"
+                    f"  {str(mismatches):>25}"
+                )
                 if sol_report is not None:
                     bounds = quant_sol_bounds(tokens, d)
-                    sol_report.add(bounds, stats["median_ms"],
-                                   label=f"ours T={tokens} d={d}")
-                    sol_report.add(bounds, torch_stats["median_ms"],
-                                   label=f"torch T={tokens} d={d}")
+                    sol_report.add(
+                        bounds, stats["median_ms"], label=f"ours T={tokens} d={d}"
+                    )
+                    sol_report.add(
+                        bounds,
+                        torch_stats["median_ms"],
+                        label=f"torch T={tokens} d={d}",
+                    )
                 del input, packed, scales
         if sol_report is not None:
             sol_report.print()

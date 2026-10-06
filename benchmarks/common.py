@@ -1,16 +1,14 @@
 """Shared benchmarking utilities for sm110a-kernel benchmarks."""
 
 import argparse
-import math
-from pathlib import Path
-import subprocess
 import statistics
+import subprocess
 import sys
+from pathlib import Path
 
 import torch
 
-
-EARLY_STOP_RATIO = 1.3       # skip config if probe > best_probe * this
+EARLY_STOP_RATIO = 1.3  # skip config if probe > best_probe * this
 MMA_PEAK_TFLOPS = 250.0
 # ``B300Sim`` changes this for the duration of one benchmark process.  Keep
 # the bandwidth constants unchanged: its purpose is to vary compute/GMEM
@@ -19,8 +17,8 @@ MMA_PEAK_SCALE = 1.0
 GMEM_BW_GBPS = 273.0
 L2_BW_GBPS = 1.281 * 1000.0
 BF16_BYTES = 2
-_DECIMAL_MB = 1000 ** 2
-_DECIMAL_GFLOP = 1000 ** 3
+_DECIMAL_MB = 1000**2
+_DECIMAL_GFLOP = 1000**3
 
 
 def powerlaw_router_scores(tokens, experts, alpha, *, device, dtype):
@@ -39,9 +37,11 @@ def powerlaw_router_scores(tokens, experts, alpha, *, device, dtype):
     ranks = torch.arange(1, experts + 1, device=device, dtype=torch.float32)
     log_weights = -alpha * ranks.log()
     # If x ~ Exp(1), -log(x) has the standard Gumbel distribution.
-    gumbel = -torch.empty(
-        (tokens, experts), device=device, dtype=torch.float32
-    ).exponential_().log_()
+    gumbel = (
+        -torch.empty((tokens, experts), device=device, dtype=torch.float32)
+        .exponential_()
+        .log_()
+    )
     return (gumbel + log_weights).to(dtype)
 
 
@@ -75,7 +75,11 @@ class B300Sim:
         # All current NVFP4 entry points include this in their filename.  Keep
         # an explicit override for future mixed-precision benchmarks.
         benchmark_name = Path(sys.argv[0]).stem.lower()
-        return "nvfp4" if ("nvfp4" in benchmark_name or "mxfp4" in benchmark_name) else "bf16"
+        return (
+            "nvfp4"
+            if ("nvfp4" in benchmark_name or "mxfp4" in benchmark_name)
+            else "bf16"
+        )
 
     @staticmethod
     def _read(path):
@@ -83,7 +87,9 @@ class B300Sim:
 
     @staticmethod
     def _frequencies(path):
-        return tuple(int(value) for value in (path / "available_frequencies").read_text().split())
+        return tuple(
+            int(value) for value in (path / "available_frequencies").read_text().split()
+        )
 
     def _write(self, path, value):
         """Write a sysfs value, escalating only for that single write."""
@@ -198,8 +204,12 @@ class B300Sim:
             return
         errors = []
         # Raise maxima before minima so restoring a wider range is valid.
-        for path, name in ((self.GPU_PATH, "max_freq"), (self.EMC_PATH, "max_freq"),
-                           (self.GPU_PATH, "min_freq"), (self.EMC_PATH, "min_freq")):
+        for path, name in (
+            (self.GPU_PATH, "max_freq"),
+            (self.EMC_PATH, "max_freq"),
+            (self.GPU_PATH, "min_freq"),
+            (self.EMC_PATH, "min_freq"),
+        ):
             try:
                 self._write(path / name, self._original[(path, name)])
             except Exception as exc:  # Preserve the benchmark exception.
@@ -210,7 +220,9 @@ class B300Sim:
             MMA_PEAK_SCALE = self._previous_mma_peak_scale
             self._previous_mma_peak_scale = None
         if errors:
-            raise RuntimeError("failed to restore devfreq limits after --b300-sim") from errors[0]
+            raise RuntimeError(
+                "failed to restore devfreq limits after --b300-sim"
+            ) from errors[0]
 
     def __exit__(self, exc_type, exc_value, traceback):
         if self._applied:
@@ -219,15 +231,22 @@ class B300Sim:
                     torch.cuda.synchronize()
             except Exception:
                 # A failed CUDA operation must not prevent clock restoration.
-                print("[b300-sim] WARNING: CUDA synchronize failed before restoration", file=sys.stderr)
+                print(
+                    "[b300-sim] WARNING: CUDA synchronize failed before restoration",
+                    file=sys.stderr,
+                )
             try:
                 self._restore()
                 print("[clocks] restored original GPC and EMC limits")
             except Exception:
                 if exc_type is None:
                     raise
-                print("[clocks] WARNING: failed to restore original devfreq limits", file=sys.stderr)
+                print(
+                    "[clocks] WARNING: failed to restore original devfreq limits",
+                    file=sys.stderr,
+                )
         return False
+
 
 class TablePrinter:
     """Print benchmark records as tables, or as lines in debug mode."""
@@ -243,25 +262,28 @@ class TablePrinter:
 
     def print_row(self, *values):
         if len(values) != len(self.columns):
-            raise ValueError(
-                f"expected {len(self.columns)} values, got {len(values)}"
-            )
+            raise ValueError(f"expected {len(self.columns)} values, got {len(values)}")
         if self.debug:
-            print(" ".join(
-                f"{title}={value}"
-                for value, (title, _) in zip(values, self.columns)
-            ))
+            print(
+                " ".join(
+                    f"{title}={value}"
+                    for value, (title, _) in zip(values, self.columns)
+                )
+            )
         else:
-            print("".join(
-                f"{value:<{width}}"
-                for value, (_, width) in zip(values, self.columns)
-            ))
+            print(
+                "".join(
+                    f"{value:<{width}}"
+                    for value, (_, width) in zip(values, self.columns)
+                )
+            )
 
 
 class BenchmarkBase:
     """Common CLI and runtime helpers for benchmark entry points."""
 
     seed = 1234
+
     def build_parser(self):
         return argparse.ArgumentParser()
 
@@ -329,7 +351,9 @@ class BenchmarkBase:
         base = (
             Path(configured)
             if configured
-            else Path(__file__).resolve().parent.parent / "profiles" / "autotune_cache.json"
+            else Path(__file__).resolve().parent.parent
+            / "profiles"
+            / "autotune_cache.json"
         )
         mode = B300Sim._resolve_mode(getattr(args, "b300_sim_mode", "auto"))
         suffix = base.suffix or ".json"
@@ -509,7 +533,9 @@ class BenchmarkBase:
         raise NotImplementedError
 
     def make_table_printer(self, columns, *, debug=False):
-        return TablePrinter(columns, debug=debug or getattr(self, "_debug_enabled", False))
+        return TablePrinter(
+            columns, debug=debug or getattr(self, "_debug_enabled", False)
+        )
 
 
 class GemmBenchmarkBase(BenchmarkBase):
@@ -620,9 +646,8 @@ def sol_bounds(
     hbm_ms = _ms_for_bytes(compulsory_bytes, GMEM_BW_GBPS)
     gmem_ms = _ms_for_bytes(tile_read_bytes, GMEM_BW_GBPS)
     pure_l2_ms = _ms_for_bytes(tile_read_bytes, L2_BW_GBPS)
-    best_l2_ms = (
-        _ms_for_bytes(a_and_b_bytes, GMEM_BW_GBPS)
-        + _ms_for_bytes(tile_read_bytes - a_and_b_bytes, L2_BW_GBPS)
+    best_l2_ms = _ms_for_bytes(a_and_b_bytes, GMEM_BW_GBPS) + _ms_for_bytes(
+        tile_read_bytes - a_and_b_bytes, L2_BW_GBPS
     )
     return {
         "mma_ms": mma_ms,
@@ -641,20 +666,30 @@ def sol_bounds(
 
 def sol_table_columns(label_width=22):
     return (
-        ("SOL", label_width), ("SOL mma(ms)", 12), ("SOL hbm(ms)", 12),
-        ("SOL gmem(ms)", 14), ("SOL pure-l2(ms)", 16),
-        ("SOL mixed(ms)", 14), ("SOL selected(ms)", 17),
-        ("SOL attainment", 16), ("SOL tile-read(MB)", 18),
+        ("SOL", label_width),
+        ("SOL mma(ms)", 12),
+        ("SOL hbm(ms)", 12),
+        ("SOL gmem(ms)", 14),
+        ("SOL pure-l2(ms)", 16),
+        ("SOL mixed(ms)", 14),
+        ("SOL selected(ms)", 17),
+        ("SOL attainment", 16),
+        ("SOL tile-read(MB)", 18),
     )
 
 
 def sol_table_values(bounds, measured_ms, *, label="SOL"):
     attainment = 100.0 * bounds["sol_ms"] / measured_ms
     return (
-        label, f"{bounds['mma_ms']:.4f}", f"{bounds['hbm_ms']:.4f}",
-        f"{bounds['gmem_ms']:.4f}", f"{bounds['pure_l2_ms']:.4f}",
-        f"{bounds['best_l2_ms']:.4f}", f"{bounds['sol_ms']:.4f}",
-        f"{attainment:.1f}%", f"{bounds['tile_read_bytes'] / _DECIMAL_MB:.1f}",
+        label,
+        f"{bounds['mma_ms']:.4f}",
+        f"{bounds['hbm_ms']:.4f}",
+        f"{bounds['gmem_ms']:.4f}",
+        f"{bounds['pure_l2_ms']:.4f}",
+        f"{bounds['best_l2_ms']:.4f}",
+        f"{bounds['sol_ms']:.4f}",
+        f"{attainment:.1f}%",
+        f"{bounds['tile_read_bytes'] / _DECIMAL_MB:.1f}",
     )
 
 

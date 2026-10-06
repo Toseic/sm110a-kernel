@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import sm110a_kernel as ext
 from common import (
     BenchmarkBase,
     SolReport,
@@ -16,7 +17,6 @@ from common import (
     quick_probe,
     sol_bounds,
 )
-import sm110a_kernel as ext
 from sm110a_kernel import (
     Fc1BlockInterleavedSwiGLUConfig,
     GroupedMConfig,
@@ -28,11 +28,10 @@ from sm110a_kernel.kernels.fc1_block_interleaved_swiglu import (
 )
 from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
 
-
 DEFAULT_EXPERTS = 256
 DEFAULT_N = 2048
 DEFAULT_K = 6144
-DEFAULT_TOKEN_VALUES = (64*32, 128*32, 256*32, 512*32, 1024*32)
+DEFAULT_TOKEN_VALUES = (64 * 32, 128 * 32, 256 * 32, 512 * 32, 1024 * 32)
 DEFAULT_TOPK = 8
 INTERLEAVE_BLOCK = 32
 FC1_CONFIGS = tuple(
@@ -70,14 +69,16 @@ def fc1_main_kernel_sol_bounds(router_scores, topk, n, k, config):
     ).indices
     expert_rows = torch.bincount(selected.reshape(-1), minlength=experts)
     m = selected.numel()
-    m_task_count = torch.div(
-        expert_rows + config.cluster_m * config.tile_m - 1,
-        config.cluster_m * config.tile_m,
-        rounding_mode="floor",
-    ).sum().item()
-    task_count = m_task_count * (
-        n // ((config.tile_n // 2) * config.cluster_n)
+    m_task_count = (
+        torch.div(
+            expert_rows + config.cluster_m * config.tile_m - 1,
+            config.cluster_m * config.tile_m,
+            rounding_mode="floor",
+        )
+        .sum()
+        .item()
     )
+    task_count = m_task_count * (n // ((config.tile_n // 2) * config.cluster_n))
     flops = 4 * m * n * k
     a_bytes = 2 * m * k
     active_experts = int((expert_rows > 0).sum().item())
@@ -116,7 +117,9 @@ def swiglu(gate, up):
 def run_baseline(a, gate_w, up_w, layout, out, config):
     gate_acc = torch.empty_like(out)
     up_acc = torch.empty_like(out)
-    metadata = prepare_grouped_m_metadata(layout, gate_w.size(0), gate_w.size(1), config=config)
+    metadata = prepare_grouped_m_metadata(
+        layout, gate_w.size(0), gate_w.size(1), config=config
+    )
     bf16_grouped_m_gemm_out(a, gate_w, metadata, gate_acc, config=config, swap_ab=False)
     bf16_grouped_m_gemm_out(a, up_w, metadata, up_acc, config=config, swap_ab=False)
     out.copy_(swiglu(gate_acc, up_acc).to(torch.bfloat16))
@@ -153,7 +156,9 @@ def resolve_fused_impl():
 def run_fused(a, interleaved_w, metadata, out, config):
     impl_name, impl = resolve_fused_impl()
     if impl is None:
-        raise RuntimeError("fused fc1_block_interleaved_swiglu_out binding is unavailable")
+        raise RuntimeError(
+            "fused fc1_block_interleaved_swiglu_out binding is unavailable"
+        )
     impl(a, interleaved_w, metadata, out, config=config)
     return impl_name
 
@@ -314,12 +319,8 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
             )
         )
 
-    def resolve_fused_kernel(
-        self, a, interleaved_w, router_scores, topk, out, args
-    ):
-        candidates = selected_candidates(
-            interleaved_w.size(1) // 2, a.size(1), args
-        )
+    def resolve_fused_kernel(self, a, interleaved_w, router_scores, topk, out, args):
+        candidates = selected_candidates(interleaved_w.size(1) // 2, a.size(1), args)
         if not candidates:
             raise RuntimeError(
                 f"no fc1 config supports N={interleaved_w.size(1) // 2}, K={a.size(1)}"
@@ -343,11 +344,15 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
             candidates,
             prepare=prepare,
             benchmark=lambda prepared: benchmark_with_stats(
-                prepared.run, args.warmup, args.iters, args.samples,
+                prepared.run,
+                args.warmup,
+                args.iters,
+                args.samples,
                 cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             ),
             probe=lambda prepared: quick_probe(
-                prepared.run, args.iters,
+                prepared.run,
+                args.iters,
                 cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             ),
             format_candidate=format_candidate,
@@ -403,9 +408,7 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
             router_scores = torch.empty(
                 (tokens, args.experts), device="cuda", dtype=torch.bfloat16
             ).uniform_(-1.0, 1.0)
-            baseline_out = torch.empty(
-                (m, args.n), device="cuda", dtype=torch.bfloat16
-            )
+            baseline_out = torch.empty((m, args.n), device="cuda", dtype=torch.bfloat16)
             test_out = torch.empty_like(baseline_out)
             selection = self.resolve_fused_kernel(
                 a, interleaved_w, router_scores, args.topk, test_out, args
@@ -417,15 +420,14 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
                 # Materialize the separate baseline operands only for an
                 # explicit correctness check, after tuning has completed.
                 weight_blocks = interleaved_w.view(
-                    args.experts, args.n // INTERLEAVE_BLOCK, 2,
-                    INTERLEAVE_BLOCK, args.k,
+                    args.experts,
+                    args.n // INTERLEAVE_BLOCK,
+                    2,
+                    INTERLEAVE_BLOCK,
+                    args.k,
                 )
-                gate_w = weight_blocks[:, :, 0].reshape(
-                    args.experts, args.n, args.k
-                )
-                up_w = weight_blocks[:, :, 1].reshape(
-                    args.experts, args.n, args.k
-                )
+                gate_w = weight_blocks[:, :, 0].reshape(args.experts, args.n, args.k)
+                up_w = weight_blocks[:, :, 1].reshape(args.experts, args.n, args.k)
                 grouped_a, grouped_layout = build_routed_reference(
                     a, router_scores, args.topk
                 )
@@ -440,7 +442,9 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
                 del gate_w, up_w, weight_blocks
                 selection.prepared.run()
                 torch.cuda.synchronize()
-                max_abs_diff = (baseline_out.float() - test_out.float()).abs().max().item()
+                max_abs_diff = (
+                    (baseline_out.float() - test_out.float()).abs().max().item()
+                )
                 passed = torch.allclose(
                     baseline_out.float(),
                     test_out.float(),

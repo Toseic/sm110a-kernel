@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
 
 import torch
 
@@ -81,9 +81,9 @@ class Nvfp4Fc1Fc2Module:
             # words for either the resident-grid barrier or one completion
             # counter per row plus one owner flag per h_split=2 task.
             workspace = torch.empty(
-                row_task_capacity * 2 * 147456 +
-                max(8, row_task_capacity * 3 * 4),
-                dtype=torch.uint8, device=a.device
+                row_task_capacity * 2 * 147456 + max(8, row_task_capacity * 3 * 4),
+                dtype=torch.uint8,
+                device=a.device,
             )
             self._workspaces[key] = workspace
         return workspace
@@ -99,8 +99,11 @@ class Nvfp4Fc1Fc2Module:
         resident_clusters = properties.multi_processor_count // (
             2 * self.config.cluster_pairs
         )
-        if (self.config.h_split > 1 and tasks > resident_clusters and
-                self.config.h_split != 2):
+        if (
+            self.config.h_split > 1
+            and tasks > resident_clusters
+            and self.config.h_split != 2
+        ):
             raise ValueError(
                 "h_split requires all logical tasks to be simultaneously "
                 f"resident (tasks={tasks}, capacity={resident_clusters})"
@@ -119,13 +122,11 @@ class Nvfp4Fc1Fc2Module:
             raise ValueError("run_out requires fuse_routing=False")
         self._validate_launch(a)
         return self._binding.nvfp4_fc1fc2_out(
-            a, w1, sfa, sfw1, w2, sfw2, output,
-            self._workspace(a), self._address
+            a, w1, sfa, sfw1, w2, sfw2, output, self._workspace(a), self._address
         )
 
     def run_routed_out(
-        self, a, w1, sfa, sfw1, w2, sfw2, metadata,
-        routing_weights, topk, output
+        self, a, w1, sfa, sfw1, w2, sfw2, metadata, routing_weights, topk, output
     ):
         if not self.config.fuse_routing:
             raise ValueError("run_routed_out requires fuse_routing=True")
@@ -144,17 +145,32 @@ class Nvfp4Fc1Fc2Module:
         resident_clusters = properties.multi_processor_count // (
             2 * self.config.cluster_pairs
         )
-        if (self.config.h_split > 1 and tasks > resident_clusters and
-                self.config.h_split != 2):
+        if (
+            self.config.h_split > 1
+            and tasks > resident_clusters
+            and self.config.h_split != 2
+        ):
             raise ValueError(
                 "routed h_split requires all logical tasks to be resident "
                 f"(tasks={tasks}, capacity={resident_clusters})"
             )
         return self._binding.nvfp4_fc1fc2_routed_out(
-            a, w1, sfa, sfw1, w2, sfw2,
-            metadata.source_rows, metadata.routing, metadata.tasks,
-            metadata.state, routing_weights, topk, row_task_count, output,
-            self._workspace(a, row_task_capacity), self._address,
+            a,
+            w1,
+            sfa,
+            sfw1,
+            w2,
+            sfw2,
+            metadata.source_rows,
+            metadata.routing,
+            metadata.tasks,
+            metadata.state,
+            routing_weights,
+            topk,
+            row_task_count,
+            output,
+            self._workspace(a, row_task_capacity),
+            self._address,
         )
 
 
@@ -164,8 +180,10 @@ _JIT = SplitCudaJit(
     binding_sources=(_SRC / "nvfp4_fc1fc2_torch_binding.cpp",),
     kernel_sources=(_SRC / "nvfp4_fc1fc2_kernel.cu",),
     kernel_dependencies=(
-        _INC / "nvfp4_fc1fc2.h", _INC / "common.h",
-        _INC / "pipeline_delay.h", _SRC / "nvfp4_fc1fc2_pipeline_delay.cuh",
+        _INC / "nvfp4_fc1fc2.h",
+        _INC / "common.h",
+        _INC / "pipeline_delay.h",
+        _SRC / "nvfp4_fc1fc2_pipeline_delay.cuh",
     ),
     kernel_symbol="sm110a_nvfp4_fc1fc2_launch",
     config_key=lambda config: config,
@@ -174,15 +192,14 @@ _JIT = SplitCudaJit(
         f"-DSM110A_NVFP4_FC1FC2_H_SPLIT={config.h_split}",
         f"-DSM110A_NVFP4_FC1FC2_CLUSTER_PAIRS={config.cluster_pairs}",
         f"-DSM110A_NVFP4_FC1FC2_FUSE_ROUTING={int(config.fuse_routing)}",
-        f"-DSM110A_NVFP4_FC1FC2_CACHE_SOURCE_ROWS="
-        f"{config.cache_source_rows}",
+        f"-DSM110A_NVFP4_FC1FC2_CACHE_SOURCE_ROWS={config.cache_source_rows}",
     ),
     make_facade=Nvfp4Fc1Fc2Module,
     include_paths=(_INC,),
 )
 
 
-def compile_nvfp4_fc1fc2(config: Optional[Nvfp4Fc1Fc2Config] = None):
+def compile_nvfp4_fc1fc2(config: Nvfp4Fc1Fc2Config | None = None):
     config = config or Nvfp4Fc1Fc2Config()
     if not isinstance(config, Nvfp4Fc1Fc2Config):
         raise TypeError("config must be an Nvfp4Fc1Fc2Config")
@@ -214,13 +231,20 @@ def nvfp4_fc1fc2_out(a, w1, sfa, sfw1, w2, sfw2, output, config=None):
         config = Nvfp4Fc1Fc2Config(
             h_split=4 if a.size(0) == 512 else (3 if a.size(0) == 1024 else 1)
         )
-    return compile_nvfp4_fc1fc2(config).run_out(
-        a, w1, sfa, sfw1, w2, sfw2, output
-    )
+    return compile_nvfp4_fc1fc2(config).run_out(a, w1, sfa, sfw1, w2, sfw2, output)
 
 
 def nvfp4_fc1fc2_routed_out(
-    a, w1, sfa, sfw1, w2, sfw2, metadata, routing_weights, topk, output,
+    a,
+    w1,
+    sfa,
+    sfw1,
+    w2,
+    sfw2,
+    metadata,
+    routing_weights,
+    topk,
+    output,
     config=None,
 ):
     config = config or Nvfp4Fc1Fc2Config(fuse_routing=True)

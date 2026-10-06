@@ -31,7 +31,6 @@ from sm110a_kernel import (
 )
 from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
 
-
 EXPERTS = 256
 N = 4096
 K = 6144
@@ -48,7 +47,7 @@ NVFP4_GROUPED_M_CONFIGS = tuple(
     for tile_k in (64, 128, 256)
     for epilogue_tile_n in (32, 64, 128)
     for cluster_m in (1, 2)
-    for mode in ( 1, 2)
+    for mode in (1, 2)
     if tile_n % epilogue_tile_n == 0
 )
 _MODE_LABELS = {0: "np", 1: "pe", 2: "clc"}
@@ -57,7 +56,8 @@ NVFP4_MMA_PEAK_TFLOPS = 4.0 * 250.0
 
 def compatible_candidates(n, k):
     return tuple(
-        config for config in NVFP4_GROUPED_M_CONFIGS
+        config
+        for config in NVFP4_GROUPED_M_CONFIGS
         if n % config.tile_n == 0 and n % 128 == 0 and k % config.tile_k == 0
     )
 
@@ -94,9 +94,7 @@ def nvfp4_grouped_m_gemm_sol_bounds(tokens_per_expert, experts, n, k, config):
     # peer, so it is fetched once per cluster rather than once per CTA.
     staged_sfb_n = max(config.tile_n, 128)
     sfb_tile_bytes = staged_sfb_n * k / 16
-    tile_read_bytes = task_count * (
-        packed_tile_bytes + sfa_tile_bytes + sfb_tile_bytes
-    )
+    tile_read_bytes = task_count * (packed_tile_bytes + sfa_tile_bytes + sfb_tile_bytes)
     return sol_bounds(
         flops,
         compulsory_bytes,
@@ -121,9 +119,7 @@ def make_workload(tokens_per_expert, experts, n, k):
         b_expert = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
         bq_expert, sfb_expert = quantize_nvfp4_rows(b_expert)
         if bq is None:
-            bq = torch.empty(
-                (experts, n, k // 2), device="cuda", dtype=bq_expert.dtype
-            )
+            bq = torch.empty((experts, n, k // 2), device="cuda", dtype=bq_expert.dtype)
             sfb = torch.empty(
                 (experts * sfb_expert.numel(),),
                 device="cuda",
@@ -165,14 +161,18 @@ class Nvfp4GroupedMGemmBenchmark(BenchmarkBase):
         parser.add_argument("--n", type=int, default=N)
         parser.add_argument("--k", type=int, default=K)
         parser.add_argument(
-            "--tokens", type=int, default=0,
+            "--tokens",
+            type=int,
+            default=0,
             help="single tokens-per-expert value; default runs the standard sweep",
         )
         self.add_timing_args(parser, warmup=2, iters=5, samples=3)
         self.add_cache_args(parser)
         self.add_pre_parallel_jit_arg(parser)
         parser.add_argument(
-            "--baseline", choices=("torch", "cutedsl"), default="torch",
+            "--baseline",
+            choices=("torch", "cutedsl"),
+            default="torch",
             help="baseline implementation",
         )
         self.add_sol_arg(parser)
@@ -184,7 +184,9 @@ class Nvfp4GroupedMGemmBenchmark(BenchmarkBase):
     def validate_args(self, args):
         self.validate_timing_args(args, allow_zero_warmup=True)
         if args.experts <= 0 or args.n <= 0 or args.k <= 0 or args.tokens < 0:
-            raise SystemExit("experts, N and K must be positive; tokens must be non-negative")
+            raise SystemExit(
+                "experts, N and K must be positive; tokens must be non-negative"
+            )
         if args.n % 128 or args.k % 64:
             raise SystemExit("N must be a multiple of 128 and K a multiple of 64")
         values = (args.tokens,) if args.tokens else DEFAULT_TOKENS_PER_EXPERT
@@ -196,18 +198,31 @@ class Nvfp4GroupedMGemmBenchmark(BenchmarkBase):
     def run_with_args(self, args):
         torch.manual_seed(args.seed)
         if args.baseline == "cutedsl":
-            print("[baseline] TRT-LLM CuTE DSL persistent NVFP4 grouped-M GEMM (autotuned)")
+            print(
+                "[baseline] TRT-LLM CuTE DSL persistent NVFP4 grouped-M GEMM (autotuned)"
+            )
             baseline_label = "CuTE DSL"
         else:
             print("[baseline] per-expert torch._scaled_mm NVFP4")
             baseline_label = "Torch"
         print("[runner] config selection cached by experts/N/K/tokens-per-expert")
-        table = TablePrinter((
-            ("Tok/E", 8), ("M", 10), ("E", 6), ("N", 8), ("K", 8),
-            ("Kernel(ms)", 14), ("Kernel TF/s", 15),
-            (f"{baseline_label}(ms)", 14), (f"{baseline_label} TF/s", 15),
-            ("Speedup", 10), ("MaxDiff", 12), ("BestConfig", 34),
-        ), debug=args.debug)
+        table = TablePrinter(
+            (
+                ("Tok/E", 8),
+                ("M", 10),
+                ("E", 6),
+                ("N", 8),
+                ("K", 8),
+                ("Kernel(ms)", 14),
+                ("Kernel TF/s", 15),
+                (f"{baseline_label}(ms)", 14),
+                (f"{baseline_label} TF/s", 15),
+                ("Speedup", 10),
+                ("MaxDiff", 12),
+                ("BestConfig", 34),
+            ),
+            debug=args.debug,
+        )
         table.print_header()
         sol_report = SolReport(debug=args.debug) if args.sol else None
         for tokens in args.tokens_per_expert_values:
@@ -218,30 +233,47 @@ class Nvfp4GroupedMGemmBenchmark(BenchmarkBase):
                 baseline_runner = CuteDslNvfp4GroupedMGemmRunner(
                     aq, bq, sfa, sfb, ref, tokens
                 )
-                baseline_runner.autotune(self.make_tune_options(
-                    args, role="baseline", pre_parallel_jit=args.pre_parallel_jit,
-                ))
+                baseline_runner.autotune(
+                    self.make_tune_options(
+                        args,
+                        role="baseline",
+                        pre_parallel_jit=args.pre_parallel_jit,
+                    )
+                )
                 baseline = baseline_runner.run
             else:
                 baseline = lambda: run_baseline(aq, bq, sfa, sfb, tokens, ref)
             baseline_stats = benchmark_with_stats(
-                baseline, args.warmup, args.iters, args.samples,
+                baseline,
+                args.warmup,
+                args.iters,
+                args.samples,
                 cold_l2_flush=args._cold_l2_flush,
             )
             selection = self.resolve_kernel(aq, bq, sfa, sfb, layout, out, tokens, args)
             diff = 0.0
             if not args.no_accuracy:
-                selection.prepared.run(); baseline(); torch.cuda.synchronize()
+                selection.prepared.run()
+                baseline()
+                torch.cuda.synchronize()
                 diff = (out.float() - ref.float()).abs().max().item()
                 if not torch.equal(out, ref):
                     raise AssertionError(f"NVFP4 grouped mismatch: max diff {diff}")
             m = tokens * args.experts
             kms, bms = selection.stats["median_ms"], baseline_stats["median_ms"]
             table.print_row(
-                tokens, m, args.experts, args.n, args.k,
-                f"{kms:.4f}", f"{tflops_from_ms(m,args.n,args.k,kms):.2f}",
-                f"{bms:.4f}", f"{tflops_from_ms(m,args.n,args.k,bms):.2f}",
-                f"{bms/kms:.2f}x", f"{diff:.6f}", format_candidate(selection.candidate),
+                tokens,
+                m,
+                args.experts,
+                args.n,
+                args.k,
+                f"{kms:.4f}",
+                f"{tflops_from_ms(m, args.n, args.k, kms):.2f}",
+                f"{bms:.4f}",
+                f"{tflops_from_ms(m, args.n, args.k, bms):.2f}",
+                f"{bms / kms:.2f}x",
+                f"{diff:.6f}",
+                format_candidate(selection.candidate),
             )
             if args.sol:
                 sol_report.add(
@@ -261,7 +293,9 @@ class Nvfp4GroupedMGemmBenchmark(BenchmarkBase):
     def resolve_kernel(self, aq, bq, sfa, sfb, layout, out, tokens, args):
         candidates = compatible_candidates(args.n, args.k)
         if not candidates:
-            raise RuntimeError(f"no NVFP4 grouped config supports N={args.n}, K={args.k}")
+            raise RuntimeError(
+                f"no NVFP4 grouped config supports N={args.n}, K={args.k}"
+            )
 
         def prepare(config):
             metadata = prepare_nvfp4_grouped_m_metadata(
@@ -270,7 +304,8 @@ class Nvfp4GroupedMGemmBenchmark(BenchmarkBase):
             run = lambda: nvfp4_grouped_m_gemm_out(
                 aq, bq, sfa, sfb, metadata, out, config=config
             )
-            run(); torch.cuda.synchronize()
+            run()
+            torch.cuda.synchronize()
             return PreparedKernel(config, run)
 
         options = self.make_tune_options(
@@ -285,7 +320,10 @@ class Nvfp4GroupedMGemmBenchmark(BenchmarkBase):
             key=(args.experts, args.n, args.k, tokens),
             prepare=prepare,
             benchmark=lambda prepared: benchmark_with_stats(
-                prepared.run, args.warmup, args.iters, args.samples,
+                prepared.run,
+                args.warmup,
+                args.iters,
+                args.samples,
                 cold_l2_flush=args._cold_l2_flush,
             ),
             probe=lambda prepared: quick_probe(
@@ -293,7 +331,7 @@ class Nvfp4GroupedMGemmBenchmark(BenchmarkBase):
             ),
             format_candidate=format_candidate,
             metric_formatter=lambda _config, stats: (
-                f"{tflops_from_ms(m,args.n,args.k,stats['median_ms']):.1f} TF/s"
+                f"{tflops_from_ms(m, args.n, args.k, stats['median_ms']):.1f} TF/s"
             ),
             pre_jit=compile_nvfp4_grouped_m_gemm,
         )

@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import ctypes
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
 
 from ..jit_runtime import SplitCudaJit
 
@@ -42,7 +42,10 @@ class Mxfp4Fc2Config:
             raise ValueError("tile_m must be 128 and tile_n must be 256")
         if self.tile_k != 128:
             raise ValueError("tile_k must be 128 (FP8 swizzle atom + b4x16_p64 box)")
-        if self.epilogue_tile_n not in (32, 64, 128) or self.tile_n % self.epilogue_tile_n:
+        if (
+            self.epilogue_tile_n not in (32, 64, 128)
+            or self.tile_n % self.epilogue_tile_n
+        ):
             raise ValueError("invalid epilogue_tile_n")
         if self.cluster_m not in (1, 2):
             raise ValueError("cluster_m must be 1 or 2")
@@ -78,34 +81,79 @@ class Mxfp4Fc2Module:
 
     def prepare_metadata(self, grouped_layout, experts: int, n: int):
         values = self._binding.prepare_mxfp4_fc2_metadata(
-            grouped_layout, experts, n, self._metadata_address,
-            self.config.tile_m, self.config.tile_n, self.config.cluster_m,
+            grouped_layout,
+            experts,
+            n,
+            self._metadata_address,
+            self.config.tile_m,
+            self.config.tile_n,
+            self.config.cluster_m,
         )
         return Mxfp4Fc2Metadata(*values)
 
     def _max_active_clusters(self, device, value):
         if value is None:
             import torch
-            value = torch.cuda.get_device_properties(device).multi_processor_count // self.config.cluster_m
+
+            value = (
+                torch.cuda.get_device_properties(device).multi_processor_count
+                // self.config.cluster_m
+            )
         if value <= 0:
             raise ValueError("max_active_clusters must be positive")
         return int(value)
 
-    def mxfp4_fc2(self, a, b, sfa, sfb, routing, routing_weights, metadata, topk,
-                  max_active_clusters=None):
+    def mxfp4_fc2(
+        self,
+        a,
+        b,
+        sfa,
+        sfb,
+        routing,
+        routing_weights,
+        metadata,
+        topk,
+        max_active_clusters=None,
+    ):
         return self._binding.mxfp4_fc2(
-            a, b, sfa, sfb, routing, routing_weights, metadata.tasks,
-            metadata.state, topk, self._address,
+            a,
+            b,
+            sfa,
+            sfb,
+            routing,
+            routing_weights,
+            metadata.tasks,
+            metadata.state,
+            topk,
+            self._address,
             self._max_active_clusters(a.device, max_active_clusters),
         )
 
     def mxfp4_fc2_out(
-        self, a, b, sfa, sfb, routing, routing_weights, metadata, topk, out,
-        max_active_clusters=None
+        self,
+        a,
+        b,
+        sfa,
+        sfb,
+        routing,
+        routing_weights,
+        metadata,
+        topk,
+        out,
+        max_active_clusters=None,
     ):
         return self._binding.mxfp4_fc2_out(
-            a, b, sfa, sfb, routing, routing_weights, metadata.tasks,
-            metadata.state, topk, out, self._address,
+            a,
+            b,
+            sfa,
+            sfb,
+            routing,
+            routing_weights,
+            metadata.tasks,
+            metadata.state,
+            topk,
+            out,
+            self._address,
             self._max_active_clusters(a.device, max_active_clusters),
         )
 
@@ -114,7 +162,8 @@ def _flags(config: Mxfp4Fc2Config, _variant):
     return tuple(
         f"-DSM110A_MXFP4_FC2_{key}={value}"
         for key, value in (
-            ("TILE_M", config.tile_m), ("TILE_N", config.tile_n),
+            ("TILE_M", config.tile_m),
+            ("TILE_N", config.tile_n),
             ("TILE_K", config.tile_k),
             ("EPILOGUE_TILE_N", config.epilogue_tile_n),
             ("CLUSTER_M", config.cluster_m),
@@ -131,17 +180,21 @@ def _flags(config: Mxfp4Fc2Config, _variant):
 
 
 _JIT = SplitCudaJit(
-    name="sm110a_mxfp4_fc2", root=_ROOT,
+    name="sm110a_mxfp4_fc2",
+    root=_ROOT,
     binding_sources=(_SRC / "mxfp4_fc2_torch_binding.cpp",),
     kernel_sources=(_SRC / "mxfp4_fc2_kernel.cu", _META),
     kernel_dependencies=(_INC / "mxfp4_moe_fc2.h", _INC / "common.h"),
-    kernel_symbol="sm110a_mxfp4_fc2_launch", config_key=lambda config: config,
-    kernel_cflags=_flags, kernel_ldflags=("-lcuda",),
-    make_facade=Mxfp4Fc2Module, include_paths=(_INC,),
+    kernel_symbol="sm110a_mxfp4_fc2_launch",
+    config_key=lambda config: config,
+    kernel_cflags=_flags,
+    kernel_ldflags=("-lcuda",),
+    make_facade=Mxfp4Fc2Module,
+    include_paths=(_INC,),
 )
 
 
-def compile_mxfp4_fc2(config: Optional[Mxfp4Fc2Config] = None):
+def compile_mxfp4_fc2(config: Mxfp4Fc2Config | None = None):
     config = config or Mxfp4Fc2Config()
     if not isinstance(config, Mxfp4Fc2Config):
         raise TypeError("config must be an Mxfp4Fc2Config")
@@ -178,27 +231,62 @@ def to_blocked_mxfp4_sfa(scales):
     if rows % 128 or blocks == 0:
         raise ValueError("scale rows must be divisible by 128")
     expanded = scales.view(torch.uint8).repeat_interleave(4, dim=1)
-    return to_blocked_fp8mxfp4_scales(
-        expanded.view(torch.float8_e8m0fnu).contiguous())
+    return to_blocked_fp8mxfp4_scales(expanded.view(torch.float8_e8m0fnu).contiguous())
 
 
 def prepare_mxfp4_fc2_metadata(grouped_layout, experts, n, config=None):
     return compile_mxfp4_fc2(config).prepare_metadata(grouped_layout, experts, n)
 
 
-def mxfp4_fc2(a, b, sfa, sfb, routing, routing_weights, metadata, topk, config=None,
-              max_active_clusters=None):
+def mxfp4_fc2(
+    a,
+    b,
+    sfa,
+    sfb,
+    routing,
+    routing_weights,
+    metadata,
+    topk,
+    config=None,
+    max_active_clusters=None,
+):
     return compile_mxfp4_fc2(config).mxfp4_fc2(
-        a, b, sfa, sfb, routing, routing_weights, metadata, topk, max_active_clusters,
+        a,
+        b,
+        sfa,
+        sfb,
+        routing,
+        routing_weights,
+        metadata,
+        topk,
+        max_active_clusters,
     )
 
 
 def mxfp4_fc2_out(
-    a, b, sfa, sfb, routing, routing_weights, metadata, topk, out, config=None,
-    max_active_clusters=None
+    a,
+    b,
+    sfa,
+    sfb,
+    routing,
+    routing_weights,
+    metadata,
+    topk,
+    out,
+    config=None,
+    max_active_clusters=None,
 ):
     return compile_mxfp4_fc2(config).mxfp4_fc2_out(
-        a, b, sfa, sfb, routing, routing_weights, metadata, topk, out, max_active_clusters,
+        a,
+        b,
+        sfa,
+        sfb,
+        routing,
+        routing_weights,
+        metadata,
+        topk,
+        out,
+        max_active_clusters,
     )
 
 
@@ -218,9 +306,13 @@ def to_blocked_mxfp4_scales(scales):
         raise ValueError("scale shape must be divisible by [128, 4]")
     grouped = scales.contiguous().view(torch.uint8).view(rows, cols // 4, 4)
     blocks = grouped.view(rows // 128, 128, cols // 4, 4).permute(0, 2, 1, 3)
-    return blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1).view(
-        torch.float8_e8m0fnu
-    ).contiguous()
+    return (
+        blocks.reshape(-1, 4, 32, 4)
+        .transpose(1, 2)
+        .reshape(-1)
+        .view(torch.float8_e8m0fnu)
+        .contiguous()
+    )
 
 
 def from_blocked_mxfp4_scales(scales, rows: int, k: int):
@@ -228,10 +320,14 @@ def from_blocked_mxfp4_scales(scales, rows: int, k: int):
     import torch
 
     if scales.dtype != torch.float8_e8m0fnu or rows % 128 or k % 128:
-        raise ValueError(
-            "expected E8M0 scales with rows % 128 == 0 and K % 128 == 0")
+        raise ValueError("expected E8M0 scales with rows % 128 == 0 and K % 128 == 0")
     tiles = scales.view(rows // 128, k // 128, 32, 4, 4)
-    blocks = tiles.view(torch.uint8).transpose(2, 3).reshape(
-        rows // 128, k // 128, 128, 4)
-    return blocks.permute(0, 2, 1, 3).reshape(rows, k // 32).view(
-        torch.float8_e8m0fnu).contiguous()
+    blocks = (
+        tiles.view(torch.uint8).transpose(2, 3).reshape(rows // 128, k // 128, 128, 4)
+    )
+    return (
+        blocks.permute(0, 2, 1, 3)
+        .reshape(rows, k // 32)
+        .view(torch.float8_e8m0fnu)
+        .contiguous()
+    )

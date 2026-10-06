@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
 
 from ..jit_runtime import SplitCudaJit
 
@@ -29,9 +29,7 @@ class Bf16Fa4MlaModule:
         self._config = config
 
     def fa_mla(self, q, k, v, causal=False, scale=1.0):
-        return self._binding.fa_mla(
-            q, k, v, self._launcher, bool(causal), scale
-        )
+        return self._binding.fa_mla(q, k, v, self._launcher, bool(causal), scale)
 
     def fa_mla_out(self, q, k, v, out, causal=False, scale=1.0):
         return self._binding.fa_mla_out(
@@ -72,7 +70,7 @@ _JITS = {
 
 
 def compile_bf16_fa4_mla(
-    config: Optional[Bf16Fa4MlaConfig] = None,
+    config: Bf16Fa4MlaConfig | None = None,
 ) -> Bf16Fa4MlaModule:
     config = config or Bf16Fa4MlaConfig()
     if not isinstance(config, Bf16Fa4MlaConfig):
@@ -81,9 +79,7 @@ def compile_bf16_fa4_mla(
     return _JITS[config.implementation].compile(config)
 
 
-def compile_bf16_fa4_mla_configs(
-    configs: Iterable[Bf16Fa4MlaConfig], max_workers=None
-):
+def compile_bf16_fa4_mla_configs(configs: Iterable[Bf16Fa4MlaConfig], max_workers=None):
     configs = tuple(configs)
     for config in configs:
         if not isinstance(config, Bf16Fa4MlaConfig):
@@ -95,11 +91,13 @@ def compile_bf16_fa4_mla_configs(
     modules = {}
     for implementation, selected in grouped.items():
         if selected:
-            modules.update(zip(selected, _JITS[implementation].compile_many(selected, max_workers)))
+            modules.update(
+                zip(selected, _JITS[implementation].compile_many(selected, max_workers))
+            )
     return [modules[config] for config in configs]
 
 
-def get_bf16_fa4_mla_module(config: Optional[Bf16Fa4MlaConfig] = None):
+def get_bf16_fa4_mla_module(config: Bf16Fa4MlaConfig | None = None):
     return compile_bf16_fa4_mla(config)
 
 
@@ -123,9 +121,7 @@ def bf16_fa4_mla(q, k, v, *, causal=False, scale=None, implementation="1cta"):
     )
 
 
-def bf16_fa4_mla_out(
-    q, k, v, out, *, causal=False, scale=None, implementation="1cta"
-):
+def bf16_fa4_mla_out(q, k, v, out, *, causal=False, scale=None, implementation="1cta"):
     """Write MLA decoding output into contiguous out [B,128,1,512]."""
     return compile_bf16_fa4_mla(Bf16Fa4MlaConfig(implementation)).fa_mla_out(
         q, k, v, out, bool(causal), _resolve_scale(q, scale)

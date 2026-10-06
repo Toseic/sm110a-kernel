@@ -19,7 +19,6 @@ if str(ROOT) not in sys.path:
 from common import BenchmarkBase, SolReport, benchmark_with_stats, sol_bounds
 from sm110a_kernel import compile_fp8_act_quant
 
-
 TOKENS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
 BLOCK_SIZES = (64, 128)
 SCALE_MODES = ("ue8m0", "fp32")
@@ -69,9 +68,11 @@ def compile_tilelang_baseline(d, block_size, scale):
     )
 
     return act_quant_kernel(
-        d, block_size,
+        d,
+        block_size,
         scale_dtype=FE8M0 if scale == "ue8m0" else "float32",
-        round_scale=scale == "ue8m0", inplace=False,
+        round_scale=scale == "ue8m0",
+        inplace=False,
     )
 
 
@@ -80,16 +81,20 @@ class Fp8ActQuantBenchmark(BenchmarkBase):
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("--d", type=int, default=4096)
         parser.add_argument("--tokens", type=int, nargs="*", default=TOKENS)
-        parser.add_argument("--bs", type=int, nargs="*", default=BLOCK_SIZES,
-                            choices=BLOCK_SIZES)
-        parser.add_argument("--scale", nargs="*", default=list(SCALE_MODES),
-                            choices=SCALE_MODES)
+        parser.add_argument(
+            "--bs", type=int, nargs="*", default=BLOCK_SIZES, choices=BLOCK_SIZES
+        )
+        parser.add_argument(
+            "--scale", nargs="*", default=list(SCALE_MODES), choices=SCALE_MODES
+        )
         self.add_timing_args(parser, warmup=30, iters=100, samples=9)
         parser.add_argument("--no-accuracy", action="store_true")
         parser.add_argument(
-            "--baseline", choices=("tilelang", "none"), default="tilelang",
+            "--baseline",
+            choices=("tilelang", "none"),
+            default="tilelang",
             help="baseline implementation (default: models/deepseek_v4_flash "
-                 "TileLang kernel)",
+            "TileLang kernel)",
         )
         self.add_sol_arg(parser)
         return parser
@@ -115,38 +120,51 @@ class Fp8ActQuantBenchmark(BenchmarkBase):
         if args.baseline == "tilelang":
             for block_size, scale in combos:
                 tilelang_kernels[(block_size, scale)] = compile_tilelang_baseline(
-                    args.d, block_size, scale)
+                    args.d, block_size, scale
+                )
         sol_report = SolReport() if args.sol else None
         for block_size, scale in combos:
             tilelang_kernel = tilelang_kernels.get((block_size, scale))
             scale_dtype = torch.float8_e8m0fnu if scale == "ue8m0" else torch.float32
             print(f"\nblock={block_size} scale={scale}")
             if tilelang_kernel is not None:
-                print("tokens   ours(ms)  TL(ms)  TL/ours    ours GB/s  TL GB/s"
-                      "  ours mismatch  TL mismatch")
+                print(
+                    "tokens   ours(ms)  TL(ms)  TL/ours    ours GB/s  TL GB/s"
+                    "  ours mismatch  TL mismatch"
+                )
             else:
                 print("tokens   ours(ms)  ours GB/s  ours mismatch")
             for tokens in args.tokens:
-                input = torch.randn((tokens, args.d), device="cuda",
-                                    dtype=torch.bfloat16)
+                input = torch.randn(
+                    (tokens, args.d), device="cuda", dtype=torch.bfloat16
+                )
                 output = torch.empty_like(input, dtype=torch.float8_e4m3fn)
-                scales = torch.empty((tokens, args.d // block_size), device="cuda",
-                                     dtype=scale_dtype)
+                scales = torch.empty(
+                    (tokens, args.d // block_size), device="cuda", dtype=scale_dtype
+                )
                 module = compile_fp8_act_quant(block_size, scale)
                 stats = benchmark_with_stats(
-                    lambda: module.quantize_out(input, output, scales), args.warmup,
-                    args.iters, args.samples, cold_l2_flush=args._cold_l2_flush)
+                    lambda: module.quantize_out(input, output, scales),
+                    args.warmup,
+                    args.iters,
+                    args.samples,
+                    cold_l2_flush=args._cold_l2_flush,
+                )
                 tilelang_stats = None
                 if tilelang_kernel is not None:
                     tilelang_output = torch.empty_like(input, dtype=torch.float8_e4m3fn)
                     tilelang_scales = torch.empty(
-                        (tokens, args.d // block_size), device="cuda",
-                        dtype=scale_dtype)
+                        (tokens, args.d // block_size), device="cuda", dtype=scale_dtype
+                    )
                     tilelang_stats = benchmark_with_stats(
                         lambda: tilelang_kernel(
-                            input, tilelang_output, tilelang_scales),
-                        args.warmup, args.iters, args.samples,
-                        cold_l2_flush=args._cold_l2_flush)
+                            input, tilelang_output, tilelang_scales
+                        ),
+                        args.warmup,
+                        args.iters,
+                        args.samples,
+                        cold_l2_flush=args._cold_l2_flush,
+                    )
                     # Join all device work (TileLang may use its own
                     # streams) before any accuracy buffer is read.
                     torch.cuda.synchronize()
@@ -165,36 +183,77 @@ class Fp8ActQuantBenchmark(BenchmarkBase):
                 # nonzero TL count at T >= 2048 is this known artifact.
                 else:
                     expected_output, expected_scales = reference(
-                        input, block_size, scale)
+                        input, block_size, scale
+                    )
                     ours_mismatches = (
-                        int((output.view(torch.uint8) != expected_output.view(torch.uint8)).sum().item()),
-                        int((scales.view(torch.uint8) != expected_scales.view(torch.uint8)).sum().item()),
+                        int(
+                            (
+                                output.view(torch.uint8)
+                                != expected_output.view(torch.uint8)
+                            )
+                            .sum()
+                            .item()
+                        ),
+                        int(
+                            (
+                                scales.view(torch.uint8)
+                                != expected_scales.view(torch.uint8)
+                            )
+                            .sum()
+                            .item()
+                        ),
                     )
                     if tilelang_kernel is not None:
                         tilelang_mismatches = (
-                            int((tilelang_output.view(torch.uint8) != expected_output.view(torch.uint8)).sum().item()),
-                            int((tilelang_scales.view(torch.uint8) != expected_scales.view(torch.uint8)).sum().item()),
+                            int(
+                                (
+                                    tilelang_output.view(torch.uint8)
+                                    != expected_output.view(torch.uint8)
+                                )
+                                .sum()
+                                .item()
+                            ),
+                            int(
+                                (
+                                    tilelang_scales.view(torch.uint8)
+                                    != expected_scales.view(torch.uint8)
+                                )
+                                .sum()
+                                .item()
+                            ),
                         )
                 # Input read + one FP8 output + one scale element per block.
                 scale_bytes = 1 if scale == "ue8m0" else 4
                 bytes_moved = tokens * args.d * (2 + 1 + scale_bytes / block_size)
                 gbps = bytes_moved / (stats["median_ms"] * 1e-3) / 1e9
                 if tilelang_kernel is not None:
-                    tilelang_gbps = bytes_moved / (tilelang_stats["median_ms"] * 1e-3) / 1e9
-                    print(f"{tokens:6d}  {stats['median_ms']:8.4f}  {tilelang_stats['median_ms']:6.4f}"
-                          f"  {tilelang_stats['median_ms'] / stats['median_ms']:7.2f}"
-                          f"  {gbps:10.2f}  {tilelang_gbps:7.2f}"
-                          f"  {str(ours_mismatches):>14}  {str(tilelang_mismatches):>13}")
+                    tilelang_gbps = (
+                        bytes_moved / (tilelang_stats["median_ms"] * 1e-3) / 1e9
+                    )
+                    print(
+                        f"{tokens:6d}  {stats['median_ms']:8.4f}  {tilelang_stats['median_ms']:6.4f}"
+                        f"  {tilelang_stats['median_ms'] / stats['median_ms']:7.2f}"
+                        f"  {gbps:10.2f}  {tilelang_gbps:7.2f}"
+                        f"  {str(ours_mismatches):>14}  {str(tilelang_mismatches):>13}"
+                    )
                 else:
-                    print(f"{tokens:6d}  {stats['median_ms']:8.4f}  {gbps:10.2f}"
-                          f"  {str(ours_mismatches):>14}")
+                    print(
+                        f"{tokens:6d}  {stats['median_ms']:8.4f}  {gbps:10.2f}"
+                        f"  {str(ours_mismatches):>14}"
+                    )
                 if sol_report is not None:
                     bounds = quant_sol_bounds(tokens, args.d, block_size, scale)
-                    sol_report.add(bounds, stats["median_ms"],
-                                   label=f"ours b{block_size}/{scale} T={tokens}")
+                    sol_report.add(
+                        bounds,
+                        stats["median_ms"],
+                        label=f"ours b{block_size}/{scale} T={tokens}",
+                    )
                     if tilelang_kernel is not None:
-                        sol_report.add(bounds, tilelang_stats["median_ms"],
-                                       label=f"TL b{block_size}/{scale} T={tokens}")
+                        sol_report.add(
+                            bounds,
+                            tilelang_stats["median_ms"],
+                            label=f"TL b{block_size}/{scale} T={tokens}",
+                        )
         if sol_report is not None:
             sol_report.print()
 

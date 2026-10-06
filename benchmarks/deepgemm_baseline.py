@@ -3,13 +3,13 @@
 Preparation and layout conversion deliberately happen before a benchmark's
 timed region.  Each returned callable is one DeepGEMM launch.
 """
+
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
 import torch
-
 
 ROOT = Path(__file__).resolve().parent.parent
 _MODULE = None
@@ -62,8 +62,7 @@ def mxfp4_nt(a, b, sfa, sfb, out, *, from_blocked_scales):
     k = packed_k * 2
     if k % 128:
         raise RuntimeError(
-            "the DeepGEMM FP4xFP4 baseline requires K divisible by 128; "
-            f"got K={k}"
+            f"the DeepGEMM FP4xFP4 baseline requires K divisible by 128; got K={k}"
         )
     a_scales = deep_gemm.transform_sf_into_required_layout(
         from_blocked_scales(sfa, m, k).float(), m, k, (1, 32)

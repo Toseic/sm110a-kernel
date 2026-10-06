@@ -29,8 +29,9 @@ def interleaved_weights(experts, n, k):
         gate = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
         up = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
         packed, scale = quantize_nvfp4_rows(
-            torch.stack((gate.view(n // 64, 64, k), up.view(n // 64, 64, k)), dim=1)
-            .reshape(2 * n, k)
+            torch.stack(
+                (gate.view(n // 64, 64, k), up.view(n // 64, 64, k)), dim=1
+            ).reshape(2 * n, k)
         )
         q_weights.append(packed)
         scales.append(scale.reshape(-1))
@@ -60,11 +61,13 @@ def main():
         (args.tokens, args.experts), device="cuda", dtype=torch.bfloat16
     )
     out = torch.empty(
-        (args.tokens * args.topk, args.n // 2), device="cuda",
+        (args.tokens * args.topk, args.n // 2),
+        device="cuda",
         dtype=torch.float4_e2m1fn_x2,
     )
     out_scale = torch.empty(
-        (args.tokens * args.topk * (args.n // 16),), device="cuda",
+        (args.tokens * args.topk * (args.n // 16),),
+        device="cuda",
         dtype=torch.float8_e4m3fn,
     )
 
@@ -80,13 +83,18 @@ def main():
     )
     if args.impl == "ours":
         module = compile_nvfp4_fc1(native_config)
-        run = lambda: module.nvfp4_fc1_out(
-            a_q, b_q, sfa, sfb, metadata, out, out_scale
-        )
+        run = lambda: module.nvfp4_fc1_out(a_q, b_q, sfa, sfb, metadata, out, out_scale)
     else:
         runner = CuteDslNvfp4Fc1Runner(
-            a_q, b_q, sfa, sfb, out, out_scale,
-            metadata.source_rows, metadata.tasks, metadata.state
+            a_q,
+            b_q,
+            sfa,
+            sfb,
+            out,
+            out_scale,
+            metadata.source_rows,
+            metadata.tasks,
+            metadata.state,
         )
         config = CuteDslNvfp4Fc1Config(
             mma_tile_m=128 * args.cluster_m,
@@ -100,13 +108,19 @@ def main():
         run()
     torch.cuda.synchronize()
     print(f"PROFILE_READY impl={args.impl}", flush=True)
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start, end = (
+        torch.cuda.Event(enable_timing=True),
+        torch.cuda.Event(enable_timing=True),
+    )
     start.record()
     for _ in range(args.iters):
         run()
     end.record()
     end.synchronize()
-    print(f"PROFILE_MS impl={args.impl} ms={start.elapsed_time(end) / args.iters:.4f}", flush=True)
+    print(
+        f"PROFILE_MS impl={args.impl} ms={start.elapsed_time(end) / args.iters:.4f}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

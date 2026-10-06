@@ -5,14 +5,54 @@ facade for one CUDA kernel family.  The package root only re-exports these
 entry points for backwards compatibility.
 """
 
+from .bf16_fa4_gqa import (
+    Bf16Fa4GqaConfig,
+    Bf16Fa4GqaTactic,
+    bf16_fa4_gqa,
+    bf16_fa4_gqa_out,
+    compile_bf16_fa4_gqa,
+    compile_bf16_fa4_gqa_configs,
+    get_bf16_fa4_gqa_module,
+)
+from .bf16_fa4_mha import (
+    bf16_fa4_mha,
+    bf16_fa4_mha_out,
+    get_bf16_fa4_mha_module,
+)
+from .bf16_fa4_mla import (
+    Bf16Fa4MlaConfig,
+    bf16_fa4_mla,
+    bf16_fa4_mla_out,
+    compile_bf16_fa4_mla,
+    compile_bf16_fa4_mla_configs,
+    get_bf16_fa4_mla_module,
+)
+from .bf16_fa4_mqa import (
+    Bf16Fa4MqaConfig,
+    bf16_fa4_mqa,
+    bf16_fa4_mqa_out,
+    compile_bf16_fa4_mqa,
+    compile_bf16_fa4_mqa_configs,
+    get_bf16_fa4_mqa_module,
+)
 from .bf16_gemm import (
     Bf16GemmConfig,
     bf16_gemm,
-    bf16_gemm_out,
     bf16_gemm_nt_out,
+    bf16_gemm_out,
     compile_bf16_gemm,
     compile_bf16_gemm_configs,
     get_bf16_gemm_module,
+)
+from .bf16_gemm_serving import (
+    Bf16GemmPersistentServingQueue,
+    Bf16GemmServingConfig,
+    bf16_gemm_serving,
+    bf16_gemm_serving_nt_out,
+    bf16_gemm_serving_out,
+    compile_bf16_gemm_serving,
+    compile_bf16_gemm_serving_configs,
+    get_bf16_gemm_serving_module,
 )
 from .bf16tofp4_quant import (
     Bf16ToFp4QuantModule,
@@ -34,79 +74,6 @@ from .bf16tonvfp4_quant import (
     bf16tonvfp4_quant_out,
     compile_bf16tonvfp4_quant,
 )
-from .fp8_act_quant import (
-    Fp8ActQuantModule,
-    compile_fp8_act_quant,
-    fp8_act_quant,
-    fp8_act_quant_out,
-)
-from .bf16_gemm_serving import (
-    Bf16GemmPersistentServingQueue,
-    Bf16GemmServingConfig,
-    bf16_gemm_serving,
-    bf16_gemm_serving_out,
-    bf16_gemm_serving_nt_out,
-    compile_bf16_gemm_serving,
-    compile_bf16_gemm_serving_configs,
-    get_bf16_gemm_serving_module,
-)
-from .bf16_fa4_mha import (
-    bf16_fa4_mha,
-    bf16_fa4_mha_out,
-    get_bf16_fa4_mha_module,
-)
-from .bf16_fa4_gqa import (
-    Bf16Fa4GqaConfig,
-    Bf16Fa4GqaTactic,
-    bf16_fa4_gqa,
-    bf16_fa4_gqa_out,
-    compile_bf16_fa4_gqa,
-    compile_bf16_fa4_gqa_configs,
-    get_bf16_fa4_gqa_module,
-)
-from .bf16_fa4_mla import (
-    Bf16Fa4MlaConfig,
-    bf16_fa4_mla,
-    bf16_fa4_mla_out,
-    compile_bf16_fa4_mla,
-    compile_bf16_fa4_mla_configs,
-    get_bf16_fa4_mla_module,
-)
-from .bf16_fa4_mqa import (
-    Bf16Fa4MqaConfig,
-    bf16_fa4_mqa,
-    bf16_fa4_mqa_out,
-    compile_bf16_fa4_mqa,
-    compile_bf16_fa4_mqa_configs,
-    get_bf16_fa4_mqa_module,
-)
-from .nvfp4_gemm import (
-    Nvfp4GemmConfig,
-    compile_nvfp4_gemm,
-    compile_nvfp4_gemm_configs,
-    nvfp4_gemm,
-    nvfp4_gemm_out,
-)
-from .mxfp4_gemm import (
-    Mxfp4GemmConfig,
-    compile_mxfp4_gemm,
-    compile_mxfp4_gemm_configs,
-    dequantize_mxfp4_rows,
-    from_blocked_mxfp4_scales,
-    mxfp4_gemm,
-    mxfp4_gemm_out,
-    mxfp4_gemm_reference,
-    quantize_mxfp4_gemm,
-    quantize_mxfp4_rows,
-    to_blocked_mxfp4_scales,
-)
-from .fp8mxfp4_gemm import (
-    Fp8Mxfp4GemmConfig, compile_fp8mxfp4_gemm,
-    compile_fp8mxfp4_gemm_configs, fp8mxfp4_gemm, fp8mxfp4_gemm_out,
-    fp8mxfp4_gemm_reference, quantize_fp8mxfp4_gemm,
-    quantize_fp8mxfp4_weights, to_blocked_fp8mxfp4_scales,
-    from_blocked_fp8mxfp4_scales,
-)
 from .fc1_block_interleaved_swiglu import (
     Fc1BlockInterleavedSwiGLUConfig,
     Fc1Metadata,
@@ -126,23 +93,75 @@ from .fc2_finalize import (
     fc2_finalize_with_routing_out,
     get_fc2_finalize_module,
 )
+from .fp8_act_quant import (
+    Fp8ActQuantModule,
+    compile_fp8_act_quant,
+    fp8_act_quant,
+    fp8_act_quant_out,
+)
+from .fp8mxfp4_gemm import (
+    Fp8Mxfp4GemmConfig,
+    compile_fp8mxfp4_gemm,
+    compile_fp8mxfp4_gemm_configs,
+    fp8mxfp4_gemm,
+    fp8mxfp4_gemm_out,
+    fp8mxfp4_gemm_reference,
+    from_blocked_fp8mxfp4_scales,
+    quantize_fp8mxfp4_gemm,
+    quantize_fp8mxfp4_weights,
+    to_blocked_fp8mxfp4_scales,
+)
 from .grouped_m_gemm import (
     GroupedMConfig,
-    compile_bf16_grouped_m_gemm,
-    compile_bf16_grouped_m_gemm_configs,
     bf16_grouped_m_gemm,
     bf16_grouped_m_gemm_out,
+    compile_bf16_grouped_m_gemm,
+    compile_bf16_grouped_m_gemm_configs,
     get_bf16_grouped_m_gemm_module,
 )
-from .nvfp4_grouped_m_gemm import (
-    Nvfp4GroupedMConfig, compile_nvfp4_grouped_m_gemm,
-    compile_nvfp4_grouped_m_gemm_configs,
-    prepare_nvfp4_grouped_m_metadata, nvfp4_grouped_m_gemm,
-    nvfp4_grouped_m_gemm_out,
+from .moe_routing import pack_routing_metadata
+from .mxfp4_fc1 import (
+    Mxfp4Fc1Config,
+    Mxfp4Fc1Metadata,
+    compile_mxfp4_fc1,
+    compile_mxfp4_fc1_configs,
+    mxfp4_fc1,
+    mxfp4_fc1_out,
+    prepare_mxfp4_fc1_metadata,
+    quantize_mxfp4_fc1_weights,
 )
+from .mxfp4_fc2 import (
+    Mxfp4Fc2Config,
+    Mxfp4Fc2Metadata,
+    compile_mxfp4_fc2,
+    compile_mxfp4_fc2_configs,
+    mxfp4_fc2,
+    mxfp4_fc2_out,
+    prepare_mxfp4_fc2_metadata,
+    to_blocked_mxfp4_sfa,
+)
+from .mxfp4_gemm import (
+    Mxfp4GemmConfig,
+    compile_mxfp4_gemm,
+    compile_mxfp4_gemm_configs,
+    dequantize_mxfp4_rows,
+    from_blocked_mxfp4_scales,
+    mxfp4_gemm,
+    mxfp4_gemm_out,
+    mxfp4_gemm_reference,
+    quantize_mxfp4_gemm,
+    quantize_mxfp4_rows,
+    to_blocked_mxfp4_scales,
+)
+from .nccl_lsa import NcclLsaAllReduce, nccl_unique_id
 from .nvfp4_fc1 import (
-    Nvfp4Fc1Config, Nvfp4Fc1Metadata, compile_nvfp4_fc1, compile_nvfp4_fc1_configs,
-    prepare_nvfp4_fc1_metadata, nvfp4_fc1, nvfp4_fc1_out,
+    Nvfp4Fc1Config,
+    Nvfp4Fc1Metadata,
+    compile_nvfp4_fc1,
+    compile_nvfp4_fc1_configs,
+    nvfp4_fc1,
+    nvfp4_fc1_out,
+    prepare_nvfp4_fc1_metadata,
 )
 from .nvfp4_fc1fc2 import (
     Nvfp4Fc1Fc2Config,
@@ -151,17 +170,20 @@ from .nvfp4_fc1fc2 import (
     nvfp4_fc1fc2,
     nvfp4_fc1fc2_out,
 )
-from .moe_routing import pack_routing_metadata
-from .mxfp4_fc1 import (
-    Mxfp4Fc1Config, Mxfp4Fc1Metadata, compile_mxfp4_fc1, compile_mxfp4_fc1_configs,
-    prepare_mxfp4_fc1_metadata, mxfp4_fc1, mxfp4_fc1_out,
-    quantize_mxfp4_fc1_weights,
+from .nvfp4_gemm import (
+    Nvfp4GemmConfig,
+    compile_nvfp4_gemm,
+    compile_nvfp4_gemm_configs,
+    nvfp4_gemm,
+    nvfp4_gemm_out,
 )
-from .mxfp4_fc2 import (
-    Mxfp4Fc2Config, Mxfp4Fc2Metadata, compile_mxfp4_fc2,
-    compile_mxfp4_fc2_configs, prepare_mxfp4_fc2_metadata, mxfp4_fc2,
-    mxfp4_fc2_out, to_blocked_mxfp4_sfa,
+from .nvfp4_grouped_m_gemm import (
+    Nvfp4GroupedMConfig,
+    compile_nvfp4_grouped_m_gemm,
+    compile_nvfp4_grouped_m_gemm_configs,
+    nvfp4_grouped_m_gemm,
+    nvfp4_grouped_m_gemm_out,
+    prepare_nvfp4_grouped_m_metadata,
 )
-from .nccl_lsa import NcclLsaAllReduce, nccl_unique_id
 
 __all__ = [name for name in globals() if not name.startswith("_")]

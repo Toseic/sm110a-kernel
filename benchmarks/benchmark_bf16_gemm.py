@@ -11,28 +11,27 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from deepgemm_baseline import bf16_nt as deepgemm_bf16_nt
+
 from common import (
     GemmBenchmarkBase,
     SolReport,
     benchmark_with_stats,
     benchmark_with_stats_batched,
-    quick_probe,
-    tflops_from_ms,
     print_sol_report,
+    quick_probe,
     sol_bounds,
+    tflops_from_ms,
 )
 from sm110a_kernel import (
     Bf16GemmConfig,
-    compile_bf16_gemm,
-    bf16_gemm_out,
-    bf16_gemm_nt_out,
     CuteDslBf16GemmRunner,
+    bf16_gemm_nt_out,
+    compile_bf16_gemm,
     cublaslt_gemm_out,
     cublaslt_gemm_out_batched,
 )
 from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
-from deepgemm_baseline import bf16_nt as deepgemm_bf16_nt
-
 
 DEFAULT_SHAPES = [
     (1, 4096, 4096),
@@ -52,6 +51,8 @@ DEFAULT_SHAPES = [
 ]
 ACCURACY_SHAPE = (512, 512, 512)
 CUBLASLT_WORKSPACE_BYTES = 32 * 1024 * 1024
+
+
 def _bf16_gemm_configs():
     for tile_m in (64, 128):
         for tile_n in (128, 256):
@@ -88,8 +89,10 @@ def compatible_candidates(m, n, k):
         and (
             (
                 not swap_ab
-                and (m % (config.tile_m * config.cluster_m) == 0
-                     or (config.cluster_m == 1 and 0 < m < config.tile_m))
+                and (
+                    m % (config.tile_m * config.cluster_m) == 0
+                    or (config.cluster_m == 1 and 0 < m < config.tile_m)
+                )
                 and n % config.tile_n == 0
             )
             or (
@@ -157,8 +160,8 @@ def run_accuracy_check(args):
     accuracy_args = argparse.Namespace(**accuracy_options)
     bench = Bf16GemmBenchmark()
     bench._debug_enabled = getattr(args, "debug", False)
-    kernel_stats, baseline_stats, max_abs_diff, baseline_name, best_candidate = bench.run_case(
-        *ACCURACY_SHAPE, args=accuracy_args
+    kernel_stats, baseline_stats, max_abs_diff, baseline_name, best_candidate = (
+        bench.run_case(*ACCURACY_SHAPE, args=accuracy_args)
     )
     bench.make_result_table(baseline_name).print_header()
     bench.make_result_table(baseline_name).print_row(
@@ -259,9 +262,7 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
             print("[baseline] locally patched DeepGEMM BF16 NT GEMM")
             return "DeepGEMM"
         baseline_name = super().emit_runtime_banner(args, actual_blas)
-        print(
-            "[runner] config selection is cached per workload and CUDA environment"
-        )
+        print("[runner] config selection is cached per workload and CUDA environment")
         print()
         return baseline_name
 
@@ -360,9 +361,7 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
         else:
             raise SystemExit(f"unsupported --baseline value: {args.baseline}")
 
-        selection = self.resolve_kernel(
-            a, b_kernel, out_kernel, m, n, k, args
-        )
+        selection = self.resolve_kernel(a, b_kernel, out_kernel, m, n, k, args)
         best_candidate, kernel_stats = selection.candidate, selection.stats
 
         max_abs_diff = 0.0
@@ -397,7 +396,11 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
         def prepare(candidate):
             config, swap_ab = candidate
             run = lambda: bf16_gemm_nt_out(
-                a, b_kernel, out, config=config, swap_ab=swap_ab,
+                a,
+                b_kernel,
+                out,
+                config=config,
+                swap_ab=swap_ab,
                 max_active_clusters=args.max_active_clusters or None,
             )
             run()
@@ -414,9 +417,13 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
             # B is now prepacked as (N, K), so prior selections measured the
             # incorrect B interpretation and must not be reused.
             namespace="bf16_gemm_nt_v5",
-            key=(m, n, k, args.max_active_clusters), prepare=prepare,
+            key=(m, n, k, args.max_active_clusters),
+            prepare=prepare,
             benchmark=lambda prepared: benchmark_with_stats(
-                prepared.run, args.warmup, args.iters, args.samples,
+                prepared.run,
+                args.warmup,
+                args.iters,
+                args.samples,
                 cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             ),
             probe=lambda prepared: quick_probe(

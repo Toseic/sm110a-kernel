@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
 
 from ..jit_runtime import SplitCudaJit
 
@@ -27,14 +27,23 @@ class Fc2FinalizeConfig:
             raise ValueError("tile_m must be 128")
         if self.cluster_m not in (1, 2):
             raise ValueError("cluster_m must be 1 or 2")
-        if self.tile_n < 8 * self.cluster_m or self.tile_n > 256 or self.tile_n % (8 * self.cluster_m):
+        if (
+            self.tile_n < 8 * self.cluster_m
+            or self.tile_n > 256
+            or self.tile_n % (8 * self.cluster_m)
+        ):
             raise ValueError("tile_n must be a supported tcgen05 tile width")
-        if self.epilogue_tile_n not in (32, 64, 128) or self.tile_n % self.epilogue_tile_n:
+        if (
+            self.epilogue_tile_n not in (32, 64, 128)
+            or self.tile_n % self.epilogue_tile_n
+        ):
             raise ValueError("epilogue_tile_n must divide tile_n and be 32, 64, or 128")
         if self.tile_k <= 0 or self.tile_k % 64:
             raise ValueError("tile_k must be a positive multiple of 64")
         if self.reduce_tile_n != 64:
-            raise ValueError("the fused FC2 epilogue currently requires reduce_tile_n=64")
+            raise ValueError(
+                "the fused FC2 epilogue currently requires reduce_tile_n=64"
+            )
         if self.tile_n % self.reduce_tile_n:
             raise ValueError("tile_n must be divisible by reduce_tile_n")
 
@@ -46,18 +55,44 @@ class Fc2FinalizeModule:
         self._config = config
 
     def fc2_finalize(self, fc1, b, router_scores, topk):
-        return self._binding.fc2_finalize(fc1, b, router_scores, topk, self._launcher_address,
-                                          self._config.tile_n, self._config.tile_k)
+        return self._binding.fc2_finalize(
+            fc1,
+            b,
+            router_scores,
+            topk,
+            self._launcher_address,
+            self._config.tile_n,
+            self._config.tile_k,
+        )
 
     def fc2_finalize_out(self, fc1, b, router_scores, topk, out):
-        return self._binding.fc2_finalize_out(fc1, b, router_scores, topk, out,
-                                              self._launcher_address, self._config.tile_n,
-                                              self._config.tile_k)
+        return self._binding.fc2_finalize_out(
+            fc1,
+            b,
+            router_scores,
+            topk,
+            out,
+            self._launcher_address,
+            self._config.tile_n,
+            self._config.tile_k,
+        )
 
-    def fc2_finalize_with_routing_out(self, fc1, b, topk, routing_weights, routing, grouped_metadata, out):
+    def fc2_finalize_with_routing_out(
+        self, fc1, b, topk, routing_weights, routing, grouped_metadata, out
+    ):
         return self._binding.fc2_finalize_with_routing_out(
-            fc1, b, topk, routing_weights, routing, grouped_metadata.tasks, grouped_metadata.state, out, self._launcher_address,
-            self._config.tile_n, self._config.tile_k)
+            fc1,
+            b,
+            topk,
+            routing_weights,
+            routing,
+            grouped_metadata.tasks,
+            grouped_metadata.state,
+            out,
+            self._launcher_address,
+            self._config.tile_n,
+            self._config.tile_k,
+        )
 
 
 def _kernel_cflags(config: Fc2FinalizeConfig, _variant):
@@ -88,7 +123,7 @@ _JIT = SplitCudaJit(
 )
 
 
-def compile_fc2_finalize(config: Optional[Fc2FinalizeConfig] = None):
+def compile_fc2_finalize(config: Fc2FinalizeConfig | None = None):
     config = config or Fc2FinalizeConfig()
     if not isinstance(config, Fc2FinalizeConfig):
         raise TypeError("config must be a Fc2FinalizeConfig")
@@ -114,14 +149,21 @@ def get_fc2_finalize_module(_fc1, _b, config=None):
 
 
 def fc2_finalize(fc1, b, router_scores, topk, config=None):
-    return get_fc2_finalize_module(fc1, b, config).fc2_finalize(fc1, b, router_scores, topk)
+    return get_fc2_finalize_module(fc1, b, config).fc2_finalize(
+        fc1, b, router_scores, topk
+    )
 
 
 def fc2_finalize_out(fc1, b, router_scores, topk, out, config=None):
-    return get_fc2_finalize_module(fc1, b, config).fc2_finalize_out(fc1, b, router_scores, topk, out)
+    return get_fc2_finalize_module(fc1, b, config).fc2_finalize_out(
+        fc1, b, router_scores, topk, out
+    )
 
 
-def fc2_finalize_with_routing_out(fc1, b, topk, routing_weights, routing, grouped_metadata, out, config=None):
+def fc2_finalize_with_routing_out(
+    fc1, b, topk, routing_weights, routing, grouped_metadata, out, config=None
+):
     """Run FC2 with ``routing_weights[t, rank] * expert_output[t, rank]`` reduction."""
     return get_fc2_finalize_module(fc1, b, config).fc2_finalize_with_routing_out(
-        fc1, b, topk, routing_weights, routing, grouped_metadata, out)
+        fc1, b, topk, routing_weights, routing, grouped_metadata, out
+    )

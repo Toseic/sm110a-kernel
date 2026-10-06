@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import ctypes
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
 
 from ..jit_runtime import SplitCudaJit
 
@@ -32,7 +32,9 @@ class Fc1BlockInterleavedSwiGLUConfig:
             raise ValueError("cluster_n=2 requires cluster_m=2")
         granularity = 8 * self.cluster_m
         if self.tile_n < granularity or self.tile_n > 256 or self.tile_n % granularity:
-            raise ValueError(f"tile_n must be at most 256 and a positive multiple of {granularity} for cluster_m={self.cluster_m}")
+            raise ValueError(
+                f"tile_n must be at most 256 and a positive multiple of {granularity} for cluster_m={self.cluster_m}"
+            )
         if self.tile_n % 2 or self.tile_n % 64 or self.tile_n < 64:
             raise ValueError("tile_n must be an even multiple of 64 and at least 64")
         if self.cluster_n == 2 and (self.tile_n // 2) % self.cluster_n:
@@ -54,21 +56,38 @@ class Fc1BlockInterleavedSwiGLUModule:
         self._binding = binding
         self._launcher_address = library.entry_address
         self._metadata_address = ctypes.cast(
-            getattr(library.handle, "sm110a_fc1_metadata_prepare"), ctypes.c_void_p).value
+            getattr(library.handle, "sm110a_fc1_metadata_prepare"), ctypes.c_void_p
+        ).value
         self._main_address = ctypes.cast(
-            getattr(library.handle, "sm110a_fc1_main_launch"), ctypes.c_void_p).value
+            getattr(library.handle, "sm110a_fc1_main_launch"), ctypes.c_void_p
+        ).value
         self._config = config
 
     def prepare_metadata(self, router_scores, topk, n):
         routing, source_rows, tasks, state = self._binding.prepare_fc1_metadata(
-            router_scores, topk, n, self._metadata_address, self._config.tile_m,
-            self._config.tile_n, self._config.cluster_m, self._config.cluster_n)
+            router_scores,
+            topk,
+            n,
+            self._metadata_address,
+            self._config.tile_m,
+            self._config.tile_n,
+            self._config.cluster_m,
+            self._config.cluster_n,
+        )
         return Fc1Metadata(routing, source_rows, tasks, state)
 
-    def fc1_block_interleaved_swiglu_out(self, a, b_interleaved, metadata: Fc1Metadata, out):
-        return self._binding.fc1_main_out(a, b_interleaved, metadata.source_rows,
-                                          metadata.tasks, metadata.state, out,
-                                          self._main_address)
+    def fc1_block_interleaved_swiglu_out(
+        self, a, b_interleaved, metadata: Fc1Metadata, out
+    ):
+        return self._binding.fc1_main_out(
+            a,
+            b_interleaved,
+            metadata.source_rows,
+            metadata.tasks,
+            metadata.state,
+            out,
+            self._main_address,
+        )
 
     def fc1_block_interleaved_swiglu(self, a, b_interleaved, metadata: Fc1Metadata):
         out = a.new_empty((metadata.source_rows.numel(), b_interleaved.size(1) // 2))
@@ -77,24 +96,32 @@ class Fc1BlockInterleavedSwiGLUModule:
 
 def _kernel_cflags(config: Fc1BlockInterleavedSwiGLUConfig, variant):
     return (
-        f"-DSM110A_FC1_TILE_M={config.tile_m}", f"-DSM110A_FC1_TILE_N={config.tile_n}",
-        f"-DSM110A_FC1_TILE_K={config.tile_k}", f"-DSM110A_FC1_CLUSTER_M={config.cluster_m}",
-        f"-DSM110A_FC1_CLUSTER_N={config.cluster_n}", f"-DSM110A_FC1_DIRECT_GMEM={int(config.direct_gmem)}",
+        f"-DSM110A_FC1_TILE_M={config.tile_m}",
+        f"-DSM110A_FC1_TILE_N={config.tile_n}",
+        f"-DSM110A_FC1_TILE_K={config.tile_k}",
+        f"-DSM110A_FC1_CLUSTER_M={config.cluster_m}",
+        f"-DSM110A_FC1_CLUSTER_N={config.cluster_n}",
+        f"-DSM110A_FC1_DIRECT_GMEM={int(config.direct_gmem)}",
     )
 
 
 _JIT = SplitCudaJit(
-    name="sm110a_fc1_moe", root=_ROOT,
+    name="sm110a_fc1_moe",
+    root=_ROOT,
     binding_sources=(_SOURCE_DIR / "bf16_moe_torch_binding.cpp",),
     kernel_sources=(_SOURCE_DIR / "bf16_fc1_block_interleaved_swiglu_kernel.cu",),
     kernel_dependencies=(_INCLUDE_DIR / "bf16_moe_fc1.h", _INCLUDE_DIR / "common.h"),
     kernel_symbol="sm110a_fc1_main_launch",
-    config_key=lambda config: config, kernel_cflags=_kernel_cflags,
-    make_facade=Fc1BlockInterleavedSwiGLUModule, include_paths=(_INCLUDE_DIR,),
+    config_key=lambda config: config,
+    kernel_cflags=_kernel_cflags,
+    make_facade=Fc1BlockInterleavedSwiGLUModule,
+    include_paths=(_INCLUDE_DIR,),
 )
 
 
-def compile_fc1_block_interleaved_swiglu(config: Optional[Fc1BlockInterleavedSwiGLUConfig] = None):
+def compile_fc1_block_interleaved_swiglu(
+    config: Fc1BlockInterleavedSwiGLUConfig | None = None,
+):
     config = config or Fc1BlockInterleavedSwiGLUConfig()
     if not isinstance(config, Fc1BlockInterleavedSwiGLUConfig):
         raise TypeError("config must be a Fc1BlockInterleavedSwiGLUConfig")
@@ -102,13 +129,17 @@ def compile_fc1_block_interleaved_swiglu(config: Optional[Fc1BlockInterleavedSwi
     return _JIT.compile(config)
 
 
-def compile_fc1_block_interleaved_swiglu_configs(configs: Iterable[Fc1BlockInterleavedSwiGLUConfig], max_workers=None):
+def compile_fc1_block_interleaved_swiglu_configs(
+    configs: Iterable[Fc1BlockInterleavedSwiGLUConfig], max_workers=None
+):
     configs = tuple(configs)
     if not configs:
         return ()
     for config in configs:
         if not isinstance(config, Fc1BlockInterleavedSwiGLUConfig):
-            raise TypeError("configs must contain Fc1BlockInterleavedSwiGLUConfig values")
+            raise TypeError(
+                "configs must contain Fc1BlockInterleavedSwiGLUConfig values"
+            )
         config.validate()
     return _JIT.compile_many(configs, max_workers)
 
@@ -118,12 +149,18 @@ def get_fc1_block_interleaved_swiglu_module(a, b_interleaved, config=None):
 
 
 def prepare_fc1_metadata(router_scores, topk, n, config=None):
-    return compile_fc1_block_interleaved_swiglu(config).prepare_metadata(router_scores, topk, n)
+    return compile_fc1_block_interleaved_swiglu(config).prepare_metadata(
+        router_scores, topk, n
+    )
 
 
 def fc1_block_interleaved_swiglu_out(a, b_interleaved, metadata, out, config=None):
-    return get_fc1_block_interleaved_swiglu_module(a, b_interleaved, config).fc1_block_interleaved_swiglu_out(a, b_interleaved, metadata, out)
+    return get_fc1_block_interleaved_swiglu_module(
+        a, b_interleaved, config
+    ).fc1_block_interleaved_swiglu_out(a, b_interleaved, metadata, out)
 
 
 def fc1_block_interleaved_swiglu(a, b_interleaved, metadata, config=None):
-    return get_fc1_block_interleaved_swiglu_module(a, b_interleaved, config).fc1_block_interleaved_swiglu(a, b_interleaved, metadata)
+    return get_fc1_block_interleaved_swiglu_module(
+        a, b_interleaved, config
+    ).fc1_block_interleaved_swiglu(a, b_interleaved, metadata)

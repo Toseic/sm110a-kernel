@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Runner-backed sweep and benchmark for routed NVFP4 FC2."""
 
-import argparse
 import math
 import sys
 from dataclasses import replace
@@ -18,8 +17,8 @@ from common import (  # noqa: E402
     SolReport,
     TablePrinter,
     benchmark_with_stats,
-    quick_probe,
     powerlaw_router_scores,
+    quick_probe,
     sol_bounds,
 )
 from sm110a_kernel import (  # noqa: E402
@@ -33,7 +32,6 @@ from sm110a_kernel import (  # noqa: E402
     quantize_nvfp4_rows,
 )
 from sm110a_kernel.runner import AutotuneRunner, PreparedKernel  # noqa: E402
-
 
 DEFAULT_EXPERTS = 256
 DEFAULT_N = 6144
@@ -76,7 +74,8 @@ def format_candidate(config):
 
 def compatible_candidates(n, k, args):
     candidates = tuple(
-        config for config in NVFP4_FC2_CONFIGS
+        config
+        for config in NVFP4_FC2_CONFIGS
         if n % config.tile_n == 0 and n % 128 == 0 and k % config.tile_k == 0
     )
     if args.tile_n is not None:
@@ -125,7 +124,8 @@ def nvfp4_fc2_sol_bounds(router_scores, topk, n, k, config):
     cluster_tile_m = config.cluster_m * config.tile_m
     task_count = sum(
         math.ceil(int(rows) / cluster_tile_m) * (n // config.tile_n)
-        for rows in expert_rows.tolist() if rows
+        for rows in expert_rows.tolist()
+        if rows
     )
     staged_sfb_n = max(config.tile_n, 128)
     tile_read_bytes = task_count * (
@@ -147,7 +147,8 @@ def unpack_e2m1(q, rows, k):
     codes = torch.stack((raw & 0xF, raw >> 4), dim=-1).reshape(rows, k)
     magnitudes = torch.tensor(
         (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0),
-        device=q.device, dtype=torch.float32,
+        device=q.device,
+        dtype=torch.float32,
     )
     values = magnitudes[(codes & 7).long()]
     return torch.where((codes & 8) != 0, -values, values)
@@ -160,8 +161,11 @@ def dequantize(q, scales, rows, k):
 
 def make_case(tokens, experts, topk, n, k):
     router_scores = powerlaw_router_scores(
-        tokens, experts, ROUTER_POWERLAW_ALPHA,
-        device="cuda", dtype=torch.bfloat16,
+        tokens,
+        experts,
+        ROUTER_POWERLAW_ALPHA,
+        device="cuda",
+        dtype=torch.bfloat16,
     )
     topk_result = torch.topk(router_scores.float(), topk, dim=1)
     selected = topk_result.indices.to(torch.int32)
@@ -201,18 +205,24 @@ def reference(case, tokens, experts, topk, n, k):
         rows = (grouped_layout == expert).nonzero().flatten()
         if rows.numel():
             b = dequantize(
-                bq[expert], sfb[expert * scale_elems:(expert + 1) * scale_elems],
-                n, k,
+                bq[expert],
+                sfb[expert * scale_elems : (expert + 1) * scale_elems],
+                n,
+                k,
             )
             grouped[rows] = a[rows] @ b.t()
 
-    assignment_to_grouped = routing[2 * experts + 2 * m:]
+    assignment_to_grouped = routing[2 * experts + 2 * m :]
     assignments = torch.arange(m, device="cuda").view(tokens, topk)
     grouped_rows = assignment_to_grouped[assignments]
     return (
-        grouped[grouped_rows].view(tokens, topk, n)
-        * routing_weights.float().unsqueeze(-1)
-    ).sum(1).bfloat16()
+        (
+            grouped[grouped_rows].view(tokens, topk, n)
+            * routing_weights.float().unsqueeze(-1)
+        )
+        .sum(1)
+        .bfloat16()
+    )
 
 
 class Nvfp4Fc2Benchmark(BenchmarkBase):
@@ -233,7 +243,9 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
         parser.add_argument("--check", action="store_true")
         parser.add_argument("--no-accuracy", action="store_true")
         parser.add_argument(
-            "--baseline", choices=("cutedsl",), default="cutedsl",
+            "--baseline",
+            choices=("cutedsl",),
+            default="cutedsl",
             help="baseline implementation to benchmark against (default: cutedsl)",
         )
         parser.add_argument("--debug", action="store_true")
@@ -269,13 +281,25 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
         return args
 
     def make_result_table(self):
-        return TablePrinter((
-            ("Tokens", 9), ("M", 10), ("TopK", 7), ("E", 6),
-            ("N", 8), ("K", 8), ("Kernel(ms)", 14), ("Kernel TF/s", 15),
-            ("CuTE DSL(ms)", 14), ("CuTE DSL TF/s", 15),
-            ("Speedup", 10), ("MaxDiff", 12), ("Cache", 8),
-            ("BestConfig", 42),
-        ), debug=getattr(self, "_debug_enabled", False))
+        return TablePrinter(
+            (
+                ("Tokens", 9),
+                ("M", 10),
+                ("TopK", 7),
+                ("E", 6),
+                ("N", 8),
+                ("K", 8),
+                ("Kernel(ms)", 14),
+                ("Kernel TF/s", 15),
+                ("CuTE DSL(ms)", 14),
+                ("CuTE DSL TF/s", 15),
+                ("Speedup", 10),
+                ("MaxDiff", 12),
+                ("Cache", 8),
+                ("BestConfig", 42),
+            ),
+            debug=getattr(self, "_debug_enabled", False),
+        )
 
     def run_with_args(self, args):
         torch.manual_seed(args.seed)
@@ -293,7 +317,16 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
 
         for tokens in args.token_values:
             case = make_case(tokens, args.experts, args.topk, args.n, args.k)
-            aq, bq, sfa, sfb, routing, grouped_layout, routing_weights, router_scores = case
+            (
+                aq,
+                bq,
+                sfa,
+                sfb,
+                routing,
+                grouped_layout,
+                routing_weights,
+                router_scores,
+            ) = case
             out = torch.empty((tokens, args.n), device="cuda", dtype=torch.bfloat16)
             baseline_out = torch.empty_like(out)
             prepared_metadata = {}
@@ -302,15 +335,28 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
             # in benchmark_nvfp4_fc1.py.  The native sweep prints many more
             # configurations, so running it first obscures baseline results.
             baseline_runner = CuteDslNvfp4Fc2Runner(
-                aq, bq, sfa, sfb, routing, routing_weights,
-                baseline_out, args.topk,
+                aq,
+                bq,
+                sfa,
+                sfb,
+                routing,
+                routing_weights,
+                baseline_out,
+                args.topk,
             )
-            baseline_runner.autotune(self.make_tune_options(
-                args, role="baseline", pre_parallel_jit=args.pre_parallel_jit,
-            ))
+            baseline_runner.autotune(
+                self.make_tune_options(
+                    args,
+                    role="baseline",
+                    pre_parallel_jit=args.pre_parallel_jit,
+                )
+            )
             baseline_fn = baseline_runner.run
             baseline_stats = benchmark_with_stats(
-                baseline_fn, args.warmup, args.iters, args.samples,
+                baseline_fn,
+                args.warmup,
+                args.iters,
+                args.samples,
                 cold_l2_flush=args._cold_l2_flush,
             )
 
@@ -319,8 +365,16 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
                     grouped_layout, args.experts, args.n, config=config
                 )
                 run = lambda: nvfp4_fc2_out(
-                    aq, bq, sfa, sfb, routing, routing_weights,
-                    metadata, args.topk, out, config=config,
+                    aq,
+                    bq,
+                    sfa,
+                    sfb,
+                    routing,
+                    routing_weights,
+                    metadata,
+                    args.topk,
+                    out,
+                    config=config,
                 )
                 # The fused epilogue scatter-adds into ``out``.  Start each
                 # tactic from zero without putting the memset in the timed path.
@@ -337,7 +391,10 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
                 candidates,
                 prepare=prepare,
                 benchmark=lambda prepared: benchmark_with_stats(
-                    prepared.run, args.warmup, args.iters, args.samples,
+                    prepared.run,
+                    args.warmup,
+                    args.iters,
+                    args.samples,
                     cold_l2_flush=args._cold_l2_flush,
                 ),
                 probe=lambda prepared: quick_probe(
@@ -374,8 +431,7 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
                     out.float(), baseline_out.float(), atol=args.atol, rtol=args.rtol
                 ):
                     raise SystemExit(
-                        f"[check] FAIL tokens={tokens} "
-                        f"max_abs_diff={max_abs_diff:.6f}"
+                        f"[check] FAIL tokens={tokens} max_abs_diff={max_abs_diff:.6f}"
                     )
                 print(
                     f"[check tokens={tokens}] PASS vs CuTE DSL "
@@ -386,9 +442,7 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
                 # Optional independent validation against the torch reference.
                 out.zero_()
                 selection.prepared.run()
-                ref = reference(
-                    case, tokens, args.experts, args.topk, args.n, args.k
-                )
+                ref = reference(case, tokens, args.experts, args.topk, args.n, args.k)
                 torch.cuda.synchronize()
                 ref_diff = (out.float() - ref.float()).abs().max().item()
                 if not torch.allclose(
@@ -407,8 +461,13 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
             kernel_ms = stats["median_ms"]
             baseline_ms = baseline_stats["median_ms"]
             table.print_row(
-                tokens, tokens * args.topk, args.topk, args.experts,
-                args.n, args.k, f"{kernel_ms:.4f}",
+                tokens,
+                tokens * args.topk,
+                args.topk,
+                args.experts,
+                args.n,
+                args.k,
+                f"{kernel_ms:.4f}",
                 f"{fc2_tflops(tokens, args.topk, args.n, args.k, kernel_ms):.2f}",
                 f"{baseline_ms:.4f}",
                 f"{fc2_tflops(tokens, args.topk, args.n, args.k, baseline_ms):.2f}",

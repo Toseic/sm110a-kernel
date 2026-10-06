@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import ctypes
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
 
 from ..jit_runtime import SplitCudaJit
 
@@ -36,7 +36,10 @@ class Nvfp4Fc2Config:
             raise ValueError("tile_m must be 128 and tile_n must be 64, 128, or 256")
         if self.tile_k not in (64, 128, 256):
             raise ValueError("tile_k must be 64, 128, or 256")
-        if self.epilogue_tile_n not in (32, 64, 128) or self.tile_n % self.epilogue_tile_n:
+        if (
+            self.epilogue_tile_n not in (32, 64, 128)
+            or self.tile_n % self.epilogue_tile_n
+        ):
             raise ValueError("invalid epilogue_tile_n")
         if self.cluster_m not in (1, 2):
             raise ValueError("cluster_m must be 1 or 2")
@@ -72,34 +75,79 @@ class Nvfp4Fc2Module:
 
     def prepare_metadata(self, grouped_layout, experts: int, n: int):
         values = self._binding.prepare_nvfp4_fc2_metadata(
-            grouped_layout, experts, n, self._metadata_address,
-            self.config.tile_m, self.config.tile_n, self.config.cluster_m,
+            grouped_layout,
+            experts,
+            n,
+            self._metadata_address,
+            self.config.tile_m,
+            self.config.tile_n,
+            self.config.cluster_m,
         )
         return Nvfp4Fc2Metadata(*values)
 
     def _max_active_clusters(self, device, value):
         if value is None:
             import torch
-            value = torch.cuda.get_device_properties(device).multi_processor_count // self.config.cluster_m
+
+            value = (
+                torch.cuda.get_device_properties(device).multi_processor_count
+                // self.config.cluster_m
+            )
         if value <= 0:
             raise ValueError("max_active_clusters must be positive")
         return int(value)
 
-    def nvfp4_fc2(self, a, b, sfa, sfb, routing, routing_weights, metadata, topk,
-                  max_active_clusters=None):
+    def nvfp4_fc2(
+        self,
+        a,
+        b,
+        sfa,
+        sfb,
+        routing,
+        routing_weights,
+        metadata,
+        topk,
+        max_active_clusters=None,
+    ):
         return self._binding.nvfp4_fc2(
-            a, b, sfa, sfb, routing, routing_weights, metadata.tasks,
-            metadata.state, topk, self._address,
+            a,
+            b,
+            sfa,
+            sfb,
+            routing,
+            routing_weights,
+            metadata.tasks,
+            metadata.state,
+            topk,
+            self._address,
             self._max_active_clusters(a.device, max_active_clusters),
         )
 
     def nvfp4_fc2_out(
-        self, a, b, sfa, sfb, routing, routing_weights, metadata, topk, out,
-        max_active_clusters=None
+        self,
+        a,
+        b,
+        sfa,
+        sfb,
+        routing,
+        routing_weights,
+        metadata,
+        topk,
+        out,
+        max_active_clusters=None,
     ):
         return self._binding.nvfp4_fc2_out(
-            a, b, sfa, sfb, routing, routing_weights, metadata.tasks,
-            metadata.state, topk, out, self._address,
+            a,
+            b,
+            sfa,
+            sfb,
+            routing,
+            routing_weights,
+            metadata.tasks,
+            metadata.state,
+            topk,
+            out,
+            self._address,
             self._max_active_clusters(a.device, max_active_clusters),
         )
 
@@ -108,7 +156,8 @@ def _flags(config: Nvfp4Fc2Config, _variant):
     return tuple(
         f"-DSM110A_NVFP4_FC2_{key}={value}"
         for key, value in (
-            ("TILE_M", config.tile_m), ("TILE_N", config.tile_n),
+            ("TILE_M", config.tile_m),
+            ("TILE_N", config.tile_n),
             ("TILE_K", config.tile_k),
             ("EPILOGUE_TILE_N", config.epilogue_tile_n),
             ("CLUSTER_M", config.cluster_m),
@@ -125,16 +174,20 @@ def _flags(config: Nvfp4Fc2Config, _variant):
 
 
 _JIT = SplitCudaJit(
-    name="sm110a_nvfp4_fc2", root=_ROOT,
+    name="sm110a_nvfp4_fc2",
+    root=_ROOT,
     binding_sources=(_SRC / "nvfp4_fc2_torch_binding.cpp",),
     kernel_sources=(_SRC / "nvfp4_fc2_kernel.cu", _META),
     kernel_dependencies=(_INC / "nvfp4_moe_fc2.h", _INC / "common.h"),
-    kernel_symbol="sm110a_nvfp4_fc2_launch", config_key=lambda config: config,
-    kernel_cflags=_flags, make_facade=Nvfp4Fc2Module, include_paths=(_INC,),
+    kernel_symbol="sm110a_nvfp4_fc2_launch",
+    config_key=lambda config: config,
+    kernel_cflags=_flags,
+    make_facade=Nvfp4Fc2Module,
+    include_paths=(_INC,),
 )
 
 
-def compile_nvfp4_fc2(config: Optional[Nvfp4Fc2Config] = None):
+def compile_nvfp4_fc2(config: Nvfp4Fc2Config | None = None):
     config = config or Nvfp4Fc2Config()
     if not isinstance(config, Nvfp4Fc2Config):
         raise TypeError("config must be an Nvfp4Fc2Config")
@@ -155,17 +208,53 @@ def prepare_nvfp4_fc2_metadata(grouped_layout, experts, n, config=None):
     return compile_nvfp4_fc2(config).prepare_metadata(grouped_layout, experts, n)
 
 
-def nvfp4_fc2(a, b, sfa, sfb, routing, routing_weights, metadata, topk, config=None,
-              max_active_clusters=None):
+def nvfp4_fc2(
+    a,
+    b,
+    sfa,
+    sfb,
+    routing,
+    routing_weights,
+    metadata,
+    topk,
+    config=None,
+    max_active_clusters=None,
+):
     return compile_nvfp4_fc2(config).nvfp4_fc2(
-        a, b, sfa, sfb, routing, routing_weights, metadata, topk, max_active_clusters,
+        a,
+        b,
+        sfa,
+        sfb,
+        routing,
+        routing_weights,
+        metadata,
+        topk,
+        max_active_clusters,
     )
 
 
 def nvfp4_fc2_out(
-    a, b, sfa, sfb, routing, routing_weights, metadata, topk, out, config=None,
-    max_active_clusters=None
+    a,
+    b,
+    sfa,
+    sfb,
+    routing,
+    routing_weights,
+    metadata,
+    topk,
+    out,
+    config=None,
+    max_active_clusters=None,
 ):
     return compile_nvfp4_fc2(config).nvfp4_fc2_out(
-        a, b, sfa, sfb, routing, routing_weights, metadata, topk, out, max_active_clusters,
+        a,
+        b,
+        sfa,
+        sfb,
+        routing,
+        routing_weights,
+        metadata,
+        topk,
+        out,
+        max_active_clusters,
     )

@@ -8,9 +8,9 @@ submit PyTorch work to that context's SM partition.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 from functools import lru_cache
 from pathlib import Path
-from typing import Sequence
 
 _ROOT = Path(__file__).resolve().parents[1]
 _SOURCE = _ROOT / "csrc/green_context/green_context_torch_binding.cpp"
@@ -76,7 +76,7 @@ class GreenContext:
     def close(self) -> None:
         self._native.close()
 
-    def __enter__(self) -> "GreenContext":
+    def __enter__(self) -> GreenContext:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
@@ -108,7 +108,9 @@ def create_green_contexts(
     counts = tuple(int(count) for count in sm_counts)
     return tuple(
         GreenContext(context)
-        for context in _binding().create_green_contexts(counts, int(device), int(priority))
+        for context in _binding().create_green_contexts(
+            counts, int(device), int(priority)
+        )
     )
 
 

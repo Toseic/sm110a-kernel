@@ -8,12 +8,12 @@ import os
 import re
 import sys
 import threading
+from collections.abc import Callable, Hashable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import Callable, Generic, Hashable, Iterable, Optional, TypeVar
-
+from typing import Generic, TypeVar
 
 __all__ = [
     "ConcurrentModuleCache",
@@ -48,7 +48,9 @@ def _parse_pipeline_delay(value: str, source: str) -> int:
     try:
         cycles = int(value, 10)
     except ValueError as error:
-        raise ValueError(f"{source} must be a non-negative integer cycle count") from error
+        raise ValueError(
+            f"{source} must be a non-negative integer cycle count"
+        ) from error
     if cycles < 0:
         raise ValueError(f"{source} must be a non-negative integer cycle count")
     return cycles
@@ -73,12 +75,14 @@ def pipeline_delay_variant() -> tuple[tuple[str, int], ...]:
             if not separator:
                 raise ValueError("SM110A_PIPELINE_DELAYS entries must be point=cycles")
             point = _normalize_pipeline_delay_point(point, "SM110A_PIPELINE_DELAYS")
-            values[point] = _parse_pipeline_delay(value.strip(), "SM110A_PIPELINE_DELAYS")
+            values[point] = _parse_pipeline_delay(
+                value.strip(), "SM110A_PIPELINE_DELAYS"
+            )
     for env_name, value in os.environ.items():
         if not env_name.startswith(_PIPELINE_DELAY_ENV_PREFIX):
             continue
         point = _normalize_pipeline_delay_point(
-            env_name[len(_PIPELINE_DELAY_ENV_PREFIX):], env_name
+            env_name[len(_PIPELINE_DELAY_ENV_PREFIX) :], env_name
         )
         values[point] = _parse_pipeline_delay(value, env_name)
     return tuple(sorted(values.items()))
@@ -144,7 +148,7 @@ def source_digest(paths: Iterable[Path], root: Path) -> str:
 def jit_build_directory(
     name: str,
     cache_root_env: str = "SM110A_JIT_CACHE_DIR",
-) -> Optional[str]:
+) -> str | None:
     """Return a persistent per-module build directory.
 
     Uses ``SM110A_JIT_CACHE_DIR`` if set, otherwise defaults to
@@ -179,9 +183,7 @@ class SplitCudaJit(Generic[ConfigT, FacadeT]):
         kernel_symbol: str,
         config_key: Callable[[ConfigT], Hashable],
         kernel_cflags: Callable[[ConfigT, Hashable], Iterable[str]],
-        make_facade: Callable[
-            [ModuleType, LoadedCudaLibrary, ConfigT], FacadeT
-        ],
+        make_facade: Callable[[ModuleType, LoadedCudaLibrary, ConfigT], FacadeT],
         variant_key: Callable[[], Hashable] = lambda: None,
         include_paths: Iterable[Path] = (),
         binding_cflags: Iterable[str] = ("-O3", "-std=c++20"),
@@ -202,8 +204,10 @@ class SplitCudaJit(Generic[ConfigT, FacadeT]):
         kernel_dependencies = tuple(kernel_dependencies)
         pipeline_delay_header = root / "include" / "pipeline_delay.h"
         self._kernel_dependencies = kernel_dependencies + (
-            (pipeline_delay_header,) if pipeline_delay_header.exists()
-            and pipeline_delay_header not in kernel_dependencies else ()
+            (pipeline_delay_header,)
+            if pipeline_delay_header.exists()
+            and pipeline_delay_header not in kernel_dependencies
+            else ()
         )
         self._kernel_symbol = kernel_symbol
         self._config_key = config_key
@@ -218,18 +222,20 @@ class SplitCudaJit(Generic[ConfigT, FacadeT]):
         self._verbose_env = verbose_env
         self._workers_env = workers_env
 
-        self._binding: Optional[ModuleType] = None
+        self._binding: ModuleType | None = None
         self._binding_lock = threading.Lock()
         self._cache_lock = threading.Lock()
         self._build_locks: dict[str, threading.Lock] = {}
         self._kernel_cache: dict[str, LoadedCudaLibrary] = {}
         self._facade_cache: dict[str, FacadeT] = {}
-        self._fast_cache: dict[tuple[Hashable, str, str, Hashable, Hashable], FacadeT] = {}
+        self._fast_cache: dict[
+            tuple[Hashable, str, str, Hashable, Hashable], FacadeT
+        ] = {}
 
     def _verbose(self) -> bool:
         return os.environ.get(self._verbose_env, "0") == "1"
 
-    def _build_directory(self, name: str) -> Optional[str]:
+    def _build_directory(self, name: str) -> str | None:
         return jit_build_directory(name, self._cache_root_env)
 
     def _binding_name(self, torch) -> str:
@@ -305,9 +311,7 @@ class SplitCudaJit(Generic[ConfigT, FacadeT]):
             self._binding = load(
                 name=name,
                 sources=[str(path) for path in self._binding_sources],
-                extra_include_paths=[
-                    str(path) for path in self._include_paths
-                ],
+                extra_include_paths=[str(path) for path in self._include_paths],
                 extra_cflags=list(self._binding_cflags),
                 extra_ldflags=list(self._binding_ldflags),
                 build_directory=self._build_directory(name),
@@ -321,11 +325,11 @@ class SplitCudaJit(Generic[ConfigT, FacadeT]):
         from torch.utils.cpp_extension import load
 
         cuda_arch = os.environ.get("CUDA_ARCH", "sm_110a")
-        compute_arch = os.environ.get(
-            "COMPUTE_CUDA_ARCH", "compute_110a"
-        )
+        compute_arch = os.environ.get("COMPUTE_CUDA_ARCH", "compute_110a")
         variant = self._variant_key()
-        extra_cuda_cflags = tuple(self._kernel_cflags(config, variant)) + pipeline_delay_cflags()
+        extra_cuda_cflags = (
+            tuple(self._kernel_cflags(config, variant)) + pipeline_delay_cflags()
+        )
         name = self._kernel_name(
             config,
             variant,
@@ -338,9 +342,7 @@ class SplitCudaJit(Generic[ConfigT, FacadeT]):
             cached = self._kernel_cache.get(name)
             if cached is not None:
                 return cached
-            build_lock = self._build_locks.setdefault(
-                name, threading.Lock()
-            )
+            build_lock = self._build_locks.setdefault(name, threading.Lock())
 
         with build_lock:
             with self._cache_lock:
@@ -351,9 +353,7 @@ class SplitCudaJit(Generic[ConfigT, FacadeT]):
                 library_path = load(
                     name=name,
                     sources=[str(path) for path in self._kernel_sources],
-                    extra_include_paths=[
-                        str(path) for path in self._include_paths
-                    ],
+                    extra_include_paths=[str(path) for path in self._include_paths],
                     extra_cuda_cflags=[
                         "-O3",
                         "-lineinfo",
@@ -367,16 +367,12 @@ class SplitCudaJit(Generic[ConfigT, FacadeT]):
                 )
                 handle = ctypes.CDLL(library_path)
                 entry = getattr(handle, self._kernel_symbol)
-                entry_address = ctypes.cast(
-                    entry, ctypes.c_void_p
-                ).value
+                entry_address = ctypes.cast(entry, ctypes.c_void_p).value
                 if entry_address is None:
                     raise RuntimeError(
                         f"failed to resolve CUDA symbol {self._kernel_symbol}"
                     )
-                library = LoadedCudaLibrary(
-                    name, library_path, handle, entry_address
-                )
+                library = LoadedCudaLibrary(name, library_path, handle, entry_address)
             except Exception:
                 with self._cache_lock:
                     self._build_locks.pop(name, None)
@@ -422,16 +418,14 @@ class SplitCudaJit(Generic[ConfigT, FacadeT]):
     def compile_many(
         self,
         configs: Iterable[ConfigT],
-        max_workers: Optional[int] = None,
+        max_workers: int | None = None,
     ) -> tuple[FacadeT, ...]:
         """Compile configurations and their shared binding concurrently."""
         configs = tuple(configs)
         if not configs:
             return ()
         if max_workers is None:
-            configured_workers = int(
-                os.environ.get(self._workers_env, "10")
-            )
+            configured_workers = int(os.environ.get(self._workers_env, "10"))
             max_workers = min(len(configs), configured_workers)
         if max_workers <= 0:
             raise ValueError("max_workers must be positive")
@@ -439,13 +433,10 @@ class SplitCudaJit(Generic[ConfigT, FacadeT]):
         with ThreadPoolExecutor(max_workers=max_workers + 1) as executor:
             binding_future = executor.submit(self._load_binding)
             kernel_futures = [
-                executor.submit(self._load_kernel, config)
-                for config in configs
+                executor.submit(self._load_kernel, config) for config in configs
             ]
             binding = binding_future.result()
-            libraries = [
-                future.result() for future in kernel_futures
-            ]
+            libraries = [future.result() for future in kernel_futures]
         facades = tuple(
             self._facade(config, binding, library)
             for config, library in zip(configs, libraries)

@@ -21,7 +21,8 @@ class Bf16ToNvfp4QuantModule:
 
     def quantize_out(self, input, packed, scales):
         return self._binding.bf16tonvfp4_quant_out(
-            input, packed, scales, self._launcher)
+            input, packed, scales, self._launcher
+        )
 
 
 _JIT = SplitCudaJit(
@@ -29,8 +30,10 @@ _JIT = SplitCudaJit(
     root=_ROOT,
     binding_sources=(_SOURCE_DIR / "bf16tonvfp4_quant_torch_binding.cpp",),
     kernel_sources=(_SOURCE_DIR / "bf16tonvfp4_quant_kernel.cu",),
-    kernel_dependencies=(_INCLUDE_DIR / "bf16tonvfp4_quant.h",
-                         _INCLUDE_DIR / "common.h"),
+    kernel_dependencies=(
+        _INCLUDE_DIR / "bf16tonvfp4_quant.h",
+        _INCLUDE_DIR / "common.h",
+    ),
     kernel_symbol="sm110a_bf16tonvfp4_quant_launch",
     config_key=lambda _config: 128,
     kernel_cflags=lambda _config, _variant: (),

@@ -15,7 +15,6 @@ if str(ROOT) not in sys.path:
 
 from common import (
     BenchmarkBase,
-    TablePrinter,
     benchmark_with_stats,
     quick_probe,
     tflops_from_ms,
@@ -28,7 +27,6 @@ from sm110a_kernel import (
     quantize_fp8mxfp4_gemm,
 )
 from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
-
 
 DEFAULT_SHAPES = (
     (128, 4096, 4096),
@@ -49,20 +47,21 @@ def load_models_mxfp4_kernel():
     """Load DeepSeek V4.1 Flash's TileLang FP8 x MXFP4 kernel on demand."""
     global _MODELS_MXFP4_MODULE
     if _MODELS_MXFP4_MODULE is None:
-        source = ROOT / 'models/deepseek_v41_flash/inference/kernel.py'
+        source = ROOT / "models/deepseek_v41_flash/inference/kernel.py"
         spec = importlib.util.spec_from_file_location(
-            '_sm110a_models_deepseek_v41_mxfp4', source,
+            "_sm110a_models_deepseek_v41_mxfp4",
+            source,
         )
         if spec is None or spec.loader is None:
-            raise RuntimeError(f'cannot load models MXFP4 baseline from {source}')
+            raise RuntimeError(f"cannot load models MXFP4 baseline from {source}")
         module = importlib.util.module_from_spec(spec)
         try:
             spec.loader.exec_module(module)
         except ModuleNotFoundError as exc:
-            if exc.name == 'tilelang':
+            if exc.name == "tilelang":
                 raise RuntimeError(
-                    'the models-mxfp4 baseline requires TileLang; install '
-                    'models/deepseek_v41_flash/inference/requirements.txt'
+                    "the models-mxfp4 baseline requires TileLang; install "
+                    "models/deepseek_v41_flash/inference/requirements.txt"
                 ) from exc
             raise
         _MODELS_MXFP4_MODULE = module
@@ -88,11 +87,15 @@ def models_mxfp4_baseline(x8, w4, sfb, out, *, compact_b_gmem):
     # The model kernel supports 128-wide activation scaling when possible,
     # and its 32-wide variant covers the native kernel's K=64 padded path.
     act_block_size = 128 if k % 128 == 0 else 32
-    sfa = torch.full((m, k // act_block_size), 127, device=x8.device,
-                     dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    sfa = torch.full(
+        (m, k // act_block_size), 127, device=x8.device, dtype=torch.uint8
+    ).view(torch.float8_e8m0fnu)
     logical_sfb = from_blocked_fp8mxfp4_scales(sfb, n, k)
     kernel = model_kernel.fp4_gemm_kernel(
-        n, k, act_block_size=act_block_size, scale_dtype=model_kernel.FE8M0,
+        n,
+        k,
+        act_block_size=act_block_size,
+        scale_dtype=model_kernel.FE8M0,
     )
 
     def run():
@@ -105,19 +108,19 @@ def load_deepgemm():
     """Load the locally patched DeepGEMM build used as an SM110 baseline."""
     global _DEEPGEMM_MODULE
     if _DEEPGEMM_MODULE is None:
-        source_root = ROOT / 'baselinedir/DeepGEMM'
+        source_root = ROOT / "baselinedir/DeepGEMM"
         if not source_root.is_dir():
             raise RuntimeError(
-                f'DeepGEMM baseline is unavailable: expected {source_root}; '
-                'clone and build the local DeepGEMM baseline first'
+                f"DeepGEMM baseline is unavailable: expected {source_root}; "
+                "clone and build the local DeepGEMM baseline first"
             )
         sys.path.insert(0, str(source_root))
         try:
             import deep_gemm
         except ImportError as exc:
             raise RuntimeError(
-                'the DeepGEMM baseline requires its local extension; run '
-                f'{source_root}/develop.sh first'
+                "the DeepGEMM baseline requires its local extension; run "
+                f"{source_root}/develop.sh first"
             ) from exc
         _DEEPGEMM_MODULE = deep_gemm
     return _DEEPGEMM_MODULE
@@ -136,8 +139,7 @@ def deepgemm_mxfp4_baseline(x8, w4, sfb, out, *, compact_b_gmem):
     n = w4.size(0)
     if k % 128:
         raise RuntimeError(
-            'the DeepGEMM FP8 x FP4 baseline requires K divisible by 128; '
-            f'got K={k}'
+            f"the DeepGEMM FP8 x FP4 baseline requires K divisible by 128; got K={k}"
         )
     if compact_b_gmem:
         packed_b = w4
@@ -152,8 +154,11 @@ def deepgemm_mxfp4_baseline(x8, w4, sfb, out, *, compact_b_gmem):
 
     def run():
         deep_gemm.fp8_fp4_gemm_nt(
-            (x8, sfa), (packed_b, sfb), out,
-            recipe_a=(1, 32), recipe_b=(1, 32),
+            (x8, sfa),
+            (packed_b, sfb),
+            out,
+            recipe_a=(1, 32),
+            recipe_b=(1, 32),
         )
 
     return run
@@ -164,9 +169,13 @@ def deepgemm_mxfp4_baseline(x8, w4, sfb, out, *, compact_b_gmem):
 # b4x16_p64 expansion of compact B requires tile_k=128.
 FP8MXFP4_GEMM_CONFIGS = tuple(
     Fp8Mxfp4GemmConfig(
-        tile_n=tile_n, tile_k=tile_k, cluster_m=cluster_m,
-        epilogue_block_n=epilogue_block_n, split_k=split_k,
-        use_prefetch=use_prefetch, compact_b_gmem=tile_k == 128,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        cluster_m=cluster_m,
+        epilogue_block_n=epilogue_block_n,
+        split_k=split_k,
+        use_prefetch=use_prefetch,
+        compact_b_gmem=tile_k == 128,
     )
     for cluster_m in (1, 2)
     for split_k in (1, 2, 4, 8)
@@ -177,10 +186,24 @@ FP8MXFP4_GEMM_CONFIGS = tuple(
     if tile_n % epilogue_block_n == 0 and cluster_m * split_k <= 8
     if not (
         # Two-mainloop-stage SMEM check from Fp8Mxfp4GemmConfig.validate.
-        (232448 - 1024 - 256 - 2 * 128 * epilogue_block_n * 2 -
-         (128 * epilogue_block_n * 4 if split_k > 1 else 0)) //
-        (((128 * 128 + (tile_n // cluster_m) * 128 + 128 * (tile_k // 8) +
-           (tile_k // 32) * ((tile_n + 127) // 128) * 512 + 1023) & ~1023)) < 2
+        (
+            232448
+            - 1024
+            - 256
+            - 2 * 128 * epilogue_block_n * 2
+            - (128 * epilogue_block_n * 4 if split_k > 1 else 0)
+        )
+        // (
+            (
+                128 * 128
+                + (tile_n // cluster_m) * 128
+                + 128 * (tile_k // 8)
+                + (tile_k // 32) * ((tile_n + 127) // 128) * 512
+                + 1023
+            )
+            & ~1023
+        )
+        < 2
     )
 )
 
@@ -198,12 +221,17 @@ def compatible_candidates(m, n, k, compact_b_gmem):
         and k % (config.tile_k * config.split_k) == 0
         # Rolling L2 prefetch is a tactic for large K or an incomplete CTA
         # wave, rather than a universally profitable instruction stream.
-        and (not config.use_prefetch or
-             k >= 8192 or
-             0.5 < (
-                 math.ceil(m / (config.tile_m * config.cluster_m)) *
-                 math.ceil(n / config.tile_n) / sm_count
-             ) < 1.0)
+        and (
+            not config.use_prefetch
+            or k >= 8192
+            or 0.5
+            < (
+                math.ceil(m / (config.tile_m * config.cluster_m))
+                * math.ceil(n / config.tile_n)
+                / sm_count
+            )
+            < 1.0
+        )
     )
 
 
@@ -227,15 +255,19 @@ class Fp8Mxfp4GemmBenchmark(BenchmarkBase):
         parser.add_argument("--seed", type=int, default=1234)
         b_gmem_group = parser.add_mutually_exclusive_group()
         b_gmem_group.add_argument(
-            "--compact-b-gmem", dest="compact_b_gmem",
-            action="store_true", default=True,
+            "--compact-b-gmem",
+            dest="compact_b_gmem",
+            action="store_true",
+            default=True,
             help=(
                 "keep B in native packed FP4 storage, expanded by TMA "
                 "b4x16_p64 (requires K divisible by 128; default)"
             ),
         )
         b_gmem_group.add_argument(
-            "--padded-b-gmem", dest="compact_b_gmem", action="store_false",
+            "--padded-b-gmem",
+            dest="compact_b_gmem",
+            action="store_false",
             help="store B in the padded 16-byte-per-group layout",
         )
         parser.add_argument(
@@ -245,13 +277,15 @@ class Fp8Mxfp4GemmBenchmark(BenchmarkBase):
             help="optional baseline: TileLang models kernel or locally patched DeepGEMM",
         )
         parser.add_argument(
-            "--debug", action="store_true",
+            "--debug",
+            action="store_true",
             help="print per-config runner probe and timing details",
         )
         self.add_cache_args(parser)
         self.add_pre_parallel_jit_arg(parser)
         parser.add_argument(
-            "--cache-path", default=None,
+            "--cache-path",
+            default=None,
             help="autotune cache path (default: profiles/autotune_cache.json)",
         )
         return parser
@@ -264,9 +298,7 @@ class Fp8Mxfp4GemmBenchmark(BenchmarkBase):
         shapes = ((args.m, args.n, args.k),) if chosen else DEFAULT_SHAPES
         for m, n, k in shapes:
             if m % 128 or n % 128 or k % 64:
-                raise SystemExit(
-                    "M and N must be multiples of 128, and K of 64"
-                )
+                raise SystemExit("M and N must be multiples of 128, and K of 64")
         args.shapes = shapes
         return args
 
@@ -323,17 +355,27 @@ class Fp8Mxfp4GemmBenchmark(BenchmarkBase):
         print("[runner] config selection is cached per workload and CUDA environment")
         if args.baseline != "none":
             columns = (
-                ("M", 8), ("N", 8), ("K", 8),
-                ("Kernel(ms)", 14), ("Kernel TF/s", 14),
-                ("Baseline(ms)", 14), ("Baseline TF/s", 14),
-                ("Speedup", 10), ("MaxDiff", 12), ("BaselineDiff", 14),
+                ("M", 8),
+                ("N", 8),
+                ("K", 8),
+                ("Kernel(ms)", 14),
+                ("Kernel TF/s", 14),
+                ("Baseline(ms)", 14),
+                ("Baseline TF/s", 14),
+                ("Speedup", 10),
+                ("MaxDiff", 12),
+                ("BaselineDiff", 14),
                 ("BestConfig", 44),
             )
         else:
             columns = (
-                ("M", 8), ("N", 8), ("K", 8),
-                ("Kernel(ms)", 14), ("Kernel TF/s", 14),
-                ("MaxDiff", 12), ("BestConfig", 44),
+                ("M", 8),
+                ("N", 8),
+                ("K", 8),
+                ("Kernel(ms)", 14),
+                ("Kernel TF/s", 14),
+                ("MaxDiff", 12),
+                ("BestConfig", 44),
             )
         table = self.make_table_printer(columns, debug=args.debug)
         table.print_header()
@@ -342,7 +384,9 @@ class Fp8Mxfp4GemmBenchmark(BenchmarkBase):
             w = torch.randn((k, n), device="cuda", dtype=torch.bfloat16)
             compact_b_gmem = args.compact_b_gmem and k % 128 == 0
             x8, w4, sfb = quantize_fp8mxfp4_gemm(
-                x, w, compact_b_gmem=compact_b_gmem,
+                x,
+                w,
+                compact_b_gmem=compact_b_gmem,
             )
             out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
             baseline_run = None
@@ -351,18 +395,34 @@ class Fp8Mxfp4GemmBenchmark(BenchmarkBase):
             if args.baseline != "none":
                 baseline_out = torch.empty_like(out)
                 baseline_factory = (
-                    models_mxfp4_baseline if args.baseline == "models-mxfp4"
+                    models_mxfp4_baseline
+                    if args.baseline == "models-mxfp4"
                     else deepgemm_mxfp4_baseline
                 )
                 baseline_run = baseline_factory(
-                    x8, w4, sfb, baseline_out, compact_b_gmem=compact_b_gmem,
+                    x8,
+                    w4,
+                    sfb,
+                    baseline_out,
+                    compact_b_gmem=compact_b_gmem,
                 )
                 baseline_stats = benchmark_with_stats(
-                    baseline_run, args.warmup, args.iters, args.samples,
+                    baseline_run,
+                    args.warmup,
+                    args.iters,
+                    args.samples,
                     cold_l2_flush=args._cold_l2_flush,
                 )
             selection = self.resolve_kernel(
-                x8, w4, sfb, out, m, n, k, compact_b_gmem, args,
+                x8,
+                w4,
+                sfb,
+                out,
+                m,
+                n,
+                k,
+                compact_b_gmem,
+                args,
             )
             kernel_stats = selection.stats
             max_diff = 0.0
@@ -383,15 +443,27 @@ class Fp8Mxfp4GemmBenchmark(BenchmarkBase):
             kms = kernel_stats["median_ms"]
             if baseline_run is None:
                 table.print_row(
-                    m, n, k, f"{kms:.4f}", f"{tflops_from_ms(m,n,k,kms):.2f}",
-                    f"{max_diff:.6f}", format_candidate(selection.candidate),
+                    m,
+                    n,
+                    k,
+                    f"{kms:.4f}",
+                    f"{tflops_from_ms(m, n, k, kms):.2f}",
+                    f"{max_diff:.6f}",
+                    format_candidate(selection.candidate),
                 )
             else:
                 bms = baseline_stats["median_ms"]
                 table.print_row(
-                    m, n, k, f"{kms:.4f}", f"{tflops_from_ms(m,n,k,kms):.2f}",
-                    f"{bms:.4f}", f"{tflops_from_ms(m,n,k,bms):.2f}",
-                    f"{bms/kms:.2f}x", f"{max_diff:.6f}", f"{baseline_diff:.6f}",
+                    m,
+                    n,
+                    k,
+                    f"{kms:.4f}",
+                    f"{tflops_from_ms(m, n, k, kms):.2f}",
+                    f"{bms:.4f}",
+                    f"{tflops_from_ms(m, n, k, bms):.2f}",
+                    f"{bms / kms:.2f}x",
+                    f"{max_diff:.6f}",
+                    f"{baseline_diff:.6f}",
                     format_candidate(selection.candidate),
                 )
 

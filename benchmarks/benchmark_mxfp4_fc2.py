@@ -9,7 +9,6 @@ routing-weight reduction. Both sides consume identical quantized operands, so
 only FP32 accumulation order differs and a plain tolerance applies.
 """
 
-import argparse
 import math
 import sys
 from dataclasses import replace
@@ -35,7 +34,6 @@ from sm110a_kernel import (  # noqa: E402
     bf16tofp8_quant,
     compile_mxfp4_fc2,
     compile_nvfp4_fc2,
-    from_blocked_fp8mxfp4_scales,
     mxfp4_fc2_out,
     nvfp4_fc2_out,
     pack_routing_metadata,
@@ -46,7 +44,6 @@ from sm110a_kernel import (  # noqa: E402
     to_blocked_mxfp4_sfa,
 )
 from sm110a_kernel.runner import AutotuneRunner, PreparedKernel  # noqa: E402
-
 
 DEFAULT_EXPERTS = 256
 DEFAULT_N = 6144
@@ -102,11 +99,11 @@ def mxfp4_candidates(args):
     if args.tile_k is not None:
         candidates = tuple(c for c in candidates if c.tile_k == args.tile_k)
     if args.cluster_m is not None:
-        candidates = tuple(
-            replace(c, cluster_m=args.cluster_m) for c in candidates)
+        candidates = tuple(replace(c, cluster_m=args.cluster_m) for c in candidates)
     if args.reduce_tile_n is not None:
         candidates = tuple(
-            replace(c, reduce_tile_n=args.reduce_tile_n) for c in candidates)
+            replace(c, reduce_tile_n=args.reduce_tile_n) for c in candidates
+        )
     return candidates
 
 
@@ -127,13 +124,12 @@ def mxfp4_fc2_sol_bounds(router_scores, topk, n, k, config):
     cluster_tile_m = config.cluster_m * config.tile_m
     task_count = sum(
         math.ceil(int(rows) / cluster_tile_m) * (n // config.tile_n)
-        for rows in expert_rows.tolist() if rows
+        for rows in expert_rows.tolist()
+        if rows
     )
     staged_sfb_n = max(config.tile_n, 128)
     tile_read_bytes = task_count * (
-        cluster_tile_m * (k + k / 8)
-        + config.tile_n * k / 2
-        + staged_sfb_n * k / 8
+        cluster_tile_m * (k + k / 8) + config.tile_n * k / 2 + staged_sfb_n * k / 8
     )
     return sol_bounds(
         flops,
@@ -149,7 +145,8 @@ def unpack_e2m1(q, rows, k):
     codes = torch.stack((raw & 0xF, raw >> 4), dim=-1).reshape(rows, k)
     magnitudes = torch.tensor(
         (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0),
-        device=q.device, dtype=torch.float32,
+        device=q.device,
+        dtype=torch.float32,
     )
     values = magnitudes[(codes & 7).long()]
     return torch.where((codes & 8) != 0, -values, values)
@@ -163,11 +160,15 @@ def blocked_to_logical_scales(scales, rows, k):
 
 
 def make_case(tokens, experts, topk, n, k):
-    router_scores = (lambda logits: (
-        torch.randn((tokens, experts), device="cuda")
-        * logits.unsqueeze(0)).to(torch.bfloat16))(
-        torch.arange(1, experts + 1, device="cuda", dtype=torch.float32)
-        .pow(-ROUTER_POWERLAW_ALPHA))
+    router_scores = (
+        lambda logits: (
+            torch.randn((tokens, experts), device="cuda") * logits.unsqueeze(0)
+        ).to(torch.bfloat16)
+    )(
+        torch.arange(1, experts + 1, device="cuda", dtype=torch.float32).pow(
+            -ROUTER_POWERLAW_ALPHA
+        )
+    )
     topk_result = torch.topk(router_scores.float(), topk, dim=1)
     selected = topk_result.indices.to(torch.int32)
     selected_flat = selected.reshape(-1)
@@ -204,13 +205,36 @@ def make_case(tokens, experts, topk, n, k):
     nv_bq = torch.stack(nv_bq_parts)
     nv_sfb = torch.cat(nv_sfb_parts)
     return (
-        aq, sfa128, bq, sfb, sfa, nv_aq, nv_sfa, nv_bq, nv_sfb,
-        routing, grouped_layout, routing_weights, router_scores,
+        aq,
+        sfa128,
+        bq,
+        sfb,
+        sfa,
+        nv_aq,
+        nv_sfa,
+        nv_bq,
+        nv_sfb,
+        routing,
+        grouped_layout,
+        routing_weights,
+        router_scores,
     )
 
 
-def mxfp4_fc2_reference(aq, sfa128, bq, sfb, routing, grouped_layout,
-                        routing_weights, tokens, experts, topk, n, k):
+def mxfp4_fc2_reference(
+    aq,
+    sfa128,
+    bq,
+    sfb,
+    routing,
+    grouped_layout,
+    routing_weights,
+    tokens,
+    experts,
+    topk,
+    n,
+    k,
+):
     m = tokens * topk
     a = aq.float() * sfa128.float().repeat_interleave(128, dim=1)
     grouped = torch.empty((m, n), device="cuda", dtype=torch.float32)
@@ -219,17 +243,24 @@ def mxfp4_fc2_reference(aq, sfa128, bq, sfb, routing, grouped_layout,
         rows = (grouped_layout == expert).nonzero().flatten()
         if rows.numel():
             sfb_e = blocked_to_logical_scales(
-                sfb[expert * scale_elems:(expert + 1) * scale_elems], n, k)
-            b = unpack_e2m1(bq[expert], n, k) * sfb_e.float().repeat_interleave(32, dim=1)
+                sfb[expert * scale_elems : (expert + 1) * scale_elems], n, k
+            )
+            b = unpack_e2m1(bq[expert], n, k) * sfb_e.float().repeat_interleave(
+                32, dim=1
+            )
             grouped[rows] = a[rows] @ b.t()
 
-    assignment_to_grouped = routing[2 * experts + 2 * m:]
+    assignment_to_grouped = routing[2 * experts + 2 * m :]
     assignments = torch.arange(m, device="cuda").view(tokens, topk)
     grouped_rows = assignment_to_grouped[assignments]
     return (
-        grouped[grouped_rows].view(tokens, topk, n)
-        * routing_weights.float().unsqueeze(-1)
-    ).sum(1).bfloat16()
+        (
+            grouped[grouped_rows].view(tokens, topk, n)
+            * routing_weights.float().unsqueeze(-1)
+        )
+        .sum(1)
+        .bfloat16()
+    )
 
 
 class Mxfp4Fc2Benchmark(BenchmarkBase):
@@ -279,67 +310,121 @@ class Mxfp4Fc2Benchmark(BenchmarkBase):
             f"routing=powerlaw(alpha={ROUTER_POWERLAW_ALPHA})"
         )
         print("[parity] NVFP4 W4A4 kernel on the same shapes (tile_n=256 family)")
-        table = TablePrinter((
-            ("Tokens", 9), ("M", 10), ("TopK", 7), ("E", 6),
-            ("N", 8), ("K", 8), ("MXFP4(ms)", 12), ("MXFP4 TF/s", 13),
-            ("NVFP4(ms)", 12), ("NVFP4 TF/s", 13),
-            ("NVFP4/MXFP4", 12), ("MaxDiff", 10),
-            ("Cache", 8), ("MXFP4Config", 32),
-        ), debug=args.debug)
+        table = TablePrinter(
+            (
+                ("Tokens", 9),
+                ("M", 10),
+                ("TopK", 7),
+                ("E", 6),
+                ("N", 8),
+                ("K", 8),
+                ("MXFP4(ms)", 12),
+                ("MXFP4 TF/s", 13),
+                ("NVFP4(ms)", 12),
+                ("NVFP4 TF/s", 13),
+                ("NVFP4/MXFP4", 12),
+                ("MaxDiff", 10),
+                ("Cache", 8),
+                ("MXFP4Config", 32),
+            ),
+            debug=args.debug,
+        )
         table.print_header()
         sol_report = SolReport(debug=args.debug) if args.sol else None
 
         for tokens in args.token_values:
             case = make_case(tokens, args.experts, args.topk, args.n, args.k)
-            (aq, sfa128, bq, sfb, sfa, nv_aq, nv_sfa, nv_bq, nv_sfb,
-             routing, grouped_layout, routing_weights, router_scores) = case
+            (
+                aq,
+                sfa128,
+                bq,
+                sfb,
+                sfa,
+                nv_aq,
+                nv_sfa,
+                nv_bq,
+                nv_sfb,
+                routing,
+                grouped_layout,
+                routing_weights,
+                router_scores,
+            ) = case
             out = torch.empty((tokens, args.n), device="cuda", dtype=torch.bfloat16)
             nv_out = torch.empty_like(out)
             m = tokens * args.topk
+
             # FC2 task packets are parameterized by cluster_m as well.  Build
             # them with the candidate rather than using default cluster-1
             # metadata for the cluster-2 NVFP4 parity candidates.
             def prepare_mxfp4(config):
                 metadata = prepare_mxfp4_fc2_metadata(
-                    grouped_layout, args.experts, args.n, config=config)
+                    grouped_layout, args.experts, args.n, config=config
+                )
                 run = lambda: mxfp4_fc2_out(
-                    aq, bq, sfa, sfb, routing, routing_weights,
-                    metadata, args.topk, out, config=config)
+                    aq,
+                    bq,
+                    sfa,
+                    sfb,
+                    routing,
+                    routing_weights,
+                    metadata,
+                    args.topk,
+                    out,  # noqa: F821
+                    config=config,
+                )
                 # The fused epilogue scatter-adds into the destination.
                 # Start each tactic from zero without timing the memset.
-                out.zero_()
+                out.zero_()  # noqa: F821
                 run()
                 torch.cuda.synchronize()
                 return PreparedKernel(config, run)
 
             def prepare_nvfp4(config):
                 metadata = prepare_nvfp4_fc2_metadata(
-                    grouped_layout, args.experts, args.n, config=config)
+                    grouped_layout, args.experts, args.n, config=config
+                )
                 run = lambda: nvfp4_fc2_out(
-                    nv_aq, nv_bq, nv_sfa, nv_sfb, routing, routing_weights,
-                    metadata, args.topk, nv_out, config=config)
-                nv_out.zero_()
+                    nv_aq,
+                    nv_bq,
+                    nv_sfa,
+                    nv_sfb,
+                    routing,
+                    routing_weights,
+                    metadata,
+                    args.topk,
+                    nv_out,  # noqa: F821
+                    config=config,
+                )
+                nv_out.zero_()  # noqa: F821
                 run()
                 torch.cuda.synchronize()
                 return PreparedKernel(config, run)
 
-            options = self.make_tune_options(args, role="ours",
-                                             pre_parallel_jit=args.pre_parallel_jit)
-            nv_options = self.make_tune_options(args, role="baseline",
-                                                pre_parallel_jit=args.pre_parallel_jit)
+            options = self.make_tune_options(
+                args, role="ours", pre_parallel_jit=args.pre_parallel_jit
+            )
+            nv_options = self.make_tune_options(
+                args, role="baseline", pre_parallel_jit=args.pre_parallel_jit
+            )
             ours_selection = AutotuneRunner(options).resolve(
                 mxfp4_candidates(args),
                 namespace="mxfp4_fc2",
                 key=("v1-w4a8", tokens, args.experts, args.topk, args.n, args.k),
                 prepare=prepare_mxfp4,
                 benchmark=lambda prepared: benchmark_with_stats(
-                    prepared.run, args.warmup, args.iters, args.samples,
-                    cold_l2_flush=args._cold_l2_flush),
+                    prepared.run,
+                    args.warmup,
+                    args.iters,
+                    args.samples,
+                    cold_l2_flush=args._cold_l2_flush,
+                ),
                 probe=lambda prepared: quick_probe(
-                    prepared.run, args.iters, cold_l2_flush=args._cold_l2_flush),
+                    prepared.run, args.iters, cold_l2_flush=args._cold_l2_flush
+                ),
                 format_candidate=format_candidate,
                 metric_formatter=lambda _c, stats: (
-                    f"{fc2_tflops(tokens, args.topk, args.n, args.k, stats['median_ms']):.1f} TF/s"),
+                    f"{fc2_tflops(tokens, args.topk, args.n, args.k, stats['median_ms']):.1f} TF/s"
+                ),
                 pre_jit=compile_mxfp4_fc2,
             )
             nv_selection = AutotuneRunner(nv_options).resolve(
@@ -348,13 +433,19 @@ class Mxfp4Fc2Benchmark(BenchmarkBase):
                 key=("mxfp4-parity", tokens, args.experts, args.topk, args.n, args.k),
                 prepare=prepare_nvfp4,
                 benchmark=lambda prepared: benchmark_with_stats(
-                    prepared.run, args.warmup, args.iters, args.samples,
-                    cold_l2_flush=args._cold_l2_flush),
+                    prepared.run,
+                    args.warmup,
+                    args.iters,
+                    args.samples,
+                    cold_l2_flush=args._cold_l2_flush,
+                ),
                 probe=lambda prepared: quick_probe(
-                    prepared.run, args.iters, cold_l2_flush=args._cold_l2_flush),
+                    prepared.run, args.iters, cold_l2_flush=args._cold_l2_flush
+                ),
                 format_candidate=format_candidate,
                 metric_formatter=lambda _c, stats: (
-                    f"{fc2_tflops(tokens, args.topk, args.n, args.k, stats['median_ms']):.1f} TF/s"),
+                    f"{fc2_tflops(tokens, args.topk, args.n, args.k, stats['median_ms']):.1f} TF/s"
+                ),
                 pre_jit=compile_nvfp4_fc2,
             )
 
@@ -364,9 +455,19 @@ class Mxfp4Fc2Benchmark(BenchmarkBase):
                 ours_selection.prepared.run()
                 torch.cuda.synchronize()
                 ref = mxfp4_fc2_reference(
-                    aq, sfa128, bq, sfb, routing, grouped_layout,
-                    routing_weights, tokens, args.experts, args.topk,
-                    args.n, args.k)
+                    aq,
+                    sfa128,
+                    bq,
+                    sfb,
+                    routing,
+                    grouped_layout,
+                    routing_weights,
+                    tokens,
+                    args.experts,
+                    args.topk,
+                    args.n,
+                    args.k,
+                )
                 max_abs_diff = (out.float() - ref.float()).abs().max().item()
                 # The fused epilogue accumulates the top-k contributions with
                 # BF16 cp.reduce.async.bulk adds, so the error scale is a few
@@ -375,19 +476,26 @@ class Mxfp4Fc2Benchmark(BenchmarkBase):
                 # rounding).  Scale atol accordingly; the fp32-summed
                 # reference itself is exact to accumulation order.
                 scaled_atol = max(args.atol, 0.03 * ref.float().abs().max().item())
-                if not torch.allclose(out.float(), ref.float(),
-                                      atol=scaled_atol, rtol=args.rtol):
+                if not torch.allclose(
+                    out.float(), ref.float(), atol=scaled_atol, rtol=args.rtol
+                ):
                     raise AssertionError(
                         f"MXFP4 FC2 mismatch tokens={tokens}: "
                         f"max_abs_diff={max_abs_diff:.6f} "
-                        f"scaled_atol={scaled_atol:.3f}")
+                        f"scaled_atol={scaled_atol:.3f}"
+                    )
                 del ref
 
             stats = ours_selection.stats
             kernel_ms = stats["median_ms"]
             nv_ms = nv_selection.stats["median_ms"]
             table.print_row(
-                tokens, m, args.topk, args.experts, args.n, args.k,
+                tokens,
+                m,
+                args.topk,
+                args.experts,
+                args.n,
+                args.k,
                 f"{kernel_ms:.4f}",
                 f"{fc2_tflops(tokens, args.topk, args.n, args.k, kernel_ms):.2f}",
                 f"{nv_ms:.4f}",
@@ -400,8 +508,12 @@ class Mxfp4Fc2Benchmark(BenchmarkBase):
             if args.sol:
                 sol_report.add(
                     mxfp4_fc2_sol_bounds(
-                        router_scores, args.topk, args.n, args.k,
-                        ours_selection.candidate),
+                        router_scores,
+                        args.topk,
+                        args.n,
+                        args.k,
+                        ours_selection.candidate,
+                    ),
                     kernel_ms,
                     label=f"MXFP4 FC2 kernel (tokens={tokens})",
                 )

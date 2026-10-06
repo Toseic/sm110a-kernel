@@ -33,12 +33,13 @@ class Fp8ActQuantModule:
 
     def quantize(self, input):
         return self._binding.fp8_act_quant(
-            input, self._block_size, self._scale_mode, self._launcher)
+            input, self._block_size, self._scale_mode, self._launcher
+        )
 
     def quantize_out(self, input, output, scales):
         return self._binding.fp8_act_quant_out(
-            input, output, scales, self._block_size, self._scale_mode,
-            self._launcher)
+            input, output, scales, self._block_size, self._scale_mode, self._launcher
+        )
 
 
 _JIT = SplitCudaJit(
@@ -71,5 +72,4 @@ def fp8_act_quant(input, block_size=128, scale="ue8m0"):
 
 def fp8_act_quant_out(input, output, scales, block_size=128, scale="ue8m0"):
     """Out variant of :func:`fp8_act_quant`."""
-    return compile_fp8_act_quant(block_size, scale).quantize_out(
-        input, output, scales)
+    return compile_fp8_act_quant(block_size, scale).quantize_out(input, output, scales)

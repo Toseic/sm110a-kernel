@@ -48,7 +48,6 @@ from sm110a_kernel import (
 )
 from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
 
-
 DEFAULT_EXPERTS = 256
 DEFAULT_N = 2048
 DEFAULT_K = 6144
@@ -92,12 +91,14 @@ NVFP4_FC1_PARITY_CONFIGS = tuple(
 
 def format_candidate(config):
     epilogue = "dg" if config.direct_gmem else "tma"
-    return "/".join([
-        f"{config.tile_m}x{config.tile_n}x{config.tile_k}",
-        f"e{config.epilogue_tile_n}",
-        f"c{config.cluster_m}",
-        epilogue,
-    ])
+    return "/".join(
+        [
+            f"{config.tile_m}x{config.tile_n}x{config.tile_k}",
+            f"e{config.epilogue_tile_n}",
+            f"c{config.cluster_m}",
+            epilogue,
+        ]
+    )
 
 
 def mxfp4_candidates(args):
@@ -123,7 +124,8 @@ def unpack_e2m1(q, rows, k):
     codes = torch.stack((raw & 0xF, raw >> 4), dim=-1).reshape(rows, k)
     magnitudes = torch.tensor(
         (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0),
-        device=q.device, dtype=torch.float32,
+        device=q.device,
+        dtype=torch.float32,
     )
     values = magnitudes[(codes & 7).long()]
     return torch.where((codes & 8) != 0, -values, values)
@@ -155,13 +157,16 @@ def mxfp4_fc1_reference(aq, sfa128, bq, sfb, metadata, experts, n, k, swiglu_lim
     grouped_a = a[metadata.source_rows.long()]
     grouped = torch.empty((m, 2 * n), device=aq.device, dtype=torch.float32)
     scale_elems = (2 * n) * (k // 32) * 4
-    layout = metadata.routing[2 * experts:2 * experts + m]
+    layout = metadata.routing[2 * experts : 2 * experts + m]
     for expert in range(experts):
         rows = (layout == expert).nonzero().flatten()
         if rows.numel():
             sfb_e = blocked_to_logical_scales(
-                sfb[expert * scale_elems:(expert + 1) * scale_elems], 2 * n, k)
-            b = unpack_e2m1(bq[expert], 2 * n, k) * sfb_e.float().repeat_interleave(32, dim=1)
+                sfb[expert * scale_elems : (expert + 1) * scale_elems], 2 * n, k
+            )
+            b = unpack_e2m1(bq[expert], 2 * n, k) * sfb_e.float().repeat_interleave(
+                32, dim=1
+            )
             grouped[rows] = grouped_a[rows] @ b.t()
 
     # Physical [gate:64, up:64] blocks -> logical SwiGLU columns.
@@ -173,18 +178,20 @@ def mxfp4_fc1_reference(aq, sfa128, bq, sfb, metadata, experts, n, k, swiglu_lim
         gate_v = torch.clamp(gate_v, max=swiglu_limit)
     act = torch.nn.functional.silu(gate_v) * up_v
     ref_q, ref_scale_raw, ref_scale = quant_fp8_e8m0(act)
-    return ref_q.float() * ref_scale.repeat_interleave(128, dim=1).view(m, n), ref_scale_raw
+    return ref_q.float() * ref_scale.repeat_interleave(128, dim=1).view(
+        m, n
+    ), ref_scale_raw
 
 
 def mxfp4_fc1_outputs_close(out, out_scale, ref, ref_scale_raw, m, n):
     """Dequantized tolerance check plus a sparse one-code fallback."""
     ks_tiles = from_blocked_fp8mxfp4_scales(out_scale, m, n).view(torch.uint8)
     ks_tiles = ks_tiles.view(m, n // 128, 4)
-    replicas_agree = bool(torch.equal(
-        ks_tiles, ks_tiles[:, :, :1].expand_as(ks_tiles)))
+    replicas_agree = bool(torch.equal(ks_tiles, ks_tiles[:, :, :1].expand_as(ks_tiles)))
     ks128 = ks_tiles[:, :, 0].view(torch.float8_e8m0fnu)
-    got = out.float() * (ks128.view(torch.uint8).to(torch.int32) << 23
-                         ).view(torch.float32).repeat_interleave(128, dim=1)
+    got = out.float() * (ks128.view(torch.uint8).to(torch.int32) << 23).view(
+        torch.float32
+    ).repeat_interleave(128, dim=1)
     max_diff = (got - ref).abs().max().item()
     if not replicas_agree:
         return False, max_diff
@@ -192,8 +199,9 @@ def mxfp4_fc1_outputs_close(out, out_scale, ref, ref_scale_raw, m, n):
         return True, max_diff
     mismatched = ~torch.isclose(got, ref, atol=2e-2, rtol=2e-2)
     mismatch = int(mismatched.sum().item())
-    limit = max(MIN_ADJACENT_CODE_MISMATCHES,
-                int(got.numel() * MAX_ADJACENT_CODE_MISMATCH_RATE))
+    limit = max(
+        MIN_ADJACENT_CODE_MISMATCHES, int(got.numel() * MAX_ADJACENT_CODE_MISMATCH_RATE)
+    )
     if mismatch > limit:
         return False, max_diff
     got_bad, ref_bad = got[mismatched], ref[mismatched]
@@ -214,14 +222,17 @@ def mxfp4_fc1_sol_bounds(router, topk, n, k, config):
     experts = router.size(1)
     selected = torch.argsort(
         torch.nan_to_num(router.float(), nan=-float("inf")),
-        dim=1, descending=True, stable=True,
+        dim=1,
+        descending=True,
+        stable=True,
     )[:, :topk]
     expert_rows = torch.bincount(selected.reshape(-1), minlength=experts)
     active_experts = int((expert_rows > 0).sum().item())
     m = selected.numel()
     m_tasks = sum(
         math.ceil(rows / (config.cluster_m * config.tile_m))
-        for rows in expert_rows.tolist() if rows
+        for rows in expert_rows.tolist()
+        if rows
     )
     task_count = m_tasks * ((2 * n) // (config.tile_n * config.cluster_n))
 
@@ -253,7 +264,11 @@ class Mxfp4Fc1Benchmark(BenchmarkBase):
         parser.add_argument("--k", type=int, default=DEFAULT_K)
         parser.add_argument("--swiglu-limit", type=float, default=DEFAULT_SWIGLU_LIMIT)
         parser.add_argument(
-            "--token", "--tokens", dest="token", type=int, default=0,
+            "--token",
+            "--tokens",
+            dest="token",
+            type=int,
+            default=0,
             help="run one token count; default runs the standard token sweep",
         )
         self.add_timing_args(parser, warmup=2, iters=5, samples=3)
@@ -272,7 +287,9 @@ class Mxfp4Fc1Benchmark(BenchmarkBase):
     def validate_args(self, args):
         self.validate_timing_args(args, allow_zero_warmup=True)
         if args.experts <= 0 or args.topk <= 0 or args.topk > args.experts:
-            raise SystemExit("experts must be positive and topk must be in [1, experts]")
+            raise SystemExit(
+                "experts must be positive and topk must be in [1, experts]"
+            )
         # TileN=256 physical: N logical must be a multiple of 128.
         if args.n <= 0 or args.n % 128 or args.k <= 0 or args.k % 64:
             raise SystemExit("N must be a positive multiple of 128 and K of 64")
@@ -299,13 +316,25 @@ class Mxfp4Fc1Benchmark(BenchmarkBase):
             f"tokens={args.token_values} routing=powerlaw(alpha={ROUTER_POWERLAW_ALPHA})"
         )
         print("[parity] NVFP4 W4A4 kernel on the same shapes (tile_n=256 family)")
-        table = TablePrinter((
-            ("Tokens", 9), ("M", 10), ("TopK", 7), ("E", 6),
-            ("N", 8), ("K", 8), ("MXFP4(ms)", 12), ("MXFP4 TF/s", 13),
-            ("NVFP4(ms)", 12), ("NVFP4 TF/s", 13),
-            ("NVFP4/MXFP4", 12), ("MaxDiff", 10),
-            ("Cache", 8), ("MXFP4Config", 28),
-        ), debug=args.debug)
+        table = TablePrinter(
+            (
+                ("Tokens", 9),
+                ("M", 10),
+                ("TopK", 7),
+                ("E", 6),
+                ("N", 8),
+                ("K", 8),
+                ("MXFP4(ms)", 12),
+                ("MXFP4 TF/s", 13),
+                ("NVFP4(ms)", 12),
+                ("NVFP4 TF/s", 13),
+                ("NVFP4/MXFP4", 12),
+                ("MaxDiff", 10),
+                ("Cache", 8),
+                ("MXFP4Config", 28),
+            ),
+            debug=args.debug,
+        )
         table.print_header()
         sol_report = SolReport(debug=args.debug) if args.sol else None
 
@@ -317,42 +346,62 @@ class Mxfp4Fc1Benchmark(BenchmarkBase):
             gate = torch.randn((args.n, args.k), device="cuda", dtype=torch.bfloat16)
             up = torch.randn((args.n, args.k), device="cuda", dtype=torch.bfloat16)
             b_expert = torch.stack(
-                (gate.view(args.n // 64, 64, args.k), up.view(args.n // 64, 64, args.k)),
-                dim=1).reshape(2 * args.n, args.k)
+                (
+                    gate.view(args.n // 64, 64, args.k),
+                    up.view(args.n // 64, 64, args.k),
+                ),
+                dim=1,
+            ).reshape(2 * args.n, args.k)
             bq_expert, sfb_expert = quantize_nvfp4_rows(b_expert)
             if nv_bq is None:
-                nv_bq = torch.empty((args.experts, 2 * args.n, args.k // 2),
-                                    device="cuda", dtype=bq_expert.dtype)
-                nv_sfb = torch.empty((args.experts * sfb_expert.numel(),),
-                                     device="cuda", dtype=sfb_expert.dtype)
+                nv_bq = torch.empty(
+                    (args.experts, 2 * args.n, args.k // 2),
+                    device="cuda",
+                    dtype=bq_expert.dtype,
+                )
+                nv_sfb = torch.empty(
+                    (args.experts * sfb_expert.numel(),),
+                    device="cuda",
+                    dtype=sfb_expert.dtype,
+                )
             nv_bq[expert].copy_(bq_expert)
-            nv_sfb[expert * sfb_expert.numel():(expert + 1) * sfb_expert.numel()] \
-                .copy_(sfb_expert)
+            nv_sfb[
+                expert * sfb_expert.numel() : (expert + 1) * sfb_expert.numel()
+            ].copy_(sfb_expert)
             del gate, up, b_expert, bq_expert, sfb_expert
 
         nv_candidates = NVFP4_FC1_PARITY_CONFIGS
 
         for tokens in args.token_values:
-            router = (lambda logits: (
-                torch.randn((tokens, args.experts), device="cuda")
-                * logits.unsqueeze(0)).to(torch.bfloat16))(
-                torch.arange(1, args.experts + 1, device="cuda",
-                             dtype=torch.float32).pow(-ROUTER_POWERLAW_ALPHA))
+            router = (
+                lambda logits: (
+                    torch.randn((tokens, args.experts), device="cuda")
+                    * logits.unsqueeze(0)
+                ).to(torch.bfloat16)
+            )(
+                torch.arange(
+                    1, args.experts + 1, device="cuda", dtype=torch.float32
+                ).pow(-ROUTER_POWERLAW_ALPHA)
+            )
             a = torch.randn((tokens, args.k), device="cuda", dtype=torch.bfloat16)
             aq, sfa128 = bf16tofp8_quant(a)
             del a
             sfa = to_blocked_mxfp4_sfa(sfa128)
             nv_aq, nv_sfa = quantize_nvfp4_rows(
-                torch.randn((tokens, args.k), device="cuda", dtype=torch.bfloat16))
+                torch.randn((tokens, args.k), device="cuda", dtype=torch.bfloat16)
+            )
 
             m = tokens * args.topk
             out = torch.empty((m, args.n), device="cuda", dtype=torch.float8_e4m3fn)
-            out_scale = torch.empty((m * (args.n // 32) * 4,), device="cuda",
-                                    dtype=torch.float8_e8m0fnu)
-            nv_out = torch.empty((m, args.n // 2), device="cuda",
-                                 dtype=torch.float4_e2m1fn_x2)
-            nv_out_scale = torch.empty((m * (args.n // 16),), device="cuda",
-                                       dtype=torch.float8_e4m3fn)
+            out_scale = torch.empty(
+                (m * (args.n // 32) * 4,), device="cuda", dtype=torch.float8_e8m0fnu
+            )
+            nv_out = torch.empty(
+                (m, args.n // 2), device="cuda", dtype=torch.float4_e2m1fn_x2
+            )
+            nv_out_scale = torch.empty(
+                (m * (args.n // 16),), device="cuda", dtype=torch.float8_e4m3fn
+            )
 
             routed_m = m
 
@@ -366,10 +415,19 @@ class Mxfp4Fc1Benchmark(BenchmarkBase):
 
             def prepare_mxfp4(config):
                 metadata = prepare_mxfp4_fc1_metadata(
-                    router, args.topk, 2 * args.n, config=config)
+                    router, args.topk, 2 * args.n, config=config
+                )
                 run = lambda: mxfp4_fc1_out(
-                    aq, bq, sfa, sfb, metadata, out, out_scale,
-                    swiglu_limit=args.swiglu_limit, config=config)
+                    aq,  # noqa: F821
+                    bq,
+                    sfa,  # noqa: F821
+                    sfb,
+                    metadata,
+                    out,  # noqa: F821
+                    out_scale,  # noqa: F821
+                    swiglu_limit=args.swiglu_limit,
+                    config=config,
+                )
                 run()
                 torch.cuda.synchronize()
                 mxfp4_metadata[config] = metadata
@@ -377,32 +435,48 @@ class Mxfp4Fc1Benchmark(BenchmarkBase):
 
             def prepare_nvfp4(config):
                 metadata = prepare_nvfp4_fc1_metadata(
-                    router, args.topk, 2 * args.n, config=config)
+                    router, args.topk, 2 * args.n, config=config
+                )
                 run = lambda: nvfp4_fc1_out(
-                    nv_aq, nv_bq, nv_sfa, nv_sfb, metadata, nv_out,
-                    nv_out_scale, config=config)
+                    nv_aq,  # noqa: F821
+                    nv_bq,
+                    nv_sfa,  # noqa: F821
+                    nv_sfb,
+                    metadata,
+                    nv_out,  # noqa: F821
+                    nv_out_scale,  # noqa: F821
+                    config=config,
+                )
                 run()
                 torch.cuda.synchronize()
                 nvfp4_metadata[config] = metadata
                 return PreparedKernel(config, run)
 
-            options = self.make_tune_options(args, role="ours",
-                                             pre_parallel_jit=args.pre_parallel_jit)
-            nv_options = self.make_tune_options(args, role="baseline",
-                                                pre_parallel_jit=args.pre_parallel_jit)
+            options = self.make_tune_options(
+                args, role="ours", pre_parallel_jit=args.pre_parallel_jit
+            )
+            nv_options = self.make_tune_options(
+                args, role="baseline", pre_parallel_jit=args.pre_parallel_jit
+            )
             ours_selection = AutotuneRunner(options).resolve(
                 mxfp4_candidates(args),
                 namespace="mxfp4_fc1",
                 key=("v1-w4a8", tokens, args.experts, args.topk, args.n, args.k),
                 prepare=prepare_mxfp4,
                 benchmark=lambda prepared: benchmark_with_stats(
-                    prepared.run, args.warmup, args.iters, args.samples,
-                    cold_l2_flush=args._cold_l2_flush),
+                    prepared.run,
+                    args.warmup,
+                    args.iters,
+                    args.samples,
+                    cold_l2_flush=args._cold_l2_flush,
+                ),
                 probe=lambda prepared: quick_probe(
-                    prepared.run, args.iters, cold_l2_flush=args._cold_l2_flush),
+                    prepared.run, args.iters, cold_l2_flush=args._cold_l2_flush
+                ),
                 format_candidate=format_candidate,
                 metric_formatter=lambda _c, stats: (
-                    f"{fc1_tflops_from_ms(routed_m, args.n, args.k, stats['median_ms']):.1f} TF/s"),
+                    f"{fc1_tflops_from_ms(routed_m, args.n, args.k, stats['median_ms']):.1f} TF/s"
+                ),
                 pre_jit=compile_mxfp4_fc1,
             )
             nv_selection = AutotuneRunner(nv_options).resolve(
@@ -411,13 +485,19 @@ class Mxfp4Fc1Benchmark(BenchmarkBase):
                 key=("mxfp4-parity", tokens, args.experts, args.topk, args.n, args.k),
                 prepare=prepare_nvfp4,
                 benchmark=lambda prepared: benchmark_with_stats(
-                    prepared.run, args.warmup, args.iters, args.samples,
-                    cold_l2_flush=args._cold_l2_flush),
+                    prepared.run,
+                    args.warmup,
+                    args.iters,
+                    args.samples,
+                    cold_l2_flush=args._cold_l2_flush,
+                ),
                 probe=lambda prepared: quick_probe(
-                    prepared.run, args.iters, cold_l2_flush=args._cold_l2_flush),
+                    prepared.run, args.iters, cold_l2_flush=args._cold_l2_flush
+                ),
                 format_candidate=format_candidate,
                 metric_formatter=lambda _c, stats: (
-                    f"{fc1_tflops_from_ms(routed_m, args.n, args.k, stats['median_ms']):.1f} TF/s"),
+                    f"{fc1_tflops_from_ms(routed_m, args.n, args.k, stats['median_ms']):.1f} TF/s"
+                ),
                 pre_jit=compile_nvfp4_fc1,
             )
 
@@ -426,20 +506,32 @@ class Mxfp4Fc1Benchmark(BenchmarkBase):
                 ours_selection.prepared.run()
                 torch.cuda.synchronize()
                 ref, ref_scale_raw = mxfp4_fc1_reference(
-                    aq, sfa128, bq, sfb, mxfp4_metadata[ours_selection.candidate],
-                    args.experts, args.n, args.k,
-                    args.swiglu_limit)
+                    aq,
+                    sfa128,
+                    bq,
+                    sfb,
+                    mxfp4_metadata[ours_selection.candidate],
+                    args.experts,
+                    args.n,
+                    args.k,
+                    args.swiglu_limit,
+                )
                 close, max_diff = mxfp4_fc1_outputs_close(
-                    out, out_scale, ref, ref_scale_raw, m, args.n)
+                    out, out_scale, ref, ref_scale_raw, m, args.n
+                )
                 del ref
                 if not close:
-                    raise AssertionError(
-                        f"MXFP4 FC1 mismatch: max diff {max_diff}")
+                    raise AssertionError(f"MXFP4 FC1 mismatch: max diff {max_diff}")
 
             kernel_ms = ours_selection.stats["median_ms"]
             nv_ms = nv_selection.stats["median_ms"]
             table.print_row(
-                tokens, m, args.topk, args.experts, args.n, args.k,
+                tokens,
+                m,
+                args.topk,
+                args.experts,
+                args.n,
+                args.k,
                 f"{kernel_ms:.4f}",
                 f"{fc1_tflops_from_ms(m, args.n, args.k, kernel_ms):.2f}",
                 f"{nv_ms:.4f}",
@@ -454,7 +546,8 @@ class Mxfp4Fc1Benchmark(BenchmarkBase):
             if args.sol:
                 sol_report.add(
                     mxfp4_fc1_sol_bounds(
-                        router, args.topk, args.n, args.k, ours_selection.candidate),
+                        router, args.topk, args.n, args.k, ours_selection.candidate
+                    ),
                     kernel_ms,
                     label=f"MXFP4 FC1 kernel (tokens={tokens}, routing excluded)",
                 )

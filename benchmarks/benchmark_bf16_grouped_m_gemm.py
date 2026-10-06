@@ -10,26 +10,27 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from deepgemm_baseline import bf16_grouped_nt as deepgemm_bf16_grouped_nt
+
 from common import (
     BenchmarkBase,
     SolReport,
     benchmark_with_stats,
     quick_probe,
-    tflops_from_ms,
     sol_bounds,
+    tflops_from_ms,
 )
 from sm110a_kernel import (
     GroupedMConfig,
-    compile_bf16_grouped_m_gemm,
     bf16_grouped_m_gemm_out,
+    compile_bf16_grouped_m_gemm,
     prepare_grouped_m_metadata,
 )
 from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
-from deepgemm_baseline import bf16_grouped_nt as deepgemm_bf16_grouped_nt
 
-'''
+"""
 roofline analysis:
-Thor: 
+Thor:
 250Tflops/s & 0.273TB/s
 peak AI: 250 / 0.273 = 915 flops/Byte
 
@@ -42,9 +43,7 @@ e = 256
 peak_m / e = 915
 peak_m = 915 * e
 
-'''
-
-
+"""
 
 
 EXPERTS = 256
@@ -69,6 +68,8 @@ GROUPED_M_CONFIGS = tuple(
     for direct_gmem in (False,)
     if tile_n % epilogue_tile_n == 0
 )
+
+
 def build_layout(tokens_per_expert, experts):
     layout = torch.arange(experts, device="cuda", dtype=torch.int32)
     return layout.repeat_interleave(tokens_per_expert)
@@ -94,9 +95,7 @@ def make_deepgemm_workload(a, layout, b, tokens_per_expert):
     """
     experts, n, k = b.shape
     padded_tokens = math.ceil(tokens_per_expert / 128) * 128
-    padded_a = torch.zeros(
-        (experts * padded_tokens, k), device=a.device, dtype=a.dtype
-    )
+    padded_a = torch.zeros((experts * padded_tokens, k), device=a.device, dtype=a.dtype)
     padded_layout = torch.full(
         (experts * padded_tokens,), -1, device=a.device, dtype=torch.int32
     )
@@ -111,7 +110,9 @@ def make_deepgemm_workload(a, layout, b, tokens_per_expert):
     )
 
     def valid_output():
-        return padded_out.view(experts, padded_tokens, n)[:, :tokens_per_expert].reshape(-1, n)
+        return padded_out.view(experts, padded_tokens, n)[
+            :, :tokens_per_expert
+        ].reshape(-1, n)
 
     return padded_a.reshape(-1, k), padded_layout.reshape(-1), padded_out, valid_output
 
@@ -134,16 +135,13 @@ def benchmark_grouped_baseline(a, b, tokens_per_expert, out, args):
     )
 
 
-def benchmark_grouped_kernel(
-    a, b, layout, out, config, swap_ab, args
-):
+def benchmark_grouped_kernel(a, b, layout, out, config, swap_ab, args):
     metadata = prepare_grouped_m_metadata(
-        layout, b.size(0), b.size(1), config=config, swap_ab=swap_ab)
+        layout, b.size(0), b.size(1), config=config, swap_ab=swap_ab
+    )
     # Compile and launch once before recording CUDA events. This also rejects a
     # configuration that cannot launch on the current device.
-    bf16_grouped_m_gemm_out(
-        a, b, metadata, out, config=config, swap_ab=swap_ab
-    )
+    bf16_grouped_m_gemm_out(a, b, metadata, out, config=config, swap_ab=swap_ab)
     torch.cuda.synchronize()
     return benchmark_with_stats(
         lambda: bf16_grouped_m_gemm_out(
@@ -158,10 +156,9 @@ def benchmark_grouped_kernel(
 
 def probe_grouped_kernel(a, b, layout, out, config, swap_ab, args):
     metadata = prepare_grouped_m_metadata(
-        layout, b.size(0), b.size(1), config=config, swap_ab=swap_ab)
-    bf16_grouped_m_gemm_out(
-        a, b, metadata, out, config=config, swap_ab=swap_ab
+        layout, b.size(0), b.size(1), config=config, swap_ab=swap_ab
     )
+    bf16_grouped_m_gemm_out(a, b, metadata, out, config=config, swap_ab=swap_ab)
     torch.cuda.synchronize()
     return quick_probe(
         lambda: bf16_grouped_m_gemm_out(
@@ -247,10 +244,7 @@ def grouped_m_gemm_sol_bounds(tokens_per_expert, experts, n, k, config):
     b_bytes = 2 * experts * n * k
     c_bytes = 2 * m * n
     tile_read_bytes = (
-        2
-        * task_count
-        * (config.cluster_m * config.tile_m + config.tile_n)
-        * k
+        2 * task_count * (config.cluster_m * config.tile_m + config.tile_n) * k
     )
     return sol_bounds(
         flops, a_bytes + b_bytes + c_bytes, a_bytes + b_bytes, tile_read_bytes
@@ -260,15 +254,10 @@ def grouped_m_gemm_sol_bounds(tokens_per_expert, experts, n, k, config):
 def print_debug_results(results, experts, n, k):
     print()
     print("[debug] per-config performance")
-    print(
-        f"{'Tok/E':<8}{'Config':<40}{'Median(ms)':<14}"
-        f"{'TFLOPS':<14}{'Best':<6}"
-    )
+    print(f"{'Tok/E':<8}{'Config':<40}{'Median(ms)':<14}{'TFLOPS':<14}{'Best':<6}")
     for tokens_per_expert, stats, config, swap_ab, is_best in results:
         valid_m = experts * tokens_per_expert
-        tflops = tflops_from_ms(
-            valid_m, n, k, stats["median_ms"]
-        )
+        tflops = tflops_from_ms(valid_m, n, k, stats["median_ms"])
         print(
             f"{tokens_per_expert:<8}"
             f"{format_candidate(config, swap_ab):<40}"
@@ -308,7 +297,9 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
         )
         self.add_torch_blas_arg(parser)
         parser.add_argument(
-            "--baseline", choices=("torch", "deepgemm"), default="torch",
+            "--baseline",
+            choices=("torch", "deepgemm"),
+            default="torch",
             help="reference implementation to benchmark",
         )
         self.add_cache_args(parser)
@@ -346,12 +337,10 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
         self.make_result_table().print_header()
         sol_report = SolReport(debug=args.debug) if args.sol else None
         for tokens_per_expert in tokens_per_expert_values:
-            a, layout, out_kernel, out_baseline = make_workload(
-                tokens_per_expert, b
-            )
+            a, layout, out_kernel, out_baseline = make_workload(tokens_per_expert, b)
             if args.baseline == "deepgemm":
-                deep_a, deep_layout, deep_out, deep_valid_output = make_deepgemm_workload(
-                    a, layout, b, tokens_per_expert
+                deep_a, deep_layout, deep_out, deep_valid_output = (
+                    make_deepgemm_workload(a, layout, b, tokens_per_expert)
                 )
                 baseline = deepgemm_bf16_grouped_nt(deep_a, b, deep_out, deep_layout)
             else:
@@ -360,7 +349,10 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
                     a, b, tokens_per_expert, out_baseline
                 )
             baseline_stats = benchmark_with_stats(
-                baseline, args.warmup, args.iters, args.samples,
+                baseline,
+                args.warmup,
+                args.iters,
+                args.samples,
                 cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             )
             selection = self.resolve_grouped_kernel(a, b, layout, out_kernel, args)
@@ -414,6 +406,7 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
         tokens_per_expert = layout.numel() // b.size(0)
         n = b.size(1)
         k = a.size(1)
+
         def prepare(candidate):
             config, swap_ab = candidate
             metadata = prepare_grouped_m_metadata(
@@ -435,17 +428,22 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
             candidates,
             prepare=prepare,
             benchmark=lambda prepared: benchmark_with_stats(
-                prepared.run, args.warmup, args.iters, args.samples,
+                prepared.run,
+                args.warmup,
+                args.iters,
+                args.samples,
                 cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             ),
             probe=lambda prepared: quick_probe(
-                prepared.run, args.iters,
+                prepared.run,
+                args.iters,
                 cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             ),
             format_candidate=lambda candidate: format_candidate(
                 candidate[0], candidate[1]
             ),
-            namespace="bf16_grouped_m_gemm", key=(n, k, tokens_per_expert),
+            namespace="bf16_grouped_m_gemm",
+            key=(n, k, tokens_per_expert),
             metric_formatter=lambda _candidate, stats: (
                 f"{tflops_from_ms(a.size(0), n, k, stats['median_ms']):.1f} TF/s"
             ),

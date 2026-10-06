@@ -15,15 +15,16 @@ Two orthogonal axes are baked in at JIT compile time:
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
-from typing import Iterable, Optional
 
 from ..jit_runtime import SplitCudaJit
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_DIR = _ROOT / "csrc/bf16_fa4/src"
+
 
 class Bf16Fa4GqaTactic(IntEnum):
     """CTA schedules supported by the BF16 FA4 GQA kernel."""
@@ -47,9 +48,7 @@ class Bf16Fa4GqaConfig:
         try:
             tactic = Bf16Fa4GqaTactic(self.tactic)
         except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "tactic must be 0 (16-warp) or 1 (12-warp)"
-            ) from exc
+            raise ValueError("tactic must be 0 (16-warp) or 1 (12-warp)") from exc
         object.__setattr__(self, "tactic", tactic)
         object.__setattr__(self, "pack_gqa", bool(self.pack_gqa))
 
@@ -62,13 +61,19 @@ class Bf16Fa4GqaConfig:
 
 class Bf16Fa4GqaModule:
     def __init__(self, binding, library, config: Bf16Fa4GqaConfig):
-        self._binding, self._launcher, self._config = binding, library.entry_address, config
+        self._binding, self._launcher, self._config = (
+            binding,
+            library.entry_address,
+            config,
+        )
 
     def fa_gqa(self, q, k, v, causal=False, scale=1.0):
         return self._binding.fa_gqa(q, k, v, self._launcher, bool(causal), scale)
 
     def fa_gqa_out(self, q, k, v, out, causal=False, scale=1.0):
-        return self._binding.fa_gqa_out(q, k, v, out, self._launcher, bool(causal), scale)
+        return self._binding.fa_gqa_out(
+            q, k, v, out, self._launcher, bool(causal), scale
+        )
 
 
 def _kernel_cflags(config: Bf16Fa4GqaConfig, _variant) -> tuple[str, ...]:
@@ -79,16 +84,19 @@ def _kernel_cflags(config: Bf16Fa4GqaConfig, _variant) -> tuple[str, ...]:
 
 
 _JIT = SplitCudaJit(
-    name="sm110a_bf16_fa4_gqa", root=_ROOT,
+    name="sm110a_bf16_fa4_gqa",
+    root=_ROOT,
     binding_sources=(_ROOT / "csrc/bf16_fa4_gqa/src/bf16_fa4_gqa_torch_binding.cpp",),
     kernel_sources=(_ROOT / "csrc/bf16_fa4_gqa/src/bf16_fa4_gqa_kernel.cu",),
     kernel_dependencies=(),
-    kernel_symbol="sm110a_bf16_fa4_gqa_launch", config_key=lambda config: config,
-    kernel_cflags=_kernel_cflags, make_facade=Bf16Fa4GqaModule,
+    kernel_symbol="sm110a_bf16_fa4_gqa_launch",
+    config_key=lambda config: config,
+    kernel_cflags=_kernel_cflags,
+    make_facade=Bf16Fa4GqaModule,
 )
 
 
-def compile_bf16_fa4_gqa(config: Optional[Bf16Fa4GqaConfig] = None) -> Bf16Fa4GqaModule:
+def compile_bf16_fa4_gqa(config: Bf16Fa4GqaConfig | None = None) -> Bf16Fa4GqaModule:
     config = config or Bf16Fa4GqaConfig()
     if not isinstance(config, Bf16Fa4GqaConfig):
         raise TypeError("config must be a Bf16Fa4GqaConfig")
@@ -105,7 +113,7 @@ def compile_bf16_fa4_gqa_configs(configs: Iterable[Bf16Fa4GqaConfig], max_worker
     return _JIT.compile_many(configs, max_workers)
 
 
-def get_bf16_fa4_gqa_module(config: Optional[Bf16Fa4GqaConfig] = None):
+def get_bf16_fa4_gqa_module(config: Bf16Fa4GqaConfig | None = None):
     return compile_bf16_fa4_gqa(config)
 
 
@@ -127,16 +135,18 @@ def _config_for(
     return Bf16Fa4GqaConfig(tactic=tactic, pack_gqa=pack_gqa)
 
 
-def bf16_fa4_gqa(q, k, v, *, causal=False, scale=None, tactic=TACTIC_16WARP,
-                 pack_gqa=False):
+def bf16_fa4_gqa(
+    q, k, v, *, causal=False, scale=None, tactic=TACTIC_16WARP, pack_gqa=False
+):
     """Compute BF16 GQA for Q `[B,Hq,S,D]` and K/V `[B,Hkv,S,D]` tensors."""
     return compile_bf16_fa4_gqa(_config_for(tactic, pack_gqa)).fa_gqa(
         q, k, v, bool(causal), _resolve_scale(q, scale)
     )
 
 
-def bf16_fa4_gqa_out(q, k, v, out, *, causal=False, scale=None, tactic=TACTIC_16WARP,
-                     pack_gqa=False):
+def bf16_fa4_gqa_out(
+    q, k, v, out, *, causal=False, scale=None, tactic=TACTIC_16WARP, pack_gqa=False
+):
     """Write BF16 FA GQA to a caller-provided contiguous output."""
     return compile_bf16_fa4_gqa(_config_for(tactic, pack_gqa)).fa_gqa_out(
         q, k, v, out, bool(causal), _resolve_scale(q, scale)

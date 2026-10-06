@@ -30,7 +30,14 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _TRTLLM_DIR = _REPO_ROOT / "baselinedir" / "TensorRT-LLM" / "tensorrt_llm"
 _TORCH_DIR = _REPO_ROOT / "baselinedir" / "TensorRT-LLM" / "tensorrt_llm" / "_torch"
-_KERNEL_ROOT = _REPO_ROOT / "baselinedir" / "TensorRT-LLM" / "tensorrt_llm" / "_torch" / "cute_dsl_kernels"
+_KERNEL_ROOT = (
+    _REPO_ROOT
+    / "baselinedir"
+    / "TensorRT-LLM"
+    / "tensorrt_llm"
+    / "_torch"
+    / "cute_dsl_kernels"
+)
 _BLACKWELL_DIR = _KERNEL_ROOT / "blackwell"
 
 _STUB_PACKAGES = (

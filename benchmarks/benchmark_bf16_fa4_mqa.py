@@ -25,7 +25,6 @@ if str(ROOT) not in sys.path:
 from common import BenchmarkBase, SolReport, benchmark_with_stats, sol_bounds
 from sm110a_kernel import bf16_fa4_mqa_out
 
-
 PREFILL_LENGTHS = (1024, 2048, 4096, 8192, 16384)
 DECODE_BATCH_SIZES = (32, 64, 128)
 DEFAULT_Q_HEADS = 32
@@ -58,7 +57,13 @@ def attention_valid_score_count(case):
 
 def attention_flops(case):
     # QK and PV each perform a multiply and an add for every visible score.
-    return 4 * case.batch * case.q_heads * attention_valid_score_count(case) * case.head_dim
+    return (
+        4
+        * case.batch
+        * case.q_heads
+        * attention_valid_score_count(case)
+        * case.head_dim
+    )
 
 
 def attention_tflops(case, elapsed_ms):
@@ -74,8 +79,12 @@ def attention_sol_bounds(case, *, tile_q=128, tile_kv=128):
     """
     element_bytes = 2  # BF16 Q, K, V, O
     q_bytes = element_bytes * case.batch * case.q_heads * case.q_len * case.head_dim
-    kv_input_bytes = 2 * element_bytes * case.batch * case.kv_heads * case.kv_len * case.head_dim
-    output_bytes = element_bytes * case.batch * case.q_heads * case.q_len * case.head_dim
+    kv_input_bytes = (
+        2 * element_bytes * case.batch * case.kv_heads * case.kv_len * case.head_dim
+    )
+    output_bytes = (
+        element_bytes * case.batch * case.q_heads * case.q_len * case.head_dim
+    )
 
     logical_q_len = case.q_len * PACK_SIZE
     q_pair_count = math.ceil(logical_q_len / (2 * tile_q))
@@ -109,9 +118,9 @@ def reference_attention(q, k, v, *, causal, scale):
     if causal:
         causal_offset = k.size(-2) - q.size(-2)
         scores.masked_fill_(
-            torch.ones((q.size(-2), k.size(-2)), device=q.device, dtype=torch.bool).triu(
-                1 + causal_offset
-            ),
+            torch.ones(
+                (q.size(-2), k.size(-2)), device=q.device, dtype=torch.bool
+            ).triu(1 + causal_offset),
             float("-inf"),
         )
     return torch.softmax(scores, dim=-1).matmul(v.float()).to(torch.bfloat16)
@@ -156,45 +165,97 @@ class Bf16Fa4MqaBenchmark(BenchmarkBase):
         return parser
 
     def validate_args(self, args):
-        if min(args.batch, args.q_heads, args.kv_heads, args.q_len, args.kv_len, args.head_dim) <= 0:
+        if (
+            min(
+                args.batch,
+                args.q_heads,
+                args.kv_heads,
+                args.q_len,
+                args.kv_len,
+                args.head_dim,
+            )
+            <= 0
+        ):
             raise SystemExit("all dimensions must be positive")
         if args.kv_heads != 1:
             raise SystemExit("MQA requires --kv-heads == 1")
         if args.q_heads < PACK_SIZE or args.q_heads % PACK_SIZE != 0:
             raise SystemExit("--q-heads must be a positive multiple of 32")
-        if args.scale is not None and (not math.isfinite(args.scale) or args.scale <= 0):
+        if args.scale is not None and (
+            not math.isfinite(args.scale) or args.scale <= 0
+        ):
             raise SystemExit("--scale must be finite and positive")
         self.validate_timing_args(args, allow_zero_warmup=True)
         return args
 
     def cases(self, args):
         if args.single:
-            yield MqaCase("single", args.batch, args.q_heads, args.kv_heads, args.q_len,
-                          args.kv_len, args.head_dim, args.causal)
+            yield MqaCase(
+                "single",
+                args.batch,
+                args.q_heads,
+                args.kv_heads,
+                args.q_len,
+                args.kv_len,
+                args.head_dim,
+                args.causal,
+            )
             return
         for seq_len in PREFILL_LENGTHS:
-            yield MqaCase("prefill", 1, DEFAULT_Q_HEADS, DEFAULT_KV_HEADS, seq_len,
-                          seq_len, DEFAULT_HEAD_DIM, True)
+            yield MqaCase(
+                "prefill",
+                1,
+                DEFAULT_Q_HEADS,
+                DEFAULT_KV_HEADS,
+                seq_len,
+                seq_len,
+                DEFAULT_HEAD_DIM,
+                True,
+            )
         # Decode is deliberately non-causal, mirroring the MHA benchmark: a
         # one-token query under the bottom-right causal mask would only see
         # KV position zero, while non-causal Q=1 models the final token
         # attending its complete KV cache.
         for batch in DECODE_BATCH_SIZES:
-            yield MqaCase("decode", batch, DEFAULT_Q_HEADS, DEFAULT_KV_HEADS, 1,
-                          8192, DEFAULT_HEAD_DIM, False)
+            yield MqaCase(
+                "decode",
+                batch,
+                DEFAULT_Q_HEADS,
+                DEFAULT_KV_HEADS,
+                1,
+                8192,
+                DEFAULT_HEAD_DIM,
+                False,
+            )
 
     def run_with_args(self, args):
         fa4_fwd = load_official_fa4()
         print("[config] 16warp/pack32")
-        columns = (("mode", 9), ("shape [B,Hq,Hkv,Q,KV,D]", 30), ("mask", 10),
-                   ("Kernel ms", 13), ("Kernel TF/s", 14), ("FA4 ms", 13),
-                   ("FA4/kernel", 14), ("Diff", 12), ("Config", 16))
+        columns = (
+            ("mode", 9),
+            ("shape [B,Hq,Hkv,Q,KV,D]", 30),
+            ("mask", 10),
+            ("Kernel ms", 13),
+            ("Kernel TF/s", 14),
+            ("FA4 ms", 13),
+            ("FA4/kernel", 14),
+            ("Diff", 12),
+            ("Config", 16),
+        )
         table = self.make_table_printer(columns)
         table.print_header()
         sol_report = SolReport(debug=args.debug) if args.sol else None
         for case in self.cases(args):
-            q = torch.empty((case.batch, case.q_heads, case.q_len, case.head_dim), device="cuda", dtype=torch.bfloat16).uniform_(-1, 1)
-            k = torch.empty((case.batch, case.kv_heads, case.kv_len, case.head_dim), device="cuda", dtype=torch.bfloat16).uniform_(-1, 1)
+            q = torch.empty(
+                (case.batch, case.q_heads, case.q_len, case.head_dim),
+                device="cuda",
+                dtype=torch.bfloat16,
+            ).uniform_(-1, 1)
+            k = torch.empty(
+                (case.batch, case.kv_heads, case.kv_len, case.head_dim),
+                device="cuda",
+                dtype=torch.bfloat16,
+            ).uniform_(-1, 1)
             v = torch.empty_like(k).uniform_(-1, 1)
             out = torch.empty_like(q)
             # FA4 consumes BSHD and permits Hq != Hkv; these conversions are
@@ -204,29 +265,60 @@ class Bf16Fa4MqaBenchmark(BenchmarkBase):
             v_fa4 = v.permute(0, 2, 1, 3).contiguous()
             out_fa4 = torch.empty_like(q_fa4)
             scale = args.scale or 1.0 / math.sqrt(case.head_dim)
+
             def kernel():
-                return bf16_fa4_mqa_out(
-                    q, k, v, out, causal=case.causal, scale=scale
-                )
+                return bf16_fa4_mqa_out(q, k, v, out, causal=case.causal, scale=scale)
+
             def fa4():
-                fa4_fwd(q_fa4, k_fa4, v_fa4, softmax_scale=scale,
-                        causal=case.causal, out=out_fa4)
+                fa4_fwd(
+                    q_fa4,
+                    k_fa4,
+                    v_fa4,
+                    softmax_scale=scale,
+                    causal=case.causal,
+                    out=out_fa4,
+                )
+
             kernel_stats = benchmark_with_stats(
-                kernel, args.warmup, args.iters, args.samples,
-                cold_l2_flush=args._cold_l2_flush)
-            kernel(); fa4(); torch.cuda.synchronize()
+                kernel,
+                args.warmup,
+                args.iters,
+                args.samples,
+                cold_l2_flush=args._cold_l2_flush,
+            )
+            kernel()
+            fa4()
+            torch.cuda.synchronize()
             out_fa4_bhsd = out_fa4.permute(0, 2, 1, 3)
-            torch.testing.assert_close(out, out_fa4_bhsd, atol=args.atol, rtol=args.rtol)
+            torch.testing.assert_close(
+                out, out_fa4_bhsd, atol=args.atol, rtol=args.rtol
+            )
             if args.single and not args.no_accuracy:
-                torch.testing.assert_close(out, reference_attention(q, k, v, causal=case.causal, scale=scale), atol=args.atol, rtol=args.rtol)
-            fa4_stats = benchmark_with_stats(fa4, args.warmup, args.iters, args.samples,
-                                             cold_l2_flush=args._cold_l2_flush)
+                torch.testing.assert_close(
+                    out,
+                    reference_attention(q, k, v, causal=case.causal, scale=scale),
+                    atol=args.atol,
+                    rtol=args.rtol,
+                )
+            fa4_stats = benchmark_with_stats(
+                fa4,
+                args.warmup,
+                args.iters,
+                args.samples,
+                cold_l2_flush=args._cold_l2_flush,
+            )
             diff = (out.float() - out_fa4_bhsd.float()).abs().max().item()
-            values = (case.name, f"{case.batch}x{case.q_heads}x{case.kv_heads}x{case.q_len}x{case.kv_len}x{case.head_dim}",
-                      "causal" if case.causal else "noncausal", f"{kernel_stats['median_ms']:.4f}",
-                      f"{attention_tflops(case, kernel_stats['median_ms']):.3f}",
-                      f"{fa4_stats['median_ms']:.4f}", f"{fa4_stats['median_ms'] / kernel_stats['median_ms']:.3f}x", f"{diff:.6g}",
-                      "16warp/pack32")
+            values = (
+                case.name,
+                f"{case.batch}x{case.q_heads}x{case.kv_heads}x{case.q_len}x{case.kv_len}x{case.head_dim}",
+                "causal" if case.causal else "noncausal",
+                f"{kernel_stats['median_ms']:.4f}",
+                f"{attention_tflops(case, kernel_stats['median_ms']):.3f}",
+                f"{fa4_stats['median_ms']:.4f}",
+                f"{fa4_stats['median_ms'] / kernel_stats['median_ms']:.3f}x",
+                f"{diff:.6g}",
+                "16warp/pack32",
+            )
             if sol_report:
                 bounds = attention_sol_bounds(case)
                 sol_report.add(
