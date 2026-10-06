@@ -120,6 +120,13 @@ from .kernels.fp8mxfp4_gemm import (
     quantize_fp8mxfp4_weights, to_blocked_fp8mxfp4_scales,
     from_blocked_fp8mxfp4_scales,
 )
+from .kernels.fp8_gemm import (
+    Fp8GemmConfig, compile_fp8_gemm,
+    compile_fp8_gemm_configs, fp8_gemm, fp8_gemm_out,
+    fp8_gemm_reference, quantize_fp8_gemm,
+    quantize_fp8_rows, dequantize_fp8_rows,
+    to_blocked_fp8_scales, from_blocked_fp8_scales,
+)
 from .kernels.cublaslt import (
     cublaslt_gemm,
     cublaslt_gemm_out,
