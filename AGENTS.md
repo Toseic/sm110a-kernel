@@ -87,6 +87,16 @@ for `CS2R ... SR_CLOCKLO`, comparison with the configured immediate, and a
 backward branch. A zero-delay binary should not contain that loop. See
 `docs/pipeline_delay.md` for the public API reference.
 
+## Reference documentation
+
+The latest PTX ISA documentation (version 9.4) lives in `docs/`:
+
+- `docs/ptx_isa_9.4.pdf` — official NVIDIA PDF.
+- `docs/ptx-isa-9.4/` — markdown tree split by chapter (`ptx/9-instruction-set/`,
+  `ptx/_images/` for mma/wgmma register layouts and TMA swizzle diagrams), with
+  `INDEX.md` as the entry point. Look instructions up with grep, e.g.
+  `grep -rl 'cp.async.bulk.tensor' docs/ptx-isa-9.4/ptx/`.
+
 ## Exclusive GPU launch handling
 
 When GPU 0 is configured with `EXCLUSIVE_PROCESS`, a launch may fail with
