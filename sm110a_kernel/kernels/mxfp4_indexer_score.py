@@ -29,18 +29,36 @@ class IndexerScoreModule:
         out=None,
         *,
         causal=True,
+        block_table=None,
+        cu_seqlens_q=None,
+        kv_seqlens=None,
+        max_q_len=None,
+        max_kv_len=None,
         options=None,
     ):
         use_default_options = options is None
-        key = (q.device.index, q.size(0), k.size(0), bool(causal))
+        q_len, kv_len, batch = _prefill_shape(
+            q, k, block_table, cu_seqlens_q, max_q_len, max_kv_len
+        )
+        key = (
+            q.device.index,
+            batch,
+            q_len,
+            kv_len,
+            k.size(1) if block_table is not None else 0,
+            cu_seqlens_q is not None,
+            kv_seqlens is not None,
+            bool(causal),
+        )
         if use_default_options and key in self._cluster_m_cache:
             return self._cluster_m_cache[key]
         if out is None:
-            out = torch.empty(
-                (q.size(0), k.size(0)), device=q.device, dtype=torch.float32
+            shape = (
+                (q.size(0), q.size(1), kv_len) if q.ndim == 4 else (q.size(0), kv_len)
             )
+            out = torch.empty(shape, device=q.device, dtype=torch.float32)
         configs = (IndexerScorePrefillConfig(1), IndexerScorePrefillConfig(2))
-        if q.size(0) <= 2:
+        if q_len <= 2:
             return 1
         with torch.cuda.device(q.device):
             if torch.cuda.is_current_stream_capturing():
@@ -74,6 +92,11 @@ class IndexerScoreModule:
                         out,
                         config.cluster_m,
                         bool(causal),
+                        block_table,
+                        cu_seqlens_q,
+                        kv_seqlens,
+                        q_len,
+                        kv_len,
                         self._launcher,
                     )
 
@@ -82,7 +105,7 @@ class IndexerScoreModule:
             selection = AutotuneRunner(options).resolve(
                 configs,
                 namespace=_PREFILL_TUNE_NAMESPACE,
-                key=(q.size(0), k.size(0), bool(causal)),
+                key=key,
                 prepare=prepare,
                 benchmark=lambda prepared: _tune_stats(prepared.run, options),
                 probe=None,
@@ -94,11 +117,37 @@ class IndexerScoreModule:
         return winner
 
     def indexer_score_prefill(
-        self, q, k, q_scales, k_scales, head_weight, cluster_m=None, *, causal=True
+        self,
+        q,
+        k,
+        q_scales,
+        k_scales,
+        head_weight,
+        cluster_m=None,
+        *,
+        causal=True,
+        block_table=None,
+        cu_seqlens_q=None,
+        kv_seqlens=None,
+        max_q_len=None,
+        max_kv_len=None,
     ):
+        q_len, kv_len, _ = _prefill_shape(
+            q, k, block_table, cu_seqlens_q, max_q_len, max_kv_len
+        )
         if cluster_m is None:
             cluster_m = self.select_cluster_m(
-                q, k, q_scales, k_scales, head_weight, causal=causal
+                q,
+                k,
+                q_scales,
+                k_scales,
+                head_weight,
+                causal=causal,
+                block_table=block_table,
+                cu_seqlens_q=cu_seqlens_q,
+                kv_seqlens=kv_seqlens,
+                max_q_len=q_len,
+                max_kv_len=kv_len,
             )
         return self._binding.indexer_score_prefill(
             q,
@@ -108,15 +157,48 @@ class IndexerScoreModule:
             head_weight,
             cluster_m,
             bool(causal),
+            block_table,
+            cu_seqlens_q,
+            kv_seqlens,
+            q_len,
+            kv_len,
             self._launcher,
         )
 
     def indexer_score_prefill_out(
-        self, q, k, q_scales, k_scales, head_weight, out, cluster_m=None, *, causal=True
+        self,
+        q,
+        k,
+        q_scales,
+        k_scales,
+        head_weight,
+        out,
+        cluster_m=None,
+        *,
+        causal=True,
+        block_table=None,
+        cu_seqlens_q=None,
+        kv_seqlens=None,
+        max_q_len=None,
+        max_kv_len=None,
     ):
+        q_len, kv_len, _ = _prefill_shape(
+            q, k, block_table, cu_seqlens_q, max_q_len, max_kv_len
+        )
         if cluster_m is None:
             cluster_m = self.select_cluster_m(
-                q, k, q_scales, k_scales, head_weight, out, causal=causal
+                q,
+                k,
+                q_scales,
+                k_scales,
+                head_weight,
+                out,
+                causal=causal,
+                block_table=block_table,
+                cu_seqlens_q=cu_seqlens_q,
+                kv_seqlens=kv_seqlens,
+                max_q_len=q_len,
+                max_kv_len=kv_len,
             )
         return self._binding.indexer_score_prefill_out(
             q,
@@ -127,8 +209,36 @@ class IndexerScoreModule:
             out,
             cluster_m,
             bool(causal),
+            block_table,
+            cu_seqlens_q,
+            kv_seqlens,
+            q_len,
+            kv_len,
             self._launcher,
         )
+
+
+def _prefill_shape(q, k, block_table, cu_seqlens_q, max_q_len, max_kv_len):
+    batch = (
+        block_table.size(0)
+        if block_table is not None
+        else (k.size(0) if k.ndim == 3 else 1)
+    )
+    q_len = (
+        max_q_len
+        if cu_seqlens_q is not None
+        else (q.size(1) if q.ndim == 4 else q.size(0))
+    )
+    kv_len = (
+        max_kv_len
+        if block_table is not None
+        else (k.size(1) if k.ndim == 3 else k.size(0))
+    )
+    if q_len is None or kv_len is None:
+        raise ValueError(
+            "max_q_len is required for packed Q and max_kv_len for paged K"
+        )
+    return q_len, kv_len, batch
 
 
 @dataclass(frozen=True)
@@ -160,26 +270,99 @@ def compile_indexer_score_prefill() -> IndexerScoreModule:
 
 
 def select_indexer_score_prefill_cluster_m(
-    q, k, q_scales, k_scales, head_weight, out=None, *, causal=True, options=None
+    q,
+    k,
+    q_scales,
+    k_scales,
+    head_weight,
+    out=None,
+    *,
+    causal=True,
+    block_table=None,
+    cu_seqlens_q=None,
+    kv_seqlens=None,
+    max_q_len=None,
+    max_kv_len=None,
+    options=None,
 ):
     return compile_indexer_score_prefill().select_cluster_m(
-        q, k, q_scales, k_scales, head_weight, out, causal=causal, options=options
+        q,
+        k,
+        q_scales,
+        k_scales,
+        head_weight,
+        out,
+        causal=causal,
+        block_table=block_table,
+        cu_seqlens_q=cu_seqlens_q,
+        kv_seqlens=kv_seqlens,
+        max_q_len=max_q_len,
+        max_kv_len=max_kv_len,
+        options=options,
     )
 
 
 def indexer_score_prefill(
-    q, k, q_scales, k_scales, head_weight, cluster_m=None, *, causal=True
+    q,
+    k,
+    q_scales,
+    k_scales,
+    head_weight,
+    cluster_m=None,
+    *,
+    causal=True,
+    block_table=None,
+    cu_seqlens_q=None,
+    kv_seqlens=None,
+    max_q_len=None,
+    max_kv_len=None,
 ):
     return compile_indexer_score_prefill().indexer_score_prefill(
-        q, k, q_scales, k_scales, head_weight, cluster_m, causal=causal
+        q,
+        k,
+        q_scales,
+        k_scales,
+        head_weight,
+        cluster_m,
+        causal=causal,
+        block_table=block_table,
+        cu_seqlens_q=cu_seqlens_q,
+        kv_seqlens=kv_seqlens,
+        max_q_len=max_q_len,
+        max_kv_len=max_kv_len,
     )
 
 
 def indexer_score_prefill_out(
-    q, k, q_scales, k_scales, head_weight, out, cluster_m=None, *, causal=True
+    q,
+    k,
+    q_scales,
+    k_scales,
+    head_weight,
+    out,
+    cluster_m=None,
+    *,
+    causal=True,
+    block_table=None,
+    cu_seqlens_q=None,
+    kv_seqlens=None,
+    max_q_len=None,
+    max_kv_len=None,
 ):
     return compile_indexer_score_prefill().indexer_score_prefill_out(
-        q, k, q_scales, k_scales, head_weight, out, cluster_m, causal=causal
+        q,
+        k,
+        q_scales,
+        k_scales,
+        head_weight,
+        out,
+        cluster_m,
+        causal=causal,
+        block_table=block_table,
+        cu_seqlens_q=cu_seqlens_q,
+        kv_seqlens=kv_seqlens,
+        max_q_len=max_q_len,
+        max_kv_len=max_kv_len,
     )
 
 
@@ -190,22 +373,38 @@ class IndexerScoreDecodeModule:
         self._split_kv_cache = {}
 
     def select_split_kv(
-        self, q, k, q_scales, k_scales, head_weight, out=None, *, options=None
+        self,
+        q,
+        k,
+        q_scales,
+        k_scales,
+        head_weight,
+        out=None,
+        *,
+        block_table=None,
+        kv_seqlens=None,
+        max_kv_len=None,
+        options=None,
     ):
         """Measure valid split counts once per (device, B, KVs), then cache the winner."""
+        kv_len = _decode_kv_len(k, block_table, max_kv_len)
         use_default_options = options is None
-        key = (q.device.index, q.size(0), k.size(1))
+        key = (
+            q.device.index,
+            q.size(0),
+            kv_len,
+            k.size(1) if block_table is not None else 0,
+            kv_seqlens is not None,
+        )
         if use_default_options and key in self._split_kv_cache:
             return self._split_kv_cache[key]
         if out is None:
-            out = torch.empty(
-                (q.size(0), k.size(1)), device=q.device, dtype=torch.float32
-            )
+            out = torch.empty((q.size(0), kv_len), device=q.device, dtype=torch.float32)
         splits = (1, 2, 4, 8)
         configs = tuple(
             IndexerScoreDecodeConfig(split)
             for split in splits
-            if split <= (k.size(1) + 255) // 256
+            if split <= (kv_len + 255) // 256
         )
         if not configs:
             raise ValueError("KVs must be positive")
@@ -238,6 +437,9 @@ class IndexerScoreDecodeModule:
                         head_weight,
                         out,
                         config.split_kv,
+                        block_table,
+                        kv_seqlens,
+                        kv_len,
                         self._launcher,
                     )
 
@@ -246,7 +448,7 @@ class IndexerScoreDecodeModule:
             selection = AutotuneRunner(options).resolve(
                 configs,
                 namespace="indexer_score_decode_splitkv_v1",
-                key=(q.size(0), k.size(1)),
+                key=key,
                 prepare=prepare,
                 benchmark=lambda prepared: _tune_stats(prepared.run, options),
                 probe=None,
@@ -258,22 +460,91 @@ class IndexerScoreDecodeModule:
         return winner
 
     def indexer_score_decode(
-        self, q, k, q_scales, k_scales, head_weight, split_kv=None
+        self,
+        q,
+        k,
+        q_scales,
+        k_scales,
+        head_weight,
+        split_kv=None,
+        *,
+        block_table=None,
+        kv_seqlens=None,
+        max_kv_len=None,
     ):
+        kv_len = _decode_kv_len(k, block_table, max_kv_len)
         if split_kv is None:
-            split_kv = self.select_split_kv(q, k, q_scales, k_scales, head_weight)
+            split_kv = self.select_split_kv(
+                q,
+                k,
+                q_scales,
+                k_scales,
+                head_weight,
+                block_table=block_table,
+                kv_seqlens=kv_seqlens,
+                max_kv_len=kv_len,
+            )
         return self._binding.indexer_score_decode(
-            q, k, q_scales, k_scales, head_weight, split_kv, self._launcher
+            q,
+            k,
+            q_scales,
+            k_scales,
+            head_weight,
+            split_kv,
+            block_table,
+            kv_seqlens,
+            kv_len,
+            self._launcher,
         )
 
     def indexer_score_decode_out(
-        self, q, k, q_scales, k_scales, head_weight, out, split_kv=None
+        self,
+        q,
+        k,
+        q_scales,
+        k_scales,
+        head_weight,
+        out,
+        split_kv=None,
+        *,
+        block_table=None,
+        kv_seqlens=None,
+        max_kv_len=None,
     ):
+        kv_len = _decode_kv_len(k, block_table, max_kv_len)
         if split_kv is None:
-            split_kv = self.select_split_kv(q, k, q_scales, k_scales, head_weight, out)
+            split_kv = self.select_split_kv(
+                q,
+                k,
+                q_scales,
+                k_scales,
+                head_weight,
+                out,
+                block_table=block_table,
+                kv_seqlens=kv_seqlens,
+                max_kv_len=kv_len,
+            )
         return self._binding.indexer_score_decode_out(
-            q, k, q_scales, k_scales, head_weight, out, split_kv, self._launcher
+            q,
+            k,
+            q_scales,
+            k_scales,
+            head_weight,
+            out,
+            split_kv,
+            block_table,
+            kv_seqlens,
+            kv_len,
+            self._launcher,
         )
+
+
+def _decode_kv_len(k, block_table, max_kv_len):
+    if block_table is not None:
+        if max_kv_len is None:
+            raise ValueError("max_kv_len is required for paged K")
+        return max_kv_len
+    return k.size(1)
 
 
 @dataclass(frozen=True)
@@ -326,20 +597,79 @@ def compile_indexer_score_decode() -> IndexerScoreDecodeModule:
 
 
 def select_indexer_score_decode_split_kv(
-    q, k, q_scales, k_scales, head_weight, out=None, *, options=None
+    q,
+    k,
+    q_scales,
+    k_scales,
+    head_weight,
+    out=None,
+    *,
+    block_table=None,
+    kv_seqlens=None,
+    max_kv_len=None,
+    options=None,
 ):
     return compile_indexer_score_decode().select_split_kv(
-        q, k, q_scales, k_scales, head_weight, out, options=options
+        q,
+        k,
+        q_scales,
+        k_scales,
+        head_weight,
+        out,
+        block_table=block_table,
+        kv_seqlens=kv_seqlens,
+        max_kv_len=max_kv_len,
+        options=options,
     )
 
 
-def indexer_score_decode(q, k, q_scales, k_scales, head_weight, split_kv=None):
+def indexer_score_decode(
+    q,
+    k,
+    q_scales,
+    k_scales,
+    head_weight,
+    split_kv=None,
+    *,
+    block_table=None,
+    kv_seqlens=None,
+    max_kv_len=None,
+):
     return compile_indexer_score_decode().indexer_score_decode(
-        q, k, q_scales, k_scales, head_weight, split_kv
+        q,
+        k,
+        q_scales,
+        k_scales,
+        head_weight,
+        split_kv,
+        block_table=block_table,
+        kv_seqlens=kv_seqlens,
+        max_kv_len=max_kv_len,
     )
 
 
-def indexer_score_decode_out(q, k, q_scales, k_scales, head_weight, out, split_kv=None):
+def indexer_score_decode_out(
+    q,
+    k,
+    q_scales,
+    k_scales,
+    head_weight,
+    out,
+    split_kv=None,
+    *,
+    block_table=None,
+    kv_seqlens=None,
+    max_kv_len=None,
+):
     return compile_indexer_score_decode().indexer_score_decode_out(
-        q, k, q_scales, k_scales, head_weight, out, split_kv
+        q,
+        k,
+        q_scales,
+        k_scales,
+        head_weight,
+        out,
+        split_kv,
+        block_table=block_table,
+        kv_seqlens=kv_seqlens,
+        max_kv_len=max_kv_len,
     )

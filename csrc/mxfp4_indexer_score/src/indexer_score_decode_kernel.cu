@@ -1,4 +1,5 @@
 #include <cassert>
+#include <cmath>
 #include <cstdint>
 
 #include <cuda.h>
@@ -51,10 +52,9 @@ static_assert(kAccumulatorTmemCols + kScaleTmemCols <= kTmemCols);
 
 // Q and K are row-major packed E2M1; their scales use the same 128x4
 // blocked UE8M0 layout as the repository's MXFP4 GEMM.
-void encode_fp4(CUtensorMap* map, const uint8_t* ptr, int rows, int batches,
+void encode_fp4(CUtensorMap* map, const uint8_t* ptr, int rows,
                 int tile_rows) {
-    const uint64_t dims[3] = {kDim, static_cast<uint64_t>(rows),
-                              static_cast<uint64_t>(batches)};
+    const uint64_t dims[3] = {kDim, static_cast<uint64_t>(rows), 1};
     const uint64_t strides[2] = {kDim / 2,
                                   static_cast<uint64_t>(rows) * (kDim / 2)};
     const uint32_t box[3] = {kDim, static_cast<uint32_t>(tile_rows), 1};
@@ -67,16 +67,13 @@ void encode_fp4(CUtensorMap* map, const uint8_t* ptr, int rows, int batches,
     assert(result == CUDA_SUCCESS);
 }
 
-void encode_scales(CUtensorMap* map, const uint8_t* ptr, int row_tiles,
-                   int batches) {
-    const uint64_t dims[5] = {256, 2, 2, static_cast<uint64_t>(row_tiles),
-                              static_cast<uint64_t>(batches)};
-    const uint64_t strides[4] = {256, 512, 1024,
-                                  static_cast<uint64_t>(row_tiles) * 1024};
-    const uint32_t box[5] = {256, 2, 2, 1, 1};
-    const uint32_t elem[5] = {1, 1, 1, 1, 1};
+void encode_scales(CUtensorMap* map, const uint8_t* ptr, int row_tiles) {
+    const uint64_t dims[4] = {256, 2, 2, static_cast<uint64_t>(row_tiles)};
+    const uint64_t strides[3] = {256, 512, 1024};
+    const uint32_t box[4] = {256, 2, 2, 1};
+    const uint32_t elem[4] = {1, 1, 1, 1};
     const CUresult result = cuTensorMapEncodeTiled(
-        map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 5,
+        map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
         const_cast<uint8_t*>(ptr), dims, strides, box, elem,
         CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
         CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
@@ -202,16 +199,31 @@ __global__ void indexer_score_decode_kernel(
     const __grid_constant__ CUtensorMap ks_map,
     const __grid_constant__ CUtensorMap out_map,
     const half* __restrict__ head_weight,
-    float* __restrict__ out, int kv_count, bool use_tma_store) {
+    float* __restrict__ out, int kv_count, int page_size,
+    const int32_t* __restrict__ block_table, int block_table_stride,
+    const int32_t* __restrict__ kv_seqlens, bool use_tma_store) {
     const int tid = threadIdx.x;
     const int warp = tid / 32;
     const int lane = tid % 32;
     const int batch = blockIdx.y;
     const int split = blockIdx.x;
+    const int local_kv_len = kv_seqlens
+        ? max(0, min(kv_count, kv_seqlens[batch])) : kv_count;
     const int total_kv_tiles = (kv_count + kTileKV - 1) / kTileKV;
     const int kv_tile_start = total_kv_tiles * split / SplitKV;
-    const int kv_tile_end = total_kv_tiles * (split + 1) / SplitKV;
+    const int split_tile_end = total_kv_tiles * (split + 1) / SplitKV;
+    const int kv_tile_end = min(split_tile_end,
+                                (local_kv_len + kTileKV - 1) / kTileKV);
     const int kv_tiles = kv_tile_end - kv_tile_start;
+
+    // Cover inactive splits and the invalid tail of the final active tile.
+    if (kv_seqlens) {
+        const int invalid_start = max(local_kv_len, kv_tile_start * kTileKV);
+        const int invalid_end = min(kv_count, split_tile_end * kTileKV);
+        for (int col = invalid_start + tid; col < invalid_end; col += blockDim.x)
+            out[static_cast<int64_t>(batch) * kv_count + col] = -INFINITY;
+    }
+    if (kv_tiles <= 0) return;
 
     extern __shared__ __align__(1024) uint8_t smem[];
     const int smem_base = static_cast<int>(__cvta_generic_to_shared(smem));
@@ -273,12 +285,12 @@ __global__ void indexer_score_decode_kernel(
                          :: "r"(q_bar), "r"(kTileM * kDim / 2 + kQScaleBytes) : "memory");
             asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
                          "[%0], [%1, {%2, %3, %4}], [%5];"
-                         :: "r"(q_addr), "l"(qptr), "r"(zero), "r"(zero),
-                            "r"(batch), "r"(q_bar) : "memory");
-            asm volatile("cp.async.bulk.tensor.5d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
-                         "[%0], [%1, {%2, %3, %4, %5, %6}], [%7];"
+                         :: "r"(q_addr), "l"(qptr), "r"(zero), "r"(batch * kHeads),
+                            "r"(zero), "r"(q_bar) : "memory");
+            asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
+                         "[%0], [%1, {%2, %3, %4, %5}], [%6];"
                          :: "r"(qs_addr), "l"(qsptr), "r"(zero), "r"(zero),
-                            "r"(zero), "r"(zero), "r"(batch), "r"(q_bar) : "memory");
+                            "r"(zero), "r"(batch), "r"(q_bar) : "memory");
 
             const uint64_t kptr = reinterpret_cast<uint64_t>(&k_map);
             const uint64_t ksptr = reinterpret_cast<uint64_t>(&ks_map);
@@ -297,18 +309,38 @@ __global__ void indexer_score_decode_kernel(
                     __cvta_generic_to_shared(&load_barrier[stage]));
                 asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
                              :: "r"(load_bar), "r"(kTileKV * kDim / 2 + kKScaleBytes) : "memory");
-                asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
-                             "[%0], [%1, {%2, %3, %4}], [%5];"
-                             :: "r"(k_addr), "l"(kptr), "r"(zero), "r"(kv_base),
-                                "r"(batch), "r"(load_bar) : "memory");
+                const int pages_per_tile = page_size ? kTileKV / page_size : 1;
+                for (int tile_page = 0; tile_page < pages_per_tile; ++tile_page) {
+                    const int logical_row = kv_base + tile_page * (page_size ? page_size : kTileKV);
+                    const int logical_page = page_size
+                        ? min(logical_row / page_size, (local_kv_len - 1) / page_size) : 0;
+                    const int physical_page = page_size
+                        ? block_table[batch * block_table_stride + logical_page] : 0;
+                    const int k_row = page_size ? physical_page * page_size
+                        : batch * kv_count + kv_base;
+                    const int dst = k_addr + tile_page * (page_size ? page_size : kTileKV) * kDim;
+                    asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
+                                 "[%0], [%1, {%2, %3, %4}], [%5];"
+                                 :: "r"(dst), "l"(kptr), "r"(zero), "r"(k_row),
+                                    "r"(zero), "r"(load_bar) : "memory");
+                }
                 #pragma unroll
-                for (int scale_tile = 0; scale_tile < kKScaleTiles; ++scale_tile)
-                    asm volatile("cp.async.bulk.tensor.5d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
-                                 "[%0], [%1, {%2, %3, %4, %5, %6}], [%7];"
+                for (int scale_tile = 0; scale_tile < kKScaleTiles; ++scale_tile) {
+                    const int logical_row = kv_base + scale_tile * 128;
+                    const int logical_page = page_size
+                        ? min(logical_row / page_size, (local_kv_len - 1) / page_size) : 0;
+                    const int physical_page = page_size
+                        ? block_table[batch * block_table_stride + logical_page] : 0;
+                    const int scale_row = page_size
+                        ? physical_page * (page_size / 128) +
+                              (logical_row / 128) % (page_size / 128)
+                        : batch * ((kv_count + 127) / 128) + logical_row / 128;
+                    asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
+                                 "[%0], [%1, {%2, %3, %4, %5}], [%6];"
                                  :: "r"(ks_addr + scale_tile * 1024), "l"(ksptr),
                                     "r"(zero), "r"(zero), "r"(zero),
-                                    "r"(kv_base / 128 + scale_tile), "r"(batch),
-                                    "r"(load_bar) : "memory");
+                                    "r"(scale_row), "r"(load_bar) : "memory");
+                }
             };
             for (int kv_tile = 0;
                  kv_tile < (kv_tiles < kPipelineStages ? kv_tiles : kPipelineStages);
@@ -351,7 +383,7 @@ __global__ void indexer_score_decode_kernel(
                         }
                     } else {
                         for (int col = lane; col < kTileKV; col += 32)
-                            if (kv_base + col < kv_count)
+                            if (kv_base + col < local_kv_len)
                                 out[static_cast<int64_t>(batch) * kv_count +
                                     kv_base + col] = output_tile[stage][store_q][col];
                     }
@@ -516,7 +548,9 @@ template <int SplitKV>
 void launch_decode(const CUtensorMap& q_map, const CUtensorMap& k_map,
                    const CUtensorMap& qs_map, const CUtensorMap& ks_map,
                    const CUtensorMap& out_map, const half* head_weight,
-                   float* out, int batch_count, int kv_count,
+                   float* out, int batch_count, int kv_count, int page_size,
+                   const int32_t* block_table, int block_table_stride,
+                   const int32_t* kv_seqlens,
                    bool use_tma_store, cudaStream_t stream) {
     cudaFuncSetAttribute(indexer_score_decode_kernel<SplitKV>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
@@ -534,25 +568,31 @@ void launch_decode(const CUtensorMap& q_map, const CUtensorMap& k_map,
     config.numAttrs = 1;
     cudaLaunchKernelEx(&config, indexer_score_decode_kernel<SplitKV>,
                        q_map, k_map, qs_map, ks_map, out_map,
-                       head_weight, out, kv_count, use_tma_store);
+                       head_weight, out, kv_count, page_size, block_table,
+                       block_table_stride, kv_seqlens, use_tma_store);
 }
 
 extern "C" void sm110a_indexer_score_decode_launch(
     const uint8_t* q, const uint8_t* k,
     const uint8_t* q_scales, const uint8_t* k_scales,
     const half* head_weight, float* out,
-    int batch_count, int kv_count, int split_kv, cudaStream_t stream) {
+    int batch_count, int kv_count, int num_pages, int page_size,
+    const int32_t* block_table, int block_table_stride,
+    const int32_t* kv_seqlens, int split_kv, cudaStream_t stream) {
     CUtensorMap q_map, k_map, qs_map, ks_map, out_map{};
-    encode_fp4(&q_map, q, kHeads, batch_count, kTileM);
-    encode_fp4(&k_map, k, kv_count, batch_count, kTileKV);
-    encode_scales(&qs_map, q_scales, 1, batch_count);
-    encode_scales(&ks_map, k_scales, (kv_count + 127) / 128, batch_count);
-    const bool use_tma_store = kv_count % 4 == 0;
+    encode_fp4(&q_map, q, batch_count * kHeads, kTileM);
+    encode_fp4(&k_map, k, page_size ? num_pages * page_size : batch_count * kv_count,
+               page_size ? page_size : kTileKV);
+    encode_scales(&qs_map, q_scales, batch_count);
+    encode_scales(&ks_map, k_scales, page_size
+        ? num_pages * (page_size / 128) : batch_count * ((kv_count + 127) / 128));
+    const bool use_tma_store = !kv_seqlens && kv_count % 4 == 0;
     if (use_tma_store)
         encode_output(&out_map, out, batch_count, kv_count);
 #define LAUNCH(S) launch_decode<S>(q_map, k_map, qs_map, ks_map, out_map, \
                                        head_weight, out, batch_count, kv_count, \
-                                       use_tma_store, stream)
+                                       page_size, block_table, block_table_stride, \
+                                       kv_seqlens, use_tma_store, stream)
     switch (split_kv) {
         case 1: LAUNCH(1); break;
         case 2: LAUNCH(2); break;

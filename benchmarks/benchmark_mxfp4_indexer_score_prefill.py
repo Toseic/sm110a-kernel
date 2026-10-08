@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cold-L2 prefill benchmark for the MXFP4 indexer score kernel."""
+"""Cold-L2 batched/paged prefill benchmark for the MXFP4 indexer score kernel."""
 
 import argparse
 import sys
@@ -29,6 +29,8 @@ from sm110a_kernel.runner import TuneOptions
 HEADS = 64
 DIM = 128
 SEQ_LENGTHS = (1024, 2048, 4096, 8192, 16384, 32768)
+EXTRA_BATCH_SEQ = 8192
+EXTRA_BATCHES = (2, 4, 8, 16)
 FP4_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 MXFP4_MMA_PEAK_TFLOPS = 4 * MMA_PEAK_TFLOPS
 
@@ -134,6 +136,96 @@ def reference_rows(
     return scores
 
 
+def reference_batched_rows(
+    q,
+    k,
+    q_scales,
+    k_scales,
+    head_weight,
+    batch,
+    query_indices,
+    q_lengths,
+    kv_lengths,
+    output_kv,
+    *,
+    block_table=None,
+    cu_seqlens_q=None,
+    causal=True,
+):
+    """Sample logical batch rows, including page lookup and packed-Q offsets."""
+    kv_len = kv_lengths[batch]
+    q_scale_tile_bytes = q_scales.numel() // len(q_lengths)
+    batch_q_scales = q_scales[
+        batch * q_scale_tile_bytes : (batch + 1) * q_scale_tile_bytes
+    ]
+    q_scale_bytes = from_blocked_mxfp4_scales(
+        batch_q_scales, q_scale_tile_bytes // 1024 * 128, DIM
+    ).view(torch.uint8)
+    if cu_seqlens_q is not None:
+        q_offset = sum(q_lengths[:batch])
+        q_flat = q.reshape(-1, DIM // 2).view(torch.uint8)
+    else:
+        q_offset = 0
+        q_flat = q[batch].reshape(-1, DIM // 2).view(torch.uint8)
+    q_code_row_ids = (
+        (q_offset + query_indices)[:, None] * HEADS
+        + torch.arange(HEADS, device="cuda")[None, :]
+    ).reshape(-1)
+    q_scale_row_ids = (
+        query_indices[:, None] * HEADS + torch.arange(HEADS, device="cuda")[None, :]
+    ).reshape(-1)
+    q_dense = decode_rows(
+        q_flat.index_select(0, q_code_row_ids),
+        q_scale_bytes.index_select(0, q_scale_row_ids),
+    )
+    if block_table is not None:
+        page_size = k.size(1)
+        page_ids = block_table[batch, : (kv_len + page_size - 1) // page_size]
+        physical_rows = (
+            (
+                page_ids[:, None] * page_size
+                + torch.arange(page_size, device="cuda")[None, :]
+            )
+            .reshape(-1)[:kv_len]
+            .long()
+        )
+        k_flat = k.reshape(-1, DIM // 2).view(torch.uint8)
+        k_scale_bytes = from_blocked_mxfp4_scales(
+            k_scales, k.size(0) * page_size, DIM
+        ).view(torch.uint8)
+        k_codes = k_flat.index_select(0, physical_rows)
+        k_scale = k_scale_bytes.index_select(0, physical_rows)
+    else:
+        k_codes = k[batch, :kv_len].view(torch.uint8)
+        scale_bytes_per_batch = ((k.size(1) + 127) // 128) * 1024
+        k_scale_bytes = from_blocked_mxfp4_scales(
+            k_scales[
+                batch * scale_bytes_per_batch : (batch + 1) * scale_bytes_per_batch
+            ],
+            ((k.size(1) + 127) // 128) * 128,
+            DIM,
+        ).view(torch.uint8)
+        k_scale = k_scale_bytes[:kv_len]
+    k_dense = decode_rows(k_codes, k_scale)
+    dot = (q_dense @ k_dense.T).clamp_min_(0)
+    weights = (
+        head_weight.index_select(0, q_offset + query_indices)
+        if cu_seqlens_q is not None
+        else head_weight[batch].index_select(0, query_indices)
+    )
+    scores = (
+        dot.view(query_indices.numel(), HEADS, kv_len) * weights.float()[:, :, None]
+    ).sum(1)
+    if causal:
+        scores.masked_fill_(
+            torch.arange(kv_len, device="cuda")[None, :] > query_indices[:, None],
+            -torch.inf,
+        )
+    expected = torch.full((query_indices.numel(), output_kv), -torch.inf, device="cuda")
+    expected[:, :kv_len] = scores
+    return expected
+
+
 class IndexerScoreBenchmark(BenchmarkBase):
     def build_parser(self):
         parser = argparse.ArgumentParser(description=__doc__)
@@ -141,8 +233,38 @@ class IndexerScoreBenchmark(BenchmarkBase):
             "--seq-lens",
             type=int,
             nargs="+",
-            default=SEQ_LENGTHS,
-            help="prefill lengths; Qs and KVs both equal each length",
+            help="maximum Qs and KVs per batch; default sweep keeps the original lengths",
+        )
+        batch_group = parser.add_mutually_exclusive_group()
+        batch_group.add_argument(
+            "--batch", type=int, help="one batch size for every selected length"
+        )
+        batch_group.add_argument(
+            "--batches",
+            type=int,
+            nargs="+",
+            help="batch sizes to cross with --seq-lens",
+        )
+        parser.add_argument(
+            "--paged-kv", action="store_true", help="use paged K and block_table"
+        )
+        parser.add_argument("--page-size", type=int, choices=(128, 256), default=128)
+        parser.add_argument(
+            "--packed-q",
+            action="store_true",
+            help="pack variable Q with cu_seqlens_q (requires --paged-kv)",
+        )
+        parser.add_argument(
+            "--q-lengths",
+            type=int,
+            nargs="+",
+            help="per-batch Q lengths; requires --packed-q and one --seq-lens value",
+        )
+        parser.add_argument(
+            "--kv-lengths",
+            type=int,
+            nargs="+",
+            help="per-batch KV lengths; requires one --seq-lens value",
         )
         parser.add_argument("--seed", type=int, default=1234)
         parser.add_argument("--no-accuracy", action="store_true")
@@ -171,12 +293,45 @@ class IndexerScoreBenchmark(BenchmarkBase):
         return parser
 
     def validate_args(self, args):
+        default_sweep = (
+            args.seq_lens is None and args.batch is None and args.batches is None
+        )
+        if args.seq_lens is None:
+            args.seq_lens = SEQ_LENGTHS
         if not args.seq_lens or any(seq <= 0 for seq in args.seq_lens):
             raise SystemExit("--seq-lens must contain positive lengths")
+        batches = args.batches or [args.batch or 1]
+        if any(batch <= 0 or batch > 65535 for batch in batches):
+            raise SystemExit("batch sizes must be in [1, 65535]")
+        if (args.q_lengths or args.kv_lengths) and args.batches:
+            raise SystemExit("explicit per-batch lengths require one --batch value")
+        if (args.q_lengths or args.kv_lengths) and args.batch is None:
+            raise SystemExit("explicit per-batch lengths require --batch")
+        if args.packed_q and not args.paged_kv:
+            raise SystemExit("--packed-q requires --paged-kv")
+        if args.q_lengths and not args.packed_q:
+            raise SystemExit("--q-lengths requires --packed-q")
+        if (args.q_lengths or args.kv_lengths) and len(args.seq_lens) != 1:
+            raise SystemExit("explicit batch lengths require one --seq-lens value")
+        for name in ("q_lengths", "kv_lengths"):
+            lengths = getattr(args, name)
+            if lengths is not None and (
+                len(lengths) != args.batch
+                or any(n <= 0 or n > args.seq_lens[0] for n in lengths)
+            ):
+                raise SystemExit(
+                    f"--{name.replace('_', '-')} needs {args.batch} lengths in [1, seq]"
+                )
         if args.atol < 0 or args.rtol < 0:
             raise SystemExit("--atol and --rtol must be non-negative")
         if args.cluster_m and args.sweep_cluster_m:
             raise SystemExit("--cluster-m and --sweep-cluster-m are mutually exclusive")
+        args.cases = (
+            [(seq, 1) for seq in SEQ_LENGTHS]
+            + [(EXTRA_BATCH_SEQ, batch) for batch in EXTRA_BATCHES]
+            if default_sweep and not (args.q_lengths or args.kv_lengths)
+            else [(seq, batch) for seq in args.seq_lens for batch in batches]
+        )
         self.validate_timing_args(args, allow_zero_warmup=True)
         return args
 
@@ -186,6 +341,9 @@ class IndexerScoreBenchmark(BenchmarkBase):
         table = TablePrinter(
             (
                 ("Seq", 8),
+                ("Batch", 8),
+                ("KV", 8),
+                ("Q", 8),
                 ("Cluster", 9),
                 ("Candidates", 14),
                 ("Kernel(ms)", 14),
@@ -195,13 +353,67 @@ class IndexerScoreBenchmark(BenchmarkBase):
         )
         table.print_header()
         sol_report = SolReport() if args.sol else None
-        for seq in args.seq_lens:
-            q = make_packed_rows(seq * HEADS).view(seq, HEADS, DIM // 2)
-            k = make_packed_rows(seq)
-            q_scales = make_blocked_scales(seq * HEADS)
-            k_scales = make_blocked_scales(seq)
-            head_weight = torch.randn((seq, HEADS), device="cuda", dtype=torch.float16)
-            out = torch.empty((seq, seq), device="cuda", dtype=torch.float32)
+        for seq, batch_size in args.cases:
+            q_lengths = args.q_lengths or [seq] * batch_size
+            kv_lengths = args.kv_lengths or [seq] * batch_size
+            cu_seqlens_q = None
+            if args.packed_q:
+                total_q = sum(q_lengths)
+                q = make_packed_rows(total_q * HEADS).view(total_q, HEADS, DIM // 2)
+                q_scales = torch.cat(
+                    [make_blocked_scales(seq * HEADS) for _ in range(batch_size)]
+                )
+                head_weight = torch.randn(
+                    (total_q, HEADS), device="cuda", dtype=torch.float16
+                )
+                cu_seqlens_q = torch.tensor(
+                    [0] + list(torch.tensor(q_lengths).cumsum(0).tolist()),
+                    device="cuda",
+                    dtype=torch.int32,
+                )
+                out = torch.empty((total_q, seq), device="cuda", dtype=torch.float32)
+            else:
+                q = torch.stack(
+                    [
+                        make_packed_rows(seq * HEADS).view(seq, HEADS, DIM // 2)
+                        for _ in range(batch_size)
+                    ]
+                )
+                q_scales = torch.cat(
+                    [make_blocked_scales(seq * HEADS) for _ in range(batch_size)]
+                )
+                head_weight = torch.randn(
+                    (batch_size, seq, HEADS), device="cuda", dtype=torch.float16
+                )
+                out = torch.empty(
+                    (batch_size, seq, seq), device="cuda", dtype=torch.float32
+                )
+            block_table = None
+            if args.paged_kv:
+                pages_per_batch = (seq + args.page_size - 1) // args.page_size
+                num_pages = batch_size * pages_per_batch
+                k = make_packed_rows(num_pages * args.page_size).view(
+                    num_pages, args.page_size, DIM // 2
+                )
+                k_scales = make_blocked_scales(num_pages * args.page_size)
+                # A permutation ensures the benchmark exercises page lookup,
+                # rather than an accidentally contiguous physical order.
+                block_table = torch.randperm(
+                    num_pages, device="cuda", dtype=torch.int32
+                ).view(batch_size, pages_per_batch)
+            else:
+                k = torch.stack([make_packed_rows(seq) for _ in range(batch_size)])
+                k_scales = torch.cat(
+                    [make_blocked_scales(seq) for _ in range(batch_size)]
+                )
+            kv_seqlens = torch.tensor(kv_lengths, device="cuda", dtype=torch.int32)
+            extra = dict(
+                block_table=block_table,
+                cu_seqlens_q=cu_seqlens_q,
+                kv_seqlens=kv_seqlens,
+                max_q_len=seq if args.packed_q else None,
+                max_kv_len=seq if args.paged_kv else None,
+            )
             if args.sweep_cluster_m:
                 cluster_m = module.select_cluster_m(
                     q,
@@ -211,6 +423,7 @@ class IndexerScoreBenchmark(BenchmarkBase):
                     head_weight,
                     out,
                     causal=not args.non_causal,
+                    **extra,
                     options=TuneOptions(
                         warmup=args.warmup,
                         iters=args.iters,
@@ -231,6 +444,7 @@ class IndexerScoreBenchmark(BenchmarkBase):
                     head_weight,
                     out,
                     causal=not args.non_causal,
+                    **extra,
                 )
 
             def kernel():
@@ -243,38 +457,68 @@ class IndexerScoreBenchmark(BenchmarkBase):
                     out,
                     cluster_m,
                     causal=not args.non_causal,
+                    **extra,
                 )
 
             kernel()
             torch.cuda.synchronize()
             max_diff = "skipped"
             if not args.no_accuracy:
-                indices = torch.tensor(
-                    sorted(
-                        {
-                            i
-                            for i in (0, 1, 254, 255, 256, 257, seq // 2, seq - 1)
-                            if i < seq
-                        }
-                    ),
-                    device="cuda",
-                    dtype=torch.long,
-                )
-                expected = reference_rows(
-                    q,
-                    k,
-                    q_scales,
-                    k_scales,
-                    head_weight,
-                    indices,
-                    causal=not args.non_causal,
-                )
-                actual = out.index_select(0, indices)
-                valid = torch.isfinite(expected)
-                max_diff = f"{(actual[valid] - expected[valid]).abs().max().item():.6g}"
-                torch.testing.assert_close(
-                    actual, expected, atol=args.atol, rtol=args.rtol
-                )
+                largest_diff = 0.0
+                q_offset = 0
+                for batch in range(batch_size):
+                    local_q = q_lengths[batch]
+                    indices = torch.tensor(
+                        sorted(
+                            {
+                                i
+                                for i in (
+                                    0,
+                                    1,
+                                    254,
+                                    255,
+                                    256,
+                                    257,
+                                    local_q // 2,
+                                    local_q - 1,
+                                )
+                                if i < local_q
+                            }
+                        ),
+                        device="cuda",
+                        dtype=torch.long,
+                    )
+                    expected = reference_batched_rows(
+                        q,
+                        k,
+                        q_scales,
+                        k_scales,
+                        head_weight,
+                        batch,
+                        indices,
+                        q_lengths,
+                        kv_lengths,
+                        seq,
+                        block_table=block_table,
+                        cu_seqlens_q=cu_seqlens_q,
+                        causal=not args.non_causal,
+                    )
+                    actual = (
+                        out.index_select(0, q_offset + indices)
+                        if args.packed_q
+                        else out[batch].index_select(0, indices)
+                    )
+                    valid = torch.isfinite(expected)
+                    if valid.any():
+                        largest_diff = max(
+                            largest_diff,
+                            (actual[valid] - expected[valid]).abs().max().item(),
+                        )
+                    torch.testing.assert_close(
+                        actual, expected, atol=args.atol, rtol=args.rtol
+                    )
+                    q_offset += local_q
+                max_diff = f"{largest_diff:.6g}"
 
             stats = benchmark_with_stats(
                 kernel,
@@ -284,16 +528,32 @@ class IndexerScoreBenchmark(BenchmarkBase):
                 cold_l2_flush=args._cold_l2_flush,
             )
             ms = stats["median_ms"]
-            bounds = indexer_score_sol_bounds(
-                seq, seq, cluster_m, causal=not args.non_causal
+            per_batch_bounds = [
+                indexer_score_sol_bounds(qs, kvs, cluster_m, causal=not args.non_causal)
+                for qs, kvs in zip(q_lengths, kv_lengths)
+            ]
+            bounds = {
+                key: sum(item[key] for item in per_batch_bounds)
+                for key in per_batch_bounds[0]
+            }
+            bounds["sol_ms"] = max(
+                bounds["mma_ms"], bounds["hbm_ms"], bounds["pure_l2_ms"]
             )
-            _, _, _, flops = indexer_score_work(
-                seq, seq, cluster_m, causal=not args.non_causal
+            flops = sum(
+                indexer_score_work(qs, kvs, cluster_m, causal=not args.non_causal)[3]
+                for qs, kvs in zip(q_lengths, kv_lengths)
             )
             table.print_row(
                 seq,
+                batch_size,
+                "paged" if args.paged_kv else "dense",
+                "packed" if args.packed_q else "fixed",
                 cluster_m,
-                seq * (seq + 1) // 2 if not args.non_causal else seq * seq,
+                sum(
+                    min(kv_len, q_idx + 1) if not args.non_causal else kv_len
+                    for q_len, kv_len in zip(q_lengths, kv_lengths)
+                    for q_idx in range(q_len)
+                ),
                 f"{ms:.4f}",
                 f"{flops / (ms * 1e9):.2f}",
                 max_diff,
@@ -302,7 +562,7 @@ class IndexerScoreBenchmark(BenchmarkBase):
                 sol_report.add(
                     bounds,
                     ms,
-                    label=f"seq={seq}",
+                    label=f"seq={seq},B={batch_size},{'paged' if args.paged_kv else 'dense'}",
                 )
         if sol_report is not None:
             sol_report.print()

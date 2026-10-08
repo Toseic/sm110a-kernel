@@ -78,6 +78,21 @@ void encode_scales(CUtensorMap* map, const uint8_t* ptr, int row_tiles) {
     assert(result == CUDA_SUCCESS);
 }
 
+// Each batch's scale rows are padded to a two-query (128-row) block. The two
+// 512-byte halves are copied separately, but stay within the same blocked tile.
+void encode_q_scale_rows(CUtensorMap* map, const uint8_t* ptr, int rows) {
+    const uint64_t dims[3] = {256, 2, static_cast<uint64_t>(rows)};
+    const uint64_t strides[2] = {256, 512};
+    const uint32_t box[3] = {256, 2, 1};
+    const uint32_t elem[3] = {1, 1, 1};
+    const CUresult result = cuTensorMapEncodeTiled(
+        map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3,
+        const_cast<uint8_t*>(ptr), dims, strides, box, elem,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    assert(result == CUDA_SUCCESS);
+}
+
 void encode_output(CUtensorMap* map, float* ptr, int query_count, int kv_count) {
     const uint64_t dims[2] = {static_cast<uint64_t>(kv_count),
                               static_cast<uint64_t>(query_count)};
@@ -198,14 +213,33 @@ __global__ __cluster_dims__(kClusterM, 1, 1) void indexer_score_prefill_kernel(
     const __grid_constant__ CUtensorMap out_map,
     const half* __restrict__ head_weight,
     float* __restrict__ out, int query_count, int kv_count,
+    int batch_count, int page_size, int block_table_stride,
+    const int32_t* __restrict__ block_table,
+    const int32_t* __restrict__ cu_seqlens_q,
+    const int32_t* __restrict__ kv_seqlens,
     bool use_tma_store, bool causal) {
     const int tid = threadIdx.x;
     const int warp = tid / 32;
     const int lane = tid % 32;
-    const int q_tiles = (query_count + kTileQ - 1) / kTileQ;
-    const int kv_tiles = (kv_count + kTileKV - 1) / kTileKV;
+    const int batch = blockIdx.y;
+    const int q_offset = cu_seqlens_q ? cu_seqlens_q[batch] : batch * query_count;
+    const int local_query_len = cu_seqlens_q
+        ? cu_seqlens_q[batch + 1] - q_offset : query_count;
+    const int local_kv_len = kv_seqlens ? kv_seqlens[batch] : kv_count;
+    const int q_tiles = (local_query_len + kTileQ - 1) / kTileQ;
+    const int kv_tiles = (local_kv_len + kTileKV - 1) / kTileKV;
     const int padded_q_tiles = ((q_tiles + kClusterM - 1) / kClusterM) * kClusterM;
     const int cta_rank = blockIdx.x % kClusterM;
+    if (blockIdx.x >= padded_q_tiles || local_kv_len <= 0) {
+        if (local_kv_len <= 0) {
+            for (int q = blockIdx.x * kTileQ; q < local_query_len;
+                 q += gridDim.x * kTileQ)
+                for (int kv = tid; kv < kv_count; kv += blockDim.x)
+                    out[(static_cast<int64_t>(q_offset + q) * kv_count) + kv] =
+                        -__int_as_float(0x7f800000);
+        }
+        return;
+    }
 
     extern __shared__ __align__(1024) uint8_t smem[];
     const int smem_base = static_cast<int>(__cvta_generic_to_shared(smem));
@@ -288,12 +322,15 @@ __global__ __cluster_dims__(kClusterM, 1, 1) void indexer_score_prefill_kernel(
                          :: "r"(q_bar), "r"(kTileM * kDim / 2 + kQScaleBytes) : "memory");
             asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
                          "[%0], [%1, {%2, %3, %4}], [%5];"
-                         :: "r"(q_addr), "l"(qptr), "r"(zero), "r"(q_base * kHeads),
+                         :: "r"(q_addr), "l"(qptr), "r"(zero), "r"((q_offset + q_base) * kHeads),
                             "r"(zero), "r"(q_bar) : "memory");
-            asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
-                         "[%0], [%1, {%2, %3, %4, %5}], [%6];"
-                         :: "r"(qs_addr), "l"(qsptr), "r"(zero), "r"(zero),
-                            "r"(zero), "r"(q_tile), "r"(q_bar) : "memory");
+            const int qs_row = batch * ((query_count + 1) & ~1) + q_base;
+            #pragma unroll
+            for (int row = 0; row < kTileQ; ++row)
+                asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
+                             "[%0], [%1, {%2, %3, %4}], [%5];"
+                             :: "r"(qs_addr + row * 512), "l"(qsptr), "r"(zero),
+                                "r"(zero), "r"(qs_row + row), "r"(q_bar) : "memory");
 
             const uint64_t kptr = reinterpret_cast<uint64_t>(&k_map);
             const uint64_t ksptr = reinterpret_cast<uint64_t>(&ks_map);
@@ -323,31 +360,53 @@ __global__ __cluster_dims__(kClusterM, 1, 1) void indexer_score_prefill_kernel(
                                  : "=r"(peer_bar) : "r"(load_bar), "r"(1 - cta_rank));
                     asm volatile("mbarrier.arrive.expect_tx.release.cluster.shared::cluster.b64 _, [%0], %1;"
                                  :: "r"(peer_bar), "r"(kTileKV * kDim / 2 + kKScaleBytes) : "memory");
-                    asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::1 "
-                                 "[%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                 :: "r"(k_addr), "l"(kptr), "r"(zero), "r"(kv_base),
-                                    "r"(zero), "r"(load_bar), "h"(int16_t{3}) : "memory");
-                } else {
-                    asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
-                                 "[%0], [%1, {%2, %3, %4}], [%5];"
-                                 :: "r"(k_addr), "l"(kptr), "r"(zero), "r"(kv_base),
-                                    "r"(zero), "r"(load_bar) : "memory");
+                }
+                const int pages_per_tile = page_size ? kTileKV / page_size : 1;
+                for (int tile_page = 0; tile_page < pages_per_tile; ++tile_page) {
+                    const int logical_row = kv_base + tile_page * (page_size ? page_size : kTileKV);
+                    const int logical_page = page_size
+                        ? min(logical_row / page_size, (local_kv_len - 1) / page_size) : 0;
+                    const int physical_page = page_size
+                        ? block_table[batch * block_table_stride + logical_page] : 0;
+                    const int k_row = page_size ? physical_page * page_size
+                        : batch * kv_count + kv_base;
+                    const int dst = k_addr + tile_page * (page_size ? page_size : kTileKV) * (kDim / 2);
+                    if constexpr (kClusterM == 2) {
+                        asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::1 "
+                                     "[%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                     :: "r"(dst), "l"(kptr), "r"(zero), "r"(k_row),
+                                        "r"(zero), "r"(load_bar), "h"(int16_t{3}) : "memory");
+                    } else {
+                        asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
+                                     "[%0], [%1, {%2, %3, %4}], [%5];"
+                                     :: "r"(dst), "l"(kptr), "r"(zero), "r"(k_row),
+                                        "r"(zero), "r"(load_bar) : "memory");
+                    }
                 }
                 #pragma unroll
                 for (int scale_tile = 0; scale_tile < kKScaleTiles; ++scale_tile) {
+                    const int logical_row = kv_base + scale_tile * 128;
+                    const int logical_page = page_size
+                        ? min(logical_row / page_size, (local_kv_len - 1) / page_size) : 0;
+                    const int physical_page = page_size
+                        ? block_table[batch * block_table_stride + logical_page] : 0;
+                    const int scale_row = page_size
+                        ? physical_page * (page_size / 128) +
+                              (logical_row / 128) % (page_size / 128)
+                        : batch * ((kv_count + 127) / 128) + logical_row / 128;
                     if constexpr (kClusterM == 2) {
                         asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::1 "
                                      "[%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
                                      :: "r"(ks_addr + scale_tile * 1024), "l"(ksptr),
                                         "r"(zero), "r"(zero), "r"(zero),
-                                        "r"(kv_base / 128 + scale_tile), "r"(load_bar),
+                                        "r"(scale_row), "r"(load_bar),
                                         "h"(int16_t{3}) : "memory");
                     } else {
                         asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
                                      "[%0], [%1, {%2, %3, %4, %5}], [%6];"
                                      :: "r"(ks_addr + scale_tile * 1024), "l"(ksptr),
                                         "r"(zero), "r"(zero), "r"(zero),
-                                        "r"(kv_base / 128 + scale_tile), "r"(load_bar) : "memory");
+                                        "r"(scale_row), "r"(load_bar) : "memory");
                     }
                 }
             };
@@ -375,7 +434,7 @@ __global__ __cluster_dims__(kClusterM, 1, 1) void indexer_score_prefill_kernel(
                 const int epi_bar = static_cast<int>(
                     __cvta_generic_to_shared(&epilogue_barrier[stage]));
                 wait_barrier(epi_bar, (task / kPipelineStages) & 1);
-                if (q_base + store_q < query_count) {
+                if (q_base + store_q < local_query_len) {
                     const int kv_base = kv_tile * kTileKV;
                     if (use_tma_store) {
                         if (lane == 0) {
@@ -394,7 +453,7 @@ __global__ __cluster_dims__(kClusterM, 1, 1) void indexer_score_prefill_kernel(
                     } else {
                         for (int col = lane; col < kTileKV; col += 32)
                             if (kv_base + col < kv_count)
-                                out[static_cast<int64_t>(q_base + store_q) * kv_count +
+                                out[static_cast<int64_t>(q_offset + q_base + store_q) * kv_count +
                                     kv_base + col] = output_tile[stage][store_q][col];
                     }
                 }
@@ -406,10 +465,10 @@ __global__ __cluster_dims__(kClusterM, 1, 1) void indexer_score_prefill_kernel(
                                  :: "r"(store_bar) : "memory");
                 }
             }
-            if (causal && q_base + store_q < query_count) {
+            if (q_base + store_q < local_query_len) {
                 for (int kv = active_kv_tiles * kTileKV + lane;
                      kv < kv_count; kv += 32)
-                    out[static_cast<int64_t>(q_base + store_q) * kv_count + kv] =
+                    out[static_cast<int64_t>(q_offset + q_base + store_q) * kv_count + kv] =
                         -__int_as_float(0x7f800000);
             }
         }
@@ -492,8 +551,8 @@ __global__ __cluster_dims__(kClusterM, 1, 1) void indexer_score_prefill_kernel(
             #pragma unroll
             for (int i = 0; i < kHeads / kReductionLanes; ++i) {
                 const int head = i * kReductionLanes + head_lane;
-                weight[i] = q_base + local_q < query_count
-                    ? __half2float(head_weight[(q_base + local_q) * kHeads + head])
+                weight[i] = q_base + local_q < local_query_len
+                    ? __half2float(head_weight[(q_offset + q_base + local_q) * kHeads + head])
                     : 0.0f;
             }
             for (int kv_tile = 0; kv_tile < active_kv_tiles; ++kv_tile) {
@@ -551,7 +610,8 @@ __global__ __cluster_dims__(kClusterM, 1, 1) void indexer_score_prefill_kernel(
                         sum += __shfl_down_sync(0xffffffffU, sum, offset);
                     if (head_lane == 0)
                         output_tile[stage][local_q][local_kv] =
-                            causal && kv_tile * kTileKV + local_kv > q_base + local_q
+                            (kv_tile * kTileKV + local_kv >= local_kv_len ||
+                             (causal && kv_tile * kTileKV + local_kv > q_base + local_q))
                                 ? -__int_as_float(0x7f800000) : sum;
                 }
                 asm volatile("bar.sync 1, %0;"
@@ -582,14 +642,22 @@ extern "C" void sm110a_indexer_score_prefill_launch(
     const uint8_t* q, const uint8_t* k,
     const uint8_t* q_scales, const uint8_t* k_scales,
     const half* head_weight, float* out,
-    int query_count, int kv_count, int cluster_m, bool causal,
+    int query_count, int kv_count, int batch_count, int total_q,
+    int num_pages, int page_size, const int32_t* block_table,
+    int block_table_stride, const int32_t* cu_seqlens_q,
+    const int32_t* kv_seqlens, int cluster_m, bool causal,
     cudaStream_t stream) {
     CUtensorMap q_map, k_map, qs_map, ks_map, out_map{};
-    encode_fp4(&q_map, q, query_count * kHeads, kTileM);
-    encode_fp4(&k_map, k, kv_count, kTileKV);
-    encode_scales(&qs_map, q_scales, (query_count + 1) / 2);
-    encode_scales(&ks_map, k_scales, (kv_count + 127) / 128);
-    const bool use_tma_store = kv_count % 4 == 0;
+    encode_fp4(&q_map, q, total_q * kHeads, kTileM);
+    encode_fp4(&k_map, k, page_size ? num_pages * page_size : batch_count * kv_count,
+               page_size ? page_size : kTileKV);
+    encode_q_scale_rows(&qs_map, q_scales,
+        batch_count * ((query_count + 1) & ~1));
+    encode_scales(&ks_map, k_scales, page_size
+        ? num_pages * (page_size / 128)
+        : batch_count * ((kv_count + 127) / 128));
+    const bool use_tma_store = batch_count == 1 && !cu_seqlens_q &&
+        !kv_seqlens && kv_count % 4 == 0;
     if (use_tma_store)
         encode_output(&out_map, out, query_count, kv_count);
     int device = 0;
@@ -604,12 +672,14 @@ extern "C" void sm110a_indexer_score_prefill_launch(
     cluster_m = use_cluster ? 2 : 1;
     const int padded_q_tiles = ((q_tiles + cluster_m - 1) / cluster_m) * cluster_m;
     const int max_cluster_ctas = (max_ctas / cluster_m) * cluster_m;
-    const dim3 grid(padded_q_tiles < max_cluster_ctas ? padded_q_tiles : max_cluster_ctas);
+    const dim3 grid(padded_q_tiles < max_cluster_ctas ? padded_q_tiles : max_cluster_ctas,
+                    batch_count);
     const auto kernel = use_cluster ? indexer_score_prefill_kernel<2>
                                     : indexer_score_prefill_kernel<1>;
     cudaFuncSetAttribute(kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
     kernel<<<grid, kThreads, kSmemBytes, stream>>>(
         q_map, k_map, qs_map, ks_map, out_map, head_weight, out,
-        query_count, kv_count, use_tma_store, causal);
+        query_count, kv_count, batch_count, page_size, block_table_stride,
+        block_table, cu_seqlens_q, kv_seqlens, use_tma_store, causal);
 }
