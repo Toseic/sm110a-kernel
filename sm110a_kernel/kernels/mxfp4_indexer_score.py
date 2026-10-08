@@ -410,7 +410,7 @@ class IndexerScoreDecodeModule:
         configs = tuple(
             IndexerScoreDecodeConfig(split)
             for split in splits
-            if split <= (kv_len + 255) // 256
+            if split <= (kv_len + 127) // 128
         )
         if not configs:
             raise ValueError("KVs must be positive")

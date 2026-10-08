@@ -51,10 +51,11 @@ def random_kv_lengths(batch, kvs, generator):
 def indexer_score_decode_sol_bounds(lengths, kv_capacity, split_kv):
     """Executed MMA tiles and approximate cold-L2 HBM/L2 traffic."""
     batch = len(lengths)
-    total_tiles = (kv_capacity + 255) // 256
-    active_tiles = sum((length + 255) // 256 for length in lengths)
+    tile_kv = 128
+    total_tiles = (kv_capacity + tile_kv - 1) // tile_kv
+    active_tiles = sum((length + tile_kv - 1) // tile_kv for length in lengths)
     active_splits = sum(
-        (length + 255) // 256 > total_tiles * split // split_kv
+        (length + tile_kv - 1) // tile_kv > total_tiles * split // split_kv
         for length in lengths
         for split in range(split_kv)
     )
@@ -66,12 +67,12 @@ def indexer_score_decode_sol_bounds(lengths, kv_capacity, split_kv):
     output_bytes = batch * kv_capacity * 2
     input_bytes = q_bytes + k_bytes + q_scale_bytes + k_scale_bytes + weight_bytes
     q_tile_read_bytes = HEADS * DIM // 2 + 1024 + HEADS * 2
-    kv_tile_read_bytes = 256 * DIM // 2 + 2048
+    kv_tile_read_bytes = tile_kv * DIM // 2 + 1024
     tile_read_bytes = (
         active_splits * q_tile_read_bytes + active_tiles * kv_tile_read_bytes
     )
     return sol_bounds(
-        flops=2 * active_tiles * 256 * HEADS * DIM,
+        flops=2 * active_tiles * tile_kv * HEADS * DIM,
         compulsory_bytes=input_bytes + output_bytes,
         a_and_b_bytes=input_bytes,
         tile_read_bytes=tile_read_bytes,
@@ -193,7 +194,7 @@ class IndexerScoreDecodeBenchmark(BenchmarkBase):
         if args.baseline == "deepgemm" and args.paged_page_size == 256:
             raise SystemExit("DeepGEMM paged MQA supports --paged-page-size 128 only")
         if not args.auto and not any(
-            split <= (kvs + (kvs // 2 if args.ragged and batch > 1 else 0) + 255) // 256
+            split <= (kvs + (kvs // 2 if args.ragged and batch > 1 else 0) + 127) // 128
             for batch in args.batches
             for kvs in args.kv_lens
             for split in args.split_kvs
@@ -229,7 +230,7 @@ class IndexerScoreDecodeBenchmark(BenchmarkBase):
             for kvs in args.kv_lens:
                 kv_capacity = kvs + kvs // 2 if args.ragged and batch > 1 else kvs
                 valid_splits = [
-                    s for s in args.split_kvs if s <= (kv_capacity + 255) // 256
+                    s for s in args.split_kvs if s <= (kv_capacity + 127) // 128
                 ]
                 skipped.extend(
                     (batch, kvs, s) for s in args.split_kvs if s not in valid_splits
@@ -392,7 +393,7 @@ class IndexerScoreDecodeBenchmark(BenchmarkBase):
                             label=f"B={batch},KVs={kvs},split={split_label}",
                         )
         if skipped:
-            print("Skipped split_kv > ceil(Kcap/256): " + ", ".join(map(str, skipped)))
+            print("Skipped split_kv > ceil(Kcap/128): " + ", ".join(map(str, skipped)))
         if sol_report is not None:
             sol_report.print()
 

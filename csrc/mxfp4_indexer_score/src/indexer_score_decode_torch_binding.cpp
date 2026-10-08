@@ -85,8 +85,8 @@ torch::Tensor run(torch::Tensor q, torch::Tensor k,
                     "kv_seqlens must have B entries");
     }
     TORCH_CHECK((split_kv == 1 || split_kv == 2 || split_kv == 4 || split_kv == 8) &&
-                split_kv <= (kvs + 255) / 256,
-                "split_kv must be 1, 2, 4, or 8 and at most ceil(KVs/256)");
+                split_kv <= (kvs + 127) / 128,
+                "split_kv must be 1, 2, 4, or 8 and at most ceil(KVs/128)");
     check_scales(q_scales, "Q scales", device, batch * 1024);
     check_scales(k_scales, "K scales", device, paged
         ? num_pages * (page_size / 128) * 1024

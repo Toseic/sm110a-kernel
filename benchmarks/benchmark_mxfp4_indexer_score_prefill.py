@@ -36,6 +36,7 @@ from sm110a_kernel.runner import TuneOptions
 
 HEADS = 64
 DIM = 128
+TILE_KV = 128
 SEQ_LENGTHS = (1024, 2048, 4096, 8192, 16384, 32768)
 EXTRA_BATCH_SEQ = 8192
 EXTRA_BATCHES = (2, 4, 8, 16)
@@ -45,15 +46,15 @@ MXFP4_MMA_PEAK_TFLOPS = 4 * MMA_PEAK_TFLOPS
 
 def indexer_score_work(qs, kvs, cluster_m=1, *, causal=True):
     q_tiles = (qs + 1) // 2
-    kv_tiles = (kvs + 255) // 256
+    kv_tiles = (kvs + TILE_KV - 1) // TILE_KV
     kv_load_groups = (q_tiles + cluster_m - 1) // cluster_m
     active_tiles = [
-        min(kv_tiles, ((group + 1) * cluster_m * 2 + 255) // 256)
+        min(kv_tiles, ((group + 1) * cluster_m * 2 + TILE_KV - 1) // TILE_KV)
         if causal
         else kv_tiles
         for group in range(kv_load_groups)
     ]
-    flops = 2 * sum(active_tiles) * cluster_m * 2 * 256 * HEADS * DIM
+    flops = 2 * sum(active_tiles) * cluster_m * 2 * TILE_KV * HEADS * DIM
     return q_tiles, kv_tiles, active_tiles, flops
 
 
@@ -61,7 +62,7 @@ def indexer_score_sol_bounds(qs, kvs, cluster_m=1, *, causal=True):
     """MMA and memory rooflines for the persistent Q-reuse schedule.
 
     Each query tile loads Q, Q scales, and head weights once, then traverses
-    its visible 256-row KV tiles. Compulsory HBM includes BF16 output stores.
+    its visible 128-row KV tiles. Compulsory HBM includes BF16 output stores.
     It does not model epilogue instruction throughput or launch overhead.
     """
     q_tiles, _, active_tiles, flops = indexer_score_work(
@@ -76,7 +77,7 @@ def indexer_score_sol_bounds(qs, kvs, cluster_m=1, *, causal=True):
     input_bytes = q_bytes + k_bytes + q_scale_bytes + k_scale_bytes + weight_bytes
     compulsory_bytes = input_bytes + output_bytes
     q_tile_read_bytes = 128 * DIM // 2 + 1024 + 2 * HEADS * 2
-    kv_tile_read_bytes = 256 * DIM // 2 + 2048
+    kv_tile_read_bytes = TILE_KV * DIM // 2 + 1024
     tile_read_bytes = (
         q_tiles * q_tile_read_bytes + sum(active_tiles) * kv_tile_read_bytes
     )
