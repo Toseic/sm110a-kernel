@@ -155,6 +155,11 @@ from .kernels.grouped_m_gemm import (
     get_bf16_grouped_m_gemm_module,
     prepare_grouped_m_metadata,
 )
+from .kernels.indexer_score import (
+    compile_indexer_score_prefill,
+    indexer_score_prefill,
+    indexer_score_prefill_out,
+)
 from .kernels.moe_routing import pack_routing_metadata
 from .kernels.mxfp4_fc1 import (
     Mxfp4Fc1Config,
