@@ -163,6 +163,7 @@ from .kernels.indexer_score import (
     indexer_score_prefill,
     indexer_score_prefill_out,
     select_indexer_score_decode_split_kv,
+    select_indexer_score_prefill_cluster_m,
 )
 from .kernels.moe_routing import pack_routing_metadata
 from .kernels.mxfp4_fc1 import (

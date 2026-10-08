@@ -189,7 +189,8 @@ __device__ __forceinline__ void wait_barrier(int address, int phase) {
                  "}" :: "r"(address), "r"(phase) : "memory");
 }
 
-__global__ void indexer_score_prefill_kernel(
+template <int kClusterM>
+__global__ __cluster_dims__(kClusterM, 1, 1) void indexer_score_prefill_kernel(
     const __grid_constant__ CUtensorMap q_map,
     const __grid_constant__ CUtensorMap k_map,
     const __grid_constant__ CUtensorMap qs_map,
@@ -203,6 +204,8 @@ __global__ void indexer_score_prefill_kernel(
     const int lane = tid % 32;
     const int q_tiles = (query_count + kTileQ - 1) / kTileQ;
     const int kv_tiles = (kv_count + kTileKV - 1) / kTileKV;
+    const int padded_q_tiles = ((q_tiles + kClusterM - 1) / kClusterM) * kClusterM;
+    const int cta_rank = blockIdx.x % kClusterM;
 
     extern __shared__ __align__(1024) uint8_t smem[];
     const int smem_base = static_cast<int>(__cvta_generic_to_shared(smem));
@@ -216,6 +219,7 @@ __global__ void indexer_score_prefill_kernel(
         reinterpret_cast<float (*)[kTileQ][kTileKV]>(
             smem + kMainloopSmemBytes + kReluSmemBytes);
     __shared__ uint64_t q_barrier;
+    __shared__ uint64_t q_done_barrier;
     __shared__ uint64_t load_barrier[kPipelineStages];
     __shared__ uint64_t mma_barrier[kPipelineStages];
     __shared__ uint64_t overlap_barrier[kPipelineStages];
@@ -224,7 +228,9 @@ __global__ void indexer_score_prefill_kernel(
     __shared__ int tmem_base;
     if (tid == 0) {
         const int q_bar = static_cast<int>(__cvta_generic_to_shared(&q_barrier));
+        const int q_done_bar = static_cast<int>(__cvta_generic_to_shared(&q_done_barrier));
         asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(q_bar));
+        asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(q_done_bar));
         #pragma unroll
         for (int stage = 0; stage < kPipelineStages; ++stage) {
             const int load_addr = static_cast<int>(__cvta_generic_to_shared(&load_barrier[stage]));
@@ -234,7 +240,8 @@ __global__ void indexer_score_prefill_kernel(
             const int epi_addr = static_cast<int>(__cvta_generic_to_shared(&epilogue_barrier[stage]));
             const int store_addr = static_cast<int>(__cvta_generic_to_shared(&store_barrier[stage]));
             asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(load_addr));
-            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(mma_addr));
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+                         :: "r"(mma_addr), "r"(kClusterM));
             asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
                          :: "r"(overlap_addr), "r"(kEpilogueLoadWarps));
             asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
@@ -249,10 +256,14 @@ __global__ void indexer_score_prefill_kernel(
                      :: "r"(addr), "r"(kTmemCols));
     }
     __syncthreads();
+    if constexpr (kClusterM == 2) {
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    }
 
     // Every CTA owns a static strided subset of query tiles. Q and its scales
     // remain in shared/TMEM while that CTA traverses all KV tiles.
-    for (int q_tile = blockIdx.x, q_round = 0; q_tile < q_tiles;
+    for (int q_tile = blockIdx.x, q_round = 0; q_tile < padded_q_tiles;
          q_tile += gridDim.x, ++q_round) {
         const int q_base = q_tile * kTileQ;
         const int first_task = q_round * kv_tiles;
@@ -262,6 +273,8 @@ __global__ void indexer_score_prefill_kernel(
             const int q_bar = static_cast<int>(__cvta_generic_to_shared(&q_barrier));
             const uint64_t qptr = reinterpret_cast<uint64_t>(&q_map);
             const uint64_t qsptr = reinterpret_cast<uint64_t>(&qs_map);
+            if (q_round > 0)
+                wait_barrier(q_bar, (q_round - 1) & 1);
             asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
                          :: "r"(q_bar), "r"(kTileM * kDim / 2 + kQScaleBytes) : "memory");
             asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
@@ -276,6 +289,9 @@ __global__ void indexer_score_prefill_kernel(
             const uint64_t kptr = reinterpret_cast<uint64_t>(&k_map);
             const uint64_t ksptr = reinterpret_cast<uint64_t>(&ks_map);
             auto load_kv = [&](int kv_tile) {
+                if constexpr (kClusterM == 2) {
+                    if ((kv_tile & 1) != cta_rank) return;
+                }
                 const int task = first_task + kv_tile;
                 const int stage = task % kPipelineStages;
                 const int kv_base = kv_tile * kTileKV;
@@ -288,19 +304,43 @@ __global__ void indexer_score_prefill_kernel(
                 const int ks_addr = k_addr + kBBytes;
                 const int load_bar = static_cast<int>(
                     __cvta_generic_to_shared(&load_barrier[stage]));
+                if (task >= kPipelineStages)
+                    wait_barrier(load_bar, ((task - kPipelineStages) / kPipelineStages) & 1);
                 asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
                              :: "r"(load_bar), "r"(kTileKV * kDim / 2 + kKScaleBytes) : "memory");
-                asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
-                             "[%0], [%1, {%2, %3, %4}], [%5];"
-                             :: "r"(k_addr), "l"(kptr), "r"(zero), "r"(kv_base),
-                                "r"(zero), "r"(load_bar) : "memory");
+                if constexpr (kClusterM == 2) {
+                    int peer_bar;
+                    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;"
+                                 : "=r"(peer_bar) : "r"(load_bar), "r"(1 - cta_rank));
+                    asm volatile("mbarrier.arrive.expect_tx.release.cluster.shared::cluster.b64 _, [%0], %1;"
+                                 :: "r"(peer_bar), "r"(kTileKV * kDim / 2 + kKScaleBytes) : "memory");
+                    asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::1 "
+                                 "[%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                 :: "r"(k_addr), "l"(kptr), "r"(zero), "r"(kv_base),
+                                    "r"(zero), "r"(load_bar), "h"(int16_t{3}) : "memory");
+                } else {
+                    asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
+                                 "[%0], [%1, {%2, %3, %4}], [%5];"
+                                 :: "r"(k_addr), "l"(kptr), "r"(zero), "r"(kv_base),
+                                    "r"(zero), "r"(load_bar) : "memory");
+                }
                 #pragma unroll
-                for (int scale_tile = 0; scale_tile < kKScaleTiles; ++scale_tile)
-                    asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
-                                 "[%0], [%1, {%2, %3, %4, %5}], [%6];"
-                                 :: "r"(ks_addr + scale_tile * 1024), "l"(ksptr),
-                                    "r"(zero), "r"(zero), "r"(zero),
-                                    "r"(kv_base / 128 + scale_tile), "r"(load_bar) : "memory");
+                for (int scale_tile = 0; scale_tile < kKScaleTiles; ++scale_tile) {
+                    if constexpr (kClusterM == 2) {
+                        asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::1 "
+                                     "[%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                     :: "r"(ks_addr + scale_tile * 1024), "l"(ksptr),
+                                        "r"(zero), "r"(zero), "r"(zero),
+                                        "r"(kv_base / 128 + scale_tile), "r"(load_bar),
+                                        "h"(int16_t{3}) : "memory");
+                    } else {
+                        asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
+                                     "[%0], [%1, {%2, %3, %4, %5}], [%6];"
+                                     :: "r"(ks_addr + scale_tile * 1024), "l"(ksptr),
+                                        "r"(zero), "r"(zero), "r"(zero),
+                                        "r"(kv_base / 128 + scale_tile), "r"(load_bar) : "memory");
+                    }
+                }
             };
             for (int kv_tile = 0;
                  kv_tile < (kv_tiles < kPipelineStages ? kv_tiles : kPipelineStages);
@@ -310,11 +350,9 @@ __global__ void indexer_score_prefill_kernel(
                 if (kv_tile + kPipelineStages < kv_tiles)
                     load_kv(kv_tile + kPipelineStages);
             }
-            const int last_task = first_task + kv_tiles - 1;
-            const int last_stage = last_task % kPipelineStages;
-            const int last_mma = static_cast<int>(
-                __cvta_generic_to_shared(&mma_barrier[last_stage]));
-            wait_barrier(last_mma, (last_task / kPipelineStages) & 1);
+            const int q_done_bar = static_cast<int>(
+                __cvta_generic_to_shared(&q_done_barrier));
+            wait_barrier(q_done_bar, q_round & 1);
         }
 
         // Keep stores off the TMA producer warp so it can maintain the KV
@@ -410,9 +448,22 @@ __global__ void indexer_score_prefill_kernel(
                 }
                 const int mma_bar = static_cast<int>(
                     __cvta_generic_to_shared(&mma_barrier[stage]));
-                asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
-                             :: "r"(mma_bar) : "memory");
+                if constexpr (kClusterM == 2) {
+                    asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 [%0], %1;"
+                                 :: "r"(mma_bar), "h"(int16_t{3}) : "memory");
+                } else {
+                    asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
+                                 :: "r"(mma_bar) : "memory");
+                }
             }
+            const int last_task = first_task + kv_tiles - 1;
+            const int last_mma = static_cast<int>(__cvta_generic_to_shared(
+                &mma_barrier[last_task % kPipelineStages]));
+            wait_barrier(last_mma, (last_task / kPipelineStages) & 1);
+            const int q_done_bar = static_cast<int>(
+                __cvta_generic_to_shared(&q_done_barrier));
+            asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
+                         :: "r"(q_done_bar) : "memory");
         }
 
         if (warp >= 4) {
@@ -498,7 +549,7 @@ __global__ void indexer_score_prefill_kernel(
     }
 
     if (warp == 2) {
-        const int rounds = (q_tiles - blockIdx.x + gridDim.x - 1) / gridDim.x;
+        const int rounds = (padded_q_tiles - blockIdx.x + gridDim.x - 1) / gridDim.x;
         const int last_task = rounds * kv_tiles - 1;
         const int last_epi = static_cast<int>(
             __cvta_generic_to_shared(&epilogue_barrier[last_task % kPipelineStages]));
@@ -514,7 +565,7 @@ extern "C" void sm110a_indexer_score_prefill_launch(
     const uint8_t* q, const uint8_t* k,
     const uint8_t* q_scales, const uint8_t* k_scales,
     const half* head_weight, float* out,
-    int query_count, int kv_count, cudaStream_t stream) {
+    int query_count, int kv_count, int cluster_m, cudaStream_t stream) {
     CUtensorMap q_map, k_map, qs_map, ks_map, out_map{};
     encode_fp4(&q_map, q, query_count * kHeads, kTileM);
     encode_fp4(&k_map, k, kv_count, kTileKV);
@@ -530,10 +581,17 @@ extern "C" void sm110a_indexer_score_prefill_launch(
                                   device) == cudaSuccess);
     const int q_tiles = (query_count + kTileQ - 1) / kTileQ;
     const int max_ctas = sm_count * kPersistentCtasPerSm;
-    const dim3 grid(q_tiles < max_ctas ? q_tiles : max_ctas);
-    cudaFuncSetAttribute(indexer_score_prefill_kernel,
+    assert(cluster_m == 1 || cluster_m == 2);
+    const bool use_cluster = cluster_m == 2 && q_tiles > 1;
+    cluster_m = use_cluster ? 2 : 1;
+    const int padded_q_tiles = ((q_tiles + cluster_m - 1) / cluster_m) * cluster_m;
+    const int max_cluster_ctas = (max_ctas / cluster_m) * cluster_m;
+    const dim3 grid(padded_q_tiles < max_cluster_ctas ? padded_q_tiles : max_cluster_ctas);
+    const auto kernel = use_cluster ? indexer_score_prefill_kernel<2>
+                                    : indexer_score_prefill_kernel<1>;
+    cudaFuncSetAttribute(kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
-    indexer_score_prefill_kernel<<<grid, kThreads, kSmemBytes, stream>>>(
+    kernel<<<grid, kThreads, kSmemBytes, stream>>>(
         q_map, k_map, qs_map, ks_map, out_map, head_weight, out,
         query_count, kv_count, use_tma_store);
 }

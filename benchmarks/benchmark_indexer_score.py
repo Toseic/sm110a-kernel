@@ -24,6 +24,7 @@ from sm110a_kernel import (
     from_blocked_mxfp4_scales,
     to_blocked_mxfp4_scales,
 )
+from sm110a_kernel.runner import TuneOptions
 
 HEADS = 64
 DIM = 128
@@ -32,7 +33,7 @@ FP4_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 MXFP4_MMA_PEAK_TFLOPS = 4 * MMA_PEAK_TFLOPS
 
 
-def indexer_score_sol_bounds(qs, kvs):
+def indexer_score_sol_bounds(qs, kvs, cluster_m=1):
     """MMA and memory rooflines for the persistent Q-reuse schedule.
 
     Each query tile loads Q, Q scales, and head weights once, then traverses
@@ -51,7 +52,10 @@ def indexer_score_sol_bounds(qs, kvs):
     compulsory_bytes = input_bytes + output_bytes
     q_tile_read_bytes = 128 * DIM // 2 + 1024 + 2 * HEADS * 2
     kv_tile_read_bytes = 256 * DIM // 2 + 2048
-    tile_read_bytes = q_tiles * (q_tile_read_bytes + kv_tiles * kv_tile_read_bytes)
+    kv_load_groups = (q_tiles + cluster_m - 1) // cluster_m
+    tile_read_bytes = (
+        q_tiles * q_tile_read_bytes + kv_load_groups * kv_tiles * kv_tile_read_bytes
+    )
     return sol_bounds(
         flops=2 * qs * kvs * HEADS * DIM,
         compulsory_bytes=compulsory_bytes,
@@ -125,6 +129,17 @@ class IndexerScoreBenchmark(BenchmarkBase):
         parser.add_argument("--atol", type=float, default=5e-2)
         parser.add_argument("--rtol", type=float, default=1e-3)
         parser.add_argument(
+            "--cluster-m",
+            type=int,
+            choices=(1, 2),
+            help="run one CTA cluster size without autotuning",
+        )
+        parser.add_argument(
+            "--sweep-cluster-m",
+            action="store_true",
+            help="remeasure cluster_m=1 and 2 with cold L2",
+        )
+        parser.add_argument(
             "--sol",
             action="store_true",
             help="report MXFP4 MMA, HBM, and L2 rooflines for each length",
@@ -137,6 +152,8 @@ class IndexerScoreBenchmark(BenchmarkBase):
             raise SystemExit("--seq-lens must contain positive lengths")
         if args.atol < 0 or args.rtol < 0:
             raise SystemExit("--atol and --rtol must be non-negative")
+        if args.cluster_m and args.sweep_cluster_m:
+            raise SystemExit("--cluster-m and --sweep-cluster-m are mutually exclusive")
         self.validate_timing_args(args, allow_zero_warmup=True)
         return args
 
@@ -146,6 +163,7 @@ class IndexerScoreBenchmark(BenchmarkBase):
         table = TablePrinter(
             (
                 ("Seq", 8),
+                ("Cluster", 9),
                 ("Candidates", 14),
                 ("Kernel(ms)", 14),
                 ("TF/s", 11),
@@ -161,10 +179,33 @@ class IndexerScoreBenchmark(BenchmarkBase):
             k_scales = make_blocked_scales(seq)
             head_weight = torch.randn((seq, HEADS), device="cuda", dtype=torch.float16)
             out = torch.empty((seq, seq), device="cuda", dtype=torch.float32)
+            if args.sweep_cluster_m:
+                cluster_m = module.select_cluster_m(
+                    q,
+                    k,
+                    q_scales,
+                    k_scales,
+                    head_weight,
+                    out,
+                    options=TuneOptions(
+                        warmup=args.warmup,
+                        iters=args.iters,
+                        samples=args.samples,
+                        cold_l2_flush=args._cold_l2_flush,
+                        force_sweep=True,
+                        debug=True,
+                    ),
+                )
+            elif args.cluster_m:
+                cluster_m = args.cluster_m
+            else:
+                cluster_m = module.select_cluster_m(
+                    q, k, q_scales, k_scales, head_weight, out
+                )
 
             def kernel():
                 return module.indexer_score_prefill_out(
-                    q, k, q_scales, k_scales, head_weight, out
+                    q, k, q_scales, k_scales, head_weight, out, cluster_m
                 )
 
             kernel()
@@ -193,11 +234,18 @@ class IndexerScoreBenchmark(BenchmarkBase):
             ms = stats["median_ms"]
             flops = 2 * seq * seq * HEADS * DIM
             table.print_row(
-                seq, seq * seq, f"{ms:.4f}", f"{flops / (ms * 1e9):.2f}", max_diff
+                seq,
+                cluster_m,
+                seq * seq,
+                f"{ms:.4f}",
+                f"{flops / (ms * 1e9):.2f}",
+                max_diff,
             )
             if sol_report is not None:
                 sol_report.add(
-                    indexer_score_sol_bounds(seq, seq), ms, label=f"seq={seq}"
+                    indexer_score_sol_bounds(seq, seq, cluster_m),
+                    ms,
+                    label=f"seq={seq}",
                 )
         if sol_report is not None:
             sol_report.print()

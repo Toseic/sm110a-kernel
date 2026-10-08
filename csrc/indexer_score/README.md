@@ -10,7 +10,13 @@ score[q, kv] = sum(h=0..63) head_weight[q, h]
 
 The kernel launches up to one CTA per SM. Each CTA owns a fixed, strided
 subset of two-query tiles. For each query tile it loads Q and Q scales once,
-then traverses all 256-row KV tiles. Warp 0 loads Q and KV data with TMA;
+then traverses all 256-row KV tiles. The default entry point autotunes
+`cluster_m=1` and `cluster_m=2` with cold L2 on the first call for each
+`(device, Qs, KVs)` and caches the winner. Pass `cluster_m=1` or `2` to select
+a tactic explicitly; `select_indexer_score_prefill_cluster_m` returns the
+selected value. With two CTAs, the producer warps take turns issuing KV TMA
+multicast loads to both CTAs, halving those load requests per query pair.
+Warp 0 loads Q and KV data with TMA;
 warps 1 and 3 store one output row each; warp 2 issues the MMAs; and warps
 4–7 perform ReLU and the weighted head reduction.
 Two 256-row KV stages have separate shared-memory and output slots. Their TMEM
@@ -47,7 +53,8 @@ Q and K tensors themselves contain only their logical rows. The kernel masks
 the final output tile using `Qs` and `KVs`.
 
 The public Python entry points are `indexer_score_prefill`,
-`indexer_score_prefill_out`, and `compile_indexer_score_prefill`.
+`indexer_score_prefill_out`, `select_indexer_score_prefill_cluster_m`, and
+`compile_indexer_score_prefill`.
 
 Benchmark the full prefill shape (`Qs = KVs = seq`) at 1K, 2K, 4K, 8K,
 16K, and 32K with cold L2 by default:
@@ -58,6 +65,8 @@ Benchmark the full prefill shape (`Qs = KVs = seq`) at 1K, 2K, 4K, 8K,
 
 Use `--seq-lens` to select lengths, `--no-accuracy` to skip the sampled
 PyTorch reference, and `--warmup`, `--iters`, and `--samples` to adjust timing.
+Use `--sweep-cluster-m` to measure both tactics again and update the autotune
+cache, or `--cluster-m 1` / `--cluster-m 2` to benchmark a fixed tactic.
 Add `--sol` for MXFP4 MMA, compulsory HBM, and tile-traffic L2 rooflines.
 The roofline omits epilogue instruction throughput and launch overhead.
 

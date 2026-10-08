@@ -1,12 +1,12 @@
 """MXFP4 indexer score for prefill and batched decoding."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from statistics import median
 
 import torch
 
-from ..jit_runtime import SplitCudaJit
+from ..jit_runtime import SplitCudaJit, source_digest
 from ..runner import AutotuneRunner, PreparedKernel, TuneOptions
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -17,16 +17,102 @@ class IndexerScoreModule:
     def __init__(self, binding, library, _config):
         self._binding = binding
         self._launcher = library.entry_address
+        self._cluster_m_cache = {}
 
-    def indexer_score_prefill(self, q, k, q_scales, k_scales, head_weight):
+    def select_cluster_m(
+        self, q, k, q_scales, k_scales, head_weight, out=None, *, options=None
+    ):
+        use_default_options = options is None
+        key = (q.device.index, q.size(0), k.size(0))
+        if use_default_options and key in self._cluster_m_cache:
+            return self._cluster_m_cache[key]
+        if out is None:
+            out = torch.empty(
+                (q.size(0), k.size(0)), device=q.device, dtype=torch.float32
+            )
+        configs = (IndexerScorePrefillConfig(1), IndexerScorePrefillConfig(2))
+        if q.size(0) <= 2:
+            return 1
+        with torch.cuda.device(q.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "autotune indexer score prefill before CUDA graph capture"
+                )
+            if options is None:
+                options = TuneOptions()
+            if options.cold_l2_flush is None:
+                l2_bytes = torch.cuda.get_device_properties(q.device).L2_cache_size
+                eviction = (
+                    torch.empty((2 * l2_bytes,), device=q.device, dtype=torch.uint8)
+                    if l2_bytes > 0
+                    else None
+                )
+                options = replace(
+                    options,
+                    cold_l2_flush=(lambda: eviction.zero_())
+                    if eviction is not None
+                    else None,
+                )
+
+            def prepare(config):
+                def run():
+                    return self._binding.indexer_score_prefill_out(
+                        q,
+                        k,
+                        q_scales,
+                        k_scales,
+                        head_weight,
+                        out,
+                        config.cluster_m,
+                        self._launcher,
+                    )
+
+                return PreparedKernel(config, run)
+
+            selection = AutotuneRunner(options).resolve(
+                configs,
+                namespace=_PREFILL_TUNE_NAMESPACE,
+                key=(q.size(0), k.size(0)),
+                prepare=prepare,
+                benchmark=lambda prepared: _tune_stats(prepared.run, options),
+                probe=None,
+                format_candidate=lambda config: f"cluster_m={config.cluster_m}",
+            )
+        winner = selection.candidate.cluster_m
+        if use_default_options:
+            self._cluster_m_cache[key] = winner
+        return winner
+
+    def indexer_score_prefill(
+        self, q, k, q_scales, k_scales, head_weight, cluster_m=None
+    ):
+        if cluster_m is None:
+            cluster_m = self.select_cluster_m(q, k, q_scales, k_scales, head_weight)
         return self._binding.indexer_score_prefill(
-            q, k, q_scales, k_scales, head_weight, self._launcher
+            q, k, q_scales, k_scales, head_weight, cluster_m, self._launcher
         )
 
-    def indexer_score_prefill_out(self, q, k, q_scales, k_scales, head_weight, out):
+    def indexer_score_prefill_out(
+        self, q, k, q_scales, k_scales, head_weight, out, cluster_m=None
+    ):
+        if cluster_m is None:
+            cluster_m = self.select_cluster_m(
+                q, k, q_scales, k_scales, head_weight, out
+            )
         return self._binding.indexer_score_prefill_out(
-            q, k, q_scales, k_scales, head_weight, out, self._launcher
+            q, k, q_scales, k_scales, head_weight, out, cluster_m, self._launcher
         )
+
+
+@dataclass(frozen=True)
+class IndexerScorePrefillConfig:
+    cluster_m: int
+
+
+_PREFILL_TUNE_NAMESPACE = (
+    "indexer_score_prefill_cluster_v1_"
+    + source_digest((_SOURCE / "indexer_score_prefill_kernel.cu",), _ROOT)[:12]
+)
 
 
 _JIT = SplitCudaJit(
@@ -46,15 +132,25 @@ def compile_indexer_score_prefill() -> IndexerScoreModule:
     return _JIT.compile(None)
 
 
-def indexer_score_prefill(q, k, q_scales, k_scales, head_weight):
-    return compile_indexer_score_prefill().indexer_score_prefill(
-        q, k, q_scales, k_scales, head_weight
+def select_indexer_score_prefill_cluster_m(
+    q, k, q_scales, k_scales, head_weight, out=None, *, options=None
+):
+    return compile_indexer_score_prefill().select_cluster_m(
+        q, k, q_scales, k_scales, head_weight, out, options=options
     )
 
 
-def indexer_score_prefill_out(q, k, q_scales, k_scales, head_weight, out):
+def indexer_score_prefill(q, k, q_scales, k_scales, head_weight, cluster_m=None):
+    return compile_indexer_score_prefill().indexer_score_prefill(
+        q, k, q_scales, k_scales, head_weight, cluster_m
+    )
+
+
+def indexer_score_prefill_out(
+    q, k, q_scales, k_scales, head_weight, out, cluster_m=None
+):
     return compile_indexer_score_prefill().indexer_score_prefill_out(
-        q, k, q_scales, k_scales, head_weight, out
+        q, k, q_scales, k_scales, head_weight, out, cluster_m
     )
 
 
@@ -123,7 +219,7 @@ class IndexerScoreDecodeModule:
                 namespace="indexer_score_decode_splitkv_v1",
                 key=(q.size(0), k.size(1)),
                 prepare=prepare,
-                benchmark=lambda prepared: _decode_tune_stats(prepared.run, options),
+                benchmark=lambda prepared: _tune_stats(prepared.run, options),
                 probe=None,
                 format_candidate=lambda config: f"split_kv={config.split_kv}",
             )
@@ -156,7 +252,7 @@ class IndexerScoreDecodeConfig:
     split_kv: int
 
 
-def _decode_tune_stats(run, options):
+def _tune_stats(run, options):
     for _ in range(options.warmup):
         run()
     torch.cuda.synchronize()
