@@ -60,3 +60,44 @@ Use `--seq-lens` to select lengths, `--no-accuracy` to skip the sampled
 PyTorch reference, and `--warmup`, `--iters`, and `--samples` to adjust timing.
 Add `--sol` for MXFP4 MMA, compulsory HBM, and tile-traffic L2 rooflines.
 The roofline omits epilogue instruction throughput and launch overhead.
+
+## Decoding
+
+`indexer_score_decode(q, k, q_scales, k_scales, head_weight, split_kv=None)`
+computes the same score for one query per batch and returns FP32 `[B, KVs]`.
+`indexer_score_decode_out` writes into a supplied contiguous FP32 output.
+The CUDA implementation and binding are in separate `indexer_score_decode_*`
+files; `compile_indexer_score_decode` precompiles their JIT module.
+
+- `q`: contiguous CUDA MXFP4 `[B, 64, 64]` (packed D=128).
+- `k`: contiguous CUDA MXFP4 `[B, KVs, 64]`.
+- `q_scales`: contiguous blocked E8M0, `B * 1024` bytes. Pad each batch's
+  64 query rows to 128 before calling `to_blocked_mxfp4_scales`.
+- `k_scales`: contiguous blocked E8M0, `B * ceil(KVs/128) * 1024` bytes.
+  Pad each batch's KV rows to a multiple of 128 before blocking scales.
+- `head_weight`: contiguous CUDA FP16 `[B, 64]`.
+
+`split_kv` accepts 1, 2, 4, or 8 and cannot exceed `ceil(KVs/256)`.
+The default `None` measures valid splits with cold L2 on the first cache miss
+for each `(device, B, KVs)`, caches the winner, and reuses it on later calls.
+Pass an integer to bypass tuning. `select_indexer_score_decode_split_kv`
+returns the selected integer without running the requested output call.
+Each batch launches one cluster of `split_kv` CTAs. The split count is a
+compile-time kernel template parameter; each CTA computes and stores its own
+nonoverlapping KV range. Since the output is the full candidate vector, no
+cross-CTA score reduction is needed. Top-k selection remains a separate step.
+
+Benchmark decoding at `KVs=16384` for batch sizes 1, 2, 4, 8, 16, 32, 64,
+and 128 across all supported split counts, with cold L2 by default:
+
+```bash
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_indexer_score_decode.py
+```
+
+Use `--batches`, `--kv-lens`, and `--split-kvs` to select cases. The benchmark
+checks sampled batch rows against the FP32 PyTorch reference unless
+`--no-accuracy` is passed. It reports latency in microseconds, useful TF/s,
+and maximum absolute error; `--sol` adds approximate rooflines.
+The default sweep also reports the autotuned split for each batch size. Use
+`--no-auto` for fixed splits only, `--force-sweep` to remeasure the tuning
+choice, and `--cache-path` to set the persistent cache location.

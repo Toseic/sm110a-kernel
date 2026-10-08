@@ -156,9 +156,13 @@ from .kernels.grouped_m_gemm import (
     prepare_grouped_m_metadata,
 )
 from .kernels.indexer_score import (
+    compile_indexer_score_decode,
     compile_indexer_score_prefill,
+    indexer_score_decode,
+    indexer_score_decode_out,
     indexer_score_prefill,
     indexer_score_prefill_out,
+    select_indexer_score_decode_split_kv,
 )
 from .kernels.moe_routing import pack_routing_metadata
 from .kernels.mxfp4_fc1 import (
