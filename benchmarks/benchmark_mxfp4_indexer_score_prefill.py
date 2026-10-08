@@ -64,7 +64,7 @@ def indexer_score_sol_bounds(qs, kvs, cluster_m=1, *, causal=True):
     q_scale_bytes = q_tiles * 1024
     k_scale_bytes = ((kvs + 127) // 128) * 1024
     weight_bytes = qs * HEADS * 2
-    output_bytes = qs * kvs * 2
+    output_bytes = (sum(min(kvs, q + 1) for q in range(qs)) if causal else qs * kvs) * 2
     input_bytes = q_bytes + k_bytes + q_scale_bytes + k_scale_bytes + weight_bytes
     compulsory_bytes = input_bytes + output_bytes
     q_tile_read_bytes = 128 * DIM // 2 + 1024 + 2 * HEADS * 2
@@ -474,6 +474,11 @@ class IndexerScoreBenchmark(BenchmarkBase):
                     **extra,
                 )
 
+            # A prefilled output makes masked writes observable during the
+            # accuracy check. Filling is outside the timed kernel call.
+            masked_sentinel = 7.25
+            if not args.no_accuracy:
+                out.fill_(masked_sentinel)
             kernel()
             torch.cuda.synchronize()
             max_diff = "skipped"
@@ -529,6 +534,13 @@ class IndexerScoreBenchmark(BenchmarkBase):
                             largest_diff,
                             (actual[valid] - expected[valid]).abs().max().item(),
                         )
+                    torch.testing.assert_close(
+                        actual[~valid],
+                        torch.full_like(actual[~valid], masked_sentinel),
+                        atol=0,
+                        rtol=0,
+                    )
+                    expected.masked_fill_(~valid, masked_sentinel)
                     torch.testing.assert_close(
                         actual, expected, atol=args.atol, rtol=args.rtol
                     )

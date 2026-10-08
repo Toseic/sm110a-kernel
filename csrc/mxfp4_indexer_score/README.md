@@ -10,14 +10,16 @@ score[q, kv] = sum(h=0..63) head_weight[q, h]
 ```
 
 By default, the batch-local, top-left-aligned causal mask matches MHA: entries
-with `kv > q` are `-inf`. Positions beyond each batch's `kv_seqlens` are also
-`-inf`. Pass `causal=False` to compute the full valid matrix. The
-`_out` entry point and cluster selector accept the same keyword.
+with `kv > q` are left untouched. Positions beyond each batch's `kv_seqlens`
+are also left untouched. Pass `causal=False` to compute the full valid matrix.
+The `_out` entry point preserves existing values at masked positions; the
+allocating entry point leaves those positions undefined. The `_out` entry point
+and cluster selector accept the same keyword.
 
 The kernel launches up to one CTA per SM. Each CTA owns a fixed, strided
 subset of two-query tiles. For each query tile it loads Q and Q scales once,
-then traverses only the KV tiles visible under the causal mask. It fills
-fully masked output tiles with `-inf` without loading KV data or issuing MMA.
+then traverses only the KV tiles visible under the causal mask. It skips
+fully masked output tiles without loading KV data or issuing MMA.
 The default entry point autotunes
 `cluster_m=1` and `cluster_m=2` with cold L2 on the first call for each
 `(device, batch, Qs, KVs, layout, causal)` and caches the winner. Pass
@@ -34,10 +36,10 @@ before signaling the next MMA, following the capacity-constrained NVFP4 GEMM
 scheme. Q and K scales reuse one 12-column TMEM scratch slot. This keeps the
 full allocation at 508 of 512 columns while loading, MMA, epilogue, and stores
 overlap across KV tiles. The store
-warps use TMA for a single fixed-length sequence when `KVs` is divisible by
-eight (the tensor-map row-stride alignment requirement), and direct stores
-otherwise. This is the full
-candidate matrix from the design note; top-k selection is a separate operation.
+warps use TMA for fully valid 256-column tiles of a single fixed-length
+sequence when `KVs` is divisible by eight (the tensor-map row-stride alignment
+requirement), and direct stores for boundary tiles and other layouts. This is
+the candidate matrix from the design note; top-k selection is separate.
 
 The epilogue stores ReLU results by candidate column and head in shared
 memory after reading 256 candidate columns per head with four TMEM loads.

@@ -231,13 +231,6 @@ __global__ __cluster_dims__(kClusterM, 1, 1) void indexer_score_prefill_kernel(
     const int padded_q_tiles = ((q_tiles + kClusterM - 1) / kClusterM) * kClusterM;
     const int cta_rank = blockIdx.x % kClusterM;
     if (blockIdx.x >= padded_q_tiles || local_kv_len <= 0) {
-        if (local_kv_len <= 0) {
-            for (int q = blockIdx.x * kTileQ; q < local_query_len;
-                 q += gridDim.x * kTileQ)
-                for (int kv = tid; kv < kv_count; kv += blockDim.x)
-                    out[(static_cast<int64_t>(q_offset + q) * kv_count) + kv] =
-                        __float2bfloat16_rn(-__int_as_float(0x7f800000));
-        }
         return;
     }
 
@@ -439,7 +432,10 @@ __global__ __cluster_dims__(kClusterM, 1, 1) void indexer_score_prefill_kernel(
                 wait_barrier(epi_bar, (task / kPipelineStages) & 1);
                 if (q_base + store_q < local_query_len) {
                     const int kv_base = kv_tile * kTileKV;
-                    if (use_tma_store) {
+                    // TMA writes a whole tile. Use direct stores at the
+                    // causal boundary so masked output stays untouched.
+                    if (use_tma_store && kv_base + kTileKV <= local_kv_len &&
+                        (!causal || kv_base + kTileKV <= q_base + store_q + 1)) {
                         if (lane == 0) {
                             const int src = static_cast<int>(
                                 __cvta_generic_to_shared(output_tile[stage][store_q]));
@@ -455,7 +451,8 @@ __global__ __cluster_dims__(kClusterM, 1, 1) void indexer_score_prefill_kernel(
                         }
                     } else {
                         for (int col = lane; col < kTileKV; col += 32)
-                            if (kv_base + col < kv_count)
+                            if (kv_base + col < local_kv_len &&
+                                (!causal || kv_base + col <= q_base + store_q))
                                 out[static_cast<int64_t>(q_offset + q_base + store_q) * kv_count +
                                     kv_base + col] = output_tile[stage][store_q][col];
                     }
@@ -467,12 +464,6 @@ __global__ __cluster_dims__(kClusterM, 1, 1) void indexer_score_prefill_kernel(
                     asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
                                  :: "r"(store_bar) : "memory");
                 }
-            }
-            if (q_base + store_q < local_query_len) {
-                for (int kv = active_kv_tiles * kTileKV + lane;
-                     kv < kv_count; kv += 32)
-                    out[static_cast<int64_t>(q_offset + q_base + store_q) * kv_count + kv] =
-                        __float2bfloat16_rn(-__int_as_float(0x7f800000));
             }
         }
 
@@ -618,11 +609,8 @@ __global__ __cluster_dims__(kClusterM, 1, 1) void indexer_score_prefill_kernel(
                     const float other = __shfl_down_sync(0xffffffffU, partial, 1);
                     if (head_lane == 0)
                         output_tile[stage][local_q][local_kv] =
-                            (kv_tile * kTileKV + local_kv >= local_kv_len ||
-                             (causal && kv_tile * kTileKV + local_kv > q_base + local_q))
-                                ? __float2bfloat16_rn(-__int_as_float(0x7f800000))
-                                : __hadd(__float2bfloat16_rn(partial),
-                                         __float2bfloat16_rn(other));
+                            __hadd(__float2bfloat16_rn(partial),
+                                   __float2bfloat16_rn(other));
                 }
                 asm volatile("bar.sync 1, %0;"
                              :: "n"(kEpilogueWarps * 32) : "memory");
