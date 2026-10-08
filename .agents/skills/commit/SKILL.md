@@ -19,7 +19,7 @@ If the working tree contains unrelated themes, split them into separate commits 
 2. Group files into coherent commit topics based on behavior or purpose.
 3. If there is only one coherent topic, create one commit that includes all current changes.
 4. If there are multiple topics, stage and commit each topic separately with clear commit messages.
-5. Use concise commit messages that describe the resulting change, not the mechanical edit.
+5. Write commit messages with both a concise title and a descriptive comment/body. The title should summarize the resulting change, while the comment/body must briefly describe the specific code changes, affected components, and any relevant behavior or rationale. Do not create title-only commit messages.
 6. Do not rewrite, drop, or revert user changes unless the user explicitly asked for that.
 
 ## Python files: ruff is mandatory
