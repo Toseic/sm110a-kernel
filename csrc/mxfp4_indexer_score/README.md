@@ -60,7 +60,7 @@ Benchmark the full prefill shape (`Qs = KVs = seq`) at 1K, 2K, 4K, 8K,
 16K, and 32K with cold L2 by default:
 
 ```bash
-/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_indexer_score.py
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_mxfp4_indexer_score_prefill.py
 ```
 
 Use `--seq-lens` to select lengths, `--no-accuracy` to skip the sampled
@@ -100,7 +100,7 @@ Benchmark decoding at `KVs=16384` for batch sizes 1, 2, 4, 8, 16, 32, 64,
 and 128 across all supported split counts, with cold L2 by default:
 
 ```bash
-/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_indexer_score_decode.py
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_mxfp4_indexer_score_decode.py
 ```
 
 Use `--batches`, `--kv-lens`, and `--split-kvs` to select cases. The benchmark

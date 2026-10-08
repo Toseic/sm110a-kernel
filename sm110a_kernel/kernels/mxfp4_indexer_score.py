@@ -10,7 +10,7 @@ from ..jit_runtime import SplitCudaJit, source_digest
 from ..runner import AutotuneRunner, PreparedKernel, TuneOptions
 
 _ROOT = Path(__file__).resolve().parents[2]
-_SOURCE = _ROOT / "csrc/indexer_score/src"
+_SOURCE = _ROOT / "csrc/mxfp4_indexer_score/src"
 
 
 class IndexerScoreModule:

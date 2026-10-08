@@ -155,16 +155,6 @@ from .kernels.grouped_m_gemm import (
     get_bf16_grouped_m_gemm_module,
     prepare_grouped_m_metadata,
 )
-from .kernels.indexer_score import (
-    compile_indexer_score_decode,
-    compile_indexer_score_prefill,
-    indexer_score_decode,
-    indexer_score_decode_out,
-    indexer_score_prefill,
-    indexer_score_prefill_out,
-    select_indexer_score_decode_split_kv,
-    select_indexer_score_prefill_cluster_m,
-)
 from .kernels.moe_routing import pack_routing_metadata
 from .kernels.mxfp4_fc1 import (
     Mxfp4Fc1Config,
@@ -198,6 +188,16 @@ from .kernels.mxfp4_gemm import (
     quantize_mxfp4_gemm,
     quantize_mxfp4_rows,
     to_blocked_mxfp4_scales,
+)
+from .kernels.mxfp4_indexer_score import (
+    compile_indexer_score_decode,
+    compile_indexer_score_prefill,
+    indexer_score_decode,
+    indexer_score_decode_out,
+    indexer_score_prefill,
+    indexer_score_prefill_out,
+    select_indexer_score_decode_split_kv,
+    select_indexer_score_prefill_cluster_m,
 )
 from .kernels.nccl_lsa import NcclLsaAllReduce, nccl_unique_id
 from .kernels.nvfp4_fc1 import (

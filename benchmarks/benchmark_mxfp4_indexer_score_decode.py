@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from benchmark_indexer_score import (
+from benchmark_mxfp4_indexer_score_prefill import (
     DIM,
     HEADS,
     MXFP4_MMA_PEAK_TFLOPS,
