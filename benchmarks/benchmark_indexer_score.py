@@ -36,11 +36,11 @@ def indexer_score_sol_bounds(qs, kvs):
     """MMA and memory rooflines for the persistent Q-reuse schedule.
 
     Each query tile loads Q, Q scales, and head weights once, then traverses
-    all K=64 KV tiles. Compulsory HBM also includes FP32 output stores.
+    all 256-row KV tiles. Compulsory HBM also includes FP32 output stores.
     It does not model epilogue instruction throughput or launch overhead.
     """
     q_tiles = (qs + 1) // 2
-    kv_tiles = (kvs + 63) // 64
+    kv_tiles = (kvs + 255) // 256
     q_bytes = qs * HEADS * DIM // 2
     k_bytes = kvs * DIM // 2
     q_scale_bytes = q_tiles * 1024
@@ -50,7 +50,7 @@ def indexer_score_sol_bounds(qs, kvs):
     input_bytes = q_bytes + k_bytes + q_scale_bytes + k_scale_bytes + weight_bytes
     compulsory_bytes = input_bytes + output_bytes
     q_tile_read_bytes = 128 * DIM // 2 + 1024 + 2 * HEADS * 2
-    kv_tile_read_bytes = 64 * DIM // 2 + 1024
+    kv_tile_read_bytes = 256 * DIM // 2 + 2048
     tile_read_bytes = q_tiles * (q_tile_read_bytes + kv_tiles * kv_tile_read_bytes)
     return sol_bounds(
         flops=2 * qs * kvs * HEADS * DIM,

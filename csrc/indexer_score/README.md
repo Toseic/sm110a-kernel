@@ -8,21 +8,27 @@ score[q, kv] = sum(h=0..63) head_weight[q, h]
                * max(dot(Q[q, h, :], K[kv, :]), 0)
 ```
 
-The kernel launches up to two CTAs per SM. Each CTA owns a fixed, strided
+The kernel launches up to one CTA per SM. Each CTA owns a fixed, strided
 subset of two-query tiles. For each query tile it loads Q and Q scales once,
-then traverses all 64-row KV tiles. Warp 0 loads Q and KV data with TMA and
-stores the first output row; warp 1 stores the second row; warp 2 issues the
-MMAs; warp 3 is idle; warps 4–7 perform ReLU and the weighted head reduction.
-Two KV stages have separate shared-memory, TMEM accumulator, and output slots
-so loading, MMA, epilogue, and stores can overlap across KV tiles. The store
+then traverses all 256-row KV tiles. Warp 0 loads Q and KV data with TMA;
+warps 1 and 3 store one output row each; warp 2 issues the MMAs; and warps
+4–7 perform ReLU and the weighted head reduction.
+Two 256-row KV stages have separate shared-memory and output slots. Their TMEM
+accumulators overlap by 16 columns, and the epilogue drains the shared range
+before signaling the next MMA, following the capacity-constrained NVFP4 GEMM
+scheme. Q and K scales reuse one 12-column TMEM scratch slot. This keeps the
+full allocation at 508 of 512 columns while loading, MMA, epilogue, and stores
+overlap across KV tiles. The store
 warps use TMA when `KVs` is divisible by four (the tensor-map row-stride
 alignment requirement), and direct stores otherwise. This is the full
 candidate matrix from the design note; top-k selection is a separate operation.
 
 The epilogue stores ReLU results by candidate column and head in shared
-memory after reading all 64 candidate columns per head with one TMEM load.
-Each lane accumulates all 64 heads for one candidate. Each epilogue
-warp keeps only its output row's query weights in registers across KV tiles.
+memory after reading 256 candidate columns per head with four TMEM loads.
+Four loader warps materialize the ReLU values, then eight reduction warps use
+two lanes per candidate; each lane accumulates 32 heads and the pair combines
+with a shuffle. Each reduction warp keeps its output row's query weights in
+registers across KV tiles.
 The head stride is padded to spread neighboring candidates across shared-memory
 banks.
 

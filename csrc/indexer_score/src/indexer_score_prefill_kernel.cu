@@ -10,20 +10,45 @@ namespace {
 constexpr int kHeads = 64;
 constexpr int kDim = 128;
 constexpr int kTileQ = 2;
-constexpr int kTileKV = 64;
+constexpr int kTileKV = 256;
 constexpr int kPipelineStages = 2;
-constexpr int kPersistentCtasPerSm = 2;
-constexpr int kReductionLanes = 1;
+constexpr int kPersistentCtasPerSm = 1;
+constexpr int kReductionLanes = 2;
 constexpr int kHeadStride = kHeads + kReductionLanes;
 constexpr int kTileM = kTileQ * kHeads;
-constexpr int kThreads = 8 * 32;
-constexpr int kEpilogueWarps = 4;
+constexpr int kEpilogueLoadWarps = 4;
+constexpr int kReductionWarpsPerQuery = 2 * kReductionLanes;
+constexpr int kEpilogueWarps = kTileQ * kReductionWarpsPerQuery;
+constexpr int kThreads = (4 + kEpilogueWarps) * 32;
 constexpr int kABytes = kTileM * 128;
 constexpr int kBBytes = kTileKV * 128;
-constexpr int kScaleBytes = 2 * 512;
-constexpr int kQSmemBytes = kABytes + kScaleBytes;
-constexpr int kKVStageSmemBytes = kBBytes + kScaleBytes;
-constexpr int kSmemBytes = kQSmemBytes + kPipelineStages * kKVStageSmemBytes;
+constexpr int kQScaleBytes = 2 * 512;
+constexpr int kKScaleTiles = kTileKV / 128;
+constexpr int kKScaleBytes = kKScaleTiles * 2 * 512;
+constexpr int kQSmemBytes = kABytes + kQScaleBytes;
+constexpr int kKVStageSmemBytes = kBBytes + kKScaleBytes;
+constexpr int kMainloopSmemBytes =
+    kQSmemBytes + kPipelineStages * kKVStageSmemBytes;
+constexpr int kReluSmemBytes =
+    kTileQ * kTileKV * kHeadStride * sizeof(float);
+constexpr int kOutputSmemBytes =
+    kPipelineStages * kTileQ * kTileKV * sizeof(float);
+constexpr int kSmemBytes =
+    kMainloopSmemBytes + kReluSmemBytes + kOutputSmemBytes;
+
+// The two 256-column accumulator stages overlap by 16 columns. The epilogue
+// drains that range first and signals the MMA warp before the adjacent stage
+// may overwrite it. Q and K scales share one 12-column scratch slot and are
+// recopied immediately before each MMA slab, matching the capacity-constrained
+// TileN=256 path in the repository's MXFP4 GEMM.
+constexpr int kAccumulatorOverlapCols = 16;
+constexpr int kAccumulatorStageStride = kTileKV - kAccumulatorOverlapCols;
+constexpr int kAccumulatorTmemCols =
+    kPipelineStages * kTileKV - kAccumulatorOverlapCols;
+constexpr int kScaleTmemCol = kAccumulatorTmemCols;
+constexpr int kScaleTmemCols = 4 + kKScaleTiles * 4;
+constexpr int kTmemCols = 512;
+static_assert(kAccumulatorTmemCols + kScaleTmemCols <= kTmemCols);
 
 // Q and K are row-major packed E2M1; their scales use the same 128x4
 // blocked UE8M0 layout as the repository's MXFP4 GEMM.
@@ -79,9 +104,9 @@ __device__ __forceinline__ uint64_t scale_desc(int addr) {
            (8ULL << 32) | (1ULL << 46);
 }
 
-// Columns 128..151 hold Q/K scales; result stages occupy 0..127.
+// Result stages overlap in columns 240..255. Scale scratch occupies 496..507.
 __device__ __forceinline__ int result_col(int stage) {
-    return stage * kTileKV;
+    return stage * kAccumulatorStageStride;
 }
 
 __device__ __forceinline__ void load_tmem_x64(float* value, int address) {
@@ -184,17 +209,19 @@ __global__ void indexer_score_prefill_kernel(
     const int q_addr = smem_base;
     const int qs_addr = q_addr + kABytes;
     const int kv_smem_base = smem_base + kQSmemBytes;
+    float (*relu_values)[kTileKV][kHeadStride] =
+        reinterpret_cast<float (*)[kTileKV][kHeadStride]>(
+            smem + kMainloopSmemBytes);
+    float (*output_tile)[kTileQ][kTileKV] =
+        reinterpret_cast<float (*)[kTileQ][kTileKV]>(
+            smem + kMainloopSmemBytes + kReluSmemBytes);
     __shared__ uint64_t q_barrier;
     __shared__ uint64_t load_barrier[kPipelineStages];
     __shared__ uint64_t mma_barrier[kPipelineStages];
+    __shared__ uint64_t overlap_barrier[kPipelineStages];
     __shared__ uint64_t epilogue_barrier[kPipelineStages];
     __shared__ uint64_t store_barrier[kPipelineStages];
     __shared__ int tmem_base;
-    // Consecutive heads for one candidate occupy separate banks. The extra
-    // float shifts adjacent candidates to different bank groups.
-    __shared__ float relu_values[kTileQ][kTileKV][kHeadStride];
-    __shared__ __align__(128) float output_tile[kPipelineStages][kTileQ][kTileKV];
-
     if (tid == 0) {
         const int q_bar = static_cast<int>(__cvta_generic_to_shared(&q_barrier));
         asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(q_bar));
@@ -202,10 +229,14 @@ __global__ void indexer_score_prefill_kernel(
         for (int stage = 0; stage < kPipelineStages; ++stage) {
             const int load_addr = static_cast<int>(__cvta_generic_to_shared(&load_barrier[stage]));
             const int mma_addr = static_cast<int>(__cvta_generic_to_shared(&mma_barrier[stage]));
+            const int overlap_addr = static_cast<int>(
+                __cvta_generic_to_shared(&overlap_barrier[stage]));
             const int epi_addr = static_cast<int>(__cvta_generic_to_shared(&epilogue_barrier[stage]));
             const int store_addr = static_cast<int>(__cvta_generic_to_shared(&store_barrier[stage]));
             asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(load_addr));
             asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(mma_addr));
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+                         :: "r"(overlap_addr), "r"(kEpilogueLoadWarps));
             asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
                          :: "r"(epi_addr), "r"(kEpilogueWarps));
             asm volatile("mbarrier.init.shared::cta.b64 [%0], 2;" :: "r"(store_addr));
@@ -214,8 +245,8 @@ __global__ void indexer_score_prefill_kernel(
     }
     if (warp == 2) {
         const int addr = static_cast<int>(__cvta_generic_to_shared(&tmem_base));
-        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 256;"
-                     :: "r"(addr));
+        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+                     :: "r"(addr), "r"(kTmemCols));
     }
     __syncthreads();
 
@@ -232,7 +263,7 @@ __global__ void indexer_score_prefill_kernel(
             const uint64_t qptr = reinterpret_cast<uint64_t>(&q_map);
             const uint64_t qsptr = reinterpret_cast<uint64_t>(&qs_map);
             asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
-                         :: "r"(q_bar), "r"(kTileM * kDim / 2 + kScaleBytes) : "memory");
+                         :: "r"(q_bar), "r"(kTileM * kDim / 2 + kQScaleBytes) : "memory");
             asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
                          "[%0], [%1, {%2, %3, %4}], [%5];"
                          :: "r"(q_addr), "l"(qptr), "r"(zero), "r"(q_base * kHeads),
@@ -258,15 +289,18 @@ __global__ void indexer_score_prefill_kernel(
                 const int load_bar = static_cast<int>(
                     __cvta_generic_to_shared(&load_barrier[stage]));
                 asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
-                             :: "r"(load_bar), "r"(kTileKV * kDim / 2 + kScaleBytes) : "memory");
+                             :: "r"(load_bar), "r"(kTileKV * kDim / 2 + kKScaleBytes) : "memory");
                 asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
                              "[%0], [%1, {%2, %3, %4}], [%5];"
                              :: "r"(k_addr), "l"(kptr), "r"(zero), "r"(kv_base),
                                 "r"(zero), "r"(load_bar) : "memory");
-                asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
-                             "[%0], [%1, {%2, %3, %4, %5}], [%6];"
-                             :: "r"(ks_addr), "l"(ksptr), "r"(zero), "r"(zero),
-                                "r"(zero), "r"(kv_base / 128), "r"(load_bar) : "memory");
+                #pragma unroll
+                for (int scale_tile = 0; scale_tile < kKScaleTiles; ++scale_tile)
+                    asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
+                                 "[%0], [%1, {%2, %3, %4, %5}], [%6];"
+                                 :: "r"(ks_addr + scale_tile * 1024), "l"(ksptr),
+                                    "r"(zero), "r"(zero), "r"(zero),
+                                    "r"(kv_base / 128 + scale_tile), "r"(load_bar) : "memory");
             };
             for (int kv_tile = 0;
                  kv_tile < (kv_tiles < kPipelineStages ? kv_tiles : kPipelineStages);
@@ -275,53 +309,36 @@ __global__ void indexer_score_prefill_kernel(
             for (int kv_tile = 0; kv_tile < kv_tiles; ++kv_tile) {
                 if (kv_tile + kPipelineStages < kv_tiles)
                     load_kv(kv_tile + kPipelineStages);
-                const int task = first_task + kv_tile;
-                const int stage = task % kPipelineStages;
-                const int epi_bar = static_cast<int>(
-                    __cvta_generic_to_shared(&epilogue_barrier[stage]));
-                wait_barrier(epi_bar, (task / kPipelineStages) & 1);
-                const int src = static_cast<int>(
-                    __cvta_generic_to_shared(output_tile[stage][0]));
-                const int kv_base = kv_tile * kTileKV;
-                if (use_tma_store) {
-                    const uint64_t map = reinterpret_cast<uint64_t>(&out_map);
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                    asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group "
-                                 "[%0, {%1, %2}], [%3];"
-                                 :: "l"(map), "r"(kv_base), "r"(q_base), "r"(src) : "memory");
-                    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
-                    asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
-                } else {
-                    for (int col = 0; col < kTileKV; ++col)
-                        if (kv_base + col < kv_count)
-                            out[static_cast<int64_t>(q_base) * kv_count + kv_base + col] =
-                                output_tile[stage][0][col];
-                }
-                const int store_bar = static_cast<int>(
-                    __cvta_generic_to_shared(&store_barrier[stage]));
-                asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
-                             :: "r"(store_bar) : "memory");
             }
+            const int last_task = first_task + kv_tiles - 1;
+            const int last_stage = last_task % kPipelineStages;
+            const int last_mma = static_cast<int>(
+                __cvta_generic_to_shared(&mma_barrier[last_stage]));
+            wait_barrier(last_mma, (last_task / kPipelineStages) & 1);
         }
 
-        if (warp == 1) {
+        // Keep stores off the TMA producer warp so it can maintain the KV
+        // load window. Warp 3, otherwise idle, stores the first query row.
+        if (warp == 1 || warp == 3) {
+            const int store_q = warp == 3 ? 0 : 1;
             for (int kv_tile = 0; kv_tile < kv_tiles; ++kv_tile) {
                 const int task = first_task + kv_tile;
                 const int stage = task % kPipelineStages;
                 const int epi_bar = static_cast<int>(
                     __cvta_generic_to_shared(&epilogue_barrier[stage]));
                 wait_barrier(epi_bar, (task / kPipelineStages) & 1);
-                if (q_base + 1 < query_count) {
+                if (q_base + store_q < query_count) {
                     const int kv_base = kv_tile * kTileKV;
                     if (use_tma_store) {
                         if (lane == 0) {
                             const int src = static_cast<int>(
-                                __cvta_generic_to_shared(output_tile[stage][1]));
+                                __cvta_generic_to_shared(output_tile[stage][store_q]));
                             const uint64_t map = reinterpret_cast<uint64_t>(&out_map);
                             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                             asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group "
                                          "[%0, {%1, %2}], [%3];"
-                                         :: "l"(map), "r"(kv_base), "r"(q_base + 1),
+                                         :: "l"(map), "r"(kv_base),
+                                            "r"(q_base + store_q),
                                             "r"(src) : "memory");
                             asm volatile("cp.async.bulk.commit_group;" ::: "memory");
                             asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
@@ -329,8 +346,8 @@ __global__ void indexer_score_prefill_kernel(
                     } else {
                         for (int col = lane; col < kTileKV; col += 32)
                             if (kv_base + col < kv_count)
-                                out[static_cast<int64_t>(q_base + 1) * kv_count +
-                                    kv_base + col] = output_tile[stage][1][col];
+                                out[static_cast<int64_t>(q_base + store_q) * kv_count +
+                                    kv_base + col] = output_tile[stage][store_q][col];
                     }
                 }
                 __syncwarp();
@@ -346,15 +363,7 @@ __global__ void indexer_score_prefill_kernel(
         if (warp == 2 && lane == 0) {
             const int q_bar = static_cast<int>(__cvta_generic_to_shared(&q_barrier));
             wait_barrier(q_bar, q_round & 1);
-            asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
-            // Q scales are invariant across all KV tiles of this query tile.
-            #pragma unroll
-            for (int slab = 0; slab < 2; ++slab)
-                asm volatile("tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;"
-                             :: "r"(tmem_base + 128 + slab * 4),
-                                "l"(scale_desc(qs_addr + slab * 512)) : "memory");
-
-            constexpr uint32_t instruction = 0x08900480U;
+            constexpr uint32_t instruction = 0x08C00480U;
             for (int kv_tile = 0; kv_tile < kv_tiles; ++kv_tile) {
                 const int task = first_task + kv_tile;
                 const int stage = task % kPipelineStages;
@@ -367,25 +376,36 @@ __global__ void indexer_score_prefill_kernel(
                         __cvta_generic_to_shared(&epilogue_barrier[stage]));
                     wait_barrier(old_epi, ((task - kPipelineStages) / kPipelineStages) & 1);
                 }
+                if (task > 0) {
+                    const int previous_stage = 1 - stage;
+                    const int overlap_addr = static_cast<int>(
+                        __cvta_generic_to_shared(&overlap_barrier[previous_stage]));
+                    wait_barrier(overlap_addr,
+                                 ((task - 1) / kPipelineStages) & 1);
+                }
                 asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
                 const int k_addr = kv_smem_base + stage * kKVStageSmemBytes;
                 const int ks_addr = k_addr + kBBytes;
                 const int taddr = tmem_base + result_col(stage);
-                const int kv_base = kv_tile * kTileKV;
                 #pragma unroll
                 for (int slab = 0; slab < 2; ++slab) {
-                    const int ks_taddr = tmem_base + 136 + stage * 8 + slab * 4;
                     asm volatile("tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;"
-                                 :: "r"(ks_taddr),
-                                    "l"(scale_desc(ks_addr + slab * 512)) : "memory");
-                    const int sfb_taddr = ks_taddr + (kv_base % 128) / 32;
+                                 :: "r"(tmem_base + kScaleTmemCol),
+                                    "l"(scale_desc(qs_addr + slab * 512)) : "memory");
+                    #pragma unroll
+                    for (int scale_tile = 0; scale_tile < kKScaleTiles; ++scale_tile)
+                        asm volatile("tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;"
+                                     :: "r"(tmem_base + kScaleTmemCol + 4 + scale_tile * 4),
+                                        "l"(scale_desc(ks_addr + scale_tile * 1024 +
+                                                       slab * 512)) : "memory");
                     const uint64_t adesc = fp4_desc(q_addr + slab * 32);
                     const uint64_t bdesc = fp4_desc(k_addr + slab * 32);
                     asm volatile("{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %6, 0;\n\t"
                                  "tcgen05.mma.cta_group::1.kind::mxf4.block_scale.scale_vec::2X "
                                  "[%0], %1, %2, %3, [%4], [%5], p;\n\t}"
                                  :: "r"(taddr), "l"(adesc), "l"(bdesc), "r"(instruction),
-                                    "r"(tmem_base + 128 + slab * 4), "r"(sfb_taddr),
+                                    "r"(tmem_base + kScaleTmemCol),
+                                    "r"(tmem_base + kScaleTmemCol + 4),
                                     "r"(slab) : "memory");
                 }
                 const int mma_bar = static_cast<int>(
@@ -397,7 +417,9 @@ __global__ void indexer_score_prefill_kernel(
 
         if (warp >= 4) {
             const int head_lane = lane % kReductionLanes;
-            const int local_q = (warp - 4) / 2;
+            const int candidate_lane = lane / kReductionLanes;
+            const int reducer_warp = warp - 4;
+            const int local_q = reducer_warp / kReductionWarpsPerQuery;
             // Reuse each query's weights across all KV tiles in this CTA.
             float weight[kHeads / kReductionLanes];
             #pragma unroll
@@ -414,32 +436,57 @@ __global__ void indexer_score_prefill_kernel(
                 const int mma_bar = static_cast<int>(
                     __cvta_generic_to_shared(&mma_barrier[stage]));
                 wait_barrier(mma_bar, phase);
-                const int row = (warp - 4) * 32 + lane;
-                float value[64];
-                const int address = tmem_base + result_col(stage) +
-                                    ((row & ~31) << 16);
-                load_tmem_x64(value, address);
-                asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
-                #pragma unroll
-                for (int i = 0; i < kTileKV; ++i)
-                    relu_values[row / kHeads][i][row % kHeads] =
-                        fmaxf(value[i], 0.0f);
-                asm volatile("bar.sync 1, 128;" ::: "memory");
+                if (warp < 4 + kEpilogueLoadWarps) {
+                    const int row = (warp - 4) * 32 + lane;
+                    const int overlap_block = stage == 0 ? kTileKV / 64 - 1 : 0;
+                    #pragma unroll
+                    for (int block_idx = 0; block_idx < kTileKV / 64; ++block_idx) {
+                        const int col_block =
+                            (overlap_block + block_idx) % (kTileKV / 64);
+                        float value[64];
+                        const int address = tmem_base + result_col(stage) +
+                                            col_block * 64 + ((row & ~31) << 16);
+                        load_tmem_x64(value, address);
+                        asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                        #pragma unroll
+                        for (int i = 0; i < 64; ++i)
+                            relu_values[row / kHeads][col_block * 64 + i]
+                                       [row % kHeads] = fmaxf(value[i], 0.0f);
+                        if (block_idx == 0 && lane == 0) {
+                            const int overlap_addr = static_cast<int>(
+                                __cvta_generic_to_shared(&overlap_barrier[stage]));
+                            asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
+                                         :: "r"(overlap_addr) : "memory");
+                        }
+                    }
+                }
+                asm volatile("bar.sync 1, %0;"
+                             :: "n"(kEpilogueWarps * 32) : "memory");
                 if (task >= kPipelineStages) {
                     const int old_store = static_cast<int>(
                         __cvta_generic_to_shared(&store_barrier[stage]));
                     wait_barrier(old_store, ((task - kPipelineStages) / kPipelineStages) & 1);
                 }
-                const int output_index = (warp - 4) * 32 + lane;
-                const int local_kv = output_index % kTileKV;
-                float sum = 0.0f;
                 #pragma unroll
-                for (int i = 0; i < kHeads / kReductionLanes; ++i) {
-                    const int head = i * kReductionLanes + head_lane;
-                    sum += weight[i] * relu_values[local_q][local_kv][head];
+                for (int col_block = 0; col_block < kTileKV / 64; ++col_block) {
+                    const int local_kv =
+                        col_block * 64 +
+                        (reducer_warp % kReductionWarpsPerQuery) *
+                            (32 / kReductionLanes) + candidate_lane;
+                    float sum = 0.0f;
+                    #pragma unroll
+                    for (int i = 0; i < kHeads / kReductionLanes; ++i) {
+                        const int head = i * kReductionLanes + head_lane;
+                        sum += weight[i] * relu_values[local_q][local_kv][head];
+                    }
+                    #pragma unroll
+                    for (int offset = kReductionLanes / 2; offset > 0; offset /= 2)
+                        sum += __shfl_down_sync(0xffffffffU, sum, offset);
+                    if (head_lane == 0)
+                        output_tile[stage][local_q][local_kv] = sum;
                 }
-                output_tile[stage][local_q][local_kv] = sum;
-                asm volatile("bar.sync 1, 128;" ::: "memory");
+                asm volatile("bar.sync 1, %0;"
+                             :: "n"(kEpilogueWarps * 32) : "memory");
                 if (lane == 0) {
                     const int epi_bar = static_cast<int>(
                         __cvta_generic_to_shared(&epilogue_barrier[stage]));
@@ -456,8 +503,8 @@ __global__ void indexer_score_prefill_kernel(
         const int last_epi = static_cast<int>(
             __cvta_generic_to_shared(&epilogue_barrier[last_task % kPipelineStages]));
         wait_barrier(last_epi, (last_task / kPipelineStages) & 1);
-        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 256;"
-                     :: "r"(tmem_base));
+        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
+                     :: "r"(tmem_base), "r"(kTmemCols));
     }
 }
 
