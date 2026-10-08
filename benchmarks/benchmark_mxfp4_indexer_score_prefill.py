@@ -36,7 +36,7 @@ from sm110a_kernel.runner import TuneOptions
 
 HEADS = 64
 DIM = 128
-TILE_KV = 128
+TILE_KV = 384
 SEQ_LENGTHS = (1024, 2048, 4096, 8192, 16384, 32768)
 EXTRA_BATCH_SEQ = 8192
 EXTRA_BATCHES = (2, 4, 8, 16)
@@ -77,7 +77,7 @@ def indexer_score_sol_bounds(qs, kvs, cluster_m=1, *, causal=True):
     input_bytes = q_bytes + k_bytes + q_scale_bytes + k_scale_bytes + weight_bytes
     compulsory_bytes = input_bytes + output_bytes
     q_tile_read_bytes = 128 * DIM // 2 + 1024 + 2 * HEADS * 2
-    kv_tile_read_bytes = TILE_KV * DIM // 2 + 1024
+    kv_tile_read_bytes = TILE_KV * DIM // 2 + (TILE_KV // 128) * 1024
     tile_read_bytes = (
         q_tiles * q_tile_read_bytes + sum(active_tiles) * kv_tile_read_bytes
     )
