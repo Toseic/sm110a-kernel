@@ -20,10 +20,19 @@ class IndexerScoreModule:
         self._cluster_m_cache = {}
 
     def select_cluster_m(
-        self, q, k, q_scales, k_scales, head_weight, out=None, *, options=None
+        self,
+        q,
+        k,
+        q_scales,
+        k_scales,
+        head_weight,
+        out=None,
+        *,
+        causal=True,
+        options=None,
     ):
         use_default_options = options is None
-        key = (q.device.index, q.size(0), k.size(0))
+        key = (q.device.index, q.size(0), k.size(0), bool(causal))
         if use_default_options and key in self._cluster_m_cache:
             return self._cluster_m_cache[key]
         if out is None:
@@ -64,6 +73,7 @@ class IndexerScoreModule:
                         head_weight,
                         out,
                         config.cluster_m,
+                        bool(causal),
                         self._launcher,
                     )
 
@@ -72,7 +82,7 @@ class IndexerScoreModule:
             selection = AutotuneRunner(options).resolve(
                 configs,
                 namespace=_PREFILL_TUNE_NAMESPACE,
-                key=(q.size(0), k.size(0)),
+                key=(q.size(0), k.size(0), bool(causal)),
                 prepare=prepare,
                 benchmark=lambda prepared: _tune_stats(prepared.run, options),
                 probe=None,
@@ -84,23 +94,40 @@ class IndexerScoreModule:
         return winner
 
     def indexer_score_prefill(
-        self, q, k, q_scales, k_scales, head_weight, cluster_m=None
-    ):
-        if cluster_m is None:
-            cluster_m = self.select_cluster_m(q, k, q_scales, k_scales, head_weight)
-        return self._binding.indexer_score_prefill(
-            q, k, q_scales, k_scales, head_weight, cluster_m, self._launcher
-        )
-
-    def indexer_score_prefill_out(
-        self, q, k, q_scales, k_scales, head_weight, out, cluster_m=None
+        self, q, k, q_scales, k_scales, head_weight, cluster_m=None, *, causal=True
     ):
         if cluster_m is None:
             cluster_m = self.select_cluster_m(
-                q, k, q_scales, k_scales, head_weight, out
+                q, k, q_scales, k_scales, head_weight, causal=causal
+            )
+        return self._binding.indexer_score_prefill(
+            q,
+            k,
+            q_scales,
+            k_scales,
+            head_weight,
+            cluster_m,
+            bool(causal),
+            self._launcher,
+        )
+
+    def indexer_score_prefill_out(
+        self, q, k, q_scales, k_scales, head_weight, out, cluster_m=None, *, causal=True
+    ):
+        if cluster_m is None:
+            cluster_m = self.select_cluster_m(
+                q, k, q_scales, k_scales, head_weight, out, causal=causal
             )
         return self._binding.indexer_score_prefill_out(
-            q, k, q_scales, k_scales, head_weight, out, cluster_m, self._launcher
+            q,
+            k,
+            q_scales,
+            k_scales,
+            head_weight,
+            out,
+            cluster_m,
+            bool(causal),
+            self._launcher,
         )
 
 
@@ -133,24 +160,26 @@ def compile_indexer_score_prefill() -> IndexerScoreModule:
 
 
 def select_indexer_score_prefill_cluster_m(
-    q, k, q_scales, k_scales, head_weight, out=None, *, options=None
+    q, k, q_scales, k_scales, head_weight, out=None, *, causal=True, options=None
 ):
     return compile_indexer_score_prefill().select_cluster_m(
-        q, k, q_scales, k_scales, head_weight, out, options=options
+        q, k, q_scales, k_scales, head_weight, out, causal=causal, options=options
     )
 
 
-def indexer_score_prefill(q, k, q_scales, k_scales, head_weight, cluster_m=None):
+def indexer_score_prefill(
+    q, k, q_scales, k_scales, head_weight, cluster_m=None, *, causal=True
+):
     return compile_indexer_score_prefill().indexer_score_prefill(
-        q, k, q_scales, k_scales, head_weight, cluster_m
+        q, k, q_scales, k_scales, head_weight, cluster_m, causal=causal
     )
 
 
 def indexer_score_prefill_out(
-    q, k, q_scales, k_scales, head_weight, out, cluster_m=None
+    q, k, q_scales, k_scales, head_weight, out, cluster_m=None, *, causal=True
 ):
     return compile_indexer_score_prefill().indexer_score_prefill_out(
-        q, k, q_scales, k_scales, head_weight, out, cluster_m
+        q, k, q_scales, k_scales, head_weight, out, cluster_m, causal=causal
     )
 
 

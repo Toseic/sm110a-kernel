@@ -33,15 +33,30 @@ FP4_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 MXFP4_MMA_PEAK_TFLOPS = 4 * MMA_PEAK_TFLOPS
 
 
-def indexer_score_sol_bounds(qs, kvs, cluster_m=1):
+def indexer_score_work(qs, kvs, cluster_m=1, *, causal=True):
+    q_tiles = (qs + 1) // 2
+    kv_tiles = (kvs + 255) // 256
+    kv_load_groups = (q_tiles + cluster_m - 1) // cluster_m
+    active_tiles = [
+        min(kv_tiles, ((group + 1) * cluster_m * 2 + 255) // 256)
+        if causal
+        else kv_tiles
+        for group in range(kv_load_groups)
+    ]
+    flops = 2 * sum(active_tiles) * cluster_m * 2 * 256 * HEADS * DIM
+    return q_tiles, kv_tiles, active_tiles, flops
+
+
+def indexer_score_sol_bounds(qs, kvs, cluster_m=1, *, causal=True):
     """MMA and memory rooflines for the persistent Q-reuse schedule.
 
     Each query tile loads Q, Q scales, and head weights once, then traverses
-    all 256-row KV tiles. Compulsory HBM also includes FP32 output stores.
+    its visible 256-row KV tiles. Compulsory HBM includes FP32 output stores.
     It does not model epilogue instruction throughput or launch overhead.
     """
-    q_tiles = (qs + 1) // 2
-    kv_tiles = (kvs + 255) // 256
+    q_tiles, _, active_tiles, flops = indexer_score_work(
+        qs, kvs, cluster_m, causal=causal
+    )
     q_bytes = qs * HEADS * DIM // 2
     k_bytes = kvs * DIM // 2
     q_scale_bytes = q_tiles * 1024
@@ -52,12 +67,11 @@ def indexer_score_sol_bounds(qs, kvs, cluster_m=1):
     compulsory_bytes = input_bytes + output_bytes
     q_tile_read_bytes = 128 * DIM // 2 + 1024 + 2 * HEADS * 2
     kv_tile_read_bytes = 256 * DIM // 2 + 2048
-    kv_load_groups = (q_tiles + cluster_m - 1) // cluster_m
     tile_read_bytes = (
-        q_tiles * q_tile_read_bytes + kv_load_groups * kv_tiles * kv_tile_read_bytes
+        q_tiles * q_tile_read_bytes + sum(active_tiles) * kv_tile_read_bytes
     )
     return sol_bounds(
-        flops=2 * qs * kvs * HEADS * DIM,
+        flops=flops,
         compulsory_bytes=compulsory_bytes,
         a_and_b_bytes=input_bytes,
         tile_read_bytes=tile_read_bytes,
@@ -91,7 +105,9 @@ def decode_rows(packed_bytes, scale_bytes):
     return (values.view(-1, DIM // 32, 32) * scales.unsqueeze(-1)).reshape(-1, DIM)
 
 
-def reference_rows(q, k, q_scales, k_scales, head_weight, query_indices):
+def reference_rows(
+    q, k, q_scales, k_scales, head_weight, query_indices, *, causal=True
+):
     qs = q.size(0)
     kvs = k.size(0)
     q_row_ids = (
@@ -111,7 +127,11 @@ def reference_rows(q, k, q_scales, k_scales, head_weight, query_indices):
     dot = q_dense @ k_dense.T
     dot.clamp_min_(0)
     weights = head_weight.index_select(0, query_indices).float()
-    return (dot.view(query_indices.numel(), HEADS, kvs) * weights[:, :, None]).sum(1)
+    scores = (dot.view(query_indices.numel(), HEADS, kvs) * weights[:, :, None]).sum(1)
+    if causal:
+        keys = torch.arange(kvs, device=scores.device)
+        scores.masked_fill_(keys[None, :] > query_indices[:, None], -torch.inf)
+    return scores
 
 
 class IndexerScoreBenchmark(BenchmarkBase):
@@ -126,6 +146,9 @@ class IndexerScoreBenchmark(BenchmarkBase):
         )
         parser.add_argument("--seed", type=int, default=1234)
         parser.add_argument("--no-accuracy", action="store_true")
+        parser.add_argument(
+            "--non-causal", action="store_true", help="disable the default causal mask"
+        )
         parser.add_argument("--atol", type=float, default=5e-2)
         parser.add_argument("--rtol", type=float, default=1e-3)
         parser.add_argument(
@@ -187,6 +210,7 @@ class IndexerScoreBenchmark(BenchmarkBase):
                     k_scales,
                     head_weight,
                     out,
+                    causal=not args.non_causal,
                     options=TuneOptions(
                         warmup=args.warmup,
                         iters=args.iters,
@@ -200,12 +224,25 @@ class IndexerScoreBenchmark(BenchmarkBase):
                 cluster_m = args.cluster_m
             else:
                 cluster_m = module.select_cluster_m(
-                    q, k, q_scales, k_scales, head_weight, out
+                    q,
+                    k,
+                    q_scales,
+                    k_scales,
+                    head_weight,
+                    out,
+                    causal=not args.non_causal,
                 )
 
             def kernel():
                 return module.indexer_score_prefill_out(
-                    q, k, q_scales, k_scales, head_weight, out, cluster_m
+                    q,
+                    k,
+                    q_scales,
+                    k_scales,
+                    head_weight,
+                    out,
+                    cluster_m,
+                    causal=not args.non_causal,
                 )
 
             kernel()
@@ -213,13 +250,28 @@ class IndexerScoreBenchmark(BenchmarkBase):
             max_diff = "skipped"
             if not args.no_accuracy:
                 indices = torch.tensor(
-                    sorted({0, seq // 2, seq - 1}), device="cuda", dtype=torch.long
+                    sorted(
+                        {
+                            i
+                            for i in (0, 1, 254, 255, 256, 257, seq // 2, seq - 1)
+                            if i < seq
+                        }
+                    ),
+                    device="cuda",
+                    dtype=torch.long,
                 )
                 expected = reference_rows(
-                    q, k, q_scales, k_scales, head_weight, indices
+                    q,
+                    k,
+                    q_scales,
+                    k_scales,
+                    head_weight,
+                    indices,
+                    causal=not args.non_causal,
                 )
                 actual = out.index_select(0, indices)
-                max_diff = f"{(actual - expected).abs().max().item():.6g}"
+                valid = torch.isfinite(expected)
+                max_diff = f"{(actual[valid] - expected[valid]).abs().max().item():.6g}"
                 torch.testing.assert_close(
                     actual, expected, atol=args.atol, rtol=args.rtol
                 )
@@ -232,18 +284,23 @@ class IndexerScoreBenchmark(BenchmarkBase):
                 cold_l2_flush=args._cold_l2_flush,
             )
             ms = stats["median_ms"]
-            flops = 2 * seq * seq * HEADS * DIM
+            bounds = indexer_score_sol_bounds(
+                seq, seq, cluster_m, causal=not args.non_causal
+            )
+            _, _, _, flops = indexer_score_work(
+                seq, seq, cluster_m, causal=not args.non_causal
+            )
             table.print_row(
                 seq,
                 cluster_m,
-                seq * seq,
+                seq * (seq + 1) // 2 if not args.non_causal else seq * seq,
                 f"{ms:.4f}",
                 f"{flops / (ms * 1e9):.2f}",
                 max_diff,
             )
             if sol_report is not None:
                 sol_report.add(
-                    indexer_score_sol_bounds(seq, seq, cluster_m),
+                    bounds,
                     ms,
                     label=f"seq={seq}",
                 )

@@ -198,7 +198,7 @@ __global__ __cluster_dims__(kClusterM, 1, 1) void indexer_score_prefill_kernel(
     const __grid_constant__ CUtensorMap out_map,
     const half* __restrict__ head_weight,
     float* __restrict__ out, int query_count, int kv_count,
-    bool use_tma_store) {
+    bool use_tma_store, bool causal) {
     const int tid = threadIdx.x;
     const int warp = tid / 32;
     const int lane = tid % 32;
@@ -262,11 +262,20 @@ __global__ __cluster_dims__(kClusterM, 1, 1) void indexer_score_prefill_kernel(
     }
 
     // Every CTA owns a static strided subset of query tiles. Q and its scales
-    // remain in shared/TMEM while that CTA traverses all KV tiles.
+    // remain in shared/TMEM while that CTA traverses visible KV tiles.
+    int next_task = 0;
     for (int q_tile = blockIdx.x, q_round = 0; q_tile < padded_q_tiles;
          q_tile += gridDim.x, ++q_round) {
         const int q_base = q_tile * kTileQ;
-        const int first_task = q_round * kv_tiles;
+        // Cluster peers multicast KV into each other's shared memory, so both
+        // CTAs must run the same number of KV tasks even at a tile boundary.
+        const int cluster_q_end =
+            (q_tile - cta_rank + kClusterM) * kTileQ;
+        const int active_kv_tiles = causal
+            ? min(kv_tiles, (cluster_q_end + kTileKV - 1) / kTileKV)
+            : kv_tiles;
+        const int first_task = next_task;
+        next_task += active_kv_tiles;
 
         if (warp == 0 && lane == 0) {
             const int zero = 0;
@@ -343,11 +352,12 @@ __global__ __cluster_dims__(kClusterM, 1, 1) void indexer_score_prefill_kernel(
                 }
             };
             for (int kv_tile = 0;
-                 kv_tile < (kv_tiles < kPipelineStages ? kv_tiles : kPipelineStages);
+                 kv_tile < (active_kv_tiles < kPipelineStages
+                                ? active_kv_tiles : kPipelineStages);
                  ++kv_tile)
                 load_kv(kv_tile);
-            for (int kv_tile = 0; kv_tile < kv_tiles; ++kv_tile) {
-                if (kv_tile + kPipelineStages < kv_tiles)
+            for (int kv_tile = 0; kv_tile < active_kv_tiles; ++kv_tile) {
+                if (kv_tile + kPipelineStages < active_kv_tiles)
                     load_kv(kv_tile + kPipelineStages);
             }
             const int q_done_bar = static_cast<int>(
@@ -359,7 +369,7 @@ __global__ __cluster_dims__(kClusterM, 1, 1) void indexer_score_prefill_kernel(
         // load window. Warp 3, otherwise idle, stores the first query row.
         if (warp == 1 || warp == 3) {
             const int store_q = warp == 3 ? 0 : 1;
-            for (int kv_tile = 0; kv_tile < kv_tiles; ++kv_tile) {
+            for (int kv_tile = 0; kv_tile < active_kv_tiles; ++kv_tile) {
                 const int task = first_task + kv_tile;
                 const int stage = task % kPipelineStages;
                 const int epi_bar = static_cast<int>(
@@ -396,13 +406,19 @@ __global__ __cluster_dims__(kClusterM, 1, 1) void indexer_score_prefill_kernel(
                                  :: "r"(store_bar) : "memory");
                 }
             }
+            if (causal && q_base + store_q < query_count) {
+                for (int kv = active_kv_tiles * kTileKV + lane;
+                     kv < kv_count; kv += 32)
+                    out[static_cast<int64_t>(q_base + store_q) * kv_count + kv] =
+                        -__int_as_float(0x7f800000);
+            }
         }
 
         if (warp == 2 && lane == 0) {
             const int q_bar = static_cast<int>(__cvta_generic_to_shared(&q_barrier));
             wait_barrier(q_bar, q_round & 1);
             constexpr uint32_t instruction = 0x08C00480U;
-            for (int kv_tile = 0; kv_tile < kv_tiles; ++kv_tile) {
+            for (int kv_tile = 0; kv_tile < active_kv_tiles; ++kv_tile) {
                 const int task = first_task + kv_tile;
                 const int stage = task % kPipelineStages;
                 const int phase = (task / kPipelineStages) & 1;
@@ -456,7 +472,7 @@ __global__ __cluster_dims__(kClusterM, 1, 1) void indexer_score_prefill_kernel(
                                  :: "r"(mma_bar) : "memory");
                 }
             }
-            const int last_task = first_task + kv_tiles - 1;
+            const int last_task = next_task - 1;
             const int last_mma = static_cast<int>(__cvta_generic_to_shared(
                 &mma_barrier[last_task % kPipelineStages]));
             wait_barrier(last_mma, (last_task / kPipelineStages) & 1);
@@ -480,7 +496,7 @@ __global__ __cluster_dims__(kClusterM, 1, 1) void indexer_score_prefill_kernel(
                     ? __half2float(head_weight[(q_base + local_q) * kHeads + head])
                     : 0.0f;
             }
-            for (int kv_tile = 0; kv_tile < kv_tiles; ++kv_tile) {
+            for (int kv_tile = 0; kv_tile < active_kv_tiles; ++kv_tile) {
                 const int task = first_task + kv_tile;
                 const int stage = task % kPipelineStages;
                 const int phase = (task / kPipelineStages) & 1;
@@ -534,7 +550,9 @@ __global__ __cluster_dims__(kClusterM, 1, 1) void indexer_score_prefill_kernel(
                     for (int offset = kReductionLanes / 2; offset > 0; offset /= 2)
                         sum += __shfl_down_sync(0xffffffffU, sum, offset);
                     if (head_lane == 0)
-                        output_tile[stage][local_q][local_kv] = sum;
+                        output_tile[stage][local_q][local_kv] =
+                            causal && kv_tile * kTileKV + local_kv > q_base + local_q
+                                ? -__int_as_float(0x7f800000) : sum;
                 }
                 asm volatile("bar.sync 1, %0;"
                              :: "n"(kEpilogueWarps * 32) : "memory");
@@ -549,8 +567,7 @@ __global__ __cluster_dims__(kClusterM, 1, 1) void indexer_score_prefill_kernel(
     }
 
     if (warp == 2) {
-        const int rounds = (padded_q_tiles - blockIdx.x + gridDim.x - 1) / gridDim.x;
-        const int last_task = rounds * kv_tiles - 1;
+        const int last_task = next_task - 1;
         const int last_epi = static_cast<int>(
             __cvta_generic_to_shared(&epilogue_barrier[last_task % kPipelineStages]));
         wait_barrier(last_epi, (last_task / kPipelineStages) & 1);
@@ -565,7 +582,8 @@ extern "C" void sm110a_indexer_score_prefill_launch(
     const uint8_t* q, const uint8_t* k,
     const uint8_t* q_scales, const uint8_t* k_scales,
     const half* head_weight, float* out,
-    int query_count, int kv_count, int cluster_m, cudaStream_t stream) {
+    int query_count, int kv_count, int cluster_m, bool causal,
+    cudaStream_t stream) {
     CUtensorMap q_map, k_map, qs_map, ks_map, out_map{};
     encode_fp4(&q_map, q, query_count * kHeads, kTileM);
     encode_fp4(&k_map, k, kv_count, kTileKV);
@@ -593,5 +611,5 @@ extern "C" void sm110a_indexer_score_prefill_launch(
                          cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
     kernel<<<grid, kThreads, kSmemBytes, stream>>>(
         q_map, k_map, qs_map, ks_map, out_map, head_weight, out,
-        query_count, kv_count, use_tma_store);
+        query_count, kv_count, use_tma_store, causal);
 }

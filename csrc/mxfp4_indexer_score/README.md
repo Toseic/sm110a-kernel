@@ -1,18 +1,24 @@
 # Indexer score prefill
 
-`indexer_score_prefill(q, k, q_scales, k_scales, head_weight)` returns an
-FP32 `[Qs, KVs]` candidate score matrix:
+`indexer_score_prefill(q, k, q_scales, k_scales, head_weight, causal=True)`
+returns an FP32 `[Qs, KVs]` candidate score matrix:
 
 ```text
 score[q, kv] = sum(h=0..63) head_weight[q, h]
                * max(dot(Q[q, h, :], K[kv, :]), 0)
 ```
 
+By default, the top-left-aligned causal mask matches MHA: entries with
+`kv > q` are `-inf`. Pass `causal=False` to compute the full matrix. The
+`_out` entry point and cluster selector accept the same keyword.
+
 The kernel launches up to one CTA per SM. Each CTA owns a fixed, strided
 subset of two-query tiles. For each query tile it loads Q and Q scales once,
-then traverses all 256-row KV tiles. The default entry point autotunes
+then traverses only the KV tiles visible under the causal mask. It fills
+fully masked output tiles with `-inf` without loading KV data or issuing MMA.
+The default entry point autotunes
 `cluster_m=1` and `cluster_m=2` with cold L2 on the first call for each
-`(device, Qs, KVs)` and caches the winner. Pass `cluster_m=1` or `2` to select
+`(device, Qs, KVs, causal)` and caches the winner. Pass `cluster_m=1` or `2` to select
 a tactic explicitly; `select_indexer_score_prefill_cluster_m` returns the
 selected value. With two CTAs, the producer warps take turns issuing KV TMA
 multicast loads to both CTAs, halving those load requests per query pair.
@@ -63,11 +69,14 @@ Benchmark the full prefill shape (`Qs = KVs = seq`) at 1K, 2K, 4K, 8K,
 /home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_mxfp4_indexer_score_prefill.py
 ```
 
-Use `--seq-lens` to select lengths, `--no-accuracy` to skip the sampled
-PyTorch reference, and `--warmup`, `--iters`, and `--samples` to adjust timing.
+Use `--seq-lens` to select lengths, `--non-causal` to disable the mask,
+`--no-accuracy` to skip the sampled PyTorch reference, and `--warmup`,
+`--iters`, and `--samples` to adjust timing.
 Use `--sweep-cluster-m` to measure both tactics again and update the autotune
 cache, or `--cluster-m 1` / `--cluster-m 2` to benchmark a fixed tactic.
 Add `--sol` for MXFP4 MMA, compulsory HBM, and tile-traffic L2 rooflines.
+The reported TF/s and MMA roofline count the executed 2-by-256 tiles,
+including partial tiles.
 The roofline omits epilogue instruction throughput and launch overhead.
 
 ## Decoding

@@ -10,7 +10,7 @@ namespace {
 
 using Launcher = void (*)(const uint8_t*, const uint8_t*, const uint8_t*,
                           const uint8_t*, const half*, float*, int, int,
-                          int, cudaStream_t);
+                          int, bool, cudaStream_t);
 
 void check_packed(const torch::Tensor& value, const char* name,
                   const c10::Device& device) {
@@ -32,7 +32,7 @@ void check_scales(const torch::Tensor& value, const char* name,
 torch::Tensor run(torch::Tensor q, torch::Tensor k,
                   torch::Tensor q_scales, torch::Tensor k_scales,
                   torch::Tensor head_weight, torch::Tensor out,
-                  int cluster_m,
+                  int cluster_m, bool causal,
                   uint64_t launcher_address) {
     TORCH_CHECK(launcher_address != 0, "indexer score launcher is null");
     TORCH_CHECK(q.is_cuda(), "Q must be a CUDA tensor");
@@ -67,7 +67,7 @@ torch::Tensor run(torch::Tensor q, torch::Tensor k,
              reinterpret_cast<const uint8_t*>(k_scales.data_ptr()),
              reinterpret_cast<const half*>(head_weight.data_ptr<at::Half>()),
              out.data_ptr<float>(), static_cast<int>(qs), static_cast<int>(kvs),
-             cluster_m,
+             cluster_m, causal,
              c10::cuda::getCurrentCUDAStream(device.index()));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
@@ -76,18 +76,20 @@ torch::Tensor run(torch::Tensor q, torch::Tensor k,
 torch::Tensor indexer_score_prefill_out(
     torch::Tensor q, torch::Tensor k, torch::Tensor q_scales,
     torch::Tensor k_scales, torch::Tensor head_weight, torch::Tensor out,
-    int cluster_m,
+    int cluster_m, bool causal,
     uint64_t launcher_address) {
-    return run(q, k, q_scales, k_scales, head_weight, out, cluster_m, launcher_address);
+    return run(q, k, q_scales, k_scales, head_weight, out, cluster_m, causal,
+               launcher_address);
 }
 
 torch::Tensor indexer_score_prefill(
     torch::Tensor q, torch::Tensor k, torch::Tensor q_scales,
-    torch::Tensor k_scales, torch::Tensor head_weight, int cluster_m,
+    torch::Tensor k_scales, torch::Tensor head_weight, int cluster_m, bool causal,
     uint64_t launcher_address) {
     auto out = torch::empty({q.size(0), k.size(0)},
                             q.options().dtype(torch::kFloat));
-    return run(q, k, q_scales, k_scales, head_weight, out, cluster_m, launcher_address);
+    return run(q, k, q_scales, k_scales, head_weight, out, cluster_m, causal,
+               launcher_address);
 }
 
 }  // namespace
