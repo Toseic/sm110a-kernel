@@ -3,13 +3,13 @@
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/CUDAGuard.h>
-#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <torch/extension.h>
 
 namespace {
 
 using Launcher = void (*)(const uint8_t*, const uint8_t*, const uint8_t*,
-                          const uint8_t*, const half*, float*, int, int, int,
+                          const uint8_t*, const __nv_bfloat16*, __nv_bfloat16*, int, int, int,
                           int, const int32_t*, int, const int32_t*, int,
                           cudaStream_t);
 
@@ -92,22 +92,22 @@ torch::Tensor run(torch::Tensor q, torch::Tensor k,
         ? num_pages * (page_size / 128) * 1024
         : batch * ((kvs + 127) / 128) * 1024);
     TORCH_CHECK(head_weight.is_cuda() && head_weight.device() == device &&
-                head_weight.scalar_type() == at::kHalf && head_weight.is_contiguous() &&
+                head_weight.scalar_type() == at::kBFloat16 && head_weight.is_contiguous() &&
                 head_weight.dim() == 2 && head_weight.size(0) == batch &&
                 head_weight.size(1) == 64,
-                "head_weight must be contiguous CUDA fp16 [B, 64]");
+                "head_weight must be contiguous CUDA bf16 [B, 64]");
     TORCH_CHECK(out.is_cuda() && out.device() == device &&
-                out.scalar_type() == at::kFloat && out.is_contiguous() &&
+                out.scalar_type() == at::kBFloat16 && out.is_contiguous() &&
                 out.dim() == 2 && out.size(0) == batch && out.size(1) == kvs,
-                "out must be contiguous CUDA fp32 [B, KVs]");
+                "out must be contiguous CUDA bf16 [B, KVs]");
     c10::cuda::CUDAGuard guard(device);
     const auto launcher = reinterpret_cast<Launcher>(static_cast<uintptr_t>(launcher_address));
     launcher(reinterpret_cast<const uint8_t*>(q.data_ptr()),
              reinterpret_cast<const uint8_t*>(k.data_ptr()),
              reinterpret_cast<const uint8_t*>(q_scales.data_ptr()),
              reinterpret_cast<const uint8_t*>(k_scales.data_ptr()),
-             reinterpret_cast<const half*>(head_weight.data_ptr<at::Half>()),
-             out.data_ptr<float>(), static_cast<int>(batch), static_cast<int>(kvs),
+             reinterpret_cast<const __nv_bfloat16*>(head_weight.data_ptr<at::BFloat16>()),
+             reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()), static_cast<int>(batch), static_cast<int>(kvs),
              static_cast<int>(num_pages), static_cast<int>(page_size),
              paged ? block_table->data_ptr<int32_t>() : nullptr,
              static_cast<int>(table_stride),
@@ -134,7 +134,7 @@ torch::Tensor indexer_score_decode(
     c10::optional<torch::Tensor> kv_seqlens, int64_t max_kv_len,
     uint64_t launcher_address) {
     auto out = torch::empty({q.size(0), block_table ? max_kv_len : k.size(1)},
-                            q.options().dtype(torch::kFloat));
+                            q.options().dtype(torch::kBFloat16));
     return run(q, k, q_scales, k_scales, head_weight, out, split_kv,
                block_table, kv_seqlens, max_kv_len, launcher_address);
 }

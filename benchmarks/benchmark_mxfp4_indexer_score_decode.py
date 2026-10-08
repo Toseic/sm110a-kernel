@@ -62,7 +62,7 @@ def indexer_score_decode_sol_bounds(lengths, kv_capacity, split_kv):
     q_scale_bytes = batch * 1024
     k_scale_bytes = sum((length + 127) // 128 for length in lengths) * 1024
     weight_bytes = batch * HEADS * 2
-    output_bytes = batch * kv_capacity * 4
+    output_bytes = batch * kv_capacity * 2
     input_bytes = q_bytes + k_bytes + q_scale_bytes + k_scale_bytes + weight_bytes
     q_tile_read_bytes = HEADS * DIM // 2 + 1024 + HEADS * 2
     kv_tile_read_bytes = 256 * DIM // 2 + 2048
@@ -171,8 +171,8 @@ class IndexerScoreDecodeBenchmark(BenchmarkBase):
             action="store_false",
             help="use KVs for every batch without extra KV capacity",
         )
-        parser.add_argument("--atol", type=float, default=5e-2)
-        parser.add_argument("--rtol", type=float, default=1e-3)
+        parser.add_argument("--atol", type=float, default=1e-1)
+        parser.add_argument("--rtol", type=float, default=1e-2)
         parser.add_argument(
             "--sol",
             action="store_true",
@@ -254,10 +254,10 @@ class IndexerScoreDecodeBenchmark(BenchmarkBase):
                         dense_k, dense_k_scales, args.paged_page_size
                     )
                 head_weight = torch.randn(
-                    (batch, HEADS), device="cuda", dtype=torch.float16
+                    (batch, HEADS), device="cuda", dtype=torch.bfloat16
                 )
                 out = torch.empty(
-                    (batch, kv_capacity), device="cuda", dtype=torch.float32
+                    (batch, kv_capacity), device="cuda", dtype=torch.bfloat16
                 )
 
                 indices = sorted({0, batch // 2, batch - 1})
@@ -308,7 +308,7 @@ class IndexerScoreDecodeBenchmark(BenchmarkBase):
                     kernel()
                     torch.cuda.synchronize()
                     if expected is not None:
-                        actual = out[indices]
+                        actual = out[indices].float()
                         finite = torch.isfinite(expected)
                         max_diff = f"{(actual[finite] - expected[finite]).abs().max().item():.6g}"
                         torch.testing.assert_close(

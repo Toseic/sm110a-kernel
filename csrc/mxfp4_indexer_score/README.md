@@ -1,7 +1,7 @@
 # Indexer score prefill
 
 `indexer_score_prefill(q, k, q_scales, k_scales, head_weight, causal=True)`
-returns an FP32 candidate score matrix, `[Qs, KVs]` for a single sequence or
+returns a BF16 candidate score matrix, `[Qs, KVs]` for a single sequence or
 `[B, Qs, max_kv_len]` for fixed-length batched Q:
 
 ```text
@@ -35,16 +35,18 @@ scheme. Q and K scales reuse one 12-column TMEM scratch slot. This keeps the
 full allocation at 508 of 512 columns while loading, MMA, epilogue, and stores
 overlap across KV tiles. The store
 warps use TMA for a single fixed-length sequence when `KVs` is divisible by
-four (the tensor-map row-stride alignment requirement), and direct stores
+eight (the tensor-map row-stride alignment requirement), and direct stores
 otherwise. This is the full
 candidate matrix from the design note; top-k selection is a separate operation.
 
 The epilogue stores ReLU results by candidate column and head in shared
 memory after reading 256 candidate columns per head with four TMEM loads.
 Four loader warps materialize the ReLU values, then eight reduction warps use
-two lanes per candidate; each lane accumulates 32 heads and the pair combines
-with a shuffle. Each reduction warp keeps its output row's query weights in
-registers across KV tiles.
+two lanes per candidate. ReLU values are rounded to BF16 before the weighted
+reduction. Each lane keeps two BF16 FMA accumulators for alternating head pairs;
+the two accumulators and then the two lanes are added in BF16, matching the
+DeepGEMM SM100 MQA logits reduction order. Each reduction warp keeps its output
+row's query weights in registers across KV tiles.
 The head stride is padded to spread neighboring candidates across shared-memory
 banks.
 
@@ -56,7 +58,7 @@ supported:
 - `q_scales`: contiguous CUDA `torch.float8_e8m0fnu`, `ceil(Qs/2)*1024`
   bytes in the blocked 128-row format from `to_blocked_mxfp4_scales`.
 - `k_scales`: same format, `ceil(KVs/128)*1024` bytes.
-- `head_weight`: contiguous CUDA FP16 `[Qs, 64]`.
+- `head_weight`: contiguous CUDA BF16 `[Qs, 64]`.
 
 For a partial final Q or KV scale tile, pad the logical rows with zeros to
 the next multiple of 128 before calling `to_blocked_mxfp4_scales`. The packed
@@ -114,8 +116,8 @@ The roofline omits epilogue instruction throughput and launch overhead.
 
 `indexer_score_decode(q, k, q_scales, k_scales, head_weight, split_kv=None,
 *, block_table=None, kv_seqlens=None, max_kv_len=None)`
-computes the same score for one query per batch and returns FP32 `[B, KVs]`.
-`indexer_score_decode_out` writes into a supplied contiguous FP32 output.
+computes the same score for one query per batch and returns BF16 `[B, KVs]`.
+`indexer_score_decode_out` writes into a supplied contiguous BF16 output.
 The CUDA implementation and binding are in separate `indexer_score_decode_*`
 files; `compile_indexer_score_decode` precompiles their JIT module.
 
@@ -126,7 +128,7 @@ files; `compile_indexer_score_decode` precompiles their JIT module.
   64 query rows to 128 before calling `to_blocked_mxfp4_scales`.
 - `k_scales`: contiguous blocked E8M0, `B * ceil(KVs/128) * 1024` bytes.
   Pad each batch's KV rows to a multiple of 128 before blocking scales.
-- `head_weight`: contiguous CUDA FP16 `[B, 64]`.
+- `head_weight`: contiguous CUDA BF16 `[B, 64]`.
 - `kv_seqlens`: optional contiguous CUDA int32 `[B]` containing each batch's
   valid KV length. Paged K requires this argument. Scores beyond the valid
   length are `-inf`, and fully invalid KV tiles skip computation.
@@ -159,7 +161,8 @@ The dense KV/output capacity (`Kcap`) is `1.5 * KVs` to allow longer sequences;
 `B=1` remains uniform. `--uniform` restores full-length sequences and `Kcap=KVs`.
 `--paged-page-size {128,256}` enables shuffled physical-page accuracy checks.
 The benchmark
-checks sampled batch rows against the FP32 PyTorch reference unless
+checks sampled batch rows against a PyTorch reference with BF16 head FMA
+rounding unless
 `--no-accuracy` is passed. It reports latency in microseconds, useful TF/s,
 and maximum absolute error; `--sol` adds approximate rooflines.
 The default sweep also reports the autotuned split for each batch size. Use

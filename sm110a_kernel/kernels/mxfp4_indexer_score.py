@@ -11,6 +11,10 @@ from ..runner import AutotuneRunner, PreparedKernel, TuneOptions
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE = _ROOT / "csrc/mxfp4_indexer_score/src"
+_DECODE_TUNE_NAMESPACE = (
+    "indexer_score_decode_splitkv_v2_"
+    + source_digest((_SOURCE / "indexer_score_decode_kernel.cu",), _ROOT)[:12]
+)
 
 
 class IndexerScoreModule:
@@ -56,7 +60,7 @@ class IndexerScoreModule:
             shape = (
                 (q.size(0), q.size(1), kv_len) if q.ndim == 4 else (q.size(0), kv_len)
             )
-            out = torch.empty(shape, device=q.device, dtype=torch.float32)
+            out = torch.empty(shape, device=q.device, dtype=torch.bfloat16)
         configs = (IndexerScorePrefillConfig(1), IndexerScorePrefillConfig(2))
         if q_len <= 2:
             return 1
@@ -399,7 +403,9 @@ class IndexerScoreDecodeModule:
         if use_default_options and key in self._split_kv_cache:
             return self._split_kv_cache[key]
         if out is None:
-            out = torch.empty((q.size(0), kv_len), device=q.device, dtype=torch.float32)
+            out = torch.empty(
+                (q.size(0), kv_len), device=q.device, dtype=torch.bfloat16
+            )
         splits = (1, 2, 4, 8)
         configs = tuple(
             IndexerScoreDecodeConfig(split)
@@ -447,7 +453,7 @@ class IndexerScoreDecodeModule:
 
             selection = AutotuneRunner(options).resolve(
                 configs,
-                namespace="indexer_score_decode_splitkv_v1",
+                namespace=_DECODE_TUNE_NAMESPACE,
                 key=key,
                 prepare=prepare,
                 benchmark=lambda prepared: _tune_stats(prepared.run, options),

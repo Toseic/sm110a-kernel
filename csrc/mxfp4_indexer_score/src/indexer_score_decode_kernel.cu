@@ -3,7 +3,7 @@
 #include <cstdint>
 
 #include <cuda.h>
-#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 namespace {
@@ -32,7 +32,7 @@ constexpr int kMainloopSmemBytes =
 constexpr int kReluSmemBytes =
     kTileQ * kTileKV * kHeadStride * sizeof(float);
 constexpr int kOutputSmemBytes =
-    kPipelineStages * kTileQ * kTileKV * sizeof(float);
+    kPipelineStages * kTileQ * kTileKV * sizeof(__nv_bfloat16);
 constexpr int kSmemBytes =
     kMainloopSmemBytes + kReluSmemBytes + kOutputSmemBytes;
 
@@ -80,14 +80,14 @@ void encode_scales(CUtensorMap* map, const uint8_t* ptr, int row_tiles) {
     assert(result == CUDA_SUCCESS);
 }
 
-void encode_output(CUtensorMap* map, float* ptr, int batch_count, int kv_count) {
+void encode_output(CUtensorMap* map, __nv_bfloat16* ptr, int batch_count, int kv_count) {
     const uint64_t dims[2] = {static_cast<uint64_t>(kv_count),
                               static_cast<uint64_t>(batch_count)};
-    const uint64_t strides[1] = {static_cast<uint64_t>(kv_count) * sizeof(float)};
+    const uint64_t strides[1] = {static_cast<uint64_t>(kv_count) * sizeof(__nv_bfloat16)};
     const uint32_t box[2] = {kTileKV, 1};
     const uint32_t elem[2] = {1, 1};
     const CUresult result = cuTensorMapEncodeTiled(
-        map, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, 2, ptr, dims, strides,
+        map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, ptr, dims, strides,
         box, elem, CU_TENSOR_MAP_INTERLEAVE_NONE,
         CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE,
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
@@ -198,8 +198,8 @@ __global__ void indexer_score_decode_kernel(
     const __grid_constant__ CUtensorMap qs_map,
     const __grid_constant__ CUtensorMap ks_map,
     const __grid_constant__ CUtensorMap out_map,
-    const half* __restrict__ head_weight,
-    float* __restrict__ out, int kv_count, int page_size,
+    const __nv_bfloat16* __restrict__ head_weight,
+    __nv_bfloat16* __restrict__ out, int kv_count, int page_size,
     const int32_t* __restrict__ block_table, int block_table_stride,
     const int32_t* __restrict__ kv_seqlens, bool use_tma_store) {
     const int tid = threadIdx.x;
@@ -221,7 +221,7 @@ __global__ void indexer_score_decode_kernel(
         const int invalid_start = max(local_kv_len, kv_tile_start * kTileKV);
         const int invalid_end = min(kv_count, split_tile_end * kTileKV);
         for (int col = invalid_start + tid; col < invalid_end; col += blockDim.x)
-            out[static_cast<int64_t>(batch) * kv_count + col] = -INFINITY;
+            out[static_cast<int64_t>(batch) * kv_count + col] = __float2bfloat16_rn(-INFINITY);
     }
     if (kv_tiles <= 0) return;
 
@@ -233,8 +233,8 @@ __global__ void indexer_score_decode_kernel(
     float (*relu_values)[kTileKV][kHeadStride] =
         reinterpret_cast<float (*)[kTileKV][kHeadStride]>(
             smem + kMainloopSmemBytes);
-    float (*output_tile)[kTileQ][kTileKV] =
-        reinterpret_cast<float (*)[kTileQ][kTileKV]>(
+    __nv_bfloat16 (*output_tile)[kTileQ][kTileKV] =
+        reinterpret_cast<__nv_bfloat16 (*)[kTileQ][kTileKV]>(
             smem + kMainloopSmemBytes + kReluSmemBytes);
     __shared__ uint64_t q_barrier;
     __shared__ uint64_t load_barrier[kPipelineStages];
@@ -458,11 +458,11 @@ __global__ void indexer_score_decode_kernel(
             const int reducer_warp = warp - 4;
             const int local_q = reducer_warp / kReductionWarpsPerQuery;
             // Reuse each query's weights across all KV tiles in this CTA.
-            float weight[kHeads / kReductionLanes];
+            __nv_bfloat16 weight[kHeads / kReductionLanes];
             #pragma unroll
             for (int i = 0; i < kHeads / kReductionLanes; ++i) {
                 const int head = i * kReductionLanes + head_lane;
-                weight[i] = __half2float(head_weight[batch * kHeads + head]);
+                weight[i] = head_weight[batch * kHeads + head];
             }
             for (int kv_tile = 0; kv_tile < kv_tiles; ++kv_tile) {
                 const int task = first_task + kv_tile;
@@ -508,17 +508,24 @@ __global__ void indexer_score_decode_kernel(
                         col_block * 64 +
                         (reducer_warp % kReductionWarpsPerQuery) *
                             (32 / kReductionLanes) + candidate_lane;
-                    float sum = 0.0f;
+                    __nv_bfloat16 sum_0 = __float2bfloat16_rn(0.0f);
+                    __nv_bfloat16 sum_1 = __float2bfloat16_rn(0.0f);
                     #pragma unroll
                     for (int i = 0; i < kHeads / kReductionLanes; ++i) {
                         const int head = i * kReductionLanes + head_lane;
-                        sum += weight[i] * relu_values[local_q][local_kv][head];
+                        const __nv_bfloat16 value = __float2bfloat16_rn(
+                            relu_values[local_q][local_kv][head]);
+                        if (i & 1)
+                            sum_1 = __hfma(value, weight[i], sum_1);
+                        else
+                            sum_0 = __hfma(value, weight[i], sum_0);
                     }
-                    #pragma unroll
-                    for (int offset = kReductionLanes / 2; offset > 0; offset /= 2)
-                        sum += __shfl_down_sync(0xffffffffU, sum, offset);
+                    const float partial = __bfloat162float(__hadd(sum_0, sum_1));
+                    const float other = __shfl_down_sync(0xffffffffU, partial, 1);
                     if (head_lane == 0)
-                        output_tile[stage][local_q][local_kv] = sum;
+                        output_tile[stage][local_q][local_kv] =
+                            __hadd(__float2bfloat16_rn(partial),
+                                   __float2bfloat16_rn(other));
                 }
                 asm volatile("bar.sync 1, %0;"
                              :: "n"(kEpilogueWarps * 32) : "memory");
@@ -547,8 +554,8 @@ __global__ void indexer_score_decode_kernel(
 template <int SplitKV>
 void launch_decode(const CUtensorMap& q_map, const CUtensorMap& k_map,
                    const CUtensorMap& qs_map, const CUtensorMap& ks_map,
-                   const CUtensorMap& out_map, const half* head_weight,
-                   float* out, int batch_count, int kv_count, int page_size,
+                   const CUtensorMap& out_map, const __nv_bfloat16* head_weight,
+                   __nv_bfloat16* out, int batch_count, int kv_count, int page_size,
                    const int32_t* block_table, int block_table_stride,
                    const int32_t* kv_seqlens,
                    bool use_tma_store, cudaStream_t stream) {
@@ -575,7 +582,7 @@ void launch_decode(const CUtensorMap& q_map, const CUtensorMap& k_map,
 extern "C" void sm110a_indexer_score_decode_launch(
     const uint8_t* q, const uint8_t* k,
     const uint8_t* q_scales, const uint8_t* k_scales,
-    const half* head_weight, float* out,
+    const __nv_bfloat16* head_weight, __nv_bfloat16* out,
     int batch_count, int kv_count, int num_pages, int page_size,
     const int32_t* block_table, int block_table_stride,
     const int32_t* kv_seqlens, int split_kv, cudaStream_t stream) {
@@ -586,7 +593,7 @@ extern "C" void sm110a_indexer_score_decode_launch(
     encode_scales(&qs_map, q_scales, batch_count);
     encode_scales(&ks_map, k_scales, page_size
         ? num_pages * (page_size / 128) : batch_count * ((kv_count + 127) / 128));
-    const bool use_tma_store = !kv_seqlens && kv_count % 4 == 0;
+    const bool use_tma_store = !kv_seqlens && kv_count % 8 == 0;
     if (use_tma_store)
         encode_output(&out_map, out, batch_count, kv_count);
 #define LAUNCH(S) launch_decode<S>(q_map, k_map, qs_map, ks_map, out_map, \

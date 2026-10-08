@@ -53,7 +53,7 @@ def indexer_score_sol_bounds(qs, kvs, cluster_m=1, *, causal=True):
     """MMA and memory rooflines for the persistent Q-reuse schedule.
 
     Each query tile loads Q, Q scales, and head weights once, then traverses
-    its visible 256-row KV tiles. Compulsory HBM includes FP32 output stores.
+    its visible 256-row KV tiles. Compulsory HBM includes BF16 output stores.
     It does not model epilogue instruction throughput or launch overhead.
     """
     q_tiles, _, active_tiles, flops = indexer_score_work(
@@ -64,7 +64,7 @@ def indexer_score_sol_bounds(qs, kvs, cluster_m=1, *, causal=True):
     q_scale_bytes = q_tiles * 1024
     k_scale_bytes = ((kvs + 127) // 128) * 1024
     weight_bytes = qs * HEADS * 2
-    output_bytes = qs * kvs * 4
+    output_bytes = qs * kvs * 2
     input_bytes = q_bytes + k_bytes + q_scale_bytes + k_scale_bytes + weight_bytes
     compulsory_bytes = input_bytes + output_bytes
     q_tile_read_bytes = 128 * DIM // 2 + 1024 + 2 * HEADS * 2
@@ -107,6 +107,23 @@ def decode_rows(packed_bytes, scale_bytes):
     return (values.view(-1, DIM // 32, 32) * scales.unsqueeze(-1)).reshape(-1, DIM)
 
 
+def bf16_head_reduce(dot, weights):
+    """Mirror the kernel's BF16 FMA order and two final BF16 additions."""
+    values = dot.view(-1, HEADS, dot.size(-1)).clamp_min(0).bfloat16()
+    weights = weights.bfloat16()
+    partial = [torch.zeros_like(values[:, 0]) for _ in range(4)]
+    for head in range(HEADS):
+        slot = head % 4
+        partial[slot] = torch.addcmul(
+            partial[slot].float(),
+            values[:, head].float(),
+            weights[:, head, None].float(),
+        ).bfloat16()
+    even = (partial[0].float() + partial[2].float()).bfloat16()
+    odd = (partial[1].float() + partial[3].float()).bfloat16()
+    return (even.float() + odd.float()).bfloat16().float()
+
+
 def reference_rows(
     q, k, q_scales, k_scales, head_weight, query_indices, *, causal=True
 ):
@@ -127,9 +144,8 @@ def reference_rows(
     )
     k_dense = decode_rows(k.view(torch.uint8), k_scale_bytes[:kvs])
     dot = q_dense @ k_dense.T
-    dot.clamp_min_(0)
     weights = head_weight.index_select(0, query_indices).float()
-    scores = (dot.view(query_indices.numel(), HEADS, kvs) * weights[:, :, None]).sum(1)
+    scores = bf16_head_reduce(dot, weights)
     if causal:
         keys = torch.arange(kvs, device=scores.device)
         scores.masked_fill_(keys[None, :] > query_indices[:, None], -torch.inf)
@@ -207,15 +223,13 @@ def reference_batched_rows(
         ).view(torch.uint8)
         k_scale = k_scale_bytes[:kv_len]
     k_dense = decode_rows(k_codes, k_scale)
-    dot = (q_dense @ k_dense.T).clamp_min_(0)
+    dot = q_dense @ k_dense.T
     weights = (
         head_weight.index_select(0, q_offset + query_indices)
         if cu_seqlens_q is not None
         else head_weight[batch].index_select(0, query_indices)
     )
-    scores = (
-        dot.view(query_indices.numel(), HEADS, kv_len) * weights.float()[:, :, None]
-    ).sum(1)
+    scores = bf16_head_reduce(dot, weights.float())
     if causal:
         scores.masked_fill_(
             torch.arange(kv_len, device="cuda")[None, :] > query_indices[:, None],
@@ -271,8 +285,8 @@ class IndexerScoreBenchmark(BenchmarkBase):
         parser.add_argument(
             "--non-causal", action="store_true", help="disable the default causal mask"
         )
-        parser.add_argument("--atol", type=float, default=5e-2)
-        parser.add_argument("--rtol", type=float, default=1e-3)
+        parser.add_argument("--atol", type=float, default=1e-1)
+        parser.add_argument("--rtol", type=float, default=1e-2)
         parser.add_argument(
             "--cluster-m",
             type=int,
@@ -364,14 +378,14 @@ class IndexerScoreBenchmark(BenchmarkBase):
                     [make_blocked_scales(seq * HEADS) for _ in range(batch_size)]
                 )
                 head_weight = torch.randn(
-                    (total_q, HEADS), device="cuda", dtype=torch.float16
+                    (total_q, HEADS), device="cuda", dtype=torch.bfloat16
                 )
                 cu_seqlens_q = torch.tensor(
                     [0] + list(torch.tensor(q_lengths).cumsum(0).tolist()),
                     device="cuda",
                     dtype=torch.int32,
                 )
-                out = torch.empty((total_q, seq), device="cuda", dtype=torch.float32)
+                out = torch.empty((total_q, seq), device="cuda", dtype=torch.bfloat16)
             else:
                 q = torch.stack(
                     [
@@ -383,10 +397,10 @@ class IndexerScoreBenchmark(BenchmarkBase):
                     [make_blocked_scales(seq * HEADS) for _ in range(batch_size)]
                 )
                 head_weight = torch.randn(
-                    (batch_size, seq, HEADS), device="cuda", dtype=torch.float16
+                    (batch_size, seq, HEADS), device="cuda", dtype=torch.bfloat16
                 )
                 out = torch.empty(
-                    (batch_size, seq, seq), device="cuda", dtype=torch.float32
+                    (batch_size, seq, seq), device="cuda", dtype=torch.bfloat16
                 )
             block_table = None
             if args.paged_kv:
@@ -508,6 +522,7 @@ class IndexerScoreBenchmark(BenchmarkBase):
                         if args.packed_q
                         else out[batch].index_select(0, indices)
                     )
+                    actual = actual.float()
                     valid = torch.isfinite(expected)
                     if valid.any():
                         largest_diff = max(
