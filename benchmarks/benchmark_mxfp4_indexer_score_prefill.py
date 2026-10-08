@@ -11,6 +11,14 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from deepgemm_baseline import (
+    mqa_fused_pages,
+    mqa_logits_dense,
+    mqa_logits_paged,
+    mqa_scale_words,
+    mqa_weights,
+)
+
 from common import (
     MMA_PEAK_TFLOPS,
     BenchmarkBase,
@@ -93,6 +101,120 @@ def make_blocked_scales(rows):
         124, 127, (padded_rows, DIM // 32), device="cuda", dtype=torch.uint8
     ).view(torch.float8_e8m0fnu)
     return to_blocked_mxfp4_scales(logical)
+
+
+def prepare_deepgemm_mqa(
+    q,
+    k,
+    q_scales,
+    k_scales,
+    head_weight,
+    q_lengths,
+    kv_lengths,
+    *,
+    block_table=None,
+    page_size=None,
+    causal=True,
+):
+    """Adapt the same MXFP4 operands to DeepGEMM before timing."""
+    batch = len(q_lengths)
+    q_scale_stride = q_scales.numel() // batch
+    q_words = torch.cat(
+        [
+            mqa_scale_words(
+                q_scales[b * q_scale_stride : (b + 1) * q_scale_stride],
+                q_scale_stride // 1024 * 128,
+                q_lengths[b] * HEADS,
+                from_blocked_scales=from_blocked_mxfp4_scales,
+            ).view(q_lengths[b], HEADS)
+            for b in range(batch)
+        ]
+    )
+    q_flat = q.reshape(-1, HEADS, DIM // 2)
+    if q.ndim == 4:
+        q_flat = torch.cat([q[b, : q_lengths[b]] for b in range(batch)])
+        weights = torch.cat([head_weight[b, : q_lengths[b]] for b in range(batch)])
+    else:
+        weights = head_weight
+    weights = mqa_weights(weights)
+    if block_table is None:
+        kv_capacity = k.size(1)
+        k_scale_stride = k_scales.numel() // batch
+        k_words = torch.cat(
+            [
+                mqa_scale_words(
+                    k_scales[b * k_scale_stride : (b + 1) * k_scale_stride],
+                    k_scale_stride // 1024 * 128,
+                    kv_capacity,
+                    from_blocked_scales=from_blocked_mxfp4_scales,
+                )
+                for b in range(batch)
+            ]
+        )
+        starts = torch.cat(
+            [
+                torch.full((length,), b * kv_capacity, device="cuda", dtype=torch.int32)
+                for b, length in enumerate(q_lengths)
+            ]
+        )
+        ends = torch.cat(
+            [
+                starts[sum(q_lengths[:b]) : sum(q_lengths[: b + 1])]
+                + (torch.arange(length, device="cuda", dtype=torch.int32) + 1).clamp(
+                    max=kv_lengths[b]
+                )
+                if causal
+                else starts[sum(q_lengths[:b]) : sum(q_lengths[: b + 1])]
+                + kv_lengths[b]
+                for b, length in enumerate(q_lengths)
+            ]
+        )
+        return mqa_logits_dense(
+            q_flat.contiguous(),
+            q_words.contiguous(),
+            k.reshape(-1, DIM // 2).contiguous(),
+            k_words,
+            weights,
+            starts,
+            ends,
+            max(kv_lengths),
+        )
+    if page_size not in (128,):
+        raise ValueError("DeepGEMM paged MQA supports --page-size 128 only")
+    k_words = mqa_scale_words(
+        k_scales,
+        k.size(0) * page_size,
+        k.size(0) * page_size,
+        from_blocked_scales=from_blocked_mxfp4_scales,
+    ).view(k.size(0), page_size)
+    fused_k = mqa_fused_pages(k, k_words)
+    context = torch.cat(
+        [
+            (torch.arange(length, device="cuda", dtype=torch.int32) + 1).clamp(
+                max=kv_lengths[b]
+            )
+            if causal
+            else torch.full((length,), kv_lengths[b], device="cuda", dtype=torch.int32)
+            for b, length in enumerate(q_lengths)
+        ]
+    ).view(-1, 1)
+    indices = torch.repeat_interleave(
+        torch.arange(batch, device="cuda", dtype=torch.int32),
+        torch.tensor(q_lengths, device="cuda", dtype=torch.int32),
+    )
+    expanded_table = block_table.repeat_interleave(
+        torch.tensor(q_lengths, device="cuda"), dim=0
+    ).contiguous()
+    return mqa_logits_paged(
+        q_flat.contiguous().unsqueeze(1),
+        q_words.contiguous().unsqueeze(1),
+        fused_k,
+        weights,
+        context,
+        expanded_table,
+        indices,
+        page_size * block_table.size(1),
+    )
 
 
 def decode_rows(packed_bytes, scale_bytes):
@@ -281,6 +403,7 @@ class IndexerScoreBenchmark(BenchmarkBase):
             help="per-batch KV lengths; requires one --seq-lens value",
         )
         parser.add_argument("--seed", type=int, default=1234)
+        parser.add_argument("--baseline", choices=("none", "deepgemm"), default="none")
         parser.add_argument("--no-accuracy", action="store_true")
         parser.add_argument(
             "--non-causal", action="store_true", help="disable the default causal mask"
@@ -340,6 +463,8 @@ class IndexerScoreBenchmark(BenchmarkBase):
             raise SystemExit("--atol and --rtol must be non-negative")
         if args.cluster_m and args.sweep_cluster_m:
             raise SystemExit("--cluster-m and --sweep-cluster-m are mutually exclusive")
+        if args.baseline == "deepgemm" and args.paged_kv and args.page_size != 128:
+            raise SystemExit("DeepGEMM paged MQA supports --page-size 128 only")
         args.cases = (
             [(seq, 1) for seq in SEQ_LENGTHS]
             + [(EXTRA_BATCH_SEQ, batch) for batch in EXTRA_BATCHES]
@@ -352,19 +477,22 @@ class IndexerScoreBenchmark(BenchmarkBase):
     def run_with_args(self, args):
         torch.manual_seed(args.seed)
         module = compile_indexer_score_prefill()
-        table = TablePrinter(
-            (
-                ("Seq", 8),
-                ("Batch", 8),
-                ("KV", 8),
-                ("Q", 8),
-                ("Cluster", 9),
-                ("Candidates", 14),
-                ("Kernel(ms)", 14),
-                ("TF/s", 11),
-                ("MaxDiff", 13),
-            ),
+        columns = (
+            ("Seq", 8),
+            ("Batch", 8),
+            ("KV", 8),
+            ("Q", 8),
+            ("Cluster", 9),
+            ("Candidates", 14),
+            ("Kernel(ms)", 14),
+            ("TF/s", 11),
         )
+        if args.baseline == "deepgemm":
+            columns += (("Baseline(ms)", 14), ("Speedup", 10))
+        columns += (("MaxDiff", 13),)
+        if args.baseline == "deepgemm":
+            columns += (("BaselineDiff", 14),)
+        table = TablePrinter(columns)
         table.print_header()
         sol_report = SolReport() if args.sol else None
         for seq, batch_size in args.cases:
@@ -474,6 +602,24 @@ class IndexerScoreBenchmark(BenchmarkBase):
                     **extra,
                 )
 
+            baseline = None
+            baseline_out = None
+            if args.baseline == "deepgemm":
+                baseline = prepare_deepgemm_mqa(
+                    q,
+                    k,
+                    q_scales,
+                    k_scales,
+                    head_weight,
+                    q_lengths,
+                    kv_lengths,
+                    block_table=block_table,
+                    page_size=args.page_size if args.paged_kv else None,
+                    causal=not args.non_causal,
+                )
+                baseline_out = baseline()
+                torch.cuda.synchronize()
+
             # A prefilled output makes masked writes observable during the
             # accuracy check. Filling is outside the timed kernel call.
             masked_sentinel = 7.25
@@ -482,8 +628,10 @@ class IndexerScoreBenchmark(BenchmarkBase):
             kernel()
             torch.cuda.synchronize()
             max_diff = "skipped"
+            baseline_diff = "skipped"
             if not args.no_accuracy:
                 largest_diff = 0.0
+                largest_baseline_diff = 0.0
                 q_offset = 0
                 for batch in range(batch_size):
                     local_q = q_lengths[batch]
@@ -534,6 +682,28 @@ class IndexerScoreBenchmark(BenchmarkBase):
                             largest_diff,
                             (actual[valid] - expected[valid]).abs().max().item(),
                         )
+                        if baseline_out is not None:
+                            baseline_actual = baseline_out.index_select(
+                                0, q_offset + indices
+                            )[:, :seq].float()
+                            baseline_valid = valid[:, : baseline_actual.size(1)]
+                            baseline_expected = expected[:, : baseline_actual.size(1)]
+                            largest_baseline_diff = max(
+                                largest_baseline_diff,
+                                (
+                                    baseline_actual[baseline_valid]
+                                    - baseline_expected[baseline_valid]
+                                )
+                                .abs()
+                                .max()
+                                .item(),
+                            )
+                            torch.testing.assert_close(
+                                baseline_actual[baseline_valid],
+                                baseline_expected[baseline_valid],
+                                atol=args.atol,
+                                rtol=args.rtol,
+                            )
                     torch.testing.assert_close(
                         actual[~valid],
                         torch.full_like(actual[~valid], masked_sentinel),
@@ -546,6 +716,7 @@ class IndexerScoreBenchmark(BenchmarkBase):
                     )
                     q_offset += local_q
                 max_diff = f"{largest_diff:.6g}"
+                baseline_diff = f"{largest_baseline_diff:.6g}"
 
             stats = benchmark_with_stats(
                 kernel,
@@ -555,6 +726,17 @@ class IndexerScoreBenchmark(BenchmarkBase):
                 cold_l2_flush=args._cold_l2_flush,
             )
             ms = stats["median_ms"]
+            baseline_ms = (
+                benchmark_with_stats(
+                    baseline,
+                    args.warmup,
+                    args.iters,
+                    args.samples,
+                    cold_l2_flush=args._cold_l2_flush,
+                )["median_ms"]
+                if baseline is not None
+                else None
+            )
             per_batch_bounds = [
                 indexer_score_sol_bounds(qs, kvs, cluster_m, causal=not args.non_causal)
                 for qs, kvs in zip(q_lengths, kv_lengths)
@@ -570,7 +752,7 @@ class IndexerScoreBenchmark(BenchmarkBase):
                 indexer_score_work(qs, kvs, cluster_m, causal=not args.non_causal)[3]
                 for qs, kvs in zip(q_lengths, kv_lengths)
             )
-            table.print_row(
+            row = (
                 seq,
                 batch_size,
                 "paged" if args.paged_kv else "dense",
@@ -583,8 +765,13 @@ class IndexerScoreBenchmark(BenchmarkBase):
                 ),
                 f"{ms:.4f}",
                 f"{flops / (ms * 1e9):.2f}",
-                max_diff,
             )
+            if baseline_ms is not None:
+                row += (f"{baseline_ms:.4f}", f"{baseline_ms / ms:.2f}x")
+            row += (max_diff,)
+            if baseline_ms is not None:
+                row += (baseline_diff,)
+            table.print_row(*row)
             if sol_report is not None:
                 sol_report.add(
                     bounds,

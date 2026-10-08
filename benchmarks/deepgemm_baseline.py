@@ -83,3 +83,63 @@ def nvfp4_nt(a, b, sfa, sfb, out):
     a_pair = (a.view(torch.int8), sfa.view(torch.uint8))
     b_pair = (b.view(torch.int8), sfb.view(torch.uint8))
     return lambda: deep_gemm.cublaslt_nvfp4_gemm_nt(a_pair, b_pair, out)
+
+
+def mqa_scale_words(blocked_scales, padded_rows, valid_rows, *, from_blocked_scales):
+    """Convert blocked E8M0 scales to DeepGEMM's four packed bytes per row."""
+    logical = from_blocked_scales(blocked_scales, padded_rows, 128)
+    return logical[:valid_rows].contiguous().view(torch.int32).reshape(valid_rows)
+
+
+def mqa_weights(weights):
+    """Give every BF16 weight row a 16-byte-aligned TMA stride."""
+    rows, heads = weights.shape
+    padded_heads = (heads + 7) // 8 * 8
+    storage = torch.empty(
+        (rows, padded_heads), device=weights.device, dtype=weights.dtype
+    )
+    result = storage[:, :heads]
+    result.copy_(weights)
+    return result
+
+
+def mqa_logits_dense(q, q_scales, k, k_scales, weights, starts, ends, max_kv):
+    """Return a single contiguous MXFP4 MQA logits launch."""
+    deep_gemm = load_deepgemm()
+    q_pair = (q.view(torch.int8), q_scales)
+    k_pair = (k.view(torch.int8), k_scales)
+    return lambda: deep_gemm.fp8_fp4_mqa_logits(
+        q_pair, k_pair, weights, starts, ends, max_kv
+    )
+
+
+def mqa_fused_pages(k, k_scales):
+    """Pack native MXFP4 pages and four scale bytes per token for DeepGEMM."""
+    pages, page_size, packed_dim = k.shape
+    fused = torch.empty(
+        (pages, page_size * (packed_dim + 4)), device=k.device, dtype=torch.uint8
+    )
+    fused[:, : page_size * packed_dim] = k.view(torch.uint8).reshape(pages, -1)
+    fused[:, page_size * packed_dim :] = k_scales.view(torch.uint8).reshape(pages, -1)
+    return fused.view(pages, page_size, 1, packed_dim + 4)
+
+
+def mqa_logits_paged(
+    q, q_scales, fused_k, weights, context_lens, block_table, indices, max_context_len
+):
+    """Return a paged MXFP4 MQA launch with metadata prepared outside timing."""
+    deep_gemm = load_deepgemm()
+    metadata = deep_gemm.get_paged_mqa_logits_metadata(
+        context_lens, fused_k.size(1), deep_gemm.get_num_sms(), indices
+    )
+    q_pair = (q.view(torch.int8), q_scales)
+    return lambda: deep_gemm.fp8_fp4_paged_mqa_logits(
+        q_pair,
+        fused_k,
+        weights,
+        context_lens,
+        block_table,
+        metadata,
+        max_context_len,
+        indices,
+    )

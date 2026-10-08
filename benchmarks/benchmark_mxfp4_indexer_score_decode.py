@@ -17,6 +17,7 @@ from benchmark_mxfp4_indexer_score_prefill import (
     MXFP4_MMA_PEAK_TFLOPS,
     make_blocked_scales,
     make_packed_rows,
+    prepare_deepgemm_mqa,
     reference_rows,
 )
 
@@ -135,6 +136,7 @@ class IndexerScoreDecodeBenchmark(BenchmarkBase):
             "--split-kvs", type=int, nargs="+", choices=SPLIT_KVS, default=SPLIT_KVS
         )
         parser.add_argument("--seed", type=int, default=1234)
+        parser.add_argument("--baseline", choices=("none", "deepgemm"), default="none")
         auto_group = parser.add_mutually_exclusive_group()
         auto_group.add_argument(
             "--auto",
@@ -188,6 +190,8 @@ class IndexerScoreDecodeBenchmark(BenchmarkBase):
             raise SystemExit("--kv-lens must contain positive lengths")
         if args.atol < 0 or args.rtol < 0:
             raise SystemExit("--atol and --rtol must be non-negative")
+        if args.baseline == "deepgemm" and args.paged_page_size == 256:
+            raise SystemExit("DeepGEMM paged MQA supports --paged-page-size 128 only")
         if not args.auto and not any(
             split <= (kvs + (kvs // 2 if args.ragged and batch > 1 else 0) + 255) // 256
             for batch in args.batches
@@ -202,19 +206,22 @@ class IndexerScoreDecodeBenchmark(BenchmarkBase):
         torch.manual_seed(args.seed)
         length_generator = torch.Generator().manual_seed(args.seed)
         module = compile_indexer_score_decode()
-        table = TablePrinter(
-            (
-                ("B", 7),
-                ("KVs", 8),
-                ("Kcap", 8),
-                ("KV range", 13),
-                ("SplitKV", 9),
-                ("Candidates", 14),
-                ("Kernel(us)", 14),
-                ("TF/s", 11),
-                ("MaxDiff", 13),
-            )
+        columns = (
+            ("B", 7),
+            ("KVs", 8),
+            ("Kcap", 8),
+            ("KV range", 13),
+            ("SplitKV", 9),
+            ("Candidates", 14),
+            ("Kernel(us)", 14),
+            ("TF/s", 11),
         )
+        if args.baseline == "deepgemm":
+            columns += (("Baseline(us)", 14), ("Speedup", 10))
+        columns += (("MaxDiff", 13),)
+        if args.baseline == "deepgemm":
+            columns += (("BaselineDiff", 14),)
+        table = TablePrinter(columns)
         table.print_header()
         sol_report = SolReport() if args.sol else None
         skipped = []
@@ -259,6 +266,30 @@ class IndexerScoreDecodeBenchmark(BenchmarkBase):
                 out = torch.empty(
                     (batch, kv_capacity), device="cuda", dtype=torch.bfloat16
                 )
+                baseline = None
+                baseline_out = None
+                if args.baseline == "deepgemm":
+                    baseline = prepare_deepgemm_mqa(
+                        q.unsqueeze(1),
+                        k,
+                        q_scales,
+                        k_scales,
+                        head_weight.unsqueeze(1),
+                        [1] * batch,
+                        lengths,
+                        block_table=block_table,
+                        page_size=args.paged_page_size,
+                        causal=False,
+                    )
+                    baseline_out = baseline()
+                    torch.cuda.synchronize()
+                    baseline_ms = benchmark_with_stats(
+                        baseline,
+                        args.warmup,
+                        args.iters,
+                        args.samples,
+                        cold_l2_flush=args._cold_l2_flush,
+                    )["median_ms"]
 
                 indices = sorted({0, batch // 2, batch - 1})
                 expected = None
@@ -303,6 +334,7 @@ class IndexerScoreDecodeBenchmark(BenchmarkBase):
                         )
 
                     max_diff = "skipped"
+                    baseline_diff = "skipped"
                     if expected is not None:
                         out.fill_(float("nan"))
                     kernel()
@@ -314,6 +346,17 @@ class IndexerScoreDecodeBenchmark(BenchmarkBase):
                         torch.testing.assert_close(
                             actual, expected, atol=args.atol, rtol=args.rtol
                         )
+                        if baseline_out is not None:
+                            dg_actual = baseline_out[indices].float()
+                            dg_expected = expected[:, : dg_actual.size(1)]
+                            dg_finite = finite[:, : dg_actual.size(1)]
+                            baseline_diff = f"{(dg_actual[dg_finite] - dg_expected[dg_finite]).abs().max().item():.6g}"
+                            torch.testing.assert_close(
+                                dg_actual[dg_finite],
+                                dg_expected[dg_finite],
+                                atol=args.atol,
+                                rtol=args.rtol,
+                            )
 
                     stats = benchmark_with_stats(
                         kernel,
@@ -324,7 +367,7 @@ class IndexerScoreDecodeBenchmark(BenchmarkBase):
                     )
                     ms = stats["median_ms"]
                     flops = 2 * sum(lengths) * HEADS * DIM
-                    table.print_row(
+                    row = (
                         batch,
                         kvs,
                         kv_capacity,
@@ -333,8 +376,13 @@ class IndexerScoreDecodeBenchmark(BenchmarkBase):
                         sum(lengths),
                         f"{ms * 1000:.2f}",
                         f"{flops / (ms * 1e9):.2f}",
-                        max_diff,
                     )
+                    if baseline is not None:
+                        row += (f"{baseline_ms * 1000:.2f}", f"{baseline_ms / ms:.2f}x")
+                    row += (max_diff,)
+                    if baseline is not None:
+                        row += (baseline_diff,)
+                    table.print_row(*row)
                     if sol_report is not None:
                         sol_report.add(
                             indexer_score_decode_sol_bounds(

@@ -114,6 +114,22 @@ The reported TF/s and MMA roofline count the executed 2-by-256 tiles,
 including partial tiles.
 The roofline omits epilogue instruction throughput and launch overhead.
 
+Pass `--baseline deepgemm` to compare with DeepGEMM's MXFP4 MQA logits
+kernel using the same packed Q/K values, E8M0 scales, BF16 weights, and
+valid score positions. The table reports `Speedup = Baseline / Kernel`.
+Scale conversion, paged KV packing, and paged scheduling metadata are
+prepared outside the timed region. DeepGEMM paged MQA supports page size
+128 here; dense cases support any selected sequence length.
+
+On SM110, the local DeepGEMM MQA API needs the tracked compatibility patch
+before building its extension (the DeepGEMM source under `baselinedir` is
+ignored by this repository):
+
+```bash
+git -C baselinedir/DeepGEMM apply ../deepgemm_sm110_mqa.patch
+PATH=/home/bifrost/miniforge3/bin:$PATH bash baselinedir/DeepGEMM/develop.sh
+```
+
 ## Decoding
 
 `indexer_score_decode(q, k, q_scales, k_scales, head_weight, split_kv=None,
@@ -170,3 +186,6 @@ and maximum absolute error; `--sol` adds approximate rooflines.
 The default sweep also reports the autotuned split for each batch size. Use
 `--no-auto` for fixed splits only, `--force-sweep` to remeasure the tuning
 choice, and `--cache-path` to set the persistent cache location.
+Pass `--baseline deepgemm` for the same MXFP4 MQA comparison during decoding;
+`Speedup` is baseline latency divided by our kernel latency. Paged comparison
+requires `--paged-page-size 128`.
