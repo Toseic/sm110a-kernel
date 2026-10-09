@@ -25,12 +25,15 @@ constexpr int kThreads = (4 + kComputeGroups * kEpilogueWarps) * 32;
 constexpr int kABytes = kTileM * (kDim / 2);
 constexpr int kBBytes = kSplitKV * (kDim / 2);
 constexpr int kQScaleBytes = kTileM * 4;
+constexpr int kHeadWeightBytes = kTileQ * kHeads * sizeof(__nv_bfloat16);
 constexpr int kKScaleBytes = kSplitKV * 4;
 constexpr int kQSmemBytes = kABytes + kQScaleBytes;
 constexpr int kKVStageSmemBytes = kBBytes + kKScaleBytes;
 constexpr int kMainloopSmemBytes =
     kQStages * kQSmemBytes + kKVStages * kKVStageSmemBytes;
-constexpr int kSmemBytes = kMainloopSmemBytes;
+// Keep the TMA stage strides unchanged; each Q stage gets a weight slot
+// after the mainloop's shared-memory region.
+constexpr int kSmemBytes = kMainloopSmemBytes + kQStages * kHeadWeightBytes;
 
 // KV supplies the 128 MMA rows and Q/head supplies the 128 columns.
 // Three accumulator slots overlap MMA with three independent reductions.
@@ -233,6 +236,18 @@ void indexer_score_prefill_kernel(
             const int scale_tile = batch * (((query_count + 1) & ~1) / 2) + q_base / 2;
             auto* compact_q_scales = reinterpret_cast<uint32_t*>(
                 smem + q_stage * kQSmemBytes + kABytes);
+            auto* shared_weights = reinterpret_cast<__nv_bfloat162*>(
+                smem + kMainloopSmemBytes + q_stage * kHeadWeightBytes);
+            #pragma unroll
+            for (int q = 0; q < kTileQ; ++q) {
+                const auto* global_weights = reinterpret_cast<const __nv_bfloat162*>(
+                    head_weight + (q_offset + q_base + q) * kHeads);
+                #pragma unroll
+                for (int i = lane; i < kHeads / 2; i += 32)
+                    shared_weights[q * (kHeads / 2) + i] =
+                        q_base + q < local_query_len
+                            ? global_weights[i] : __floats2bfloat162_rn(0.0f, 0.0f);
+            }
             if (q_base < local_query_len) {
                 pack_scale_tile(q_scales + scale_tile * 1024, compact_q_scales, lane);
             } else {
@@ -434,17 +449,19 @@ void indexer_score_prefill_kernel(
             const int compute_group = (warp - 4) / kEpilogueWarps;
             const int local_kv = ((warp - 4) % kEpilogueWarps) * 32 + lane;
             const int tmem_row = ((warp - 4) % 4) * 32;
-            // One lane owns one KV candidate. Keep both queries' head weights
-            // in registers while this CTA walks its visible KV tiles.
+            const int q_bar = static_cast<int>(__cvta_generic_to_shared(
+                &q_barrier[q_round % kQStages]));
+            wait_barrier(q_bar, (q_round / kQStages) & 1);
+            // The Q producer loads each query's weights once per CTA. Every
+            // epilogue lane reads that stage's shared copy for its KV tiles.
+            const auto* shared_weights = reinterpret_cast<const __nv_bfloat162*>(
+                smem + kMainloopSmemBytes + (q_round % kQStages) * kHeadWeightBytes);
             __nv_bfloat162 weights[kTileQ][kHeads / 2];
             #pragma unroll
             for (int q = 0; q < kTileQ; ++q) {
                 #pragma unroll
                 for (int i = 0; i < kHeads / 2; ++i) {
-                    weights[q][i] = q_base + q < local_query_len
-                        ? reinterpret_cast<const __nv_bfloat162*>(head_weight +
-                            (q_offset + q_base + q) * kHeads)[i]
-                        : __floats2bfloat162_rn(0.0f, 0.0f);
+                    weights[q][i] = shared_weights[q * (kHeads / 2) + i];
                 }
             }
             for (int kv_tile = 0; kv_tile < active_kv_tiles; ++kv_tile) {

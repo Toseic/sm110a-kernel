@@ -20,11 +20,12 @@ constexpr int kBBytes = kTileKV * 128;
 constexpr int kQScaleBytes = 2 * 512;
 constexpr int kKScaleTiles = kTileKV / 128;
 constexpr int kKScaleBytes = kKScaleTiles * 2 * 512;
+constexpr int kHeadWeightBytes = kHeads * sizeof(__nv_bfloat16);
 constexpr int kQSmemBytes = kABytes + kQScaleBytes;
 constexpr int kKVStageSmemBytes = kBBytes + kKScaleBytes;
 constexpr int kMainloopSmemBytes =
     kQSmemBytes + kPipelineStages * kKVStageSmemBytes;
-constexpr int kSmemBytes = kMainloopSmemBytes;
+constexpr int kSmemBytes = kMainloopSmemBytes + kHeadWeightBytes;
 
 // KV supplies the MMA rows and Q/head supplies the columns. The pipeline
 // stages have disjoint accumulator columns and share eight scale columns.
@@ -146,6 +147,8 @@ __global__ void indexer_score_decode_kernel(
     const int q_addr = smem_base;
     const int qs_addr = q_addr + kABytes;
     const int kv_smem_base = smem_base + kQSmemBytes;
+    auto* shared_weights = reinterpret_cast<__nv_bfloat162*>(
+        smem + kMainloopSmemBytes);
     __shared__ uint64_t q_barrier;
     __shared__ uint64_t load_barrier[kPipelineStages];
     __shared__ uint64_t mma_barrier[kPipelineStages];
@@ -153,7 +156,8 @@ __global__ void indexer_score_decode_kernel(
     __shared__ int tmem_base;
     if (tid == 0) {
         const int q_bar = static_cast<int>(__cvta_generic_to_shared(&q_barrier));
-        asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(q_bar));
+        // Q TMA and the weight producer each arrive once.
+        asm volatile("mbarrier.init.shared::cta.b64 [%0], 2;" :: "r"(q_bar));
         #pragma unroll
         for (int stage = 0; stage < kPipelineStages; ++stage) {
             const int load_addr = static_cast<int>(__cvta_generic_to_shared(&load_barrier[stage]));
@@ -172,6 +176,18 @@ __global__ void indexer_score_decode_kernel(
                      :: "r"(addr), "r"(kTmemCols));
     }
     __syncthreads();
+
+    if (warp == 1) {
+        const auto* global_weights = reinterpret_cast<const __nv_bfloat162*>(
+            head_weight + batch * kHeads);
+        shared_weights[lane] = global_weights[lane];
+        __syncwarp();
+        if (lane == 0) {
+            const int q_bar = static_cast<int>(__cvta_generic_to_shared(&q_barrier));
+            asm volatile("mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
+                         :: "r"(q_bar) : "memory");
+        }
+    }
 
     // One cluster per batch; each CTA owns a disjoint contiguous KV slice.
     // A 128-column MMA tile holds the 64 valid query heads and 64 zero-fill columns.
@@ -309,13 +325,13 @@ __global__ void indexer_score_decode_kernel(
         if (warp >= 4) {
             const int local_kv = (warp - 4) * 32 + lane;
             const int tmem_row = (warp - 4) * 32;
-            // Each lane owns one KV candidate and retains the query weights
-            // while this CTA walks its visible KV tiles.
+            const int q_bar = static_cast<int>(__cvta_generic_to_shared(&q_barrier));
+            wait_barrier(q_bar, 0);
+            // Warp 1 loaded the weights once; all epilogue lanes reuse them.
             __nv_bfloat162 weights[kHeads / 2];
             #pragma unroll
             for (int i = 0; i < kHeads / 2; ++i)
-                weights[i] = reinterpret_cast<const __nv_bfloat162*>(
-                    head_weight + batch * kHeads)[i];
+                weights[i] = shared_weights[i];
             for (int kv_tile = 0; kv_tile < kv_tiles; ++kv_tile) {
                 const int task = first_task + kv_tile;
                 const int stage = task % kPipelineStages;
