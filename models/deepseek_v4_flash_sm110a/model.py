@@ -1,0 +1,692 @@
+"""DeepSeek-V4-Flash runtime backed by this repository's SM110A kernels.
+
+This module reuses the official readable model's module/state-dict layout while
+swapping the operator backend for one forward call, so converted official
+checkpoints load without another conversion step.
+"""
+
+from __future__ import annotations
+
+from collections import Counter, OrderedDict
+from contextlib import contextmanager
+from importlib import import_module
+import math
+from pathlib import Path
+import sys
+
+import torch
+import torch.nn.functional as F
+
+_OFFICIAL_INFERENCE_ROOT = (
+    Path(__file__).resolve().parents[1] / "deepseek_v4_flash" / "inference"
+)
+if str(_OFFICIAL_INFERENCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_OFFICIAL_INFERENCE_ROOT))
+
+_official = import_module("models.deepseek_v4_flash.inference.model")
+
+from sm110a_kernel import (
+    Bf16GemmConfig,
+    Fp8GemmConfig,
+    Fp8Mxfp4GemmConfig,
+    bf16_fa4_sparse_mla,
+    bf16_fa4_sparse_mla_prefill,
+    bf16_gemm_nt_out,
+    bf16tofp4_quant_dequant,
+    bf16tofp8_quant,
+    compile_mxfp4_fc1,
+    compile_mxfp4_fc2,
+    compile_topk,
+    fp8_act_quant,
+    fp8_gemm,
+    fp8mxfp4_gemm_scaled,
+    Mxfp4Fc1Config,
+    Mxfp4Fc2Config,
+    to_blocked_fp8_scales,
+    to_blocked_fp8mxfp4_scales,
+    to_blocked_mxfp4_sfa,
+)
+
+
+ModelArgs = _official.ModelArgs
+_OFFICIAL_FP4_ACT_QUANT = _official.fp4_act_quant
+
+_STATS: Counter[str] = Counter()
+_SCALE_CACHE: OrderedDict[tuple, torch.Tensor] = OrderedDict()
+_SCALE_CACHE_BYTES = 0
+_SCALE_CACHE_LIMIT = 256 * 2**20
+
+
+def reset_backend_stats() -> None:
+    _STATS.clear()
+
+
+def backend_stats() -> dict[str, int]:
+    return dict(sorted(_STATS.items()))
+
+
+def clear_backend_cache() -> None:
+    global _SCALE_CACHE_BYTES
+    _SCALE_CACHE.clear()
+    _SCALE_CACHE_BYTES = 0
+
+
+def _cache_scale(key: tuple, make) -> torch.Tensor:
+    global _SCALE_CACHE_BYTES
+    cached = _SCALE_CACHE.pop(key, None)
+    if cached is not None:
+        _SCALE_CACHE[key] = cached
+        return cached
+    value = make()
+    size = value.numel() * value.element_size()
+    while _SCALE_CACHE and _SCALE_CACHE_BYTES + size > _SCALE_CACHE_LIMIT:
+        _, evicted = _SCALE_CACHE.popitem(last=False)
+        _SCALE_CACHE_BYTES -= evicted.numel() * evicted.element_size()
+    if size <= _SCALE_CACHE_LIMIT:
+        _SCALE_CACHE[key] = value
+        _SCALE_CACHE_BYTES += size
+    return value
+
+
+def _tensor_key(tensor: torch.Tensor, layout: str) -> tuple:
+    return (
+        layout,
+        tensor.device.type,
+        tensor.device.index,
+        tensor.data_ptr(),
+        tensor._version,
+        tuple(tensor.shape),
+    )
+
+
+def _pad_quantized_rows(
+    values: torch.Tensor, scales: torch.Tensor, multiple: int = 128
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    rows = values.size(0)
+    padded_rows = math.ceil(rows / multiple) * multiple
+    if padded_rows == rows:
+        return values.contiguous(), scales.contiguous(), rows
+    values = torch.cat(
+        (values, values.new_zeros((padded_rows - rows, values.size(1)))), dim=0
+    )
+    if scales.dtype == torch.float8_e8m0fnu:
+        # E8M0 byte 127 is exactly 1.0; the padded values are zero either way.
+        padding = torch.full(
+            (padded_rows - rows, scales.size(1)),
+            127,
+            device=scales.device,
+            dtype=torch.uint8,
+        ).view(torch.float8_e8m0fnu)
+    else:
+        padding = scales.new_ones((padded_rows - rows, scales.size(1)))
+    return values.contiguous(), torch.cat((scales, padding), dim=0).contiguous(), rows
+
+
+def _blocked_activation_scales(scales: torch.Tensor) -> torch.Tensor:
+    if scales.dtype != torch.float8_e8m0fnu:
+        raise TypeError("SM110A block-scaled GEMMs require E8M0 activation scales")
+    expanded = scales.view(torch.uint8).repeat_interleave(4, dim=1)
+    return to_blocked_fp8mxfp4_scales(
+        expanded.view(torch.float8_e8m0fnu).contiguous()
+    )
+
+
+def _blocked_fp8_weight_scales(
+    scales: torch.Tensor, rows: int, k: int
+) -> torch.Tensor:
+    if scales.dtype != torch.float8_e8m0fnu:
+        raise TypeError("SM110A FP8 GEMM requires E8M0 weight scales")
+
+    def make() -> torch.Tensor:
+        expected = (math.ceil(rows / 128), math.ceil(k / 128))
+        if tuple(scales.shape) != expected:
+            raise ValueError(
+                f"official FP8 weight scales must have shape {expected}, got {tuple(scales.shape)}"
+            )
+        logical = scales.view(torch.uint8).repeat_interleave(128, 0)
+        logical = logical[:rows].repeat_interleave(4, 1)[:, : k // 32]
+        return to_blocked_fp8_scales(
+            logical.view(torch.float8_e8m0fnu).contiguous()
+        )
+
+    return _cache_scale(_tensor_key(scales, "fp8-weight"), make)
+
+
+def _blocked_mxfp4_weight_scales(scales: torch.Tensor) -> torch.Tensor:
+    if scales.dtype != torch.float8_e8m0fnu:
+        raise TypeError("SM110A MXFP4 GEMM requires E8M0 weight scales")
+    return _cache_scale(
+        _tensor_key(scales, "mxfp4-weight"),
+        lambda: to_blocked_fp8mxfp4_scales(scales.contiguous()),
+    )
+
+
+def act_quant(
+    x: torch.Tensor,
+    block_size: int = 128,
+    scale_fmt: str | None = None,
+    scale_dtype: torch.dtype = torch.float32,
+    inplace: bool = False,
+):
+    scale_mode = "ue8m0" if scale_dtype == torch.float8_e8m0fnu else "fp32"
+    width = x.size(-1)
+    flat = x.contiguous().view(-1, width)
+    values, scales = fp8_act_quant(flat, block_size, scale_mode)
+    values = values.view_as(x)
+    scales = scales.view(*x.shape[:-1], width // block_size)
+    _STATS["sm110a.fp8_act_quant"] += 1
+    if not inplace:
+        return values, scales
+
+    # TODO(sm110a): replace the PyTorch dequant/copy with a fused FP8
+    # quantize-dequantize kernel.  The quantization itself is already SM110A.
+    restored = values.float() * scales.float().repeat_interleave(block_size, dim=-1)
+    x.copy_(restored.to(x.dtype))
+    _STATS["torch.fp8_dequant_inplace_todo"] += 1
+    return x
+
+
+def fp4_act_quant(x: torch.Tensor, block_size: int = 32, inplace: bool = False):
+    if block_size != 32 or not inplace:
+        # TODO(sm110a): add the remaining FP4 quantizer modes used by future
+        # model variants.  DSV4-Flash only requests block-32 inplace QAT.
+        _STATS["torch.fp4_quant_todo"] += 1
+        return _OFFICIAL_FP4_ACT_QUANT(x, block_size, inplace)
+    width = x.size(-1)
+    restored = bf16tofp4_quant_dequant(x.contiguous().view(-1, width)).view_as(x)
+    x.copy_(restored)
+    _STATS["sm110a.bf16tofp4_quant_dequant"] += 1
+    return x
+
+
+def fp8_gemm_backend(
+    a: torch.Tensor,
+    a_s: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+    scale_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    k = a.size(-1)
+    rows = a.numel() // k
+    n = b.size(0)
+    a2d, a_s2d, valid_rows = _pad_quantized_rows(
+        a.reshape(rows, k), a_s.reshape(rows, -1)
+    )
+    if n % 128 or k % 128 or a_s2d.dtype != torch.float8_e8m0fnu:
+        # TODO(sm110a): support non-E8M0 and non-128-aligned dense FP8 model
+        # shapes.  This branch is not used by the DSV4-Flash benchmark config.
+        _STATS["torch.fp8_linear_todo"] += 1
+        lhs = a2d.float() * a_s2d.float().repeat_interleave(128, dim=1)
+        weight_scale = b_s.float().repeat_interleave(128, 0).repeat_interleave(128, 1)
+        result = lhs @ (b.float() * weight_scale[:n, :k]).t()
+    else:
+        config = Fp8GemmConfig(
+            tile_n=256 if n % 256 == 0 else 128,
+            tile_k=128,
+            cluster_m=1,
+        )
+        result = fp8_gemm(
+            a2d,
+            b.contiguous(),
+            _blocked_activation_scales(a_s2d),
+            _blocked_fp8_weight_scales(b_s, n, k),
+            config=config,
+        )
+        _STATS["sm110a.fp8_gemm"] += 1
+    return result[:valid_rows].view(*a.shape[:-1], n).to(torch.bfloat16)
+
+
+def fp4_gemm_backend(
+    a: torch.Tensor,
+    a_s: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+    scale_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    k = a.size(-1)
+    rows = a.numel() // k
+    n = b.size(0)
+    a2d, a_s2d, valid_rows = _pad_quantized_rows(
+        a.reshape(rows, k), a_s.reshape(rows, -1)
+    )
+    if n % 128 or k % 128 or a_s2d.dtype != torch.float8_e8m0fnu:
+        # TODO(sm110a): add odd-shape/FP32-scale W4A8 kernels.  Kept as a
+        # clear functional fallback for configurations outside DSV4-Flash.
+        _STATS["torch.mxfp4_linear_todo"] += 1
+        result = _torch_fp4_linear(a2d, a_s2d, b, b_s)
+    else:
+        config = Fp8Mxfp4GemmConfig(
+            tile_n=256 if n % 256 == 0 else 128,
+            tile_k=128,
+            cluster_m=1,
+            compact_b_gmem=True,
+        )
+        result = fp8mxfp4_gemm_scaled(
+            a2d,
+            b.view(torch.uint8).contiguous(),
+            _blocked_activation_scales(a_s2d),
+            _blocked_mxfp4_weight_scales(b_s),
+            config=config,
+        )
+        _STATS["sm110a.fp8mxfp4_gemm"] += 1
+    return result[:valid_rows].view(*a.shape[:-1], n).to(torch.bfloat16)
+
+
+def _torch_fp4_linear(a, a_s, b, b_s):
+    lhs = a.float() * a_s.float().repeat_interleave(128, dim=1)
+    raw = b.view(torch.uint8)
+    codes = torch.stack((raw & 0xF, raw >> 4), dim=-1).reshape(b.size(0), -1)
+    magnitudes = torch.tensor(
+        (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0),
+        device=b.device,
+        dtype=torch.float32,
+    )
+    weight = magnitudes[(codes & 7).long()]
+    weight = torch.where((codes & 8) != 0, -weight, weight)
+    weight *= b_s.float().repeat_interleave(32, dim=1)
+    return (lhs @ weight.t()).to(torch.bfloat16)
+
+
+def linear(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    assert bias is None
+    if weight.dtype == torch.float4_e2m1fn_x2:
+        values, scales = act_quant(
+            x, _official.block_size, _official.scale_fmt, _official.scale_dtype
+        )
+        return fp4_gemm_backend(
+            values, scales, weight, weight.scale, _official.scale_dtype
+        )
+    if weight.dtype == torch.float8_e4m3fn:
+        values, scales = act_quant(
+            x, _official.block_size, _official.scale_fmt, _official.scale_dtype
+        )
+        return fp8_gemm_backend(
+            values, scales, weight, weight.scale, _official.scale_dtype
+        )
+    if x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16:
+        k = x.size(-1)
+        rows = x.numel() // k
+        n = weight.size(0)
+        padded_rows = math.ceil(rows / 128) * 128
+        a = x.reshape(rows, k).contiguous()
+        if padded_rows != rows:
+            a = torch.cat((a, a.new_zeros((padded_rows - rows, k))), dim=0)
+        if n % 32:
+            # TODO(sm110a): add an epilogue for BF16 projection widths that
+            # are not a multiple of the current 32-column store atom.
+            _STATS["torch.bf16_linear_todo"] += 1
+            return F.linear(x, weight)
+        tile_n = 256 if n % 256 == 0 else 128 if n % 128 == 0 else 64 if n % 64 == 0 else 32
+        out = torch.empty((padded_rows, n), device=x.device, dtype=torch.bfloat16)
+        config = Bf16GemmConfig(
+            tile_m=128,
+            tile_n=tile_n,
+            tile_k=128,
+            cluster_m=1,
+        )
+        bf16_gemm_nt_out(a, weight.contiguous(), out, config=config)
+        _STATS["sm110a.bf16_gemm"] += 1
+        return out[:rows].view(*x.shape[:-1], n)
+
+    # TODO(sm110a): RMS/HC/router projections are FP32 in the reference
+    # checkpoint.  Replace these F.linear calls when an FP32-capable SM110A
+    # kernel (or a fused surrounding operator) is available.
+    _STATS["torch.fp32_linear_todo"] += 1
+    return F.linear(x, weight)
+
+
+def sparse_attn(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    b, seqlen, heads, dim = q.shape
+    if heads == 64 and dim == 512:
+        q_bhsd = q.transpose(1, 2).contiguous()
+        if seqlen == 1:
+            out = bf16_fa4_sparse_mla(
+                q_bhsd,
+                kv.contiguous(),
+                topk_idxs[:, 0].contiguous(),
+                attn_sink.contiguous(),
+                scale=softmax_scale,
+            )
+            _STATS["sm110a.sparse_mla_decode"] += 1
+        else:
+            out = bf16_fa4_sparse_mla_prefill(
+                q_bhsd,
+                kv.contiguous(),
+                topk_idxs.contiguous(),
+                attn_sink.contiguous(),
+                scale=softmax_scale,
+            )
+            _STATS["sm110a.sparse_mla_prefill"] += 1
+        return out.transpose(1, 2).contiguous()
+
+    # TODO(sm110a): add sparse MLA families for other head counts/dimensions.
+    _STATS["torch.sparse_attention_todo"] += 1
+    return _torch_sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale)
+
+
+def _torch_sparse_attn(q, kv, sink, indices, scale):
+    safe = indices.clamp_min(0).long()
+    batch = torch.arange(q.size(0), device=q.device)[:, None, None]
+    selected = kv[batch, safe].float()
+    scores = torch.einsum("bshd,bskd->bshk", q.float(), selected) * scale
+    scores.masked_fill_(indices[:, :, None, :] < 0, -torch.inf)
+    sink_scores = sink.view(1, 1, -1, 1).expand(*scores.shape[:-1], 1)
+    probabilities = torch.cat((scores, sink_scores), dim=-1).softmax(-1)[..., :-1]
+    return torch.einsum("bshk,bskd->bshd", probabilities, selected).to(q.dtype)
+
+
+def hc_split_sinkhorn(
+    mixes: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int = 4,
+    sinkhorn_iters: int = 20,
+    eps: float = 1e-6,
+):
+    # TODO(sm110a): replace this functional PyTorch implementation with a
+    # native fused HC split + Sinkhorn kernel.
+    _STATS["torch.hc_sinkhorn_todo"] += 1
+    pre_logits, post_logits, comb_logits = torch.split(
+        mixes, (hc_mult, hc_mult, hc_mult * hc_mult), dim=-1
+    )
+    pre = torch.sigmoid(pre_logits * hc_scale[0] + hc_base[:hc_mult]) + eps
+    post = 2 * torch.sigmoid(
+        post_logits * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult]
+    )
+    comb = comb_logits * hc_scale[2] + hc_base[2 * hc_mult :]
+    comb = comb.unflatten(-1, (hc_mult, hc_mult)).softmax(-1) + eps
+    comb = comb / (comb.sum(-2, keepdim=True) + eps)
+    for _ in range(sinkhorn_iters - 1):
+        comb = comb / (comb.sum(-1, keepdim=True) + eps)
+        comb = comb / (comb.sum(-2, keepdim=True) + eps)
+    return pre, post, comb
+
+
+class Sm110aIndexer(_official.Indexer):
+    """CSA indexer with SM110A row top-k after the reference score producer."""
+
+    def forward(self, x, qr, start_pos: int, offset: int):
+        bsz, seqlen, _ = x.shape
+        ratio, rd = self.compress_ratio, self.rope_head_dim
+        end_pos = start_pos + seqlen
+        if self.compressor.kv_cache is None:
+            self.compressor.kv_cache = self.kv_cache
+            self.compressor.freqs_cis = self.freqs_cis
+        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
+        _official.apply_rotary_emb(q[..., -rd:], self.freqs_cis[start_pos:end_pos])
+        q = _official.rotate_activation(q)
+        fp4_act_quant(q, _official.fp4_block_size, True)
+        self.compressor(x, start_pos)
+        weights = self.weights_proj(x) * (
+            self.softmax_scale * self.n_heads ** -0.5
+        )
+        # TODO(sm110a): replace the reference QAT/BF16 score producer with
+        # the native MXFP4 indexer score kernel and its packed KV cache.
+        scores = torch.einsum(
+            "bshd,btd->bsht", q, self.kv_cache[:bsz, : end_pos // ratio]
+        )
+        scores = (scores.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+        if _official.world_size > 1:
+            torch.distributed.all_reduce(scores)
+        if start_pos == 0:
+            valid_groups = torch.arange(1, seqlen + 1, device=x.device)[:, None] // ratio
+            mask = torch.arange(seqlen // ratio, device=x.device) >= valid_groups
+            scores = scores.masked_fill(mask, -torch.inf)
+
+        width = scores.size(-1)
+        k = min(self.index_topk, width)
+        indices = self._sm110a_topk.topk(
+            scores.contiguous().view(bsz * seqlen, width), k
+        ).view(bsz, seqlen, k)
+        _STATS["sm110a.indexer_topk"] += 1
+        if start_pos == 0:
+            indices = torch.where(indices >= valid_groups, -1, indices + offset)
+        else:
+            indices = indices + offset
+        return indices
+
+
+class Sm110aMoE(_official.MoE):
+    """Official MoE state layout executed by fused SM110A FC1 and FC2."""
+
+    def prepare_fused_weights(self) -> None:
+        if getattr(self, "_sm110a_prepared", False):
+            return
+        if _official.world_size != 1:
+            raise NotImplementedError(
+                "TODO(sm110a): fused DSV4 MoE currently supports one GPU only"
+            )
+        if not self.experts or any(expert is None for expert in self.experts):
+            raise RuntimeError("all single-GPU experts must be resident before packing")
+
+        first = self.experts[0]
+        experts = self.n_routed_experts
+        inter_dim = first.w1.out_features
+        dim = self.dim
+        device = first.w1.weight.device
+        fp4 = torch.float4_e2m1fn_x2
+        self._sm110a_swiglu_limit = first.swiglu_limit
+
+        fc1_weight = torch.empty(
+            (experts, 2 * inter_dim, dim // 2), device=device, dtype=fp4
+        )
+        fc2_weight = torch.empty(
+            (experts, dim, inter_dim // 2), device=device, dtype=fp4
+        )
+        fc1_scale_parts = []
+        fc2_scale_parts = []
+        for expert_id, expert in enumerate(self.experts):
+            gate = expert.w1.weight.view(inter_dim // 64, 64, dim // 2)
+            up = expert.w3.weight.view(inter_dim // 64, 64, dim // 2)
+            fc1_weight[expert_id].copy_(
+                torch.stack((gate, up), dim=1).reshape(2 * inter_dim, dim // 2)
+            )
+            gate_scale = expert.w1.scale.view(inter_dim // 64, 64, dim // 32)
+            up_scale = expert.w3.scale.view(inter_dim // 64, 64, dim // 32)
+            fc1_logical_scale = torch.stack(
+                (gate_scale, up_scale), dim=1
+            ).reshape(2 * inter_dim, dim // 32)
+            fc1_scale_parts.append(
+                to_blocked_fp8mxfp4_scales(fc1_logical_scale.contiguous())
+            )
+
+            fc2_weight[expert_id].copy_(expert.w2.weight)
+            fc2_scale_parts.append(
+                to_blocked_fp8mxfp4_scales(expert.w2.scale.contiguous())
+            )
+
+        self.register_buffer("sm110a_fc1_weight", fc1_weight, persistent=False)
+        self.register_buffer(
+            "sm110a_fc1_scale", torch.cat(fc1_scale_parts), persistent=False
+        )
+        self.register_buffer("sm110a_fc2_weight", fc2_weight, persistent=False)
+        self.register_buffer(
+            "sm110a_fc2_scale", torch.cat(fc2_scale_parts), persistent=False
+        )
+        self._sm110a_fc1 = compile_mxfp4_fc1(
+            Mxfp4Fc1Config(
+                cluster_m=1,
+                routing_weight_position=self._sm110a_weight_position,
+                activation_bf16_rounding=self._sm110a_weight_position == "fc1",
+            )
+        )
+        self._sm110a_fc2 = compile_mxfp4_fc2(
+            Mxfp4Fc2Config(
+                cluster_m=1,
+                routing_weight_position=self._sm110a_weight_position,
+                deterministic=self._sm110a_deterministic_fc2,
+            )
+        )
+        self._sm110a_inter_dim = inter_dim
+
+        # The fused tensors now own the routed-expert weights.  Drop the
+        # official per-expert modules instead of retaining a second 3+ GiB
+        # copy per layer.
+        self.experts = torch.nn.ModuleList()
+        self._sm110a_prepared = True
+
+    def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        if not getattr(self, "_sm110a_prepared", False):
+            self.prepare_fused_weights()
+
+        shape = x.shape
+        x = x.view(-1, self.dim)
+        tokens = x.size(0)
+        weights, indices = self.gate(x, input_ids.flatten())
+        topk = self.n_activated_experts
+        padded_tokens = math.ceil(tokens / 128) * 128
+
+        if padded_tokens != tokens:
+            x_padded = torch.cat(
+                (x, x.new_zeros((padded_tokens - tokens, self.dim))), dim=0
+            )
+            weights_padded = torch.cat(
+                (
+                    weights,
+                    weights.new_zeros((padded_tokens - tokens, topk)),
+                ),
+                dim=0,
+            )
+            dummy_indices = torch.arange(
+                topk, device=indices.device, dtype=indices.dtype
+            ).expand(padded_tokens - tokens, -1)
+            indices_padded = torch.cat((indices, dummy_indices), dim=0)
+        else:
+            x_padded, weights_padded, indices_padded = x, weights, indices
+
+        # FC1 metadata performs its own top-k.  Synthetic descending values
+        # preserve the exact order returned by the official gate, including
+        # hash-routed layers. The selected compile-time weighting mode receives
+        # the real routing weights without multiplying them a second time.
+        router = torch.full(
+            (padded_tokens, self.n_routed_experts),
+            -torch.inf,
+            device=x.device,
+            dtype=torch.bfloat16,
+        )
+        rank_values = torch.arange(
+            topk, 0, -1, device=x.device, dtype=torch.bfloat16
+        ).expand(padded_tokens, -1)
+        router.scatter_(1, indices_padded.long(), rank_values)
+
+        aq, sfa128 = bf16tofp8_quant(x_padded.contiguous())
+        sfa = to_blocked_mxfp4_sfa(sfa128)
+        fc1_metadata = self._sm110a_fc1.prepare_metadata(
+            router, topk, 2 * self._sm110a_inter_dim
+        )
+        hidden, hidden_scale = self._sm110a_fc1.mxfp4_fc1(
+            aq,
+            self.sm110a_fc1_weight,
+            sfa,
+            self.sm110a_fc1_scale,
+            fc1_metadata,
+            self._sm110a_swiglu_limit,
+            routing_weights=(
+                weights_padded.float()
+                if self._sm110a_weight_position == "fc1"
+                else None
+            ),
+        )
+
+        assignments = padded_tokens * topk
+        grouped_layout = fc1_metadata.routing.narrow(
+            0, 2 * self.n_routed_experts, assignments
+        )
+        fc2_metadata = self._sm110a_fc2.prepare_metadata(
+            grouped_layout, self.n_routed_experts, self.dim
+        )
+        out = torch.zeros(
+            (padded_tokens, self.dim), device=x.device, dtype=torch.bfloat16
+        )
+        self._sm110a_fc2.mxfp4_fc2_out(
+            hidden,
+            self.sm110a_fc2_weight,
+            hidden_scale,
+            self.sm110a_fc2_scale,
+            fc1_metadata.routing,
+            weights_padded.to(torch.bfloat16),
+            fc2_metadata,
+            topk,
+            out,
+        )
+        _STATS["sm110a.mxfp4_fc1"] += 1
+        _STATS["sm110a.mxfp4_fc2"] += 1
+
+        # The shared expert is dense FP8 in the official checkpoint and goes
+        # through the SM110A dense backend installed by the forward context.
+        out = out[:tokens] + self.shared_experts(x)
+        return out.to(x.dtype).view(shape)
+
+
+_PATCHES = {
+    "act_quant": act_quant,
+    "fp4_act_quant": fp4_act_quant,
+    "fp8_gemm": fp8_gemm_backend,
+    "fp4_gemm": fp4_gemm_backend,
+    "linear": linear,
+    "sparse_attn": sparse_attn,
+    "hc_split_sinkhorn": hc_split_sinkhorn,
+}
+
+
+@contextmanager
+def _use_sm110a_backend():
+    originals = {name: getattr(_official, name) for name in _PATCHES}
+    try:
+        for name, replacement in _PATCHES.items():
+            setattr(_official, name, replacement)
+        yield
+    finally:
+        for name, original in originals.items():
+            setattr(_official, name, original)
+
+
+class Transformer(_official.Transformer):
+    """Checkpoint-compatible official model with SM110A operator dispatch."""
+
+    def __init__(
+        self,
+        args: ModelArgs,
+        *,
+        routing_weight_position: str = "fc1",
+        deterministic_fc2: bool = True,
+    ):
+        if routing_weight_position not in ("fc1", "fc2"):
+            raise ValueError("routing_weight_position must be 'fc1' or 'fc2'")
+        super().__init__(args)
+        self.routing_weight_position = routing_weight_position
+        self.deterministic_fc2 = deterministic_fc2
+        for layer in self.layers:
+            layer.ffn.__class__ = Sm110aMoE
+        for layer in self.mtp:
+            layer.ffn.__class__ = Sm110aMoE
+        for layer in (*self.layers, *self.mtp):
+            layer.ffn._sm110a_weight_position = routing_weight_position
+            layer.ffn._sm110a_deterministic_fc2 = deterministic_fc2
+            indexer = getattr(layer.attn, "indexer", None)
+            if indexer is not None:
+                indexer.__class__ = Sm110aIndexer
+                indexer._sm110a_topk = compile_topk()
+        self._sm110a_prepared = False
+
+    def prepare_for_inference(self) -> None:
+        if self._sm110a_prepared:
+            return
+        for layer in (*self.layers, *self.mtp):
+            layer.ffn.prepare_fused_weights()
+        self._sm110a_prepared = True
+
+    @torch.inference_mode()
+    def forward(self, input_ids: torch.Tensor, start_pos: int = 0):
+        if not self._sm110a_prepared:
+            self.prepare_for_inference()
+        with _use_sm110a_backend():
+            return super().forward(input_ids, start_pos)

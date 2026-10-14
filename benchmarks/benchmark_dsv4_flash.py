@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Single-GPU prefill/decode benchmark for the reduced official DSV4-Flash runtime."""
+"""Benchmark the SM110A DSV4-Flash runtime with graphed decoding."""
+
+# ruff: noqa: E402, I001
 
 import argparse
+import gc
 import json
 import sys
 import time
@@ -10,15 +13,23 @@ from pathlib import Path
 import torch
 
 BENCHMARK_ROOT = Path(__file__).resolve().parent
-MODEL_ROOT = BENCHMARK_ROOT.parent / "models" / "deepseek_v4_flash"
-MODEL_CONFIG = MODEL_ROOT / "benchmark_config_32g.json"
-sys.path.insert(0, str(MODEL_ROOT))
-sys.path.insert(0, str(MODEL_ROOT / "inference"))
+REPO_ROOT = BENCHMARK_ROOT.parent
+OFFICIAL_MODEL_ROOT = REPO_ROOT / "models" / "deepseek_v4_flash"
+SM110A_MODEL_ROOT = REPO_ROOT / "models" / "deepseek_v4_flash_sm110a"
+MODEL_CONFIG = SM110A_MODEL_ROOT / "benchmark_config_32g.json"
+sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(OFFICIAL_MODEL_ROOT))
+sys.path.insert(0, str(OFFICIAL_MODEL_ROOT / "inference"))
 
-from benchmark_utils import gib, model_storage_bytes  # noqa: E402
-from model import ModelArgs, Transformer  # noqa: E402
-
-from common import GMEM_BW_GBPS  # noqa: E402
+from benchmark_utils import gib, model_storage_bytes
+from common import GMEM_BW_GBPS
+from models.deepseek_v4_flash_sm110a.model import (
+    ModelArgs as Sm110aModelArgs,
+    Transformer as Sm110aTransformer,
+    backend_stats,
+    clear_backend_cache,
+    reset_backend_stats,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,7 +71,19 @@ def parse_args() -> argparse.Namespace:
         help="skip prefill and benchmark decode against zero-initialized KV cache at --seq-len",
     )
     parser.add_argument(
-        "--layers", type=int, help="Override the default six transformer layers"
+        "--layers", type=int, help="Override the default two transformer layers"
+    )
+    parser.add_argument(
+        "--routing-weight-position",
+        choices=("fc1", "fc2"),
+        default="fc1",
+        help="compile-time expert weighting mode (default: before FC1 activation quantization)",
+    )
+    parser.add_argument(
+        "--fc2-reduction",
+        choices=("deterministic", "atomic"),
+        default="deterministic",
+        help="expert accumulation (default: fixed-order FP32 reduction)",
     )
     parser.add_argument(
         "--warmup", type=int, default=2, help="Unmeasured iterations (default: 2)"
@@ -96,8 +119,15 @@ def benchmark_config(args: argparse.Namespace) -> dict:
         < 0
     ):
         raise ValueError("batch size, lengths, warmup, and iters must be non-negative")
-    if args.batch_size == 0 or args.prefill_len == 0 or args.iters == 0:
-        raise ValueError("batch size, prefill length, and iters must be positive")
+    if (
+        args.batch_size == 0
+        or args.prefill_len == 0
+        or args.decode_len == 0
+        or args.iters == 0
+    ):
+        raise ValueError(
+            "batch size, prefill/decode lengths, and iters must be positive"
+        )
     if args.decode_only:
         if args.seq_len is None:
             raise ValueError("--decode-only requires --seq-len")
@@ -129,6 +159,19 @@ def benchmark_config(args: argparse.Namespace) -> dict:
 def budget_check(config: dict, args: argparse.Namespace) -> tuple[int, int]:
     parameter_bytes, buffer_bytes = model_storage_bytes(config)
     resident_bytes = parameter_bytes + buffer_bytes
+    # Fused FC1/FC2 use the same packed FP4 payload but a padded 4-byte
+    # hardware scale layout.  The official state stores one byte per logical
+    # K=32 scale, so packing adds three bytes per logical expert scale.
+    logical_expert_scales = (
+        config["n_layers"]
+        * config["n_routed_experts"]
+        * (
+            2 * config["moe_inter_dim"] * config["dim"] // 32
+            + config["dim"] * config["moe_inter_dim"] // 32
+        )
+    )
+    sm110a_extra_bytes = 3 * logical_expert_scales
+    sm110a_resident_bytes = resident_bytes + sm110a_extra_bytes
     budget_bytes = int(args.memory_limit_gib * 2**30)
     reserve_bytes = int(args.runtime_reserve_gib * 2**30)
     print(
@@ -142,18 +185,21 @@ def budget_check(config: dict, args: argparse.Namespace) -> tuple[int, int]:
         ),
     )
     print(
-        f"model resident: {gib(resident_bytes):.2f} GiB (parameters {gib(parameter_bytes):.2f}, buffers {gib(buffer_bytes):.2f})"
+        f"SM110A resident: {gib(sm110a_resident_bytes):.2f} GiB "
+        f"(checkpoint tensors {gib(resident_bytes):.2f}, "
+        f"blocked expert-scale overhead {gib(sm110a_extra_bytes):.2f} GiB)"
     )
     print(
-        f"with runtime reserve: {gib(resident_bytes + reserve_bytes):.2f} / {args.memory_limit_gib:.2f} GiB"
+        f"SM110A + runtime reserve: {gib(sm110a_resident_bytes + reserve_bytes):.2f} / "
+        f"{args.memory_limit_gib:.2f} GiB"
     )
-    if resident_bytes + reserve_bytes > budget_bytes:
+    if sm110a_resident_bytes + reserve_bytes > budget_bytes:
         raise RuntimeError("requested shape exceeds the configured GPU memory budget")
-    return parameter_bytes, buffer_bytes
+    return parameter_bytes + sm110a_extra_bytes, buffer_bytes
 
 
 def decode_kv_cache_load_bytes(config: dict, prompt_len: int, decode_len: int) -> int:
-    """Return persistent KV-cache bytes read by the official decode path.
+    """Return persistent KV-cache bytes read by the SM110A decode path.
 
     ``sparse_attn`` gathers only valid indices in ``topk_idxs`` rather than
     reading the entire cache. Ratio-4 layers also read their indexer's
@@ -240,7 +286,7 @@ def print_memory_sol(
 
 
 @torch.no_grad()
-def initialize_random_weights(model: Transformer, n_routed_experts: int) -> None:
+def initialize_random_weights(model: torch.nn.Module, n_routed_experts: int) -> None:
     """Initialize every official-runtime parameter, including packed FP4 tensors.
 
     FP4 weights are represented as packed nibbles, so they cannot be populated
@@ -262,15 +308,34 @@ def initialize_random_weights(model: Transformer, n_routed_experts: int) -> None
             )
             parameter.copy_(scale.to(fp8_scale))
         elif parameter.dtype in (torch.int32, torch.int64):
-            parameter.copy_(
-                torch.randint(
+            if name.endswith("tid2eid"):
+                # Hash routing expects distinct expert ids per token.  Keep
+                # random initialization deterministic without introducing
+                # duplicate assignments that a top-k metadata builder cannot
+                # represent.
+                base = torch.randint(
                     0,
                     n_routed_experts,
-                    parameter.shape,
+                    parameter.shape[:-1],
                     dtype=parameter.dtype,
                     device=parameter.device,
                 )
-            )
+                offsets = torch.arange(
+                    parameter.size(-1),
+                    dtype=parameter.dtype,
+                    device=parameter.device,
+                )
+                parameter.copy_((base.unsqueeze(-1) + offsets) % n_routed_experts)
+            else:
+                parameter.copy_(
+                    torch.randint(
+                        0,
+                        n_routed_experts,
+                        parameter.shape,
+                        dtype=parameter.dtype,
+                        device=parameter.device,
+                    )
+                )
         elif name.endswith("norm.weight"):
             parameter.fill_(1.0)
         else:
@@ -283,10 +348,113 @@ def initialize_random_weights(model: Transformer, n_routed_experts: int) -> None
             parameter.copy_(values.to(parameter.dtype))
 
 
+class DecodeCudaGraph:
+    """Fixed-address CUDA Graph containing a complete autoregressive decode."""
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        sample_tokens: torch.Tensor,
+        start_pos: int,
+        decode_len: int,
+    ) -> None:
+        if decode_len <= 0:
+            raise ValueError("a decode CUDA Graph requires at least one step")
+        self.static_tokens = torch.empty_like(sample_tokens)
+        self.static_tokens.copy_(sample_tokens)
+        self.cache_state = [
+            (buffer, buffer.clone())
+            for name, buffer in model.named_buffers()
+            if name.rsplit(".", 1)[-1] in ("kv_cache", "kv_state", "score_state")
+        ]
+
+        def restore_cache():
+            self.reset_cache()
+
+        # CUDA Graph capture requires all lazy initialization and allocations
+        # to have run on a non-capturing stream first. This pass is setup only
+        # and is deliberately excluded from --warmup and measured iterations.
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            warmup_token = self.static_tokens
+            for position in range(start_pos, start_pos + decode_len):
+                logits = model(warmup_token, position)
+                if position == start_pos:
+                    expected_first_logits = logits.clone()
+                warmup_token = logits.argmax(dim=-1, keepdim=True)
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+        torch.cuda.synchronize()
+        expected_output = warmup_token.clone()
+        expected_final_logits = logits.clone()
+
+        restore_cache()
+        self.static_tokens.copy_(sample_tokens)
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            graph_token = self.static_tokens
+            for position in range(start_pos, start_pos + decode_len):
+                logits = model(graph_token, position)
+                if position == start_pos:
+                    self.static_first_logits = logits
+                graph_token = logits.argmax(dim=-1, keepdim=True)
+            self.static_output = graph_token
+            self.static_logits = logits
+        torch.cuda.synchronize()
+
+        # Capture records operations without producing valid outputs. Compare
+        # actual replays against eager decode, starting from identical caches.
+        # Compare the first step's logits: BF16 atomic reductions can change
+        # near-tied argmax choices, so later autoregressive inputs may differ.
+        similarities = []
+        tokens_match = True
+        for _ in range(2):
+            restore_cache()
+            self.static_tokens.copy_(sample_tokens)
+            self.graph.replay()
+            torch.cuda.synchronize()
+            if not torch.isfinite(self.static_logits).all().item():
+                raise RuntimeError("decode CUDA Graph produced non-finite logits")
+            cosine = torch.nn.functional.cosine_similarity(
+                self.static_first_logits.float().flatten(),
+                expected_first_logits.float().flatten(),
+                dim=0,
+            ).item()
+            if cosine < 0.999:
+                raise RuntimeError(
+                    f"decode graph first-step logits differ from eager: cosine={cosine}"
+                )
+            similarities.append(cosine)
+            tokens_match &= torch.equal(self.static_output, expected_output)
+            if model.deterministic_fc2:
+                torch.testing.assert_close(
+                    self.static_first_logits, expected_first_logits, atol=0, rtol=0
+                )
+                torch.testing.assert_close(
+                    self.static_logits, expected_final_logits, atol=0, rtol=0
+                )
+                if not tokens_match:
+                    raise RuntimeError(
+                        "deterministic decode graph changed its final token"
+                    )
+        restore_cache()
+        torch.cuda.synchronize()
+        print(
+            f"[graph] eager/replay first-step logits cosine={min(similarities):.8f}; "
+            f"final tokens equal={tokens_match} "
+            f"(FC2 reduction={'deterministic' if model.deterministic_fc2 else 'atomic'})"
+        )
+
+    def reset_cache(self) -> None:
+        for buffer, initial in self.cache_state:
+            buffer.copy_(initial)
+
+
 @torch.inference_mode()
 def run_iteration(
-    model: Transformer, prompt: torch.Tensor, decode_len: int
+    model: torch.nn.Module, prompt: torch.Tensor, decode_graph: DecodeCudaGraph
 ) -> tuple[float, float]:
+    decode_graph.reset_cache()
     torch.cuda.synchronize()
     start = time.perf_counter()
     logits = model(prompt, 0)
@@ -294,33 +462,131 @@ def run_iteration(
     prefill_seconds = time.perf_counter() - start
 
     next_token = logits.argmax(dim=-1, keepdim=True)
+    decode_graph.static_tokens.copy_(next_token)
     torch.cuda.synchronize()
     start = time.perf_counter()
-    for position in range(prompt.size(1), prompt.size(1) + decode_len):
-        logits = model(next_token, position)
-        next_token = logits.argmax(dim=-1, keepdim=True)
+    decode_graph.graph.replay()
     torch.cuda.synchronize()
     return prefill_seconds, time.perf_counter() - start
 
 
 @torch.inference_mode()
 def run_decode_only_iteration(
-    model: Transformer, tokens: torch.Tensor, start_pos: int, decode_len: int
+    decode_graph: DecodeCudaGraph, tokens: torch.Tensor
 ) -> float:
-    """Time decode from an already allocated, zero-initialized KV cache."""
+    """Time one replay of a decode-only CUDA Graph."""
+    decode_graph.reset_cache()
+    decode_graph.static_tokens.copy_(tokens)
     torch.cuda.synchronize()
     start = time.perf_counter()
-    for position in range(start_pos, start_pos + decode_len):
-        logits = model(tokens, position)
-        tokens = logits.argmax(dim=-1, keepdim=True)
+    decode_graph.graph.replay()
     torch.cuda.synchronize()
     return time.perf_counter() - start
+
+
+def _load_model(config, checkpoint, args):
+    torch.manual_seed(args.seed)
+    with torch.device("cuda"):
+        model = Sm110aTransformer(
+            Sm110aModelArgs(**config),
+            routing_weight_position=args.routing_weight_position,
+            deterministic_fc2=args.fc2_reduction == "deterministic",
+        ).eval()
+    if checkpoint is None:
+        initialize_random_weights(model, config["n_routed_experts"])
+    else:
+        from safetensors.torch import load_model
+
+        load_model(model, checkpoint, strict=False)
+    model.prepare_for_inference()
+    return model
+
+
+def _measure_sm110a(config, checkpoint, args, prompt, tokens, decode_start_pos):
+    print("[sm110a] loading model")
+    torch.cuda.reset_peak_memory_stats()
+    clear_backend_cache()
+    reset_backend_stats()
+    model = _load_model(config, checkpoint, args)
+    if args.decode_only:
+        graph_seed = tokens
+    else:
+        # Seed capture after a real prefill so all KV/cache state and lazy
+        # model paths match normal autoregressive execution.
+        graph_seed = model(prompt, 0).argmax(dim=-1, keepdim=True)
+    print(f"[sm110a] capturing fixed decode CUDA Graph ({args.decode_len} steps)")
+    print(
+        f"[moe] routing-weight-position={args.routing_weight_position}; "
+        f"FC2 reduction={args.fc2_reduction}"
+    )
+    decode_graph = DecodeCudaGraph(model, graph_seed, decode_start_pos, args.decode_len)
+
+    if args.decode_only:
+        for _ in range(args.warmup):
+            run_decode_only_iteration(decode_graph, tokens)
+        decode_seconds = (
+            sum(
+                run_decode_only_iteration(decode_graph, tokens)
+                for _ in range(args.iters)
+            )
+            / args.iters
+        )
+        prefill_seconds = None
+    else:
+        for _ in range(args.warmup):
+            run_iteration(model, prompt, decode_graph)
+        results = [
+            run_iteration(model, prompt, decode_graph) for _ in range(args.iters)
+        ]
+        prefill_seconds = sum(item[0] for item in results) / len(results)
+        decode_seconds = sum(item[1] for item in results) / len(results)
+
+    result = {
+        "label": "sm110a",
+        "prefill_seconds": prefill_seconds,
+        "decode_seconds": decode_seconds,
+        "peak_bytes": torch.cuda.max_memory_allocated(),
+        "kernel_stats": backend_stats(),
+        "cuda_graph": True,
+    }
+    del decode_graph
+    del model
+    gc.collect()
+    clear_backend_cache()
+    torch.cuda.empty_cache()
+    return result
+
+
+def _print_results(results, args):
+    prefill_tokens = args.batch_size * args.prefill_len
+    decode_tokens = args.batch_size * args.decode_len
+    print("\nDecode execution: fixed CUDA Graph replay")
+    print(
+        "\nBackend        Prefill(ms)   Prefill tok/s   Decode(ms)   Decode tok/s   Peak GiB"
+    )
+    print("-" * 85)
+    for result in results:
+        prefill = result["prefill_seconds"]
+        decode = result["decode_seconds"]
+        print(
+            f"{result['label']:<14} "
+            f"{prefill * 1e3 if prefill is not None else float('nan'):>11.2f}   "
+            f"{prefill_tokens / prefill if prefill is not None else float('nan'):>13.2f}   "
+            f"{decode * 1e3:>10.2f}   "
+            f"{decode_tokens / decode if decode_tokens else float('nan'):>12.2f}   "
+            f"{gib(result['peak_bytes']):>8.2f}"
+        )
+    ours = results[-1]
+    if ours["kernel_stats"]:
+        print("SM110A eager/capture dispatch counts (replays do not re-enter Python):")
+        for name, count in ours["kernel_stats"].items():
+            print(f"  {name}: {count}")
 
 
 def main() -> None:
     args = parse_args()
     config = benchmark_config(args)
-    parameter_bytes, _ = budget_check(config, args)
+    sm110a_parameter_bytes, _ = budget_check(config, args)
     decode_start_pos = (
         config["max_seq_len"] - args.decode_len
         if args.decode_only
@@ -330,7 +596,7 @@ def main() -> None:
         if args.sol:
             print_memory_sol(
                 config,
-                parameter_bytes,
+                sm110a_parameter_bytes,
                 decode_start_pos,
                 args.decode_len,
                 include_prefill=not args.decode_only,
@@ -345,69 +611,57 @@ def main() -> None:
         raise SystemExit("CUDA is unavailable")
 
     torch.cuda.set_device(0)
-    torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+    if hasattr(torch._C, "_accelerator_setAllocatorSettings"):
+        torch._C._accelerator_setAllocatorSettings("expandable_segments:True")
+    else:
+        torch.cuda.memory._set_allocator_settings("expandable_segments:True")
     torch.set_default_dtype(torch.bfloat16)
-    torch.manual_seed(args.seed)
-    with torch.device("cuda"):
-        model = Transformer(ModelArgs(**config)).eval()
-    if checkpoint is None:
-        initialize_random_weights(model, config["n_routed_experts"])
-        print("weights: deterministic random initialization")
-    else:
-        from safetensors.torch import load_model
-
-        load_model(model, checkpoint, strict=False)
-        print(f"weights: {checkpoint}")
-    # The official kernel helpers construct cached index tensors with
-    # torch.arange/full; match generate.py so those tensors are CUDA-resident.
     torch.set_default_device("cuda")
-    if args.decode_only:
-        tokens = torch.randint(
-            0, config["vocab_size"], (args.batch_size, 1), device="cuda"
-        )
-        for _ in range(args.warmup):
-            run_decode_only_iteration(model, tokens, decode_start_pos, args.decode_len)
-        decode_seconds = (
-            sum(
-                run_decode_only_iteration(
-                    model, tokens, decode_start_pos, args.decode_len
-                )
-                for _ in range(args.iters)
-            )
-            / args.iters
-        )
-        prefill_seconds = None
-    else:
-        prompt = torch.randint(
-            0, config["vocab_size"], (args.batch_size, args.prefill_len), device="cuda"
-        )
-        for _ in range(args.warmup):
-            run_iteration(model, prompt, args.decode_len)
-        results = [
-            run_iteration(model, prompt, args.decode_len) for _ in range(args.iters)
-        ]
-        prefill_seconds = sum(item[0] for item in results) / len(results)
-        decode_seconds = sum(item[1] for item in results) / len(results)
-        prefill_tokens = args.batch_size * args.prefill_len
-        print(
-            f"prefill: {prefill_seconds * 1e3:.2f} ms, {prefill_tokens / prefill_seconds:.2f} tokens/s"
-        )
-    decode_tokens = args.batch_size * args.decode_len
-    if decode_tokens:
-        print(
-            f"decode: {decode_seconds * 1e3:.2f} ms, {decode_tokens / decode_seconds:.2f} tokens/s"
-        )
-    if args.sol:
-        print_memory_sol(
+    generator = torch.Generator(device="cuda").manual_seed(args.seed + 1)
+    prompt = torch.randint(
+        0,
+        config["vocab_size"],
+        (args.batch_size, args.prefill_len),
+        device="cuda",
+        generator=generator,
+    )
+    tokens = torch.randint(
+        0,
+        config["vocab_size"],
+        (args.batch_size, 1),
+        device="cuda",
+        generator=generator,
+    )
+    print(
+        f"weights: {checkpoint if checkpoint is not None else 'deterministic random initialization'}"
+    )
+    print(
+        "[cache] full model passes exceed L2 capacity; reported comparisons are cold-L2"
+    )
+
+    results = [
+        _measure_sm110a(
             config,
-            parameter_bytes,
+            checkpoint,
+            args,
+            prompt,
+            tokens,
             decode_start_pos,
-            args.decode_len,
-            include_prefill=not args.decode_only,
-            prefill_seconds=prefill_seconds,
-            decode_seconds=decode_seconds,
         )
-    print(f"peak allocated: {gib(torch.cuda.max_memory_allocated()):.2f} GiB")
+    ]
+    _print_results(results, args)
+    if args.sol:
+        for result in results:
+            print(f"[{result['label']}]")
+            print_memory_sol(
+                config,
+                sm110a_parameter_bytes,
+                decode_start_pos,
+                args.decode_len,
+                include_prefill=not args.decode_only,
+                prefill_seconds=result["prefill_seconds"],
+                decode_seconds=result["decode_seconds"],
+            )
 
 
 if __name__ == "__main__":
