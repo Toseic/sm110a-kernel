@@ -11,7 +11,6 @@ constexpr int kHeads = 64;
 constexpr int kDim = 128;
 constexpr int kTileQ = 1;
 constexpr int kTileKV = 128;
-constexpr int kPipelineStages = 2;
 constexpr int kTileM = 128;  // 64 query heads and 64 zero-fill columns.
 constexpr int kEpilogueWarps = kTileKV / 32;
 constexpr int kThreads = (4 + kEpilogueWarps) * 32;
@@ -23,17 +22,10 @@ constexpr int kKScaleBytes = kKScaleTiles * 2 * 512;
 constexpr int kHeadWeightBytes = kHeads * sizeof(__nv_bfloat16);
 constexpr int kQSmemBytes = kABytes + kQScaleBytes;
 constexpr int kKVStageSmemBytes = kBBytes + kKScaleBytes;
-constexpr int kMainloopSmemBytes =
-    kQSmemBytes + kPipelineStages * kKVStageSmemBytes;
-constexpr int kSmemBytes = kMainloopSmemBytes + kHeadWeightBytes;
-
 // KV supplies the MMA rows and Q/head supplies the columns. The pipeline
-// stages have disjoint accumulator columns and share eight scale columns.
-constexpr int kAccumulatorTmemCols = kPipelineStages * kTileM;
-constexpr int kScaleTmemCol = kAccumulatorTmemCols;
+// result slots have disjoint accumulator columns and share eight scale columns.
 constexpr int kScaleTmemCols = 8;
 constexpr int kTmemCols = 512;
-static_assert(kAccumulatorTmemCols + kScaleTmemCols <= kTmemCols);
 
 // Q and K are row-major packed E2M1; their scales use the same 128x4
 // blocked UE8M0 layout as the repository's MXFP4 GEMM.
@@ -77,7 +69,7 @@ __device__ __forceinline__ uint64_t scale_desc(int addr) {
            (8ULL << 32) | (1ULL << 46);
 }
 
-// Result stages occupy columns 0..127 and 128..255; scales occupy 256..263.
+// Each result slot occupies 128 columns; scales follow all result slots.
 __device__ __forceinline__ int result_col(int stage) {
     return stage * kTileM;
 }
@@ -116,7 +108,8 @@ __device__ __forceinline__ bool elect_one() {
     return elected != 0;
 }
 
-template <int SplitKV, bool kDense = false, int kPageSize = 0>
+template <int SplitKV, bool kDense = false, int kPageSize = 0,
+          int kKVStages = 2, int kResultStages = 2>
 __global__ void indexer_score_decode_kernel(
     const __grid_constant__ CUtensorMap q_map,
     const __grid_constant__ CUtensorMap k_map,
@@ -126,6 +119,11 @@ __global__ void indexer_score_decode_kernel(
     __nv_bfloat16* __restrict__ out, int kv_count, int page_size,
     const int32_t* __restrict__ block_table, int block_table_stride,
     const int32_t* __restrict__ kv_seqlens) {
+    constexpr int kPipelineStages = kKVStages;
+    constexpr int kMainloopSmemBytes = kQSmemBytes + kKVStages * kKVStageSmemBytes;
+    constexpr int kScaleTmemCol = kResultStages * kTileM;
+    static_assert(kKVStages > 0 && kResultStages > 0);
+    static_assert(kScaleTmemCol + kScaleTmemCols <= kTmemCols);
     // Specialize address generation, but keep per-batch KV lengths dynamic.
     if constexpr (kDense) {
         page_size = 0;
@@ -164,8 +162,11 @@ __global__ void indexer_score_decode_kernel(
         smem + kMainloopSmemBytes);
     __shared__ uint64_t q_barrier;
     __shared__ uint64_t load_barrier[kPipelineStages];
+    // KV reuse waits for MMA consumption, while result reuse waits for the
+    // epilogue. Independent rings let TMA prefetch past occupied result slots.
     __shared__ uint64_t mma_barrier[kPipelineStages];
-    __shared__ uint64_t epilogue_barrier[kPipelineStages];
+    __shared__ uint64_t epilogue_barrier[kResultStages];
+    __shared__ uint64_t result_barrier[kKVStages != kResultStages ? kResultStages : 1];
     __shared__ int tmem_base;
     if (tid == 0) {
         const int q_bar = static_cast<int>(__cvta_generic_to_shared(&q_barrier));
@@ -175,11 +176,23 @@ __global__ void indexer_score_decode_kernel(
         for (int stage = 0; stage < kPipelineStages; ++stage) {
             const int load_addr = static_cast<int>(__cvta_generic_to_shared(&load_barrier[stage]));
             const int mma_addr = static_cast<int>(__cvta_generic_to_shared(&mma_barrier[stage]));
-            const int epi_addr = static_cast<int>(__cvta_generic_to_shared(&epilogue_barrier[stage]));
             asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(load_addr));
             asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(mma_addr));
-            asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
-                         :: "r"(epi_addr), "r"(kEpilogueWarps));
+            if constexpr (kKVStages == kResultStages) {
+                const int epi_addr = static_cast<int>(__cvta_generic_to_shared(&epilogue_barrier[stage]));
+                asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+                             :: "r"(epi_addr), "r"(kEpilogueWarps));
+            }
+        }
+        if constexpr (kKVStages != kResultStages) {
+            #pragma unroll
+            for (int stage = 0; stage < kResultStages; ++stage) {
+                const int epi_addr = static_cast<int>(__cvta_generic_to_shared(&epilogue_barrier[stage]));
+                asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+                             :: "r"(epi_addr), "r"(kEpilogueWarps));
+                const int result_addr = static_cast<int>(__cvta_generic_to_shared(&result_barrier[stage]));
+                asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(result_addr));
+            }
         }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
@@ -300,15 +313,16 @@ __global__ void indexer_score_decode_kernel(
                 const int load_bar = static_cast<int>(
                     __cvta_generic_to_shared(&load_barrier[stage]));
                 wait_barrier(load_bar, phase);
-                if (task >= kPipelineStages) {
+                const int result_stage = task % kResultStages;
+                if (task >= kResultStages) {
                     const int old_epi = static_cast<int>(
-                        __cvta_generic_to_shared(&epilogue_barrier[stage]));
-                    wait_barrier(old_epi, ((task - kPipelineStages) / kPipelineStages) & 1);
+                        __cvta_generic_to_shared(&epilogue_barrier[result_stage]));
+                    wait_barrier(old_epi, ((task - kResultStages) / kResultStages) & 1);
                 }
                 asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
                 const int k_addr = kv_smem_base + stage * kKVStageSmemBytes;
                 const int ks_addr = k_addr + kBBytes;
-                const int taddr = tmem_base + result_col(stage);
+                const int taddr = tmem_base + result_col(result_stage);
                 #pragma unroll
                 for (int slab = 0; slab < 2; ++slab) {
                     asm volatile("tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;"
@@ -331,6 +345,13 @@ __global__ void indexer_score_decode_kernel(
                     __cvta_generic_to_shared(&mma_barrier[stage]));
                 asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
                              :: "r"(mma_bar) : "memory");
+                if constexpr (kKVStages != kResultStages) {
+                    // Signal result readiness separately from KV-buffer reuse.
+                    const int result_bar = static_cast<int>(
+                        __cvta_generic_to_shared(&result_barrier[result_stage]));
+                    asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
+                                 :: "r"(result_bar) : "memory");
+                }
             }
         }
 
@@ -346,10 +367,11 @@ __global__ void indexer_score_decode_kernel(
                 weights[i] = shared_weights[i];
             for (int kv_tile = 0; kv_tile < kv_tiles; ++kv_tile) {
                 const int task = first_task + kv_tile;
-                const int stage = task % kPipelineStages;
-                const int phase = (task / kPipelineStages) & 1;
+                const int stage = task % kResultStages;
+                const int phase = (task / kResultStages) & 1;
                 const int mma_bar = static_cast<int>(
-                    __cvta_generic_to_shared(&mma_barrier[stage]));
+                    __cvta_generic_to_shared(kKVStages == kResultStages
+                        ? &mma_barrier[stage] : &result_barrier[stage]));
                 wait_barrier(mma_bar, phase);
                 __nv_bfloat162 sum_0 = __floats2bfloat162_rn(0.0f, 0.0f);
                 __nv_bfloat162 sum_1 = __floats2bfloat162_rn(0.0f, 0.0f);
@@ -388,8 +410,8 @@ __global__ void indexer_score_decode_kernel(
     if (warp == 2) {
         const int last_task = kv_tiles - 1;
         const int last_epi = static_cast<int>(
-            __cvta_generic_to_shared(&epilogue_barrier[last_task % kPipelineStages]));
-        wait_barrier(last_epi, (last_task / kPipelineStages) & 1);
+            __cvta_generic_to_shared(&epilogue_barrier[last_task % kResultStages]));
+        wait_barrier(last_epi, (last_task / kResultStages) & 1);
         asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
                      :: "r"(tmem_base), "r"(kTmemCols));
     }
@@ -397,14 +419,18 @@ __global__ void indexer_score_decode_kernel(
 
 }  // namespace
 
-template <int SplitKV, bool kDense = false, int kPageSize = 0>
+// Measured KV prefetch depths are 8 for dense and 4 for paged; result slots
+// remain independently double-buffered in both paths.
+template <int SplitKV, bool kDense = false, int kPageSize = 0,
+          int kKVStages = kDense ? 8 : 4, int kResultStages = 2>
 void launch_decode(const CUtensorMap& q_map, const CUtensorMap& k_map,
                    const CUtensorMap& qs_map, const CUtensorMap& ks_map,
                    const __nv_bfloat16* head_weight,
                    __nv_bfloat16* out, int batch_count, int kv_count, int page_size,
                    const int32_t* block_table, int block_table_stride,
                    const int32_t* kv_seqlens, cudaStream_t stream) {
-    cudaFuncSetAttribute(indexer_score_decode_kernel<SplitKV, kDense, kPageSize>,
+    constexpr int kSmemBytes = kQSmemBytes + kKVStages * kKVStageSmemBytes + kHeadWeightBytes;
+    cudaFuncSetAttribute(indexer_score_decode_kernel<SplitKV, kDense, kPageSize, kKVStages, kResultStages>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
     cudaLaunchConfig_t config{};
     config.gridDim = dim3(SplitKV, batch_count);
@@ -418,7 +444,7 @@ void launch_decode(const CUtensorMap& q_map, const CUtensorMap& k_map,
     cluster_attr.val.clusterDim.z = 1;
     config.attrs = &cluster_attr;
     config.numAttrs = 1;
-    cudaLaunchKernelEx(&config, indexer_score_decode_kernel<SplitKV, kDense, kPageSize>,
+    cudaLaunchKernelEx(&config, indexer_score_decode_kernel<SplitKV, kDense, kPageSize, kKVStages, kResultStages>,
                        q_map, k_map, qs_map, ks_map,
                        head_weight, out, kv_count, page_size, block_table,
                        block_table_stride, kv_seqlens);
