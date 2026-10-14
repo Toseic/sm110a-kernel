@@ -246,6 +246,7 @@ from .kernels.nvfp4_grouped_m_gemm import (
     nvfp4_grouped_m_gemm_out,
     prepare_nvfp4_grouped_m_metadata,
 )
+from .kernels.topk import compile_topk, topk, topk_out
 
 _RUNNER_EXPORTS = {"AutotuneRunner", "PreparedKernel", "Selection", "TuneOptions"}
 _CUTEDSL_EXPORTS = {

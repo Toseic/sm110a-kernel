@@ -1,0 +1,19 @@
+diff --git a/setup.py b/setup.py
+index bdeb8e6..6317125 100644
+--- a/setup.py
++++ b/setup.py
+@@ -126,6 +126,14 @@ def build_on_cuda_platform():
+         "-gencode", "arch=compute_103a,code=sm_103a",
+     ]
+ 
++    # Allow this repository's paired architecture override on Thor.
++    cuda_arch = os.environ.get("CUDA_ARCH")
++    compute_arch = os.environ.get("COMPUTE_CUDA_ARCH")
++    if cuda_arch or compute_arch:
++        if not (cuda_arch and compute_arch):
++            raise RuntimeError("Set CUDA_ARCH and COMPUTE_CUDA_ARCH together")
++        cc_flag = ["-gencode", f"arch={compute_arch},code={cuda_arch}"]
++
+     this_dir = os.path.dirname(os.path.abspath(__file__))
+ 
+     ext_modules = [CUDAExtension(
