@@ -17,9 +17,13 @@
 // MXFP4 FC2 kernel directly. swiglu_limit clamps gate from above and up from
 // both sides before the SwiGLU product (0 disables the clamp).
 // source_rows maps each grouped output row back to its source token row.
+// The WeightInFc1 template specialization multiplies FP32 routing_weights
+// indexed through grouped_assignments before quantization. Bf16Rounding
+// rounds gate/up, then the weighted hidden, to match model activation nodes.
 void launch_mxfp4_fc1_main(
     const uint8_t* a, const uint8_t* b, const uint8_t* sfa,
     const uint8_t* sfb, const int32_t* source_rows, const int32_t* tasks,
     int32_t* state, uint8_t* c, uint8_t* sfc, int tokens, int m, int experts,
     int n, int k, float swiglu_limit, int max_tasks, int max_active_clusters,
-    cudaStream_t stream);
+    cudaStream_t stream, const int32_t* grouped_assignments,
+    const float* routing_weights);

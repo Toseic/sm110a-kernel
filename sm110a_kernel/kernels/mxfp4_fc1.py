@@ -24,6 +24,15 @@ _INC = _ROOT / "include"
 
 @dataclass(frozen=True)
 class Mxfp4Fc1Config:
+    """Compile-time FC1 epilogue semantics.
+
+    ``routing_weight_position='fc1'`` multiplies SwiGLU by the FP32 router
+    weight before activation quantization; FC2 must use the same position.
+    ``activation_bf16_rounding=True`` rounds gate/up before SwiGLU and the
+    weighted hidden before FP8 quantization, matching the official model.
+    Defaults retain the original unweighted FP32 SwiGLU epilogue.
+    """
+
     tile_m: int = 128
     # TileN is fixed at 256 (128 logical output columns): one accumulator
     # stage must cover exactly one 128-column E8M0 output-scale block.
@@ -35,6 +44,8 @@ class Mxfp4Fc1Config:
     cluster_n: int = 1
     direct_gmem: bool = False
     macro_swizzle_n_major: bool = True
+    routing_weight_position: str = "fc2"
+    activation_bf16_rounding: bool = False
 
     def validate(self) -> None:
         if self.tile_m != 128 or self.tile_n != 256:
@@ -49,6 +60,10 @@ class Mxfp4Fc1Config:
             raise ValueError("cluster_n must be 1")
         if not isinstance(self.macro_swizzle_n_major, bool):
             raise ValueError("macro_swizzle_n_major must be bool")
+        if self.routing_weight_position not in ("fc1", "fc2"):
+            raise ValueError("routing_weight_position must be 'fc1' or 'fc2'")
+        if not isinstance(self.activation_bf16_rounding, bool):
+            raise ValueError("activation_bf16_rounding must be bool")
 
 
 @dataclass(frozen=True)
@@ -161,7 +176,13 @@ class Mxfp4Fc1Module:
         out_scale,
         swiglu_limit: float = 0.0,
         max_active_clusters=None,
+        *,
+        routing_weights=None,
     ):
+        if self.config.routing_weight_position == "fc1" and routing_weights is None:
+            raise ValueError(
+                "FC1 weighting requires FP32 routing_weights [tokens,topk]"
+            )
         return self._binding.mxfp4_fc1_out(
             a,
             b,
@@ -175,6 +196,8 @@ class Mxfp4Fc1Module:
             float(swiglu_limit),
             self._address,
             self._max_active_clusters(a.device, max_active_clusters),
+            metadata.routing,
+            routing_weights,
         )
 
     def mxfp4_fc1(
@@ -186,6 +209,8 @@ class Mxfp4Fc1Module:
         metadata: Mxfp4Fc1Metadata,
         swiglu_limit: float = 0.0,
         max_active_clusters=None,
+        *,
+        routing_weights=None,
     ):
         import torch
 
@@ -196,7 +221,16 @@ class Mxfp4Fc1Module:
             (m * (logical_n // 32) * 4,), device=a.device, dtype=torch.float8_e8m0fnu
         )
         self.mxfp4_fc1_out(
-            a, b, sfa, sfb, metadata, out, out_scale, swiglu_limit, max_active_clusters
+            a,
+            b,
+            sfa,
+            sfb,
+            metadata,
+            out,
+            out_scale,
+            swiglu_limit,
+            max_active_clusters,
+            routing_weights=routing_weights,
         )
         return out, out_scale
 
@@ -213,6 +247,8 @@ def _flags(config: Mxfp4Fc1Config, variant):
             ("CLUSTER_N", config.cluster_n),
             ("DIRECT_GMEM", int(config.direct_gmem)),
             ("MACRO_SWIZZLE_N_MAJOR", int(config.macro_swizzle_n_major)),
+            ("WEIGHT_IN_FC1", int(config.routing_weight_position == "fc1")),
+            ("ACTIVATION_BF16_ROUNDING", int(config.activation_bf16_rounding)),
         )
     )
 
@@ -262,10 +298,26 @@ def prepare_mxfp4_fc1_metadata(router_scores, topk, n, config=None):
 
 
 def mxfp4_fc1(
-    a, b, sfa, sfb, metadata, swiglu_limit=0.0, config=None, max_active_clusters=None
+    a,
+    b,
+    sfa,
+    sfb,
+    metadata,
+    swiglu_limit=0.0,
+    config=None,
+    max_active_clusters=None,
+    *,
+    routing_weights=None,
 ):
     return compile_mxfp4_fc1(config).mxfp4_fc1(
-        a, b, sfa, sfb, metadata, swiglu_limit, max_active_clusters
+        a,
+        b,
+        sfa,
+        sfb,
+        metadata,
+        swiglu_limit,
+        max_active_clusters,
+        routing_weights=routing_weights,
     )
 
 
@@ -280,7 +332,18 @@ def mxfp4_fc1_out(
     swiglu_limit=0.0,
     config=None,
     max_active_clusters=None,
+    *,
+    routing_weights=None,
 ):
     return compile_mxfp4_fc1(config).mxfp4_fc1_out(
-        a, b, sfa, sfb, metadata, out, out_scale, swiglu_limit, max_active_clusters
+        a,
+        b,
+        sfa,
+        sfb,
+        metadata,
+        out,
+        out_scale,
+        swiglu_limit,
+        max_active_clusters,
+        routing_weights=routing_weights,
     )

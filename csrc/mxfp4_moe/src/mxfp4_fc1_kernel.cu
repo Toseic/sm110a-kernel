@@ -60,6 +60,12 @@
 #ifndef SM110A_MXFP4_FC1_DIRECT_GMEM
 #define SM110A_MXFP4_FC1_DIRECT_GMEM 0
 #endif
+#ifndef SM110A_MXFP4_FC1_WEIGHT_IN_FC1
+#define SM110A_MXFP4_FC1_WEIGHT_IN_FC1 0
+#endif
+#ifndef SM110A_MXFP4_FC1_ACTIVATION_BF16_ROUNDING
+#define SM110A_MXFP4_FC1_ACTIVATION_BF16_ROUNDING 0
+#endif
 namespace {
 
 constexpr int kMmaK = 32;
@@ -799,7 +805,9 @@ template <
     int kClusterM,
     int kClusterN,
     bool kSwapAB = false,
-    bool kDirectGmem = false>
+    bool kDirectGmem = false,
+    bool kWeightInFc1 = false,
+    bool kActivationBf16Rounding = false>
 __global__ __cluster_dims__(kClusterM, kClusterN, 1)
 __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void mxfp4_fc1_kernel(
     const uint8_t *a,
@@ -817,7 +825,9 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void m
     uint8_t *sfc,
     int n,
     int k,
-    float swiglu_limit) {
+    float swiglu_limit,
+    const int32_t *grouped_assignments,
+    const float *routing_weights) {
     using Config = KernelConfig<kTileM, kTileN, kTileK, kEpilogueTileN, kClusterM, kClusterN>;
     using Shape = ClusterShape<kClusterM, kClusterN>;
     (void)sizeof(Shape);
@@ -965,7 +975,21 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void m
 
     // One pass over a 64-logical-column block: TMEM gate/up x16 loads only.
     // Each lane owns one row, so the returned amax is that row's block amax.
-    auto block_amax = [&](int mainloop_stage, int n_block) -> float {
+    auto activation = [&](float gate, float up, float router_scale) -> float {
+        if constexpr (kActivationBf16Rounding) {
+            gate = __bfloat162float(__float2bfloat16_rn(gate));
+            up = __bfloat162float(__float2bfloat16_rn(up));
+        }
+        float value = swiglu_activate(gate, up, swiglu_limit);
+        if constexpr (kWeightInFc1) {
+            value *= router_scale;
+        }
+        if constexpr (kActivationBf16Rounding) {
+            value = __bfloat162float(__float2bfloat16_rn(value));
+        }
+        return value;
+    };
+    auto block_amax = [&](int mainloop_stage, int n_block, float router_scale) -> float {
         float amax = 0.0f;
         const int tmem_row = m_rank * kTileM + warp_id * kWarpSize;
         for (int group = 0; group < kGroupsPerNBlock; ++group) {
@@ -1007,7 +1031,7 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void m
             asm volatile("tcgen05.wait::ld.sync.aligned;");
             for (int i = 0; i < 16; ++i) {
                 amax = fmaxf(amax, fabsf(
-                    swiglu_activate(gate_values[i], up_values[i], swiglu_limit)));
+                    activation(gate_values[i], up_values[i], router_scale)));
             }
         }
         return amax;
@@ -1018,7 +1042,7 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void m
     // the 128B-swizzled C slot (16 bytes per lane per group).
     auto quantize_block = [&](int mainloop_stage, int n_block, float inverse_scale,
                               int cta_row, int tile_col, int valid_rows,
-                              char *slot_base) {
+                              char *slot_base, float router_scale) {
         const int tmem_row = m_rank * kTileM + warp_id * kWarpSize;
         for (int group = 0; group < kGroupsPerNBlock; ++group) {
             const int logical_col = n_block * kOutputEpilogueTileN + group * 16;
@@ -1061,10 +1085,10 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void m
             uint8_t packed[16];
             for (int i = 0; i < 16; i += 2) {
                 const float2 scaled = make_float2(
-                    swiglu_activate(gate_values[i], up_values[i], swiglu_limit) *
+                    activation(gate_values[i], up_values[i], router_scale) *
                         inverse_scale,
-                    swiglu_activate(gate_values[i + 1], up_values[i + 1],
-                                    swiglu_limit) * inverse_scale);
+                    activation(gate_values[i + 1], up_values[i + 1],
+                               router_scale) * inverse_scale);
                 const __nv_fp8x2_storage_t fp8x2 =
                     __nv_cvt_float2_to_fp8x2(scaled, __NV_SATFINITE, __NV_E4M3);
                 packed[i] = static_cast<uint8_t>(fp8x2 & 0xFF);
@@ -1527,12 +1551,24 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void m
 
                 // Pass 1: row-local amax over both 64-column blocks of this
                 // stage's single 128-column output-scale block.
-                float block_max = block_amax(epilogue_mainloop_stage, first_n_block);
+                float router_scale = 1.0f;
+                if constexpr (kWeightInFc1) {
+                    if (tid < valid_rows) {
+                        router_scale = routing_weights[grouped_assignments[cta_row + tid]];
+                    }
+                }
+                float block_max = block_amax(epilogue_mainloop_stage, first_n_block,
+                                             router_scale);
                 block_max = fmaxf(block_max,
-                    block_amax(epilogue_mainloop_stage, first_n_block ^ 1));
+                    block_amax(epilogue_mainloop_stage, first_n_block ^ 1, router_scale));
+                if constexpr (kActivationBf16Rounding) {
+                    // Match the official activation quantizer even for zero
+                    // or tiny weighted experts (the weight can be exactly zero).
+                    block_max = fmaxf(block_max, 1.0e-4f);
+                }
 
                 // Shared E8M0 scale for the whole 128-column block, computed
-                // exactly like bf16tofp8_quant (round-to-nearest-even power
+                // exactly like bf16tofp8_quant (round-towards-positive-infinity power
                 // of two via the hardware E8M0 conversion of amax / E4M3 max).
                 uint8_t scale_raw = 0;
                 float inverse_scale = 1.0f;
@@ -1568,7 +1604,7 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void m
                 // aliased TMEM columns (both of this block's passes have read
                 // them; the disjoint block's reads have not started).
                 quantize_block(epilogue_mainloop_stage, first_n_block, inverse_scale,
-                               cta_row, tile_col, valid_rows, slot_base);
+                               cta_row, tile_col, valid_rows, slot_base, router_scale);
                 if constexpr (!kDirectGmem || kSwapAB) {
                     asm volatile("bar.sync 1, 128;" ::: "memory");
                 }
@@ -1578,7 +1614,7 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void m
                 // Pass 2b: quantize the remaining block, then release the
                 // whole accumulator stage once its last TMEM reads are done.
                 quantize_block(epilogue_mainloop_stage, first_n_block ^ 1, inverse_scale,
-                               cta_row, tile_col, valid_rows, slot_base);
+                               cta_row, tile_col, valid_rows, slot_base, router_scale);
                 if constexpr (!kDirectGmem || kSwapAB) {
                     asm volatile("bar.sync 1, 128;" ::: "memory");
                 }
@@ -1693,7 +1729,7 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void m
 }
 
 template <int kTileM, int kTileN, int kTileK, int kEpilogueTileN, int kClusterM,
-          int kClusterN, bool kSwapAB>
+          int kClusterN, bool kSwapAB, bool kWeightInFc1, bool kActivationBf16Rounding>
 void launch_mxfp4_fc1_impl(
     const uint8_t *d_a,
     const uint8_t *d_b,
@@ -1711,7 +1747,8 @@ void launch_mxfp4_fc1_impl(
     int k,
     float swiglu_limit,
     int max_tasks, int max_active_clusters,
-    cudaStream_t stream) {
+    cudaStream_t stream, const int32_t *grouped_assignments,
+    const float *routing_weights) {
     using Config = KernelConfig<kTileM, kTileN, kTileK, kEpilogueTileN, kClusterM, kClusterN>;
     using Shape = ClusterShape<kClusterM, kClusterN>;
     (void)sizeof(Shape);
@@ -1781,7 +1818,7 @@ void launch_mxfp4_fc1_impl(
             kEpilogueTileN,
             kClusterM,
             kClusterN, kSwapAB,
-            (SM110A_MXFP4_FC1_DIRECT_GMEM != 0)>;
+            (SM110A_MXFP4_FC1_DIRECT_GMEM != 0), kWeightInFc1, kActivationBf16Rounding>;
     if constexpr (kDynamicSmemBytes > 48 * 1024) {
         cudaFuncSetAttribute(kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -1809,7 +1846,8 @@ void launch_mxfp4_fc1_impl(
     kernel<<<dim3(kClusterM * launched_clusters, kClusterN, 1), kBlockThreads,
         kDynamicSmemBytes, stream>>>(
         d_a, a_tensor_map, b_tensor_map, d_sfa, sfa_tensor_map, sfb_tensor_map, c_tensor_map, d_source_rows, tasks, task_count,
-        next_cluster_tile, d_c, d_sfc, n, k, swiglu_limit);
+        next_cluster_tile, d_c, d_sfc, n, k, swiglu_limit,
+        grouped_assignments, routing_weights);
 }
 
 void launch_mxfp4_fc1_entry(
@@ -1817,16 +1855,23 @@ void launch_mxfp4_fc1_entry(
     const int32_t *source_rows, const int32_t *tasks, int32_t *state, uint8_t *c,
     uint8_t *sfc,
     int tokens, int m, int experts, int n, int k, float swiglu_limit,
-    int max_tasks, int max_active_clusters, cudaStream_t stream) {
+    int max_tasks, int max_active_clusters, cudaStream_t stream,
+    const int32_t *grouped_assignments, const float *routing_weights) {
     if (!a || !b || !sfa || !sfb || !source_rows || !tasks || !state || !c || !sfc ||
         tokens <= 0 || m <= 0 || experts <= 0 || n <= 0 || k <= 0 || max_tasks <= 0)
         return;
+    if constexpr (SM110A_MXFP4_FC1_WEIGHT_IN_FC1 != 0) {
+        if (!grouped_assignments || !routing_weights) return;
+    }
     launch_mxfp4_fc1_impl<SM110A_MXFP4_FC1_TILE_M,
         SM110A_MXFP4_FC1_TILE_N, SM110A_MXFP4_FC1_TILE_K,
         SM110A_MXFP4_FC1_EPILOGUE_TILE_N, SM110A_MXFP4_FC1_CLUSTER_M,
         SM110A_MXFP4_FC1_CLUSTER_N,
-        false>(a, b, sfa, sfb, source_rows, tasks, state, c, sfc, tokens, m, experts,
-            n, k, swiglu_limit, max_tasks, max_active_clusters, stream);
+        false, (SM110A_MXFP4_FC1_WEIGHT_IN_FC1 != 0),
+        (SM110A_MXFP4_FC1_ACTIVATION_BF16_ROUNDING != 0)>(
+            a, b, sfa, sfb, source_rows, tasks, state, c, sfc, tokens, m, experts,
+            n, k, swiglu_limit, max_tasks, max_active_clusters, stream,
+            grouped_assignments, routing_weights);
 }
 
 } // namespace
@@ -1836,10 +1881,11 @@ void launch_mxfp4_fc1_main(
     const int32_t *source_rows, const int32_t *tasks, int32_t *state, uint8_t *c,
     uint8_t *sfc,
     int tokens, int m, int experts, int n, int k, float swiglu_limit,
-    int max_tasks, int max_active_clusters, cudaStream_t stream) {
+    int max_tasks, int max_active_clusters, cudaStream_t stream,
+    const int32_t *grouped_assignments, const float *routing_weights) {
     launch_mxfp4_fc1_entry(
         a, b, sfa, sfb, source_rows, tasks, state, c, sfc, tokens, m, experts, n, k,
-        swiglu_limit, max_tasks, max_active_clusters, stream);
+        swiglu_limit, max_tasks, max_active_clusters, stream, grouped_assignments, routing_weights);
 }
 
 extern "C" void sm110a_mxfp4_fc1_launch(
@@ -1847,8 +1893,9 @@ extern "C" void sm110a_mxfp4_fc1_launch(
     const int32_t *source_rows, const int32_t *tasks, int32_t *state, uint8_t *c,
     uint8_t *sfc,
     int tokens, int m, int experts, int n, int k, float swiglu_limit,
-    int max_tasks, int max_active_clusters, cudaStream_t stream) {
+    int max_tasks, int max_active_clusters, cudaStream_t stream,
+    const int32_t *grouped_assignments, const float *routing_weights) {
     launch_mxfp4_fc1_main(
         a, b, sfa, sfb, source_rows, tasks, state, c, sfc, tokens, m, experts, n, k,
-        swiglu_limit, max_tasks, max_active_clusters, stream);
+        swiglu_limit, max_tasks, max_active_clusters, stream, grouped_assignments, routing_weights);
 }

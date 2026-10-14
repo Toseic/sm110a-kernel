@@ -14,6 +14,7 @@ differ by one code, which the sparse same-sign fallback accepts.
 import argparse
 import math
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -111,7 +112,14 @@ def mxfp4_candidates(args):
         candidates = tuple(c for c in candidates if c.direct_gmem)
     if args.tma_epilogue:
         candidates = tuple(c for c in candidates if not c.direct_gmem)
-    return candidates
+    return tuple(
+        replace(
+            c,
+            routing_weight_position=args.routing_weight_position,
+            activation_bf16_rounding=args.activation_bf16_rounding,
+        )
+        for c in candidates
+    )
 
 
 def fc1_tflops_from_ms(m, n, k, elapsed_ms):
@@ -138,12 +146,17 @@ def blocked_to_logical_scales(scales, rows, k):
     return logical.view(torch.float8_e8m0fnu)
 
 
-def quant_fp8_e8m0(x):
-    """Mirror the hardware quantizer: E8M0 byte = round(log2(amax/448)) + 127."""
+def quant_fp8_e8m0(x, *, min_amax=0.0):
+    """Mirror __nv_fp8_e8m0(float): ceil(log2(amax/448)) + 127.
+
+    The CUDA constructor defaults to cudaRoundPosInf, not round-to-nearest.
+    """
     rows, cols = x.shape
     blocks = x.view(rows, cols // 128, 128)
     amax = blocks.abs().amax(-1)
-    exponent = torch.round(torch.log2(amax / 448.0))
+    if min_amax:
+        amax = amax.clamp_min(min_amax)
+    exponent = torch.ceil(torch.log2(amax / 448.0))
     exponent = torch.where(amax > 0, exponent, torch.full_like(exponent, -127.0))
     byte = (exponent + 127.0).clamp(0, 254)
     scale = torch.ldexp(torch.ones_like(exponent), byte - 127.0)
@@ -151,7 +164,20 @@ def quant_fp8_e8m0(x):
     return q.view(rows, cols), byte.to(torch.uint8).view(torch.float8_e8m0fnu), scale
 
 
-def mxfp4_fc1_reference(aq, sfa128, bq, sfb, metadata, experts, n, k, swiglu_limit):
+def mxfp4_fc1_reference(
+    aq,
+    sfa128,
+    bq,
+    sfb,
+    metadata,
+    experts,
+    n,
+    k,
+    swiglu_limit,
+    *,
+    routing_weights=None,
+    activation_bf16_rounding=False,
+):
     m = metadata.source_rows.numel()
     a = aq.float() * sfa128.float().repeat_interleave(128, dim=1)
     grouped_a = a[metadata.source_rows.long()]
@@ -173,11 +199,21 @@ def mxfp4_fc1_reference(aq, sfa128, bq, sfb, metadata, experts, n, k, swiglu_lim
     g_blocks = grouped.view(m, 2 * n // 128, 2, 64)
     gate_v = g_blocks[:, :, 0, :].reshape(m, n)
     up_v = g_blocks[:, :, 1, :].reshape(m, n)
+    if activation_bf16_rounding:
+        gate_v = gate_v.bfloat16().float()
+        up_v = up_v.bfloat16().float()
     if swiglu_limit > 0:
         up_v = torch.clamp(up_v, min=-swiglu_limit, max=swiglu_limit)
         gate_v = torch.clamp(gate_v, max=swiglu_limit)
     act = torch.nn.functional.silu(gate_v) * up_v
-    ref_q, ref_scale_raw, ref_scale = quant_fp8_e8m0(act)
+    if routing_weights is not None:
+        assignments = metadata.routing[2 * experts + m : 2 * experts + 2 * m]
+        act = act * routing_weights.flatten()[assignments.long()].float().unsqueeze(-1)
+    if activation_bf16_rounding:
+        act = act.bfloat16().float()
+    ref_q, ref_scale_raw, ref_scale = quant_fp8_e8m0(
+        act, min_amax=1e-4 if activation_bf16_rounding else 0.0
+    )
     return ref_q.float() * ref_scale.repeat_interleave(128, dim=1).view(
         m, n
     ), ref_scale_raw
@@ -282,6 +318,10 @@ class Mxfp4Fc1Benchmark(BenchmarkBase):
         parser.add_argument("--cluster-m", type=int, choices=(1, 2))
         parser.add_argument("--direct-gmem", action="store_true")
         parser.add_argument("--tma-epilogue", action="store_true")
+        parser.add_argument(
+            "--routing-weight-position", choices=("fc1", "fc2"), default="fc2"
+        )
+        parser.add_argument("--activation-bf16-rounding", action="store_true")
         return parser
 
     def validate_args(self, args):
@@ -384,6 +424,9 @@ class Mxfp4Fc1Benchmark(BenchmarkBase):
                 ).pow(-ROUTER_POWERLAW_ALPHA)
             )
             a = torch.randn((tokens, args.k), device="cuda", dtype=torch.bfloat16)
+            routing_weights = torch.softmax(
+                router.float().topk(args.topk, dim=1).values, dim=1
+            )
             aq, sfa128 = bf16tofp8_quant(a)
             del a
             sfa = to_blocked_mxfp4_sfa(sfa128)
@@ -427,6 +470,9 @@ class Mxfp4Fc1Benchmark(BenchmarkBase):
                     out_scale,  # noqa: F821
                     swiglu_limit=args.swiglu_limit,
                     config=config,
+                    routing_weights=routing_weights
+                    if args.routing_weight_position == "fc1"
+                    else None,
                 )
                 run()
                 torch.cuda.synchronize()
@@ -515,6 +561,10 @@ class Mxfp4Fc1Benchmark(BenchmarkBase):
                     args.n,
                     args.k,
                     args.swiglu_limit,
+                    routing_weights=routing_weights
+                    if args.routing_weight_position == "fc1"
+                    else None,
+                    activation_bf16_rounding=args.activation_bf16_rounding,
                 )
                 close, max_diff = mxfp4_fc1_outputs_close(
                     out, out_scale, ref, ref_scale_raw, m, args.n

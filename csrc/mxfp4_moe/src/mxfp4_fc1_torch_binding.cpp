@@ -8,7 +8,7 @@
 namespace {
 using Launcher = void (*)(const uint8_t*, const uint8_t*, const uint8_t*, const uint8_t*,
     const int32_t*, const int32_t*, int32_t*, uint8_t*, uint8_t*, int, int, int, int,
-    int, float, int, int, cudaStream_t);
+    int, float, int, int, cudaStream_t, const int32_t*, const float*);
 using MetadataLauncher = void (*)(const int32_t*, int32_t*, int32_t*, int32_t*, int32_t*,
     int, int, int, int, int, int, bool, cudaStream_t);
 using RoutingLauncher = void (*)(const __nv_bfloat16*, int, int, int, int32_t*, int32_t*,
@@ -81,7 +81,8 @@ std::vector<torch::Tensor> prepare_routing(
 torch::Tensor run_out(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb,
     torch::Tensor source_rows, torch::Tensor tasks, torch::Tensor state,
     torch::Tensor out, torch::Tensor out_scale, double swiglu_limit, uint64_t address,
-    int64_t max_active_clusters) {
+    int64_t max_active_clusters, torch::Tensor routing,
+    c10::optional<torch::Tensor> routing_weights) {
   check_fp8(a, "A", 2); check_fp4(b, "B", 3);
   const int64_t tokens = a.size(0), m = out.size(0);
   const int64_t e = b.size(0), n = b.size(1), k = a.size(1);
@@ -107,6 +108,20 @@ torch::Tensor run_out(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch
       a.device() == state.device() && a.device() == out.device() &&
       a.device() == out_scale.device(),
       "all MXFP4 FC1 tensors must share a CUDA device");
+  const int32_t* assignments = nullptr;
+  const float* weights = nullptr;
+  if (routing_weights.has_value()) {
+    const auto& w = routing_weights.value();
+    TORCH_CHECK(w.is_cuda() && w.scalar_type() == torch::kFloat32 &&
+        w.dim() == 2 && w.is_contiguous() && w.device() == a.device() &&
+        w.size(0) == tokens && w.numel() == m,
+        "routing_weights must be contiguous CUDA FP32 [tokens,topk]");
+    TORCH_CHECK(routing.is_cuda() && routing.scalar_type() == torch::kInt32 &&
+        routing.is_contiguous() && routing.device() == a.device() &&
+        routing.numel() == 2 * e + 3 * m, "invalid packed routing metadata");
+    assignments = routing.data_ptr<int32_t>() + 2 * e + m;
+    weights = w.data_ptr<float>();
+  }
   c10::cuda::CUDAGuard guard(a.device());
   auto stream = c10::cuda::getCurrentCUDAStream(a.device().index());
   reinterpret_cast<Launcher>(address)(reinterpret_cast<uint8_t*>(a.data_ptr()),
@@ -116,19 +131,21 @@ torch::Tensor run_out(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch
       reinterpret_cast<uint8_t*>(out.data_ptr()),
       reinterpret_cast<uint8_t*>(out_scale.data_ptr()), tokens, m, e, n, k,
       static_cast<float>(swiglu_limit),
-      tasks.size(0), static_cast<int>(max_active_clusters), stream);
+      tasks.size(0), static_cast<int>(max_active_clusters), stream, assignments, weights);
   C10_CUDA_KERNEL_LAUNCH_CHECK(); return out;
 }
 std::vector<torch::Tensor> run(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb,
     torch::Tensor source_rows, torch::Tensor tasks, torch::Tensor state,
-    double swiglu_limit, uint64_t address, int64_t max_active_clusters) {
+    double swiglu_limit, uint64_t address, int64_t max_active_clusters,
+    torch::Tensor routing, c10::optional<torch::Tensor> routing_weights) {
   const auto m = source_rows.numel();
   const auto logical_n = b.size(1) / 2;
   auto out = torch::empty({m, logical_n},
       a.options().dtype(at::kFloat8_e4m3fn));
   auto out_scale = torch::empty({m * (logical_n / 32) * 4},
       a.options().dtype(at::kFloat8_e8m0fnu));
-  run_out(a,b,sfa,sfb,source_rows,tasks,state,out,out_scale,swiglu_limit,address,max_active_clusters);
+  run_out(a,b,sfa,sfb,source_rows,tasks,state,out,out_scale,swiglu_limit,address,
+      max_active_clusters,routing,routing_weights);
   return {out, out_scale};
 }
 }
