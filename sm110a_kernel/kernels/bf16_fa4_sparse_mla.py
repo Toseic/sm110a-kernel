@@ -86,7 +86,7 @@ def bf16_fa4_sparse_mla_out(q, kv, indices, sink, out, *, scale=None):
 
 
 def bf16_fa4_sparse_mla_prefill(q, kv, indices, sink, *, scale=None):
-    """Return H=64 prefill output for Q [B,64,Q,512], KV [B,Q,512], indices [B,Q,K]."""
+    """Return H=64 prefill output for Q [B,64,Q,512], KV [B,N,512], indices [B,Q,K]."""
     return compile_bf16_fa4_sparse_mla_prefill().sparse_mla(
         q, kv, indices, sink, _resolve_scale(scale)
     )

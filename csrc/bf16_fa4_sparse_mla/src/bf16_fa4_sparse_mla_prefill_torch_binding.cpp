@@ -37,8 +37,6 @@ void check_inputs(const torch::Tensor& q, const torch::Tensor& kv,
   TORCH_CHECK(kv.dim() == 3 && kv.size(0) == q.size(0) &&
                   kv.size(1) > 0 && kv.size(2) == 512,
               "KV must have shape [B, N, 512]");
-  TORCH_CHECK(q.size(2) == kv.size(1),
-              "prefill requires Q length to equal KV length");
   TORCH_CHECK(indices.dim() == 3 && indices.size(0) == q.size(0) &&
                   indices.size(1) == q.size(2) && indices.size(2) > 0,
               "indices must have shape [B, Q, K]");

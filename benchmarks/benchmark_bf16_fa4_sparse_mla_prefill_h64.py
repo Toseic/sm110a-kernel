@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Correctness and cold-L2 timing for H=64 sparse MLA prefill."""
+"""Correctness and cold-L2 timing for H=64 sparse MLA prefill and append."""
 
 import argparse
 import math
@@ -27,6 +27,8 @@ D = 512
 PREFILL_Q_LENGTHS = (1024, 2048, 4096)
 BATCHED_Q_LENGTHS = (1024,)
 BATCHED_BATCH = 4
+APPEND_Q_LENGTHS = (1, 16, 128)
+APPEND_CACHE_LENGTH = 1024
 
 
 @dataclass(frozen=True)
@@ -63,22 +65,34 @@ def sparse_mla_sol_bounds(case, indices):
     return sol_bounds(flops, compulsory_bytes, input_bytes, tile_read_bytes)
 
 
-def make_inputs(batch, q_len, cache_len, selected_len, invalid):
-    assert q_len == cache_len
+def make_inputs(batch, q_len, cache_len, selected_len, invalid, out_of_range=0):
+    assert cache_len >= q_len
     q = torch.empty((batch, H, q_len, D), device="cuda", dtype=torch.bfloat16).uniform_(
         -1, 1
     )
     kv = torch.empty(
         (batch, cache_len, D), device="cuda", dtype=torch.bfloat16
     ).uniform_(-1, 1)
-    # Each query sees only its own KV prefix. Slots beyond the number of
-    # available positions are padded; selected indices otherwise vary by Q.
-    visible = torch.arange(1, q_len + 1, device="cuda").view(1, q_len, 1)
+    # Append queries are the last Q entries of a larger KV cache. Each query
+    # sees the old cache plus its causal new prefix; ordinary prefill is the
+    # special case with no old cache. Keep duplicate selections intentional.
+    visible = (cache_len - q_len + torch.arange(1, q_len + 1, device="cuda")).view(
+        1, q_len, 1
+    )
     slots = torch.arange(selected_len, device="cuda").view(1, 1, selected_len)
     indices = (torch.rand((batch, q_len, selected_len), device="cuda") * visible).to(
         torch.int32
     )
+    if cache_len != q_len:
+        # Exercise KV offsets beyond Q length, not merely an oversized unused
+        # allocation. Include both the newest visible row and an old row.
+        indices[..., 0] = (visible - 1).squeeze(-1)
+        if selected_len > 1:
+            indices[..., 1] = 0
     indices.masked_fill_(slots >= visible, -1)
+    if out_of_range:
+        end = selected_len - invalid
+        indices[..., end - out_of_range : end] = cache_len
     if invalid:
         indices[..., -invalid:] = -1
     sink = torch.randn(H, device="cuda", dtype=torch.float32)
@@ -115,10 +129,16 @@ class SparseMlaPrefillBenchmark(BenchmarkBase):
             "--kv-len",
             type=int,
             default=None,
-            help="must equal --q-len in --single mode; defaults to Q length",
+            help="total KV length including appended queries; defaults to Q length",
         )
         parser.add_argument("--selected-len", type=int, default=640)
         parser.add_argument("--invalid", type=int, default=0)
+        parser.add_argument(
+            "--out-of-range",
+            type=int,
+            default=0,
+            help="number of selections set to KV length (invalid upper bound)",
+        )
         parser.add_argument("--scale", type=float, default=D**-0.5)
         parser.add_argument("--no-accuracy", action="store_true")
         parser.add_argument("--atol", type=float, default=3e-2)
@@ -135,12 +155,14 @@ class SparseMlaPrefillBenchmark(BenchmarkBase):
             )
         if args.kv_len is not None and args.kv_len <= 0:
             raise SystemExit("KV length must be positive")
-        if args.single and args.kv_len is not None and args.kv_len != args.q_len:
-            raise SystemExit("full prefill requires --kv-len == --q-len")
+        if args.single and args.kv_len is not None and args.kv_len < args.q_len:
+            raise SystemExit("causal prefill/append requires --kv-len >= --q-len")
         if not args.single and args.kv_len is not None:
             raise SystemExit("--kv-len is only used with --single")
         if not 0 <= args.invalid <= args.selected_len:
             raise SystemExit("invalid must be in [0, selected length]")
+        if not 0 <= args.out_of_range <= args.selected_len - args.invalid:
+            raise SystemExit("invalid + out-of-range must not exceed selected length")
         if not math.isfinite(args.scale) or args.scale <= 0:
             raise SystemExit("scale must be finite and positive")
         self.validate_timing_args(args, allow_zero_warmup=True)
@@ -148,18 +170,35 @@ class SparseMlaPrefillBenchmark(BenchmarkBase):
 
     def cases(self, args):
         if args.single:
+            kv_len = args.kv_len if args.kv_len is not None else args.q_len
             yield PrefillCase(
-                "single", args.batch, args.q_len, args.q_len, args.selected_len
+                "append" if kv_len != args.q_len else "single",
+                args.batch,
+                args.q_len,
+                kv_len,
+                args.selected_len,
             )
             return
         for q_len in PREFILL_Q_LENGTHS:
             yield PrefillCase("prefill", 1, q_len, q_len, args.selected_len)
         for q_len in BATCHED_Q_LENGTHS:
             yield PrefillCase("batched", BATCHED_BATCH, q_len, q_len, args.selected_len)
+        for q_len in APPEND_Q_LENGTHS:
+            yield PrefillCase(
+                "append", 1, q_len, APPEND_CACHE_LENGTH, args.selected_len
+            )
+        yield PrefillCase(
+            "append", BATCHED_BATCH, 16, APPEND_CACHE_LENGTH, args.selected_len
+        )
 
     def run_case(self, case, args):
         q, kv, indices, sink = make_inputs(
-            case.batch, case.q_len, case.kv_len, case.selected_len, args.invalid
+            case.batch,
+            case.q_len,
+            case.kv_len,
+            case.selected_len,
+            args.invalid,
+            args.out_of_range,
         )
         out = torch.empty_like(q)
 

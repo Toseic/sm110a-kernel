@@ -1186,7 +1186,7 @@ cudaError_t bf16_fa4_sparse_mla_prefill_cuda(
     constexpr int kHeadDim = 512;
     constexpr int kPrefillWarps = 16;
 
-    if (query_len <= 0 || query_len != cache_len || heads != 64 ||
+    if (query_len <= 0 || cache_len <= 0 || heads != 64 ||
         selected_len <= 0 || batch <= 0 || !(scale > 0.0f)) {
         return cudaErrorInvalidValue;
     }
