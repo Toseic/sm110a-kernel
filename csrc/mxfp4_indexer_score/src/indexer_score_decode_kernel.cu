@@ -85,6 +85,21 @@ __device__ __forceinline__ void load_tmem_x16(float* value, int address) {
         : "r"(address));
 }
 
+template <int Offset>
+__device__ __forceinline__ void load_tmem_x16_uniform(float* value, int address) {
+    // Every epilogue lane uses the same TMEM row/column base. Keep the
+    // warp-uniform reduction and load in one PTX block for uniform lowering.
+    asm volatile(
+        "{ .reg .u32 a; redux.sync.min.u32 a, %16, 0xffffffff; "
+        "tcgen05.ld.sync.aligned.32x32b.x16.b32 "
+        "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [a+%17]; }"
+        : "=f"(value[0]), "=f"(value[1]), "=f"(value[2]), "=f"(value[3]),
+          "=f"(value[4]), "=f"(value[5]), "=f"(value[6]), "=f"(value[7]),
+          "=f"(value[8]), "=f"(value[9]), "=f"(value[10]), "=f"(value[11]),
+          "=f"(value[12]), "=f"(value[13]), "=f"(value[14]), "=f"(value[15])
+        : "r"(address), "n"(Offset));
+}
+
 __device__ __forceinline__ __nv_bfloat162 relu_bf16x2(float x, float y) {
     uint32_t packed;
     asm volatile("cvt.rn.relu.bf16x2.f32 %0, %1, %2;"
@@ -365,6 +380,9 @@ __global__ void indexer_score_decode_kernel(
             #pragma unroll
             for (int i = 0; i < kHeads / 2; ++i)
                 weights[i] = shared_weights[i];
+            // Allocation is complete and its base is immutable until dealloc.
+            // Cache it across paged TMEM loads despite inline-PTX memory clobbers.
+            const int paged_tmem_base = kDense ? 0 : tmem_base;
             for (int kv_tile = 0; kv_tile < kv_tiles; ++kv_tile) {
                 const int task = first_task + kv_tile;
                 const int stage = task % kResultStages;
@@ -378,9 +396,18 @@ __global__ void indexer_score_decode_kernel(
                 #pragma unroll
                 for (int head_base = 0; head_base < kHeads; head_base += 16) {
                     float value[16];
-                    const int address = tmem_base + result_col(stage) +
+                    const int address = (kDense ? tmem_base : paged_tmem_base) + result_col(stage) +
                         head_base + (tmem_row << 16);
-                    load_tmem_x16(value, address);
+                    if constexpr (kDense)
+                        load_tmem_x16(value, address);
+                    else {
+                        // The loop is unrolled, but use explicit compile-time
+                        // offsets to keep the base uniform through lowering.
+                        if (head_base == 0) load_tmem_x16_uniform<0>(value, address);
+                        else if (head_base == 16) load_tmem_x16_uniform<16>(value, address - 16);
+                        else if (head_base == 32) load_tmem_x16_uniform<32>(value, address - 32);
+                        else load_tmem_x16_uniform<48>(value, address - 48);
+                    }
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                     #pragma unroll
                     for (int i = 0; i < 16; i += 4) {
