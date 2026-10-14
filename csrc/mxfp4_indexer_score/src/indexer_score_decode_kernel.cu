@@ -109,7 +109,14 @@ __device__ __forceinline__ void wait_barrier(int address, int phase) {
                  "}" :: "r"(address), "r"(phase) : "memory");
 }
 
-template <int SplitKV>
+__device__ __forceinline__ bool elect_one() {
+    uint32_t elected;
+    asm volatile("{ .reg .pred p; elect.sync _|p, 0xffffffff; "
+                 "selp.u32 %0, 1, 0, p; }" : "=r"(elected));
+    return elected != 0;
+}
+
+template <int SplitKV, bool kDense = false, int kPageSize = 0>
 __global__ void indexer_score_decode_kernel(
     const __grid_constant__ CUtensorMap q_map,
     const __grid_constant__ CUtensorMap k_map,
@@ -119,6 +126,12 @@ __global__ void indexer_score_decode_kernel(
     __nv_bfloat16* __restrict__ out, int kv_count, int page_size,
     const int32_t* __restrict__ block_table, int block_table_stride,
     const int32_t* __restrict__ kv_seqlens) {
+    // Specialize address generation, but keep per-batch KV lengths dynamic.
+    if constexpr (kDense) {
+        page_size = 0;
+        block_table = nullptr;
+    }
+    static_assert(kDense || kPageSize == 128 || kPageSize == 256);
     const int tid = threadIdx.x;
     const int warp = tid / 32;
     const int lane = tid % 32;
@@ -227,39 +240,38 @@ __global__ void indexer_score_decode_kernel(
                     __cvta_generic_to_shared(&load_barrier[stage]));
                 asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
                              :: "r"(load_bar), "r"(kTileKV * kDim / 2 + kKScaleBytes) : "memory");
-                const int pages_per_tile = page_size && page_size < kTileKV
-                    ? kTileKV / page_size : 1;
-                for (int tile_page = 0; tile_page < pages_per_tile; ++tile_page) {
-                    const int logical_row = kv_base + tile_page * (page_size ? page_size : kTileKV);
-                    const int logical_page = page_size
-                        ? min(logical_row / page_size, (local_kv_len - 1) / page_size) : 0;
-                    const int physical_page = page_size
-                        ? block_table[batch * block_table_stride + logical_page] : 0;
-                    const int k_row = page_size ? physical_page * page_size + logical_row % page_size
-                        : batch * kv_count + kv_base;
-                    const int dst = k_addr + tile_page * (page_size && page_size < kTileKV
-                        ? page_size : kTileKV) * kDim;
+                if constexpr (!kDense) {
+                    static_assert(kTileKV == 128 && kKScaleTiles == 1);
+                    // Active tiles start before local_kv_len and fit in one
+                    // aligned page. K and its scales share the same lookup.
+                    const int physical_page = block_table[
+                        batch * block_table_stride + kv_base / kPageSize];
+                    const int k_row = physical_page * kPageSize + kv_base % kPageSize;
+                    const int scale_row = k_row / 128;
                     asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
                                  "[%0], [%1, {%2, %3, %4}], [%5];"
-                                 :: "r"(dst), "l"(kptr), "r"(zero), "r"(k_row),
+                                 :: "r"(k_addr), "l"(kptr), "r"(zero), "r"(k_row),
                                     "r"(zero), "r"(load_bar) : "memory");
-                }
-                #pragma unroll
-                for (int scale_tile = 0; scale_tile < kKScaleTiles; ++scale_tile) {
-                    const int logical_row = kv_base + scale_tile * 128;
-                    const int logical_page = page_size
-                        ? min(logical_row / page_size, (local_kv_len - 1) / page_size) : 0;
-                    const int physical_page = page_size
-                        ? block_table[batch * block_table_stride + logical_page] : 0;
-                    const int scale_row = page_size
-                        ? physical_page * (page_size / 128) +
-                              (logical_row / 128) % (page_size / 128)
-                        : batch * ((kv_count + 127) / 128) + logical_row / 128;
                     asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
                                  "[%0], [%1, {%2, %3, %4, %5}], [%6];"
-                                 :: "r"(ks_addr + scale_tile * 1024), "l"(ksptr),
-                                    "r"(zero), "r"(zero), "r"(zero),
-                                    "r"(scale_row), "r"(load_bar) : "memory");
+                                 :: "r"(ks_addr), "l"(ksptr), "r"(zero), "r"(zero),
+                                    "r"(zero), "r"(scale_row), "r"(load_bar) : "memory");
+                } else {
+                    const int k_row = batch * kv_count + kv_base;
+                    asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
+                                 "[%0], [%1, {%2, %3, %4}], [%5];"
+                                 :: "r"(k_addr), "l"(kptr), "r"(zero), "r"(k_row),
+                                    "r"(zero), "r"(load_bar) : "memory");
+                    #pragma unroll
+                    for (int scale_tile = 0; scale_tile < kKScaleTiles; ++scale_tile) {
+                        const int scale_row = batch * ((kv_count + 127) / 128) +
+                                              kv_base / 128 + scale_tile;
+                        asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::1 "
+                                     "[%0], [%1, {%2, %3, %4, %5}], [%6];"
+                                     :: "r"(ks_addr + scale_tile * 1024), "l"(ksptr),
+                                        "r"(zero), "r"(zero), "r"(zero),
+                                        "r"(scale_row), "r"(load_bar) : "memory");
+                    }
                 }
             };
             for (int kv_tile = 0;
@@ -277,7 +289,7 @@ __global__ void indexer_score_decode_kernel(
             wait_barrier(last_mma, (last_task / kPipelineStages) & 1);
         }
 
-        if (warp == 2 && lane == 0) {
+        if (warp == 2 && (kDense ? elect_one() : lane == 0)) {
             const int q_bar = static_cast<int>(__cvta_generic_to_shared(&q_barrier));
             wait_barrier(q_bar, 0);
             constexpr uint32_t instruction = 0x08A00480U;
@@ -385,14 +397,14 @@ __global__ void indexer_score_decode_kernel(
 
 }  // namespace
 
-template <int SplitKV>
+template <int SplitKV, bool kDense = false, int kPageSize = 0>
 void launch_decode(const CUtensorMap& q_map, const CUtensorMap& k_map,
                    const CUtensorMap& qs_map, const CUtensorMap& ks_map,
                    const __nv_bfloat16* head_weight,
                    __nv_bfloat16* out, int batch_count, int kv_count, int page_size,
                    const int32_t* block_table, int block_table_stride,
                    const int32_t* kv_seqlens, cudaStream_t stream) {
-    cudaFuncSetAttribute(indexer_score_decode_kernel<SplitKV>,
+    cudaFuncSetAttribute(indexer_score_decode_kernel<SplitKV, kDense, kPageSize>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
     cudaLaunchConfig_t config{};
     config.gridDim = dim3(SplitKV, batch_count);
@@ -406,7 +418,7 @@ void launch_decode(const CUtensorMap& q_map, const CUtensorMap& k_map,
     cluster_attr.val.clusterDim.z = 1;
     config.attrs = &cluster_attr;
     config.numAttrs = 1;
-    cudaLaunchKernelEx(&config, indexer_score_decode_kernel<SplitKV>,
+    cudaLaunchKernelEx(&config, indexer_score_decode_kernel<SplitKV, kDense, kPageSize>,
                        q_map, k_map, qs_map, ks_map,
                        head_weight, out, kv_count, page_size, block_table,
                        block_table_stride, kv_seqlens);
@@ -426,16 +438,26 @@ extern "C" void sm110a_indexer_score_decode_launch(
     encode_scales(&qs_map, q_scales, batch_count);
     encode_scales(&ks_map, k_scales, page_size
         ? num_pages * (page_size / 128) : batch_count * ((kv_count + 127) / 128));
-#define LAUNCH(S) launch_decode<S>(q_map, k_map, qs_map, ks_map, \
+#define LAUNCH(S, DENSE, PAGE) launch_decode<S, DENSE, PAGE>(q_map, k_map, qs_map, ks_map, \
                                        head_weight, out, batch_count, kv_count, \
                                        page_size, block_table, block_table_stride, \
                                        kv_seqlens, stream)
-    switch (split_kv) {
-        case 1: LAUNCH(1); break;
-        case 2: LAUNCH(2); break;
-        case 4: LAUNCH(4); break;
-        case 8: LAUNCH(8); break;
-        default: assert(false && "split_kv must be 1, 2, 4, or 8");
+#define DISPATCH(DENSE, PAGE) \
+    switch (split_kv) { \
+        case 1: LAUNCH(1, DENSE, PAGE); break; \
+        case 2: LAUNCH(2, DENSE, PAGE); break; \
+        case 4: LAUNCH(4, DENSE, PAGE); break; \
+        case 8: LAUNCH(8, DENSE, PAGE); break; \
+        default: assert(false && "split_kv must be 1, 2, 4, or 8"); \
     }
+    if (page_size == 0) {
+        DISPATCH(true, 0);
+    } else if (page_size == 128) {
+        DISPATCH(false, 128);
+    } else {
+        assert(page_size == 256);
+        DISPATCH(false, 256);
+    }
+#undef DISPATCH
 #undef LAUNCH
 }
