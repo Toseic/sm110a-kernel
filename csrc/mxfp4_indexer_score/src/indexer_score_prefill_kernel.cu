@@ -128,7 +128,16 @@ __device__ __forceinline__ void wait_barrier(int address, int phase) {
                  "}" :: "r"(address), "r"(phase) : "memory");
 }
 
-template <int kClusterM>
+__device__ __forceinline__ bool elect_one() {
+    // Make the single issuer explicit to ptxas; a lane-index predicate can
+    // introduce another election loop around each tcgen05 instruction.
+    uint32_t elected;
+    asm volatile("{ .reg .pred p; elect.sync _|p, 0xffffffff; "
+                 "selp.u32 %0, 1, 0, p; }" : "=r"(elected));
+    return elected != 0;
+}
+
+template <int kClusterM, bool kDenseCompactCausal = false>
 __global__ __launch_bounds__(kThreads, 1) __cluster_dims__(kClusterM, 1, 1)
 void indexer_score_prefill_kernel(
     const __grid_constant__ CUtensorMap q_map,
@@ -142,6 +151,16 @@ void indexer_score_prefill_kernel(
     const int32_t* __restrict__ cu_seqlens_q,
     const int32_t* __restrict__ kv_seqlens,
     bool causal, bool compact_scales) {
+    static_assert(!kDenseCompactCausal || kClusterM == 1);
+    // Fold layout/mask choices for the common 1CTA path. KV lengths remain
+    // dynamic: dense batches may still have shorter logical KV sequences.
+    if constexpr (kDenseCompactCausal) {
+        page_size = 0;
+        block_table = nullptr;
+        cu_seqlens_q = nullptr;
+        causal = true;
+        compact_scales = true;
+    }
     const int tid = threadIdx.x;
     const int warp = tid / 32;
     const int lane = tid % 32;
@@ -393,7 +412,9 @@ void indexer_score_prefill_kernel(
             }
         }
 
-        if (warp == 2 && lane == 0) {
+        // Explicit election improves the single-CTA specialization. Keep the
+        // measured lane-index path for multicast clusters, where it is faster.
+        if (warp == 2 && (kClusterM == 1 ? elect_one() : lane == 0)) {
             const int q_stage = q_round % kQStages;
             const int q_addr = smem_base + q_stage * kQSmemBytes;
             const int qs_addr = q_addr + kABytes;
@@ -581,8 +602,11 @@ extern "C" void sm110a_indexer_score_prefill_launch(
     const int max_cluster_ctas = (max_ctas / cluster_m) * cluster_m;
     const dim3 grid(padded_q_tiles < max_cluster_ctas ? padded_q_tiles : max_cluster_ctas,
                     batch_count);
+    const bool dense_compact_causal = !use_cluster && page_size == 0 &&
+        compact_scales && causal && !cu_seqlens_q;
     const auto kernel = use_cluster ? indexer_score_prefill_kernel<2>
-                                    : indexer_score_prefill_kernel<1>;
+        : dense_compact_causal ? indexer_score_prefill_kernel<1, true>
+                               : indexer_score_prefill_kernel<1>;
     cudaFuncSetAttribute(kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
     kernel<<<grid, kThreads, kSmemBytes, stream>>>(
