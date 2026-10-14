@@ -196,6 +196,7 @@ from .kernels.mxfp4_indexer_score import (
     indexer_score_decode_out,
     indexer_score_prefill,
     indexer_score_prefill_out,
+    pack_indexer_score_prefill_scales,
     select_indexer_score_decode_split_kv,
     select_indexer_score_prefill_cluster_m,
 )

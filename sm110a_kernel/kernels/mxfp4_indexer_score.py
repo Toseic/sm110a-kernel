@@ -17,6 +17,25 @@ _DECODE_TUNE_NAMESPACE = (
 )
 
 
+def pack_indexer_score_prefill_scales(scales):
+    """Compact blocked E8M0 tiles into the 512-byte tcgen05 scale layout.
+
+    Prepare Q and K scales before timing a prefill call. Each 1024-byte input
+    tile becomes 512 bytes; the prefill API also accepts the original layout.
+    """
+    if scales.dtype != torch.float8_e8m0fnu or scales.numel() % 1024:
+        raise ValueError("scales must be blocked E8M0 tiles of 1024 bytes")
+    return (
+        scales.contiguous()
+        .view(torch.uint8)
+        .reshape(-1, 2, 32, 4, 4)[..., :2]
+        .permute(0, 2, 3, 1, 4)
+        .contiguous()
+        .view(torch.float8_e8m0fnu)
+        .flatten()
+    )
+
+
 class IndexerScoreModule:
     def __init__(self, binding, library, _config):
         self._binding = binding

@@ -30,6 +30,7 @@ from common import (
 from sm110a_kernel import (
     compile_indexer_score_prefill,
     from_blocked_mxfp4_scales,
+    pack_indexer_score_prefill_scales,
     to_blocked_mxfp4_scales,
 )
 from sm110a_kernel.runner import TuneOptions
@@ -70,14 +71,14 @@ def indexer_score_sol_bounds(qs, kvs, cluster_m=1, *, causal=True):
     )
     q_bytes = qs * HEADS * DIM // 2
     k_bytes = kvs * DIM // 2
-    q_scale_bytes = q_tiles * 1024
-    k_scale_bytes = ((kvs + 127) // 128) * 1024
+    q_scale_bytes = q_tiles * 512
+    k_scale_bytes = ((kvs + 127) // 128) * 512
     weight_bytes = qs * HEADS * 2
     output_bytes = (sum(min(kvs, q + 1) for q in range(qs)) if causal else qs * kvs) * 2
     input_bytes = q_bytes + k_bytes + q_scale_bytes + k_scale_bytes + weight_bytes
     compulsory_bytes = input_bytes + output_bytes
-    q_tile_read_bytes = 128 * DIM // 2 + 1024 + 2 * HEADS * 2
-    kv_tile_read_bytes = TILE_KV * DIM // 2 + (TILE_KV // 128) * 1024
+    q_tile_read_bytes = 128 * DIM // 2 + 512 + 2 * HEADS * 2
+    kv_tile_read_bytes = TILE_KV * DIM // 2 + (TILE_KV // 128) * 512
     tile_read_bytes = (
         q_tiles * q_tile_read_bytes + sum(active_tiles) * kv_tile_read_bytes
     )
@@ -557,12 +558,15 @@ class IndexerScoreBenchmark(BenchmarkBase):
                 max_q_len=seq if args.packed_q else None,
                 max_kv_len=seq if args.paged_kv else None,
             )
+            # Match DeepGEMM: adapt scale layout once, before tuning and timing.
+            compact_q_scales = pack_indexer_score_prefill_scales(q_scales)
+            compact_k_scales = pack_indexer_score_prefill_scales(k_scales)
             if args.sweep_cluster_m:
                 cluster_m = module.select_cluster_m(
                     q,
                     k,
-                    q_scales,
-                    k_scales,
+                    compact_q_scales,
+                    compact_k_scales,
                     head_weight,
                     out,
                     causal=not args.non_causal,
@@ -582,8 +586,8 @@ class IndexerScoreBenchmark(BenchmarkBase):
                 cluster_m = module.select_cluster_m(
                     q,
                     k,
-                    q_scales,
-                    k_scales,
+                    compact_q_scales,
+                    compact_k_scales,
                     head_weight,
                     out,
                     causal=not args.non_causal,
@@ -594,8 +598,8 @@ class IndexerScoreBenchmark(BenchmarkBase):
                 return module.indexer_score_prefill_out(
                     q,
                     k,
-                    q_scales,
-                    k_scales,
+                    compact_q_scales,
+                    compact_k_scales,
                     head_weight,
                     out,
                     cluster_m,

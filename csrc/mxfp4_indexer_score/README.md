@@ -62,6 +62,11 @@ supported:
 - `k_scales`: same format, `ceil(KVs/128)*1024` bytes.
 - `head_weight`: contiguous CUDA BF16 `[Qs, 64]`.
 
+For prefill timing, call `pack_indexer_score_prefill_scales` on each blocked
+scale buffer before launching or tuning. The prefill API accepts these compact
+E8M0 buffers (512 bytes per tile) for Q and K together, and copies them into
+shared memory without repacking. Existing blocked inputs remain supported.
+
 For a partial final Q or KV scale tile, pad the logical rows with zeros to
 the next multiple of 128 before calling `to_blocked_mxfp4_scales`. The packed
 Q and K tensors themselves contain only their logical rows. The kernel masks
@@ -117,8 +122,8 @@ The roofline omits epilogue instruction throughput and launch overhead.
 Pass `--baseline deepgemm` to compare with DeepGEMM's MXFP4 MQA logits
 kernel using the same packed Q/K values, E8M0 scales, BF16 weights, and
 valid score positions. The table reports `Speedup = Baseline / Kernel`.
-Scale conversion, paged KV packing, and paged scheduling metadata are
-prepared outside the timed region. DeepGEMM paged MQA supports page size
+Scale conversion for both kernels, paged KV packing, and paged scheduling
+metadata are prepared outside the timed region. DeepGEMM paged MQA supports page size
 128 here; dense cases support any selected sequence length.
 
 On SM110, the local DeepGEMM MQA API needs the tracked compatibility patch

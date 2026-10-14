@@ -12,7 +12,7 @@ namespace {
 using Launcher = void (*)(const uint8_t*, const uint8_t*, const uint8_t*,
                           const uint8_t*, const __nv_bfloat16*, __nv_bfloat16*, int, int,
                           int, int, int, int, const int32_t*, int,
-                          const int32_t*, const int32_t*, int, bool, cudaStream_t);
+                          const int32_t*, const int32_t*, int, bool, bool, cudaStream_t);
 
 void check_packed(const torch::Tensor& value, const char* name,
                   const c10::Device& device) {
@@ -27,8 +27,10 @@ void check_scales(const torch::Tensor& value, const char* name,
     TORCH_CHECK(value.is_cuda() && value.device() == device, name, " must be on the same CUDA device as Q");
     TORCH_CHECK(value.scalar_type() == at::kFloat8_e8m0fnu,
                 name, " must have dtype torch.float8_e8m0fnu");
-    TORCH_CHECK(value.is_contiguous() && value.numel() == bytes,
-                name, " must contain ", bytes, " blocked scale bytes");
+    TORCH_CHECK(value.is_contiguous() &&
+                (value.numel() == bytes || value.numel() == bytes / 2),
+                name, " must contain ", bytes, " blocked or ", bytes / 2,
+                " compact scale bytes");
 }
 
 void check_int32(const torch::Tensor& value, const char* name,
@@ -119,6 +121,12 @@ torch::Tensor run(torch::Tensor q, torch::Tensor k,
     check_scales(k_scales, "K scales", device, paged
         ? num_pages * (page_size / 128) * 1024
         : batch * ((kvs + 127) / 128) * 1024);
+    const bool compact_scales = q_scales.numel() == batch * ((qs + 1) / 2) * 512;
+    TORCH_CHECK(compact_scales ==
+                (k_scales.numel() == (paged
+                    ? num_pages * (page_size / 128) * 512
+                    : batch * ((kvs + 127) / 128) * 512)),
+                "Q and K scales must use the same layout");
     TORCH_CHECK(head_weight.is_cuda() && head_weight.device() == device &&
                 head_weight.scalar_type() == at::kBFloat16 && head_weight.is_contiguous() &&
                 head_weight.dim() == q.dim() - 1 &&
@@ -145,7 +153,7 @@ torch::Tensor run(torch::Tensor q, torch::Tensor k,
              static_cast<int>(table_stride),
              packed_q ? cu_seqlens_q->data_ptr<int32_t>() : nullptr,
              kv_seqlens ? kv_seqlens->data_ptr<int32_t>() : nullptr,
-             cluster_m, causal,
+             cluster_m, causal, compact_scales,
              c10::cuda::getCurrentCUDAStream(device.index()));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;

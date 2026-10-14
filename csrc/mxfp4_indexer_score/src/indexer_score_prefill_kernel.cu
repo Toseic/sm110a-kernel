@@ -46,7 +46,7 @@ constexpr int kTmemCols = 512;
 static_assert(kAccumulatorTmemCols + kScaleTmemCols <= kTmemCols);
 
 // Q and K are row-major packed E2M1; scales arrive in the repository's
-// blocked 128x4 UE8M0 layout and are compacted by the producer warps.
+// blocked 128x4 UE8M0 layout or precompacted 512-byte tiles.
 void encode_fp4(CUtensorMap* map, const uint8_t* ptr, int rows, int tile_rows) {
     const uint64_t dims[3] = {kDim, static_cast<uint64_t>(rows), 1};
     const uint64_t strides[2] = {kDim / 2, static_cast<uint64_t>(rows) * (kDim / 2)};
@@ -81,6 +81,18 @@ __device__ __forceinline__ void pack_scale_tile(
         const uint32_t lo = *reinterpret_cast<const uint16_t*>(src + offset);
         const uint32_t hi = *reinterpret_cast<const uint16_t*>(src + 512 + offset);
         dst[lane * 4 + i] = lo | (hi << 16);
+    }
+}
+
+__device__ __forceinline__ void load_scale_tile(
+    const uint8_t* src, uint32_t* dst, int lane, bool compact) {
+    if (compact) {
+        const auto* words = reinterpret_cast<const uint32_t*>(src);
+        #pragma unroll
+        for (int i = 0; i < 4; ++i)
+            dst[lane * 4 + i] = words[lane * 4 + i];
+    } else {
+        pack_scale_tile(src, dst, lane);
     }
 }
 
@@ -129,7 +141,7 @@ void indexer_score_prefill_kernel(
     const int32_t* __restrict__ block_table,
     const int32_t* __restrict__ cu_seqlens_q,
     const int32_t* __restrict__ kv_seqlens,
-    bool causal) {
+    bool causal, bool compact_scales) {
     const int tid = threadIdx.x;
     const int warp = tid / 32;
     const int lane = tid % 32;
@@ -249,7 +261,8 @@ void indexer_score_prefill_kernel(
                             ? global_weights[i] : __floats2bfloat162_rn(0.0f, 0.0f);
             }
             if (q_base < local_query_len) {
-                pack_scale_tile(q_scales + scale_tile * 1024, compact_q_scales, lane);
+                load_scale_tile(q_scales + scale_tile * (compact_scales ? 512 : 1024),
+                                compact_q_scales, lane, compact_scales);
             } else {
                 #pragma unroll
                 for (int i = 0; i < 4; ++i)
@@ -321,10 +334,10 @@ void indexer_score_prefill_kernel(
                         ? physical_page * (page_size / 128) +
                           (logical_row / 128) % (page_size / 128)
                         : batch * ((kv_count + 127) / 128) + logical_row / 128;
-                    pack_scale_tile(k_scales + scale_row * 1024,
+                    load_scale_tile(k_scales + scale_row * (compact_scales ? 512 : 1024),
                                     reinterpret_cast<uint32_t*>(
                                         smem + kQStages * kQSmemBytes + stage * kKVStageSmemBytes +
-                                        kBBytes + subtile * 512), lane);
+                                        kBBytes + subtile * 512), lane, compact_scales);
                 }
                 __syncwarp();
                 if (lane != 0) return;
@@ -548,7 +561,7 @@ extern "C" void sm110a_indexer_score_prefill_launch(
     int query_count, int kv_count, int batch_count, int total_q,
     int num_pages, int page_size, const int32_t* block_table,
     int block_table_stride, const int32_t* cu_seqlens_q,
-    const int32_t* kv_seqlens, int cluster_m, bool causal,
+    const int32_t* kv_seqlens, int cluster_m, bool causal, bool compact_scales,
     cudaStream_t stream) {
     CUtensorMap q_map, k_map;
     encode_fp4(&q_map, q, total_q * kHeads, kTileM);
@@ -575,5 +588,5 @@ extern "C" void sm110a_indexer_score_prefill_launch(
     kernel<<<grid, kThreads, kSmemBytes, stream>>>(
         q_map, k_map, q_scales, k_scales, head_weight, out,
         query_count, kv_count, batch_count, page_size, block_table_stride,
-        block_table, cu_seqlens_q, kv_seqlens, causal);
+        block_table, cu_seqlens_q, kv_seqlens, causal, compact_scales);
 }
