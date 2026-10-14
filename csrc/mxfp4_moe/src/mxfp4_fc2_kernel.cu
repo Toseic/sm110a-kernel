@@ -53,6 +53,12 @@
 #ifndef SM110A_MXFP4_FC2_REDUCE_TILE_N
 #define SM110A_MXFP4_FC2_REDUCE_TILE_N 64
 #endif
+#ifndef SM110A_MXFP4_FC2_WEIGHT_IN_FC1
+#define SM110A_MXFP4_FC2_WEIGHT_IN_FC1 0
+#endif
+#ifndef SM110A_MXFP4_FC2_DETERMINISTIC
+#define SM110A_MXFP4_FC2_DETERMINISTIC 0
+#endif
 
 namespace {
 
@@ -491,7 +497,9 @@ template <
     int kClusterM,
     bool kPersistent,
     bool kDynamicClc = false,
-    int kTaskPacketSize = 1>
+    int kTaskPacketSize = 1,
+    bool kWeightInFc1 = false,
+    bool kDeterministic = false>
 __global__ __cluster_dims__(kClusterM, 1, 1)
 __launch_bounds__(kWarpSize * kBaseWarpCount)
 void mxfp4_fc2_fused_kernel(
@@ -1157,8 +1165,12 @@ void mxfp4_fc2_fused_kernel(
                 float router_scale = 0.0f;
                 if (valid_row) {
                     const int expanded_id = grouped_assignments[cta_row + tid];
-                    token_idx = expanded_id / topk;
-                    router_scale = __bfloat162float(routing_weights[expanded_id]);
+                    token_idx = kDeterministic ? expanded_id : expanded_id / topk;
+                    if constexpr (kWeightInFc1) {
+                        router_scale = 1.0f;
+                    } else {
+                        router_scale = __bfloat162float(routing_weights[expanded_id]);
+                    }
                 }
                 if (valid_rows == 0) {
                     // A 2-CTA M=256 tile frequently has no rows in rank 1 for
@@ -1203,12 +1215,21 @@ void mxfp4_fc2_fused_kernel(
                         if (valid_row) {
                             auto *source = stage_smem +
                                 tid * SM110A_MXFP4_FC2_REDUCE_TILE_N + group_begin * 8;
-                            bulk_reduce_add_bf16(final_output +
-                                                     static_cast<size_t>(token_idx) * n +
-                                                     tile_col + reduce_n + group_begin * 8,
-                                                 source,
-                                                 (group_end - group_begin) * 8 *
-                                                     sizeof(nv_bfloat16));
+                            auto *destination = final_output +
+                                static_cast<size_t>(token_idx) * n +
+                                tile_col + reduce_n + group_begin * 8;
+                            if constexpr (kDeterministic) {
+                                // Each expanded assignment owns a unique row:
+                                // no atomic accumulation or schedule-dependent rounding.
+                                for (int group = group_begin; group < group_end; ++group) {
+                                    const int offset = (group - group_begin) * 8;
+                                    *reinterpret_cast<uint4*>(destination + offset) =
+                                        *reinterpret_cast<const uint4*>(source + offset);
+                                }
+                            } else {
+                                bulk_reduce_add_bf16(destination, source,
+                                    (group_end - group_begin) * 8 * sizeof(nv_bfloat16));
+                            }
                         }
                         bulk_commit_group();
                         bulk_wait_group_read_0();
@@ -1352,7 +1373,8 @@ void mxfp4_fc2_fused_kernel(
     }
 }
 
-template <int kTileM, int kTileN, int kTileK, int kClusterM>
+template <int kTileM, int kTileN, int kTileK, int kClusterM,
+          bool kWeightInFc1, bool kDeterministic>
 void launch_mxfp4_fc2_impl(
     const uint8_t *d_a,
     const uint8_t *d_b,
@@ -1406,14 +1428,14 @@ void launch_mxfp4_fc2_impl(
         kClusterM,
         true,
         false,
-        1>;
+        1, kWeightInFc1, kDeterministic>;
     auto packet_kernel = mxfp4_fc2_fused_kernel<kTileM,
         kTileN,
         kTileK,
         kClusterM,
         true,
         false,
-        kTaskPacketTileCount>;
+        kTaskPacketTileCount, kWeightInFc1, kDeterministic>;
     if constexpr (kDynamicSmemBytes > 48 * 1024) {
         cudaFuncSetAttribute(single_tile_kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -1466,9 +1488,26 @@ void launch_mxfp4_fc2_entry(
         return;
     launch_mxfp4_fc2_impl<SM110A_MXFP4_FC2_TILE_M,
         SM110A_MXFP4_FC2_TILE_N, SM110A_MXFP4_FC2_TILE_K,
-        SM110A_MXFP4_FC2_CLUSTER_M>(
+        SM110A_MXFP4_FC2_CLUSTER_M,
+        (SM110A_MXFP4_FC2_WEIGHT_IN_FC1 != 0),
+        (SM110A_MXFP4_FC2_DETERMINISTIC != 0)>(
         a, b, sfa, sfb, tasks, state, grouped_assignments, routing_weights, c,
         m, experts, n, k, topk, max_tasks, max_active_clusters, stream);
+}
+
+__global__ void mxfp4_fc2_finalize_deterministic(
+    const __nv_bfloat16* assignments, __nv_bfloat16* output,
+    int tokens, int n, int topk) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= static_cast<size_t>(tokens) * n) return;
+    const int token = index / n;
+    const int column = index % n;
+    float sum = 0.0f;
+    for (int rank = 0; rank < topk; ++rank) {
+        sum = __fadd_rn(sum, __bfloat162float(
+            assignments[(static_cast<size_t>(token) * topk + rank) * n + column]));
+    }
+    output[index] = __float2bfloat16_rn(sum);
 }
 
 }  // namespace
@@ -1479,21 +1518,29 @@ void launch_mxfp4_fc2_main(
     const int32_t* tasks, int32_t* state,
     __nv_bfloat16* c, const __nv_bfloat16* routing_weights, int tokens,
     int m, int experts, int n, int k, int topk, int max_tasks, int max_active_clusters,
-    cudaStream_t stream) {
+    cudaStream_t stream, __nv_bfloat16* assignment_scratch) {
     if (!a || !b || !sfa || !sfb || !grouped_assignments || !tasks ||
         !state || !c || !routing_weights || tokens <= 0 ||
         m <= 0 || experts <= 0 || n <= 0 || k <= 0 || topk <= 0 ||
         max_tasks <= 0) {
         return;
     }
-    // The fused epilogue accumulates routing-weighted expert outputs directly
-    // into the token-major result via cp.reduce.async.bulk add, so the
-    // destination must be cleared before the kernel runs.
-    cudaMemsetAsync(c, 0, static_cast<size_t>(tokens) * n * sizeof(__nv_bfloat16),
-                    stream);
+    if constexpr (SM110A_MXFP4_FC2_DETERMINISTIC != 0) {
+        if (!assignment_scratch) return;
+    } else {
+        // BF16 cp.reduce requires zeroed token-major output.
+        cudaMemsetAsync(c, 0, static_cast<size_t>(tokens) * n * sizeof(__nv_bfloat16), stream);
+    }
     launch_mxfp4_fc2_entry(a, b, sfa, sfb, grouped_assignments, tasks,
-                           state, c, routing_weights, tokens, m, experts, n, k,
+                           state, SM110A_MXFP4_FC2_DETERMINISTIC ? assignment_scratch : c,
+                           routing_weights, tokens, m, experts, n, k,
                            topk, max_tasks, max_active_clusters, stream);
+    if constexpr (SM110A_MXFP4_FC2_DETERMINISTIC != 0) {
+        constexpr int threads = 256;
+        const int blocks = (static_cast<size_t>(tokens) * n + threads - 1) / threads;
+        mxfp4_fc2_finalize_deterministic<<<blocks, threads, 0, stream>>>(
+            assignment_scratch, c, tokens, n, topk);
+    }
 }
 
 extern "C" void sm110a_mxfp4_fc2_launch(
@@ -1502,8 +1549,8 @@ extern "C" void sm110a_mxfp4_fc2_launch(
     const int32_t* tasks, int32_t* state,
     __nv_bfloat16* c, const __nv_bfloat16* routing_weights, int tokens,
     int m, int experts, int n, int k, int topk, int max_tasks, int max_active_clusters,
-    cudaStream_t stream) {
+    cudaStream_t stream, __nv_bfloat16* assignment_scratch) {
     launch_mxfp4_fc2_main(a, b, sfa, sfb, grouped_assignments, tasks,
                           state, c, routing_weights, tokens, m, experts, n, k,
-                          topk, max_tasks, max_active_clusters, stream);
+                          topk, max_tasks, max_active_clusters, stream, assignment_scratch);
 }

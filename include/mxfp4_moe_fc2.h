@@ -9,16 +9,19 @@
 // [experts, N, K/2] (packed E2M1, low nibble = even element) with blocked
 // UE8M0 K=32 scales in the same 512-byte tile format. C is the token-major,
 // routing-weighted FC2 result [tokens, N] in BF16. The token-major reduction
-// is fused into the grouped-GEMM epilogue, so no workspace is required and C
-// is accumulated in place via cp.reduce.async.bulk.
+// is fused into the default grouped-GEMM epilogue, requiring no workspace;
+// that specialization accumulates C in place via cp.reduce.async.bulk.
 //
 // grouped_assignments maps each grouped output row to its expanded assignment
 // id (assignment = token * topk + rank); the epilogue uses it to recover both
 // the output row and the router scale.
+// WeightInFc1 disables the router multiply. The Deterministic specialization
+// writes BF16 assignment_scratch [tokens*topk,N] and finalizes in rank order
+// with FP32 additions and one final BF16 conversion (no BF16 atomic adds).
 void launch_mxfp4_fc2_main(
     const uint8_t* a, const uint8_t* b, const uint8_t* sfa,
     const uint8_t* sfb, const int32_t* grouped_assignments,
     const int32_t* tasks, int32_t* state, __nv_bfloat16* c,
     const __nv_bfloat16* routing_weights, int tokens,
     int m, int experts, int n, int k, int topk, int max_tasks, int max_active_clusters,
-    cudaStream_t stream);
+    cudaStream_t stream, __nv_bfloat16* assignment_scratch);

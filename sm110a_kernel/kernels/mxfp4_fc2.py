@@ -17,6 +17,15 @@ _INC = _ROOT / "include"
 
 @dataclass(frozen=True)
 class Mxfp4Fc2Config:
+    """Compile-time weighting and accumulation semantics.
+
+    ``routing_weight_position='fc1'`` disables the FC2 router multiply.
+    ``deterministic=True`` stores each assignment once in BF16 scratch and
+    sums ranks in FP32 with one final BF16 rounding. It requires an extra
+    ``tokens * topk * n * 2`` bytes and one finalize kernel. The default
+    in-place BF16 atomic reduction has schedule-dependent rounding.
+    """
+
     tile_m: int = 128
     # FC2 is launched persistently.  A wider N tile and a 128-wide K stage
     # amortize the task scheduler, TMA, and scale-copy work while preserving
@@ -33,8 +42,14 @@ class Mxfp4Fc2Config:
     macro_swizzle_serpentine: bool = False
     macro_swizzle_m: int = 8
     macro_swizzle_n: int = 8
+    routing_weight_position: str = "fc2"
+    deterministic: bool = False
 
     def validate(self) -> None:
+        if self.routing_weight_position not in ("fc1", "fc2"):
+            raise ValueError("routing_weight_position must be 'fc1' or 'fc2'")
+        if not isinstance(self.deterministic, bool):
+            raise ValueError("deterministic must be bool")
         # TileN=256 is the only shape validated against the torch reference
         # for the W4A8 kernel (the 128-column TMEM scale-block offset of
         # narrower tiles is untested here).
@@ -127,6 +142,7 @@ class Mxfp4Fc2Module:
             topk,
             self._address,
             self._max_active_clusters(a.device, max_active_clusters),
+            self.config.deterministic,
         )
 
     def mxfp4_fc2_out(
@@ -155,6 +171,7 @@ class Mxfp4Fc2Module:
             out,
             self._address,
             self._max_active_clusters(a.device, max_active_clusters),
+            self.config.deterministic,
         )
 
 
@@ -168,6 +185,8 @@ def _flags(config: Mxfp4Fc2Config, _variant):
             ("EPILOGUE_TILE_N", config.epilogue_tile_n),
             ("CLUSTER_M", config.cluster_m),
             ("REDUCE_TILE_N", config.reduce_tile_n),
+            ("WEIGHT_IN_FC1", int(config.routing_weight_position == "fc1")),
+            ("DETERMINISTIC", int(config.deterministic)),
         )
     ) + (
         # The grouped-M task builder is compiled into this module too; it keys

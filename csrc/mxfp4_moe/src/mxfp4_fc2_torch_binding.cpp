@@ -12,7 +12,8 @@ namespace {
 using Launcher = void (*)(
     const uint8_t*, const uint8_t*, const uint8_t*, const uint8_t*,
     const int32_t*, const int32_t*, int32_t*, __nv_bfloat16*,
-    const __nv_bfloat16*, int, int, int, int, int, int, int, int, cudaStream_t);
+    const __nv_bfloat16*, int, int, int, int, int, int, int, int, cudaStream_t,
+    __nv_bfloat16*);
 using MetadataLauncher = void (*)(
     const int32_t*, int32_t*, int32_t*, int32_t*, int32_t*, int, int, int,
     int, int, int, bool, cudaStream_t);
@@ -69,7 +70,8 @@ torch::Tensor run_out(
     torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb,
     torch::Tensor routing, torch::Tensor routing_weights,
     torch::Tensor tasks, torch::Tensor state, int64_t topk,
-    torch::Tensor out, uint64_t address, int64_t max_active_clusters) {
+    torch::Tensor out, uint64_t address, int64_t max_active_clusters,
+    bool deterministic) {
   check_fp8(a, "A", 2);
   check_fp4(b, "B", 3);
   TORCH_CHECK(routing.is_cuda() && routing.scalar_type() == torch::kInt32 &&
@@ -126,6 +128,10 @@ torch::Tensor run_out(
   // 2*experts + m), not the inverse assignment_to_grouped map.
   const auto* grouped_assignments = routing.data_ptr<int32_t>() +
                                     2 * experts + m;
+  // Distinct assignments have distinct scratch rows; a second CUDA kernel
+  // sums BF16 expert outputs in FP32 without nondeterministic BF16 atomics.
+  auto scratch = deterministic
+      ? torch::empty({m, n}, out.options()) : torch::Tensor();
   launcher(reinterpret_cast<const uint8_t*>(a.data_ptr()),
            reinterpret_cast<const uint8_t*>(b.data_ptr()),
            reinterpret_cast<const uint8_t*>(sfa.data_ptr()),
@@ -136,7 +142,8 @@ torch::Tensor run_out(
            reinterpret_cast<const __nv_bfloat16*>(routing_weights.data_ptr<at::BFloat16>()),
            static_cast<int>(tokens), static_cast<int>(m), static_cast<int>(experts),
            static_cast<int>(n), static_cast<int>(k), static_cast<int>(topk),
-           static_cast<int>(tasks.size(0)), static_cast<int>(max_active_clusters), stream);
+           static_cast<int>(tasks.size(0)), static_cast<int>(max_active_clusters), stream,
+           deterministic ? reinterpret_cast<__nv_bfloat16*>(scratch.data_ptr()) : nullptr);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
@@ -145,12 +152,12 @@ torch::Tensor run(
     torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb,
     torch::Tensor routing, torch::Tensor routing_weights,
     torch::Tensor tasks, torch::Tensor state, int64_t topk,
-    uint64_t address, int64_t max_active_clusters) {
+    uint64_t address, int64_t max_active_clusters, bool deterministic) {
   TORCH_CHECK(topk > 0, "topk must be positive");
   auto out = torch::empty({a.size(0) / topk, b.size(1)},
                           a.options().dtype(torch::kBFloat16));
   return run_out(a, b, sfa, sfb, routing, routing_weights, tasks, state,
-                 topk, out, address, max_active_clusters);
+                 topk, out, address, max_active_clusters, deterministic);
 }
 
 }  // namespace

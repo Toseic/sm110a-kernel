@@ -104,7 +104,14 @@ def mxfp4_candidates(args):
         candidates = tuple(
             replace(c, reduce_tile_n=args.reduce_tile_n) for c in candidates
         )
-    return candidates
+    return tuple(
+        replace(
+            c,
+            routing_weight_position=args.routing_weight_position,
+            deterministic=args.deterministic,
+        )
+        for c in candidates
+    )
 
 
 def mxfp4_fc2_sol_bounds(router_scores, topk, n, k, config):
@@ -234,6 +241,9 @@ def mxfp4_fc2_reference(
     topk,
     n,
     k,
+    *,
+    routing_weight_position="fc2",
+    deterministic=False,
 ):
     m = tokens * topk
     a = aq.float() * sfa128.float().repeat_interleave(128, dim=1)
@@ -253,14 +263,12 @@ def mxfp4_fc2_reference(
     assignment_to_grouped = routing[2 * experts + 2 * m :]
     assignments = torch.arange(m, device="cuda").view(tokens, topk)
     grouped_rows = assignment_to_grouped[assignments]
-    return (
-        (
-            grouped[grouped_rows].view(tokens, topk, n)
-            * routing_weights.float().unsqueeze(-1)
-        )
-        .sum(1)
-        .bfloat16()
-    )
+    contributions = grouped[grouped_rows].view(tokens, topk, n)
+    if routing_weight_position == "fc2":
+        contributions = contributions * routing_weights.float().unsqueeze(-1)
+    if deterministic:
+        contributions = contributions.bfloat16().float()
+    return contributions.sum(1).bfloat16()
 
 
 class Mxfp4Fc2Benchmark(BenchmarkBase):
@@ -283,6 +291,10 @@ class Mxfp4Fc2Benchmark(BenchmarkBase):
         parser.add_argument("--tile-k", type=int, choices=(128,))
         parser.add_argument("--cluster-m", type=int, choices=(1, 2))
         parser.add_argument("--reduce-tile-n", type=int, choices=(32, 64, 128, 256))
+        parser.add_argument(
+            "--routing-weight-position", choices=("fc1", "fc2"), default="fc2"
+        )
+        parser.add_argument("--deterministic", action="store_true")
         return parser
 
     def validate_args(self, args):
@@ -467,8 +479,26 @@ class Mxfp4Fc2Benchmark(BenchmarkBase):
                     args.topk,
                     args.n,
                     args.k,
+                    routing_weight_position=args.routing_weight_position,
+                    deterministic=args.deterministic,
                 )
                 max_abs_diff = (out.float() - ref.float()).abs().max().item()
+                if args.deterministic:
+                    relative_l2 = (
+                        out.float() - ref.float()
+                    ).norm() / ref.float().norm().clamp_min(1e-30)
+                    if relative_l2.item() > 1e-3:
+                        raise AssertionError(
+                            f"deterministic MXFP4 FC2 mismatch: relative L2 {relative_l2.item():.6g}"
+                        )
+                    first = out.clone()
+                    for _ in range(5):
+                        ours_selection.prepared.run()
+                        if not torch.equal(first, out):
+                            raise AssertionError(
+                                "deterministic MXFP4 FC2 changed across launches"
+                            )
+                    del first
                 # The fused epilogue accumulates the top-k contributions with
                 # BF16 cp.reduce.async.bulk adds, so the error scale is a few
                 # BF16 ULPs of the largest partial sum, not of each output
