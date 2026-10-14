@@ -112,6 +112,23 @@ __device__ __forceinline__ void load_tmem_x16(float* value, int address) {
         : "r"(address));
 }
 
+__device__ __forceinline__ void load_tmem_x16_uniform(
+    float* value, int address, int column_offset) {
+    // All 32 active lanes supply the same address. Keep the uniform REDUX
+    // result and the TMEM use in one PTX block: returning it through C++ can
+    // lower to a UR -> R -> UR round-trip. No TMEM-base-zero assumption.
+    asm volatile(
+        "{ .reg .u32 a; redux.sync.min.u32 a, %16, 0xffffffff; "
+        "add.u32 a, a, %17; "
+        "tcgen05.ld.sync.aligned.32x32b.x16.b32 "
+        "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [a]; }"
+        : "=f"(value[0]), "=f"(value[1]), "=f"(value[2]), "=f"(value[3]),
+          "=f"(value[4]), "=f"(value[5]), "=f"(value[6]), "=f"(value[7]),
+          "=f"(value[8]), "=f"(value[9]), "=f"(value[10]), "=f"(value[11]),
+          "=f"(value[12]), "=f"(value[13]), "=f"(value[14]), "=f"(value[15])
+        : "r"(address), "r"(column_offset));
+}
+
 __device__ __forceinline__ __nv_bfloat162 relu_bf16x2(float x, float y) {
     uint32_t packed;
     asm volatile("cvt.rn.relu.bf16x2.f32 %0, %1, %2;"
@@ -504,6 +521,14 @@ void indexer_score_prefill_kernel(
                 const int ready = static_cast<int>(
                     __cvta_generic_to_shared(&result_barrier[compute_group]));
                 wait_barrier(ready, task & 1);
+                // Capture the allocated base once per split instead of
+                // reloading it for every x16 TMEM load. Preserve the measured
+                // cluster path and all synchronization instructions.
+                const int epilogue_tmem_base = tmem_base;
+                int epilogue_tmem_address = 0;
+                if constexpr (kDenseCompactCausal)
+                    epilogue_tmem_address = epilogue_tmem_base +
+                        result_col(compute_group) + (tmem_row << 16);
                 #pragma unroll
                 for (int local_q = 0; local_q < kTileQ; ++local_q) {
                     __nv_bfloat162 sum_0 = __floats2bfloat162_rn(0.0f, 0.0f);
@@ -511,9 +536,16 @@ void indexer_score_prefill_kernel(
                     #pragma unroll
                     for (int head_base = 0; head_base < kHeads; head_base += 16) {
                         float value[16];
-                        const int address = tmem_base + result_col(compute_group) +
-                            local_q * kHeads + head_base + (tmem_row << 16);
-                        load_tmem_x16(value, address);
+                        if constexpr (kDenseCompactCausal) {
+                            load_tmem_x16_uniform(value, epilogue_tmem_address,
+                                                  local_q * kHeads + head_base);
+                        } else {
+                            const int address =
+                                (kClusterM == 1 ? epilogue_tmem_base : tmem_base) +
+                                result_col(compute_group) +
+                                local_q * kHeads + head_base + (tmem_row << 16);
+                            load_tmem_x16(value, address);
+                        }
                         asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                         if (local_q == kTileQ - 1 && head_base == kHeads - 16) {
                             // All TMEM values are in registers. Release the
