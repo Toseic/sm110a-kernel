@@ -140,6 +140,8 @@ from .kernels.fp8mxfp4_gemm import (
     fp8mxfp4_gemm,
     fp8mxfp4_gemm_out,
     fp8mxfp4_gemm_reference,
+    fp8mxfp4_gemm_scaled,
+    fp8mxfp4_gemm_scaled_out,
     from_blocked_fp8mxfp4_scales,
     quantize_fp8mxfp4_gemm,
     quantize_fp8mxfp4_weights,

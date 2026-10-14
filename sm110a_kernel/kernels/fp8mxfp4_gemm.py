@@ -122,6 +122,20 @@ class Fp8Mxfp4GemmModule:
             a, b, self._sfa(a), sfb, out, *self._args()
         )
 
+    def fp8mxfp4_gemm_scaled(self, a, b, sfa, sfb):
+        """Run with caller-provided blocked activation scales.
+
+        The original facade is intentionally convenient for already-scaled
+        E4M3 activations and supplies identity SFA internally.  Model runtimes
+        quantize BF16 activations dynamically, so they need to pass the real
+        K=32 blocked SFA to the same kernel.
+        """
+        return self._binding.fp8mxfp4_gemm(a, b, sfa, sfb, *self._args())
+
+    def fp8mxfp4_gemm_scaled_out(self, a, b, sfa, sfb, out):
+        """Out variant of :meth:`fp8mxfp4_gemm_scaled`."""
+        return self._binding.fp8mxfp4_gemm_out(a, b, sfa, sfb, out, *self._args())
+
 
 _JIT = SplitCudaJit(
     name="sm110a_fp8mxfp4_gemm",
@@ -308,3 +322,17 @@ def fp8mxfp4_gemm(a, b, sfb, config=None):
 
 def fp8mxfp4_gemm_out(a, b, sfb, out, config=None):
     return _compiled_facade(config or _default(a, b)).fp8mxfp4_gemm_out(a, b, sfb, out)
+
+
+def fp8mxfp4_gemm_scaled(a, b, sfa, sfb, config=None):
+    """E4M3 x MXFP4 GEMM with explicit blocked activation scales."""
+    return _compiled_facade(config or _default(a, b)).fp8mxfp4_gemm_scaled(
+        a, b, sfa, sfb
+    )
+
+
+def fp8mxfp4_gemm_scaled_out(a, b, sfa, sfb, out, config=None):
+    """Out variant of :func:`fp8mxfp4_gemm_scaled`."""
+    return _compiled_facade(config or _default(a, b)).fp8mxfp4_gemm_scaled_out(
+        a, b, sfa, sfb, out
+    )
