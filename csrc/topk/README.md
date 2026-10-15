@@ -7,7 +7,7 @@ step after the MXFP4 indexer score kernel.
 ```python
 from sm110a_kernel import compile_topk, topk, topk_out
 
-indices = topk(scores, 512)
+indices = topk(scores)  # K is fixed at 512
 
 # Precompile before CUDA graph capture; reuse the output buffer.
 module = compile_topk()
@@ -19,13 +19,13 @@ topk_out(scores, indices, 512)
 The API accepts:
 
 - `scores`: contiguous CUDA BF16 or FP32 `[Qlen, KVlen]`.
-- `k`: integer in `[0, KVlen]`.
+- `k`: defaults to 512; only 512 is supported. `KVlen` must be >= 512.
 - `out` for `topk_out`: contiguous CUDA INT32 `[Qlen, k]`, on the scores
   device, without aliasing scores.
 
-Empty query batches and K=0 are supported. Scores are unchanged; ties choose
+Empty query batches are supported. Scores are unchanged; ties choose
 smaller indices, signed zeros compare equal, and NaNs rank above +inf. The
-out entry point allocates no GPU memory and launches on the input device's
+out entry point allocates no GPU memory after autotune prewarming and launches on the input device's
 current CUDA stream.
 
 Decode scores `[B, KVlen]` can be passed directly. Flatten a contiguous
@@ -36,27 +36,120 @@ that producer leaves masked positions untouched. Top-K does not add a mask
 or KV-length metadata. If fewer than K unmasked entries exist, masked `-inf`
 positions fill the remaining slots; this API does not emit `-1` padding.
 
-## Naive implementation
+## Buffered radix implementation
 
-`src/topk_kernel.cu` implements the design in
-[`docs/note/.topk.design.md`](../../docs/note/.topk.design.md): one 256-thread
-CTA per row. The CTA finds the kth-largest score with 32 binary radix passes,
-then emits indices using block prefix scans. Output happens to follow input
-index order; consumers should rely only on unordered top-k semantics.
+`src/topk_kernel.cu` implements the full loop in
+[`docs/note/.topk.design.md`](../../docs/note/.topk.design.md), with a cluster
+of 1, 2, 4, or 8 256-thread CTAs per row. Each iteration reads 1024 scores and
+stably appends values above the threshold, carrying original indices.
+Before the first selection, all values participate, including `-inf`.
 
-This is the functional starting point for optimization. There is no
-autotuning, multi-CTA partitioning, or fusion with score production.
+Input uses a configurable ring of 2–8 shared-memory stages. The CTA primes
+multiple slots before processing and consumes them in input order. After
+filtering and any radix selection, it refills the consumed slot for the block
+`stages` positions ahead. Loads overlap computation through asynchronous
+copies; the compute threads also issue prefetches. There is no independent
+producer warp or per-stage free barrier.
+
+`compile_topk(stages=2, copy_engine="ldgsts")` selects a fixed JIT
+configuration. The default is two stages with LDGSTS. `copy_engine="tma"`
+enables single-thread 1D TMA bulk copies for full blocks of 16-byte-aligned
+rows, with one completion mbarrier per stage and phase tracking across reuse.
+This copy requires no tensor-map descriptor. Other blocks use LDGSTS:
+16-byte copies for aligned rows and 4-byte copies for other 4-byte-aligned
+rows. BF16 rows with only 2-byte alignment use ordinary loads into the ring.
+Tail copies are zero-filled and masked by logical row length.
+
+Input staging costs `stages * 1024 * sizeof(dtype)` bytes, in addition to the
+candidate buffer, scratch, and `stages * sizeof(uint64_t)` barrier storage.
+Larger configurations opt in to shared memory above the default 48 KiB block
+limit. Stage count and copy engine are JIT cache keys; prepare the desired
+module before CUDA graph capture.
+
+```bash
+# Compare identical workloads; shared benchmark logic locks GPC/EMC by default.
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_topk.py \
+  --baseline deepselect --stages 4 --copy-engine tma
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_topk.py \
+  --baseline deepselect --stages 4 --copy-engine ldgsts
+```
+
+### Mask filter
+
+Each thread owns four consecutive elements, retains them in registers, and
+builds a four-bit `uint32_t` mask. One CTA count scan assigns output ranges;
+`ffs` and `mask &= mask - 1` visit selected elements. BF16 uses packed
+`set.gtu.s32.bf16x2`, `prmt.b32`, and `dp4a.s32.s32`; FP32 compares monotonic
+keys. Tail bits are masked, NaNs rank first, and signed zeros tie. This is the
+only Filter implementation; `filter_mode` and `--filter-mode` were removed.
+
+### CGA split-K and autotuning
+
+`module.topk(scores, k, split_k=4)` and `topk_out(..., split_k=4)` fix the
+number of CTAs per row to 1, 2, 4, or 8. Each CTA streams a contiguous range
+of 1024-element input blocks and retains at most K local candidates. A binary
+tree merges these candidates within the cluster using distributed shared
+memory, compacting bounded chunks through the same radix device function.
+There is no global candidate workspace or second merge kernel. Empty
+partitions participate in synchronization; ties preserve smaller indices.
+Split 1 uses a normal CTA launch and has no cluster synchronization.
+
+The default `split_k=None` selects the fastest valid split with
+`AutotuneRunner` and cold-L2 CUDA event timings. The cache key includes device,
+shape, dtype, input alignment, stages, and copy engine. K is fixed at 512;
+a dedicated tuning namespace keeps earlier variable-K choices separate. Candidates that
+would have empty input partitions are excluded from tuning; explicit splits
+still support them. Results use the shared persistent cache plus a module
+memory cache. First-time tuning allocates eviction and optional output
+buffers. After prewarming, `topk_out` allocates no GPU memory.
+
+Before CUDA graph capture, prewarm the same shape with `topk_out`, or specify
+an explicit split. `module.select_split_k(scores, k, out, options=TuneOptions(...))`
+exposes runner options. Benchmark selection uses common clock locking,
+cache controls, and L2 eviction. Selected splits appear in logs and each JSON
+result; timing uses a fixed selected split outside the runner.
+
+```bash
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_topk.py \
+  --baseline deepselect --force-sweep-ours --json reports/topk_split_auto.json
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_topk.py \
+  --baseline deepselect --split-k 8 --json reports/topk_split8.json
+```
+
+### Candidate selection
+
+K is a CUDA compile-time constant of 512; candidates live in shared memory. When their count reaches
+K+1024, the device function `radixselectTopk` selects the K largest candidates
+using four 8-bit histogram passes, compacts values and indices in place, and
+returns the kth-largest value as the new threshold. A final selection handles
+the tail. Later values equal to the threshold are discarded because retained
+ties have smaller original indices. The buffer reserves K+2048 entries to
+cover an entire block append before compaction.
+
+`radixselectTopk` and its scratch storage are local to the `.cu` file. CTA
+prefix sums use warp shuffles and shared memory; there is no CUB dependency.
+Each warp scans the eight warp totals in registers, requiring two CTA
+barriers per prefix sum. Histogram selection reuses its bucket-publication barrier to
+protect scan scratch, requiring only one barrier inside that scan. In-place
+compaction publishes output once at the end rather than after every tile.
+The primitive takes a runtime candidate count so it also handles partial
+final blocks. Compaction is safe in place because each tile loads its values
+and indices into registers before writing earlier output positions.
+
 `src/topk_torch_binding.cpp` validates tensors and launches the kernel;
 `sm110a_kernel/kernels/topk.py` owns the split CUDA JIT and Python facade.
+Output follows input index order; consumers should rely only on unordered
+Top-K semantics. FP32/BF16 support, NaN ordering, signed-zero ties, allocation
+behavior, and stream/graph contracts are unchanged.
 
 ## Benchmark
 
 All correctness checks live in `benchmarks/benchmark_topk.py`. The default
-run executes 31 naive contract check groups, then checks every measured
+run executes 29 radix contract check groups, then checks every measured
 implementation for exact selected-value multisets, distinct indices, and
 index bounds. Tie positions may differ between implementations.
 
-The contract checks cover odd widths, K=0/1/KVlen, empty rows, ties, masks,
+The contract checks cover odd widths, KVlen=512, empty rows, ties, masks,
 infinities, NaNs, signed zeros, invalid inputs, a nondefault stream, and CUDA
 graph replay. `--check-only` runs these checks without timing or loading
 baselines; `--no-accuracy` skips correctness checks.
@@ -67,11 +160,11 @@ The default sweep is:
 |---|---|
 | Qlen | 1, 8, 64, 256 |
 | KVlen | 4096, 16384, 65536, 131072 |
-| K | 128, 512, 1024 |
+| K | 512 |
 | dtype | BF16, FP32 |
 | Distribution | normal |
 
-This gives 96 configurations and 432 implementation measurements with all
+This gives 32 configurations and 144 implementation measurements with all
 baselines enabled. L2 eviction runs before every measured invocation, outside
 the CUDA event pair. Compilation, allocations, and initialization occur
 before timing. Default performance comparisons use cold L2.
@@ -87,7 +180,7 @@ before timing. Default performance comparisons use cold L2.
 
 # Adversarial distributions.
 /home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_topk.py \
-  --q-lens 1 8 --kv-lens 4096 --topks 128 1024 --dtypes bf16 fp32 \
+  --q-lens 1 8 --kv-lens 4096 --topks 512 --dtypes bf16 fp32 \
   --distributions ties constant ascending masked spikes
 ```
 
@@ -95,8 +188,8 @@ Use `--baseline none|torch|gvr-v2|deepselect|all` to select baselines (`all`
 is the default). `--seed` controls input generation; `--json` exports device,
 source revisions, workload/configuration metadata, accuracy status, and
 min/median/max timing statistics. `--no-lock-clocks` leaves clocks unchanged.
-The reported speedup is naive time divided by the measured implementation's
-time, or `score+naive` time divided by chain time for producer chains.
+The reported speedup is radix time divided by the measured implementation's
+time, or `score+radix` time divided by chain time for producer chains.
 
 ## Baselines
 
@@ -127,7 +220,7 @@ Set `--deepselect-root` for another checkout; no global package installation
 is required after an in-place build.
 
 GVR's NaN selection differs from Torch, and DeepSelect's NaN check aborts by
-default. NaN contract checks exercise only naive; measured distributions
+default. NaN contract checks exercise only radix; measured distributions
 contain no NaNs.
 
 ### Building DeepSelect on Thor
@@ -178,7 +271,96 @@ state left by score production. Chains include necessary conversion/padding
 copies. Top-K checks compare with Torch on produced scores; indexer numerical
 accuracy is covered by its own benchmarks.
 
+## Current K=512 sweep after rollback
+
+2026-10-15, all 32 default workloads completed with stages=2, LDGSTS,
+cooperative 256-thread prefetch, and freshly autotuned split-K. Common
+benchmark logic locked GPC=1575 MHz / EMC=4266 MHz and used cold L2 with a
+64 MiB dirty write-flush. Seed=1234, normal inputs, warmup=3, iters=10,
+samples=5. This performance sweep used `--no-accuracy`.
+
+| dtype | current / DeepSelect time | speedup vs producer/consumer |
+|---|---:|---:|
+| BF16 | 2.669× | 1.209× |
+| FP32 | 1.919× | 1.183× |
+| All | 2.263× | 1.196× |
+
+Ratios are geometric means; producer/consumer comparisons use separate runs
+with the same measurement settings. All 32 workloads remain slower than
+DeepSelect. Split=1/2/4/8 is selected for 16/6/6/4 workloads respectively.
+
+```bash
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_topk.py \
+  --baseline deepselect --no-accuracy --force-sweep-ours --debug \
+  --json reports/topk512_rollback_sweep.json
+```
+
+Full results and candidate timings are in ignored `reports/`:
+`topk512_rollback_sweep.md`, `topk512_rollback_sweep.json`, and
+`topk512_rollback_sweep.log`.
+
+## Reverted producer/consumer experiment
+
+2026-10-15, NVIDIA Thor. Compared against the former cooperative pipeline
+with **K=512 as a compile-time constant in both versions**. Each sweep covers
+32 default workloads, with split-K freshly autotuned. GPU runs are serial,
+GPC=1575 MHz / EMC=4266 MHz locked, cold L2 with 64 MiB dirty write-flush,
+warmup=3, iters=10, samples=5, normal inputs, seed=1234. This measurement used
+`--no-accuracy`.
+
+| Copy engine | Stages | Before/after time (speedup) | Faster workloads |
+|---|---:|---:|---:|
+| LDGSTS | 2 | 0.832× | 1/32 |
+| LDGSTS | 8 | 0.932× | 13/32 |
+| TMA | 2 | 0.990× | 15/32 |
+| TMA | 8 | 1.003× | 19/32 |
+
+The independent producer provides no stable overall gain in this sweep.
+LDGSTS takes about 20% longer with two stages and 7% longer with eight;
+TMA stays approximately unchanged. Matching split-K candidate comparisons
+also show the LDGSTS regression. The full report includes commands, per-case
+medians, split choices, and source snapshots in ignored `reports/`:
+`topk_pc_comparison.md`, `topk_{before_pc,pc}_{ldgsts,tma}_s{2,8}.json/.log`,
+and `topk_pc_ab_sources/`. The prior implementation was restored only in a
+temporary directory for comparison. The producer/consumer experiment has
+been reverted; the workspace now uses the cooperative prefetch pipeline.
+
+## Previous variable-K split-K sweep
+
+These historical results predate fixing K=512; they include K=128/512/1024.
+
+2026-10-15, NVIDIA Thor, stages=2, LDGSTS, mask filter, normal inputs,
+seed=1234. The full default 96-workload sweep remeasured split-K choices
+1/2/4/8. Common benchmark logic locked GPC=1575 MHz / EMC=4266 MHz and used
+cold L2 with 64 MiB dirty write-flush. Warmup=3, iters=10, samples=5.
+This performance run used `--no-accuracy`; no correctness checks were run.
+
+| dtype | speedup vs previous fixed-split mask | current / DeepSelect time |
+|---|---:|---:|
+| BF16 | 1.162× | 2.762× |
+| FP32 | 1.200× | 1.996× |
+| All | 1.181× | 2.348× |
+
+Ratios are geometric means. The old-mask comparison uses separate runs with
+the same clock/cache/timing settings. All 96 current workloads remain slower
+than DeepSelect. Qlen=1 and Qlen=8 improve by 1.434× and 1.280×; Qlen=256
+selects split=1 for every workload. Overall split choices are
+1:47, 2:19, 4:17, 8:13 workloads.
+
+```bash
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_topk.py \
+  --baseline deepselect --no-accuracy --force-sweep-ours --debug \
+  --json reports/topk_split_sweep.json
+```
+
+Local artifacts in ignored `reports/`: `topk_split_sweep.json`,
+`topk_split_sweep.log` (including candidate timings), and
+`topk_split_sweep.md` (all 96 rows and split choices).
+
 ## Thor measurements
+
+These historical results measure the former naive implementation, before the
+buffered radix replacement described above.
 
 Measured on NVIDIA Thor (SM110a), 2026-10-14, seed 1234, cold L2 with a 64 MiB
 dirty write-flush buffer and unlocked clocks (`--no-lock-clocks`). Source
@@ -224,6 +406,6 @@ ignored `reports/` directory: `topk_all_deepselect_full_sm110a.json`,
 # Reproduce the memory check.
 compute-sanitizer --tool memcheck --error-exitcode 1 \
   /home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_topk.py \
-  --baseline deepselect --q-lens 1 8 --kv-lens 513 8193 --topks 129 \
+  --baseline deepselect --q-lens 1 8 --kv-lens 513 8193 --topks 512 \
   --dtypes bf16 fp32 --warmup 0 --iters 1 --samples 1 --no-lock-clocks
 ```

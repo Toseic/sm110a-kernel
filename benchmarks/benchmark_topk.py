@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cold-L2 exact top-k: naive vs Torch, TRT-LLM GVR v2, and DeepSelect."""
+"""Cold-L2 exact top-k: radix vs Torch, TRT-LLM GVR v2, and DeepSelect."""
 
 import argparse
 import importlib
@@ -7,6 +7,7 @@ import itertools
 import json
 import subprocess
 import sys
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -32,24 +33,16 @@ def check_topk(scores, indices, k):
     torch.testing.assert_close(actual, expected, atol=0, rtol=0, equal_nan=True)
 
 
-def run_contract_checks(module):
-    """Untimed naive-kernel checks, including shapes outside GVR's contract."""
+def run_contract_checks(module, split_k=None):
+    """Untimed radix-kernel checks, including shapes outside GVR's contract."""
+    topk = partial(module.topk, split_k=split_k)
+    topk_out = partial(module.topk_out, split_k=split_k)
     cases = 0
     for dtype in (torch.float32, torch.bfloat16):
-        for n, k in (
-            (1, 1),
-            (31, 7),
-            (257, 1),
-            (513, 129),
-            (4096, 1024),
-            (1025, 1025),
-            (131072, 512),
-            (0, 0),
-            (11, 0),
-        ):
+        for n, k in ((512, 512), (513, 512), (1025, 512), (131072, 512)):
             scores = torch.randn(3, n, device="cuda", dtype=dtype)
             before = scores.clone()
-            check_topk(scores, module.topk(scores, k), k)
+            check_topk(scores, topk(scores, k), k)
             torch.testing.assert_close(scores, before)
             cases += 1
         for kind in ("ties", "constant", "masked", "special", "ascending"):
@@ -64,35 +57,62 @@ def run_contract_checks(module):
                     device="cuda",
                     dtype=dtype,
                 )
-            out = torch.full((3, 257), -1, device="cuda", dtype=torch.int32)
-            assert module.topk_out(scores, out, 257).data_ptr() == out.data_ptr()
-            check_topk(scores, out, 257)
+            out = torch.full((3, 512), -1, device="cuda", dtype=torch.int32)
+            assert topk_out(scores, out, 512).data_ptr() == out.data_ptr()
+            check_topk(scores, out, 512)
             if kind == "constant":
                 torch.testing.assert_close(
                     out,
-                    torch.arange(257, device="cuda", dtype=torch.int32).expand(3, -1),
+                    torch.arange(512, device="cuda", dtype=torch.int32).expand(3, -1),
                 )
             cases += 1
+    # Exercise filtering after the first candidate prune, including packed
+    # BF16 comparisons near zero and the NaN threshold special case.
+    for dtype in (torch.float32, torch.bfloat16):
+        for kind in ("late_nan", "nan_threshold", "subnormal", "signed_zero"):
+            n, k = 4097, 512
+            scores = torch.zeros(3, n, device="cuda", dtype=dtype)
+            if kind == "late_nan":
+                scores[:, 2048::17] = torch.nan
+                scores[:, 2049::19] = torch.inf
+            elif kind == "nan_threshold":
+                scores[:, :2048] = torch.nan
+                scores[:, 2048:] = torch.inf
+            elif kind == "subnormal":
+                pattern = (torch.arange(n, device="cuda") % 31 - 15).float() * (
+                    2.0**-133
+                )
+                scores.copy_(pattern.to(dtype).expand_as(scores))
+            else:
+                scores[:, ::2] = -0.0
+                scores[:, 2048::3] = 2.0**-133
+            actual = topk(scores, k)
+            check_topk(scores, actual, k)
+            expected = scores.float().argsort(dim=1, descending=True, stable=True)[
+                :, :k
+            ]
+            torch.testing.assert_close(actual, expected.sort(dim=1).values.int())
+            cases += 1
     check_topk(
-        torch.empty(0, 10, device="cuda"),
-        module.topk(torch.empty(0, 10, device="cuda"), 3),
-        3,
+        torch.empty(0, 512, device="cuda"),
+        topk(torch.empty(0, 512, device="cuda"), 512),
+        512,
     )
     cases += 1
     scores = torch.randn(5, 513, device="cuda", dtype=torch.bfloat16)
-    out = torch.empty(5, 67, device="cuda", dtype=torch.int32)
+    out = torch.empty(5, 512, device="cuda", dtype=torch.int32)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        module.topk_out(scores, out, 67)
+        topk_out(scores, out, 512)
     torch.cuda.current_stream().wait_stream(stream)
-    check_topk(scores, out, 67)
+    check_topk(scores, out, 512)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        module.topk_out(scores, out, 67)
+        topk_out(scores, out, 512)
     scores.normal_()
     graph.replay()
-    check_topk(scores, out, 67)
+    check_topk(scores, out, 512)
     cases += 1
 
     def rejected(fn):
@@ -102,18 +122,18 @@ def run_contract_checks(module):
             return
         raise AssertionError("invalid input was accepted")
 
-    x = torch.randn(3, 17, device="cuda")
+    x = torch.randn(3, 512, device="cuda")
     for bad in (x.cpu(), x.to(torch.float16), x.t(), x.flatten()):
-        rejected(lambda: module.topk(bad, 3))
-    for k in (-1, 18):
-        rejected(lambda: module.topk(x, k))
+        rejected(lambda: topk(bad, 512))
+    for k in (-1, 0, 128, 1024):
+        rejected(lambda: topk(x, k))
     for bad_out in (
-        torch.empty(3, 3, device="cuda", dtype=torch.int64),
-        torch.empty(3, 4, device="cuda", dtype=torch.int32),
-        torch.empty(3, 3, dtype=torch.int32),
+        torch.empty(3, 512, device="cuda", dtype=torch.int64),
+        torch.empty(3, 513, device="cuda", dtype=torch.int32),
+        torch.empty(3, 512, dtype=torch.int32),
     ):
-        rejected(lambda: module.topk_out(x, bad_out, 3))
-    rejected(lambda: module.topk_out(x, x.view(torch.int32), 17))
+        rejected(lambda: topk_out(x, bad_out, 512))
+    rejected(lambda: topk_out(x, x.view(torch.int32), 512))
     torch.cuda.synchronize()
     print(
         f"Contract checks: {cases + 1} groups passed (boundaries, ties, special values, stream, graph, validation)"
@@ -250,7 +270,7 @@ class TopKBenchmark(BenchmarkBase):
         p.add_argument(
             "--kv-lens", type=int, nargs="+", default=(4096, 16384, 65536, 131072)
         )
-        p.add_argument("--topks", type=int, nargs="+", default=(128, 512, 1024))
+        p.add_argument("--topks", type=int, nargs="+", choices=(512,), default=(512,))
         p.add_argument(
             "--dtypes", nargs="+", choices=("bf16", "fp32"), default=("bf16", "fp32")
         )
@@ -280,12 +300,26 @@ class TopKBenchmark(BenchmarkBase):
             "--deepselect-root", type=Path, default=ROOT / "baselinedir/DeepSelect"
         )
         p.add_argument("--json", type=Path, help="save results and source revision")
+        p.add_argument(
+            "--split-k",
+            type=int,
+            choices=(1, 2, 4, 8),
+            default=None,
+            help="CTAs per row; default autotunes 1/2/4/8 with the shared runner",
+        )
+        p.add_argument("--stages", type=int, choices=range(2, 9), default=2)
+        p.add_argument("--copy-engine", choices=("tma", "ldgsts"), default="ldgsts")
         p.add_argument("--seed", type=int, default=1234)
         p.add_argument("--no-accuracy", action="store_true")
         p.add_argument(
             "--check-only",
             action="store_true",
-            help="run all naive contract checks without timing or baselines",
+            help="run all radix contract checks without timing or baselines",
+        )
+        self.add_cache_args(p)
+        p.add_argument("--cache-path", type=Path)
+        p.add_argument(
+            "--debug", action="store_true", help="show each autotune candidate timing"
         )
         self.add_timing_args(p, warmup=3, iters=10, samples=5)
         return p
@@ -297,6 +331,8 @@ class TopKBenchmark(BenchmarkBase):
             raise SystemExit("dimensions and topks must be positive")
         if any(k > n for k, n in itertools.product(args.topks, args.kv_lens)):
             raise SystemExit("every topk must be <= every KV length")
+        if any(k != 512 for k in args.topks):
+            raise SystemExit("radix TopK is fixed at 512")
         if args.baseline in ("gvr-v2", "all") and any(n % 4 for n in args.kv_lens):
             raise SystemExit("GVR v2 requires KV length divisible by 4")
         if args.baseline in ("deepselect", "all"):
@@ -317,9 +353,9 @@ class TopKBenchmark(BenchmarkBase):
 
     def run_with_args(self, args):
         torch.manual_seed(args.seed)
-        module = compile_topk()
+        module = compile_topk(stages=args.stages, copy_engine=args.copy_engine)
         if not args.no_accuracy:
-            run_contract_checks(module)
+            run_contract_checks(module, args.split_k)
         if args.check_only:
             return
         gvr = load_gvr(args.trtllm_root) if args.baseline in ("gvr-v2", "all") else None
@@ -368,7 +404,15 @@ class TopKBenchmark(BenchmarkBase):
                 else None
             )
             out = torch.empty((rows, k), device="cuda", dtype=torch.int32)
-            cases = [("naive", lambda: module.topk_out(scores, out, k), out)]
+            split_k = args.split_k
+            if split_k is None:
+                split_k = module.select_split_k(
+                    scores, k, out, options=self.make_tune_options(args)
+                )
+            print(f"[topk] Q={rows} N={n} K={k} {dtype_name}: split_k={split_k}")
+            cases = [
+                ("radix", lambda: module.topk_out(scores, out, k, split_k=split_k), out)
+            ]
             if args.baseline in ("torch", "all"):
                 values = torch.empty((rows, k), device="cuda", dtype=dtype)
                 torch_out = torch.empty((rows, k), device="cuda", dtype=torch.int64)
@@ -420,7 +464,7 @@ class TopKBenchmark(BenchmarkBase):
                         select()
 
                     cases.append(("score+" + name, chain, indices))
-            naive_us = None
+            radix_us = None
             for name, fn, indices in cases:
                 # Compile, allocate lazy state, and validate outside timed regions.
                 fn()
@@ -435,8 +479,8 @@ class TopKBenchmark(BenchmarkBase):
                     cold_l2_flush=args._cold_l2_flush,
                 )
                 us = stats["median_ms"] * 1000
-                if name in ("naive", "score+naive"):
-                    naive_us = us
+                if name in ("radix", "score+radix"):
+                    radix_us = us
                 row = dict(
                     q_len=rows,
                     kv_len=n,
@@ -444,6 +488,7 @@ class TopKBenchmark(BenchmarkBase):
                     dtype=dtype_name,
                     distribution=dist,
                     score_source=args.score_source,
+                    split_k=split_k,
                     implementation=name,
                     accuracy="skipped" if args.no_accuracy else "passed",
                     **stats,
@@ -458,7 +503,7 @@ class TopKBenchmark(BenchmarkBase):
                     name,
                     f"{us:.3f}",
                     f"{stats['min_ms'] * 1000:.3f}",
-                    f"{naive_us / us:.2f}x",
+                    f"{radix_us / us:.2f}x",
                 )
         if args.json:
             args.json.parent.mkdir(parents=True, exist_ok=True)
@@ -466,6 +511,9 @@ class TopKBenchmark(BenchmarkBase):
                 json.dumps(
                     dict(
                         device=torch.cuda.get_device_name(),
+                        stages=args.stages,
+                        split_k=args.split_k,
+                        copy_engine=args.copy_engine,
                         trtllm_revision=revision,
                         deepselect_revision=deepselect_revision,
                         cold_l2=args.cold_l2,
