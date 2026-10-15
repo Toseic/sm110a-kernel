@@ -172,11 +172,25 @@ __device__ __forceinline__ float radixselectTopk(
         float value[Items];
         int32_t index[Items];
         unsigned equals = 0, greater = 0;
+        const int first = base + threadIdx.x * Items;
+        if (first + Items <= count) {
+            // Four adjacent words per lane: wide shared loads avoid the
+            // four-way bank conflicts of four separate strided word loads.
+            const float4 v = *reinterpret_cast<const float4 *>(values + first);
+            const int4 ix = *reinterpret_cast<const int4 *>(indices + first);
+            value[0] = v.x; value[1] = v.y; value[2] = v.z; value[3] = v.w;
+            index[0] = ix.x; index[1] = ix.y; index[2] = ix.z; index[3] = ix.w;
+        } else {
+#pragma unroll
+            for (int item = 0; item < Items; ++item) {
+                const int i = first + item;
+                value[item] = i < count ? values[i] : 0.f;
+                index[item] = i < count ? indices[i] : 0;
+            }
+        }
 #pragma unroll
         for (int item = 0; item < Items; ++item) {
-            const int i = base + threadIdx.x * Items + item;
-            value[item] = i < count ? values[i] : 0.f;
-            index[item] = i < count ? indices[i] : 0;
+            const int i = first + item;
             const uint32_t v = key(value[item]);
             equals |= unsigned(i < count && v == selection.threshold_key) << item;
             greater |= unsigned(i < count && v > selection.threshold_key) << item;
@@ -265,8 +279,10 @@ __device__ __forceinline__ uint32_t packed_mask(
     if (threshold == 0xffffffffu)
         return 0;
     const uint32_t float_bits = threshold ^ ((threshold & 0x80000000u) ? 0x80000000u : 0xffffffffu);
-    const uint32_t half = __bfloat16_as_ushort(__float2bfloat16(__uint_as_float(float_bits)));
-    const uint32_t pair_threshold = half | (half << 16);
+    // The selected threshold is an exact BF16 expansion; its upper half is
+    // already the BF16 encoding. Avoid a redundant FP32-to-BF16 conversion.
+    uint32_t pair_threshold;
+    asm("prmt.b32 %0, %1, %1, 0x3232;" : "=r"(pair_threshold) : "r"(float_bits));
     uint32_t cmp01, cmp23, bytes, mask;
     // Unordered greater includes candidate NaNs, matching the public ordering.
     asm("set.gtu.s32.bf16x2 %0, %1, %2;" : "=r"(cmp01) : "r"(data.x), "r"(pair_threshold));
@@ -298,11 +314,14 @@ __device__ __forceinline__ int filter_mask(
         (have_threshold ? packed_mask(data, threshold, input) : 15u) & ((1u << valid) - 1u);
     const ScanResult scan = block_scan<true, true>(__popc(mask), s);
     int destination = count + scan.rank;
-    while (mask) {
-        const int bit = __ffs(mask) - 1;
-        values[destination] = packed_value(data, bit, input);
-        indices[destination++] = int32_t(base + offset + bit);
-        mask &= mask - 1u;
+    // Constant item indices eliminate the bit-scan loop and dynamic packed
+    // extraction. Ascending stores preserve stable ordering within a thread.
+#pragma unroll
+    for (int bit = 0; bit < 4; ++bit) {
+        if (mask & (1u << bit)) {
+            values[destination] = packed_value(data, bit, input);
+            indices[destination++] = int32_t(base + offset + bit);
+        }
     }
     return count + scan.total;
 }
@@ -407,7 +426,7 @@ __global__ void topk_buffered(
     __shared__ int retained;
     __shared__ __align__(16) T input[Stages][Block];
     __shared__ __align__(8) uint64_t ready[Stages];
-    extern __shared__ uint32_t buffer[];
+    extern __shared__ __align__(16) uint32_t buffer[];
     // Before an append count < k+B2; one block can add at most Block entries.
     constexpr int capacity = k + B2 + Block;
     float *values = reinterpret_cast<float *>(buffer);

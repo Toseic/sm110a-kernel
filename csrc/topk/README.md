@@ -78,7 +78,8 @@ module before CUDA graph capture.
 
 Each thread owns four consecutive elements, retains them in registers, and
 builds a four-bit `uint32_t` mask. One CTA count scan assigns output ranges;
-`ffs` and `mask &= mask - 1` visit selected elements. BF16 uses packed
+four unrolled, predicated stores visit selected elements in index order.
+BF16 broadcasts the exact threshold's upper two bytes with `prmt.b32`, then uses packed
 `set.gtu.s32.bf16x2`, `prmt.b32`, and `dp4a.s32.s32`; FP32 uses unordered
 floating greater-than without FTZ, avoiding per-element key generation.
 A NaN threshold keeps no later candidates. Tail bits are masked, NaNs rank first, and signed zeros tie. This is the
@@ -134,7 +135,8 @@ there is no CUB dependency.
 BF16 candidates are exact FP32 expansions, so two high-byte passes determine
 the entire key; the low half is reconstructed, including negative values and
 canonical NaNs. Compaction reads four adjacent candidates per thread into
-registers, packs equal/greater counts into two 11-bit fields, and scans once
+registers using aligned 128-bit shared loads for complete groups (scalar
+loads for the tail), packs equal/greater counts into two 11-bit fields, and scans once
 per 1024 candidates. Each thread emits its selected candidates in input order,
 preserving stable ties. General shuffle scans handle these packed counts;
 filter counts use three ballot bit planes with `popc` and `%lanemask_le`. General histogram counts use shuffle prefix steps with the
@@ -283,7 +285,16 @@ state left by score production. Chains include necessary conversion/padding
 copies. Top-K checks compare with Torch on produced scores; indexer numerical
 accuracy is covered by its own benchmarks.
 
-## Current four-candidate compaction sweep
+## Instruction optimization
+
+The 2026-10-15 SASS/PTX review retains unrolled filter stores, aligned
+128-bit candidate loads, and a single `prmt.b32` for the BF16 threshold
+broadcast. Fixed-configuration cold-L2 measurements improve the 12 normal
+workloads by 1.036x geometrically, with larger gains on long rows.
+See [instruction optimization analysis](instruction_optimization.md) for
+SASS evidence, PTX references, measurements, rejected experiments, and commands.
+
+## Previous four-candidate compaction sweep
 
 2026-10-15, relative to `813de09`, two complete 32-case cold-L2 sweeps measured
 1.066x and 1.064x geometric mean speedups. The final repeat gives BF16 1.068x,
