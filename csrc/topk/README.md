@@ -129,15 +129,17 @@ ties have smaller original indices. The buffer reserves K+2048 entries to
 cover an entire block append before compaction.
 
 `radixselectTopk` and its scratch storage are local to the `.cu` file. CTA
-prefix sums use warp shuffles and shared memory; there is no CUB dependency.
+prefix sums use ballot/popcount, warp reductions, shuffles and shared memory;
+there is no CUB dependency.
 BF16 candidates are exact FP32 expansions, so two high-byte passes determine
 the entire key; the low half is reconstructed, including negative values and
 canonical NaNs. Compaction packs the equal/greater boolean counts into two
 9-bit fields of one integer scan, preserving stable tie order while removing
-one scan and two barriers per tile. Shuffle prefix steps use the hardware
-validity predicate to avoid a separate select instruction.
-Each warp scans the eight warp totals in registers, requiring two CTA
-barriers per prefix sum. Histogram selection reuses its bucket-publication barrier to
+one scan and two barriers per tile. Boolean compaction uses two ballot bit
+planes and filter counts use three, with `popc` and `%lanemask_le` computing
+warp prefixes. General histogram counts use shuffle prefix steps with the
+hardware validity predicate. Each warp uses `redux.sync.add` for the total
+and for the sum of preceding warps, requiring two CTA barriers per prefix sum. Histogram selection reuses its bucket-publication barrier to
 protect scan scratch, requiring only one barrier inside that scan. In-place
 compaction publishes output once at the end rather than after every tile.
 The primitive takes a runtime candidate count so it also handles partial
@@ -281,7 +283,53 @@ state left by score production. Chains include necessary conversion/padding
 copies. Top-K checks compare with Torch on produced scores; indexer numerical
 accuracy is covered by its own benchmarks.
 
-## Current compute optimization sweep
+## Current scan optimization sweep
+
+2026-10-15, relative to commit `732ba82`, two full 32-case cold-L2 sweeps
+with split-K autotuning measured 1.076x and 1.067x geometric mean speedups.
+The final repeat gives BF16 1.075x (16/16 faster), FP32 1.059x (15/16 faster),
+and 31/32 faster overall; the remaining case regresses 0.5%. Configuration:
+stage-2 LDGSTS, K=512, normal inputs, seed=1234, GPC=1575 MHz/EMC=4266 MHz,
+64 MiB dirty L2 eviction, warmup=3, iters=10, samples=5.
+
+Retained changes use `redux.sync.add.s32` for warp-total reductions and
+`vote.sync.ballot`/`popc`/`%lanemask_le` for the bounded compaction and filter
+prefixes. PTX ISA 9.4 sections 9.7.15.13, 9.7.15.10, 9.7.1.15 and 10.19
+in `docs/ptx-isa-9.4/` describe these operations. Reduction does not replace
+the ordered general histogram scan. The filter-only increment was smaller:
+1.008x overall relative to the reduction + compaction-ballot version.
+The autotune namespace is `topk512_cga_mask_scan_v3`.
+
+Accuracy passed 192/192 shape/distribution cases and 29 contract groups for
+each split-k=1/2/4/8 with stage-2 LDGSTS and stage-8 TMA, both before and
+after the scan changes. These include tails, stable ties, special values,
+streams and CUDA Graphs. The final timed sweep also enabled accuracy.
+
+NCU/SASS confirms REDUX, VOTE and POPC with no spills. At Q=256,N=131072,
+split=1, `smsp__average_warps_issue_stalled_short_scoreboard_per_issue_active.ratio`
+fell from 2.658 to 1.215 (BF16) and 2.554 to 1.166 (FP32). Dynamic warp
+instruction counts increased 5.84%/2.58%; the benefit is a shorter dependency
+chain, and total instruction count alone does not predict performance.
+At Q=1,N=131072,BF16,split=8, short-scoreboard fell 2.879 to 1.808.
+Barrier stalls remain significant. NCU replay durations are diagnostic,
+not benchmark timings.
+
+```bash
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_topk.py \
+  --baseline deepselect --force-sweep-ours \
+  --json /tmp/topk-scan-opt/final_sweep.json
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_topk.py \
+  --baseline none --distributions normal ties constant ascending masked spikes \
+  --warmup 0 --iters 1 --samples 1 \
+  --json /tmp/topk-scan-opt/accuracy_after.json
+```
+
+Detailed A/B, full tables, accuracy logs and commands:
+`/tmp/topk-scan-opt/results.md`. Source snapshots and JSON are alongside it.
+NCU reports, raw/source CSVs, resource usage and SASS:
+`/tmp/ncu-reports/topk_scan*`. These artifacts are temporary and not committed.
+
+## Previous compute optimization sweep
 
 2026-10-15, two complete 32-workload sweeps of the optimized kernel, compared
 with a freshly measured pre-optimization baseline. All runs used stages=2,

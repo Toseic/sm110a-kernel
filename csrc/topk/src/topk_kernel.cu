@@ -52,35 +52,55 @@ struct ScanResult {
     int total;
 };
 
-// Each warp scans the eight warp totals in registers. ProtectReuse=false is
+// Each warp reduces the eight warp totals in registers. ProtectReuse=false is
 // valid only when the caller supplies a barrier before the next scratch write.
-template <bool ProtectReuse = true>
+template <bool ProtectReuse = true, bool BooleanPair = false, bool CountFour = false>
 __device__ __forceinline__ ScanResult block_scan(
     int value,
     RadixStorage &s) {
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
-    int sum = value;
+    int sum;
+    // BooleanPair packs two booleans at bits 0/9; CountFour is in [0, 4].
+    // Ballot bit planes avoid the five dependent shuffle/add steps.
+    if constexpr (BooleanPair) {
+        unsigned inclusive_lanes;
+        asm("mov.u32 %0, %%lanemask_le;" : "=r"(inclusive_lanes));
+        const unsigned equal = __ballot_sync(FullWarp, value & 1);
+        const unsigned greater = __ballot_sync(FullWarp, value & 512);
+        sum = __popc(equal & inclusive_lanes) |
+            (__popc(greater & inclusive_lanes) << 9);
+    } else if constexpr (CountFour) {
+        unsigned inclusive_lanes;
+        asm("mov.u32 %0, %%lanemask_le;" : "=r"(inclusive_lanes));
+        sum = 0;
 #pragma unroll
-    for (int offset = 1; offset < 32; offset *= 2) {
-        asm("{ .reg .pred p; .reg .b32 other;\n"
-            "shfl.sync.up.b32 other|p, %0, %1, 0, 0xffffffff;\n"
-            "@p add.s32 %0, %0, other; }"
-            : "+r"(sum) : "r"(offset));
+        for (int bit = 0; bit < 3; ++bit) {
+            const unsigned plane = __ballot_sync(FullWarp, value & (1 << bit));
+            sum += __popc(plane & inclusive_lanes) << bit;
+        }
+    } else {
+        sum = value;
+#pragma unroll
+        for (int offset = 1; offset < 32; offset *= 2) {
+            asm("{ .reg .pred p; .reg .b32 other;\n"
+                "shfl.sync.up.b32 other|p, %0, %1, 0, 0xffffffff;\n"
+                "@p add.s32 %0, %0, other; }"
+                : "+r"(sum) : "r"(offset));
+        }
     }
     if (lane == 31)
         s.warp_sums[warp] = sum;
     __syncthreads();
-    int warp_sum = lane < Threads / 32 ? s.warp_sums[lane] : 0;
-#pragma unroll
-    for (int offset = 1; offset < Threads / 32; offset *= 2) {
-        asm("{ .reg .pred p; .reg .b32 other;\n"
-            "shfl.sync.up.b32 other|p, %0, %1, 0, 0xffffffff;\n"
-            "@p add.s32 %0, %0, other; }"
-            : "+r"(warp_sum) : "r"(offset));
-    }
-    const int preceding = __shfl_sync(FullWarp, warp_sum, warp ? warp - 1 : 0);
-    const int total = __shfl_sync(FullWarp, warp_sum, Threads / 32 - 1);
+    const int warp_sum = lane < Threads / 32 ? s.warp_sums[lane] : 0;
+    int preceding, total;
+    // Every warp uses the same full member mask; zero unwanted inputs
+    // instead of using a per-lane reduction mask (which would be invalid).
+    const int preceding_value = lane < warp ? warp_sum : 0;
+    asm("redux.sync.add.s32 %0, %1, 0xffffffff;"
+        : "=r"(total) : "r"(warp_sum));
+    asm("redux.sync.add.s32 %0, %1, 0xffffffff;"
+        : "=r"(preceding) : "r"(preceding_value));
     const ScanResult result = {sum - value + (warp ? preceding : 0), total};
     if constexpr (ProtectReuse)
         __syncthreads();
@@ -161,7 +181,7 @@ __device__ __forceinline__ float radixselectTopk(
         const int greater = i < count && v > selection.threshold_key;
         // Two independent boolean scans packed into one integer scan. A tile
         // has at most 256 equals, so the low 9 bits cannot carry into greater.
-        const ScanResult both = block_scan(equal | (greater << 9), s);
+        const ScanResult both = block_scan<true, true>(equal | (greater << 9), s);
         const int equal_rank = both.rank & 511;
         const int equal_total = both.total & 511;
         const int equal_budget = max(0, selection.equal_needed - equal_seen);
@@ -269,7 +289,7 @@ __device__ __forceinline__ int filter_mask(
     const int valid = remaining <= 0 ? 0 : remaining >= 4 ? 4 : int(remaining);
     uint32_t mask =
         (have_threshold ? packed_mask(data, threshold, input) : 15u) & ((1u << valid) - 1u);
-    const ScanResult scan = block_scan(__popc(mask), s);
+    const ScanResult scan = block_scan<true, false, true>(__popc(mask), s);
     int destination = count + scan.rank;
     while (mask) {
         const int bit = __ffs(mask) - 1;
