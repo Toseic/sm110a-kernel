@@ -54,23 +54,15 @@ struct ScanResult {
 
 // Each warp reduces the eight warp totals in registers. ProtectReuse=false is
 // valid only when the caller supplies a barrier before the next scratch write.
-template <bool ProtectReuse = true, bool BooleanPair = false, bool CountFour = false>
+template <bool ProtectReuse = true, bool CountFour = false>
 __device__ __forceinline__ ScanResult block_scan(
     int value,
     RadixStorage &s) {
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     int sum;
-    // BooleanPair packs two booleans at bits 0/9; CountFour is in [0, 4].
-    // Ballot bit planes avoid the five dependent shuffle/add steps.
-    if constexpr (BooleanPair) {
-        unsigned inclusive_lanes;
-        asm("mov.u32 %0, %%lanemask_le;" : "=r"(inclusive_lanes));
-        const unsigned equal = __ballot_sync(FullWarp, value & 1);
-        const unsigned greater = __ballot_sync(FullWarp, value & 512);
-        sum = __popc(equal & inclusive_lanes) |
-            (__popc(greater & inclusive_lanes) << 9);
-    } else if constexpr (CountFour) {
+    // Filter counts are in [0, 4]; bit planes shorten their warp prefix.
+    if constexpr (CountFour) {
         unsigned inclusive_lanes;
         asm("mov.u32 %0, %%lanemask_le;" : "=r"(inclusive_lanes));
         sum = 0;
@@ -172,32 +164,47 @@ __device__ __forceinline__ float radixselectTopk(
     const Selection selection = radix_threshold<T>(values, count, k, s);
     int equal_seen = 0;
     int emitted = 0;
-    for (int base = 0; base < count; base += Threads) {
-        const int i = base + threadIdx.x;
-        const float value = i < count ? values[i] : 0.f;
-        const int32_t index = i < count ? indices[i] : 0;
-        const uint32_t v = key(value);
-        const int equal = i < count && v == selection.threshold_key;
-        const int greater = i < count && v > selection.threshold_key;
-        // Two independent boolean scans packed into one integer scan. A tile
-        // has at most 256 equals, so the low 9 bits cannot carry into greater.
-        const ScanResult both = block_scan<true, true>(equal | (greater << 9), s);
-        const int equal_rank = both.rank & 511;
-        const int equal_total = both.total & 511;
-        const int equal_budget = max(0, selection.equal_needed - equal_seen);
-        const int take = greater || (equal && equal_rank < equal_budget);
-        const int selected_rank = (both.rank >> 9) + min(equal_rank, equal_budget);
-        if (take) {
-            values[emitted + selected_rank] = value;
-            indices[emitted + selected_rank] = index;
+    // Each thread owns four adjacent candidates. Register loads precede the
+    // scan barriers, so stable in-place writes cannot clobber unread input.
+    // One scan covers 1024 candidates instead of 256.
+    constexpr int Items = 4;
+    for (int base = 0; base < count; base += Threads * Items) {
+        float value[Items];
+        int32_t index[Items];
+        unsigned equals = 0, greater = 0;
+#pragma unroll
+        for (int item = 0; item < Items; ++item) {
+            const int i = base + threadIdx.x * Items + item;
+            value[item] = i < count ? values[i] : 0.f;
+            index[item] = i < count ? indices[i] : 0;
+            const uint32_t v = key(value[item]);
+            equals |= unsigned(i < count && v == selection.threshold_key) << item;
+            greater |= unsigned(i < count && v > selection.threshold_key) << item;
         }
-        if (equal && equal_seen + equal_rank == 0)
-            s.threshold = value;
+        // At most 1024 equals: reserve 11 bits to prevent a carry.
+        const ScanResult both = block_scan(__popc(equals) | (__popc(greater) << 11), s);
+        const int equal_rank = both.rank & 2047;
+        const int equal_total = both.total & 2047;
+        const int equal_budget = max(0, selection.equal_needed - equal_seen);
+        int destination = emitted + (both.rank >> 11) + min(equal_rank, equal_budget);
+        int local_equal = 0;
+#pragma unroll
+        for (int item = 0; item < Items; ++item) {
+            const bool equal = equals & (1u << item);
+            const int equal_index = equal_seen + equal_rank + local_equal;
+            if ((greater & (1u << item)) ||
+                (equal && equal_index < selection.equal_needed)) {
+                values[destination] = value[item];
+                indices[destination++] = index[item];
+            }
+            if (equal && equal_index == 0)
+                s.threshold = value[item];
+            local_equal += equal;
+        }
         equal_seen += equal_total;
-        emitted += (both.total >> 9) + min(equal_total, equal_budget);
-        // Stable compaction only writes to this tile or earlier tiles. The
-        // next tile's reads cannot overlap these writes; its scan barriers
-        // protect its register loads before any subsequent compaction write.
+        emitted += (both.total >> 11) + min(equal_total, equal_budget);
+        // Every candidate in this tile was loaded before scan barriers.
+        // Stable writes never overlap the next tile's input.
     }
     __syncthreads();
     const float threshold = s.threshold;
@@ -289,7 +296,7 @@ __device__ __forceinline__ int filter_mask(
     const int valid = remaining <= 0 ? 0 : remaining >= 4 ? 4 : int(remaining);
     uint32_t mask =
         (have_threshold ? packed_mask(data, threshold, input) : 15u) & ((1u << valid) - 1u);
-    const ScanResult scan = block_scan<true, false, true>(__popc(mask), s);
+    const ScanResult scan = block_scan<true, true>(__popc(mask), s);
     int destination = count + scan.rank;
     while (mask) {
         const int bit = __ffs(mask) - 1;

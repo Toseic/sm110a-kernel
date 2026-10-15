@@ -133,11 +133,11 @@ prefix sums use ballot/popcount, warp reductions, shuffles and shared memory;
 there is no CUB dependency.
 BF16 candidates are exact FP32 expansions, so two high-byte passes determine
 the entire key; the low half is reconstructed, including negative values and
-canonical NaNs. Compaction packs the equal/greater boolean counts into two
-9-bit fields of one integer scan, preserving stable tie order while removing
-one scan and two barriers per tile. Boolean compaction uses two ballot bit
-planes and filter counts use three, with `popc` and `%lanemask_le` computing
-warp prefixes. General histogram counts use shuffle prefix steps with the
+canonical NaNs. Compaction reads four adjacent candidates per thread into
+registers, packs equal/greater counts into two 11-bit fields, and scans once
+per 1024 candidates. Each thread emits its selected candidates in input order,
+preserving stable ties. General shuffle scans handle these packed counts;
+filter counts use three ballot bit planes with `popc` and `%lanemask_le`. General histogram counts use shuffle prefix steps with the
 hardware validity predicate. Each warp uses `redux.sync.add` for the total
 and for the sum of preceding warps, requiring two CTA barriers per prefix sum. Histogram selection reuses its bucket-publication barrier to
 protect scan scratch, requiring only one barrier inside that scan. In-place
@@ -283,7 +283,56 @@ state left by score production. Chains include necessary conversion/padding
 copies. Top-K checks compare with Torch on produced scores; indexer numerical
 accuracy is covered by its own benchmarks.
 
-## Current scan optimization sweep
+## Current four-candidate compaction sweep
+
+2026-10-15, relative to `813de09`, two complete 32-case cold-L2 sweeps measured
+1.066x and 1.064x geometric mean speedups. The final repeat gives BF16 1.068x,
+FP32 1.061x, with 29/32 cases faster (16/16 FP32). Three BF16 long-sequence
+cases regress 1.0–1.4%. Conditions: stage2 LDGSTS, K512, freshly autotuned
+split-k=1/2/4/8, normal seed1234, GPC1575MHz/EMC4266MHz, 64MiB dirty L2
+flush, warmup3/iters10/samples5. Final sweep enables accuracy.
+
+The retained change processes four adjacent candidates per thread in radix
+compaction. Register loads precede the scan barriers, protecting in-place
+compaction; scan frequency falls from once per 256 candidates to once per
+1024. Two 11-bit fields prevent carry between equal/greater counts. The
+filter keeps its bit-plane scan. The unused single-item boolean-pair scan
+specialization was removed; namespace is `topk512_cga_mask_items4_v4`.
+
+Experiments with 8 or 10 candidates per thread, double-buffered scan scratch,
+a filter barrier removal, a scan shortcut before the initial threshold,
+and threshold-warp-only histogram scans were not retained.
+
+An explicit `bfe.u32` byte-extraction experiment follows PTX ISA 9.4 section
+9.7.1.20 in `docs/ptx-isa-9.4/`. On SM110a it compiled to PRMT selections.
+An isolated 32-case comparison against the same four-candidate implementation
+measured 0.9946x (12/32 faster), so explicit BFE was reverted. Source snapshots
+and A/B JSON are in `/tmp/topk-scan2-opt/`, including `items4bfe.cu` and
+`items4bfe_sweep.json`; SASS is `/tmp/ncu-reports/topk_bfe.sass`.
+
+Validation: 192/192 exact selected-value workload/distribution cases and 29
+contract groups for each split-k=1/2/4/8 with stage2 LDGSTS and stage8 TMA.
+Racecheck on the 29 split1 contract groups reports zero errors/warnings.
+
+NCU source counters confirm dynamic BAR instructions fell 9.67% for
+Q256/N131072/BF16/split1, 8.96% for FP32 at the same configuration, and
+25.95% for Q1/N131072/BF16/split8. Registers are 37/40/39 respectively,
+with no stack or local spills in any variant. Stall ratios do not uniformly
+improve; BF16 large-Q dynamic instructions increase, consistent with its
+small regressions. Compare NCU replay diagnostics separately from benchmark
+timing. Metric names and complete before/after tables are in the results file.
+
+```bash
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_topk.py \
+  --baseline deepselect --force-sweep-ours \
+  --json /tmp/topk-scan2-opt/final_sweep.json
+```
+
+Detailed results and validation commands: `/tmp/topk-scan2-opt/results.md`.
+NCU/SASS and resource reports: `/tmp/ncu-reports/topk_items4*`.
+These artifacts are temporary and not committed.
+
+## Previous scan optimization sweep
 
 2026-10-15, relative to commit `732ba82`, two full 32-case cold-L2 sweeps
 with split-K autotuning measured 1.076x and 1.067x geometric mean speedups.
