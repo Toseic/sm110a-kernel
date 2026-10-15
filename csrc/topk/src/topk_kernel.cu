@@ -18,26 +18,23 @@ constexpr int TopK = 512;
 constexpr int Threads = 256;
 constexpr int Block = 1024;
 constexpr int B2 = 1024;
-constexpr unsigned FullWarp = 0xffffffffu;
-
-__device__ __forceinline__ float as_float(
-    float x) {
-    return x;
-}
-__device__ __forceinline__ float as_float(
-    __nv_bfloat16 x) {
-    return __bfloat162float(x);
-}
 
 // NaNs rank above +inf; signed zeros compare equal.
 __device__ __forceinline__ uint32_t key(
     float x) {
-    if (isnan(x))
-        return 0xffffffffu;
-    if (x == 0.f)
-        x = 0.f;
-    const uint32_t bits = __float_as_uint(x);
-    return bits ^ ((bits & 0x80000000u) ? 0xffffffffu : 0x80000000u);
+    uint32_t result;
+    // Classify zero/NaN independently of the sign transform. The LUT is
+    // a ^ (b | c): 0xf0 ^ (0xcc | 0xaa) = 0x1e. No .ftz: keep subnormals.
+    asm("{ .reg .b32 bits, sign, ordered; .reg .pred zero, nan;\n"
+        "mov.b32 bits, %1;\n"
+        "shr.s32 sign, bits, 31;\n"
+        "lop3.b32 ordered, bits, sign, 0x80000000, 0x1e;\n"
+        "setp.eq.f32 zero, %1, 0f00000000;\n"
+        "setp.nan.f32 nan, %1, %1;\n"
+        "selp.b32 ordered, 0x80000000, ordered, zero;\n"
+        "selp.b32 %0, 0xffffffff, ordered, nan; }"
+        : "=r"(result) : "f"(x));
+    return result;
 }
 
 struct RadixStorage {
@@ -45,7 +42,6 @@ struct RadixStorage {
     int warp_sums[Threads / 32];
     int digit;
     int above;
-    float threshold;
 };
 struct ScanResult {
     int rank;
@@ -68,7 +64,12 @@ __device__ __forceinline__ ScanResult block_scan(
         sum = 0;
 #pragma unroll
         for (int bit = 0; bit < 3; ++bit) {
-            const unsigned plane = __ballot_sync(FullWarp, value & (1 << bit));
+            unsigned plane;
+            asm("{ .reg .b32 masked; .reg .pred p;\n"
+                "and.b32 masked, %1, %2;\n"
+                "setp.ne.b32 p, masked, 0;\n"
+                "vote.sync.ballot.b32 %0, p, 0xffffffff; }"
+                : "=r"(plane) : "r"(value), "r"(1 << bit));
             sum += __popc(plane & inclusive_lanes) << bit;
         }
     } else {
@@ -89,11 +90,24 @@ __device__ __forceinline__ ScanResult block_scan(
     // Every warp uses the same full member mask; zero unwanted inputs
     // instead of using a per-lane reduction mask (which would be invalid).
     const int preceding_value = lane < warp ? warp_sum : 0;
-    asm("redux.sync.add.s32 %0, %1, 0xffffffff;"
-        : "=r"(total) : "r"(warp_sum));
-    asm("redux.sync.add.s32 %0, %1, 0xffffffff;"
-        : "=r"(preceding) : "r"(preceding_value));
-    const ScanResult result = {sum - value + (warp ? preceding : 0), total};
+    if constexpr (CountFour) {
+        // Both block counts are <= 1024, so the fields cannot carry into
+        // each other. One reduction supplies the total and preceding count.
+        static_assert(Threads * 4 < 2048);
+        const int packed = warp_sum | (preceding_value << 11);
+        int both;
+        asm("redux.sync.add.s32 %0, %1, 0xffffffff;"
+            : "=r"(both) : "r"(packed));
+        total = both & 2047;
+        preceding = both >> 11;
+    } else {
+        asm("redux.sync.add.s32 %0, %1, 0xffffffff;"
+            : "=r"(total) : "r"(warp_sum));
+        asm("redux.sync.add.s32 %0, %1, 0xffffffff;"
+            : "=r"(preceding) : "r"(preceding_value));
+    }
+    // preceding is already zero for warp 0; no extra select is necessary.
+    const ScanResult result = {sum - value + preceding, total};
     if constexpr (ProtectReuse)
         __syncthreads();
     return result;
@@ -104,14 +118,17 @@ struct Selection {
     int equal_needed;
 };
 
-// Find the threshold among shared-memory FP32 candidates.
+// Find the threshold among shared-memory monotonic keys. Normalize promotes
+// the raw FP32 suffix [keyed_count, count) once, during the first histogram.
+// That round's existing completion barrier publishes the normalized keys.
 // All 256 consumer threads participate; count >= k > 0.
-template <typename T>
+template <typename T, bool Normalize>
 __device__ __forceinline__ Selection radix_threshold(
-    const float *values,
+    uint32_t *values,
     int count,
     int k,
-    RadixStorage &s) {
+    RadixStorage &s,
+    int keyed_count) {
     uint32_t prefix = 0;
     uint32_t mask = 0;
     int remaining = k;
@@ -119,8 +136,16 @@ __device__ __forceinline__ Selection radix_threshold(
     for (int shift = 24; shift >= (sizeof(T) == 2 ? 16 : 0); shift -= 8) {
         s.histogram[threadIdx.x] = 0;
         __syncthreads();
+        // Avoid automatic eight-way unrolling and its remainder paths.
+#pragma unroll 4
         for (int i = threadIdx.x; i < count; i += Threads) {
-            const uint32_t v = key(as_float(values[i]));
+            uint32_t v = values[i];
+            if constexpr (Normalize) {
+                if (shift == 24 && i >= keyed_count) {
+                    v = key(__uint_as_float(v));
+                    values[i] = v;
+                }
+            }
             if ((v & mask) == prefix)
                 atomicAdd(&s.histogram[(v >> shift) & 255u], 1);
         }
@@ -140,7 +165,7 @@ __device__ __forceinline__ Selection radix_threshold(
         // The next round's histogram barriers precede the next digit write.
     }
     if constexpr (sizeof(T) == 2) {
-        // BF16 candidates are exact FP32 expansions. Once the high half is
+        // Keys came from exact BF16-to-FP32 expansions. Once the high half is
         // known, the low half is zero for nonnegative values, all ones for
         // negative values and for the canonical NaN key.
         if (!(prefix & 0x80000000u) || prefix == 0xffff0000u)
@@ -149,19 +174,20 @@ __device__ __forceinline__ Selection radix_threshold(
     return {prefix, remaining};
 }
 
-// Device primitive: compact count shared FP32 candidates to K in place,
+// Device primitive: compact count shared keys to K in place,
 // carrying their GMEM indices. Input order is stable, so ties keep lower indices.
 // Each tile is loaded into registers before any overlapping output write.
-// Returns an actual selected threshold in every thread's register.
-template <typename T>
-__device__ __forceinline__ float radixselectTopk(
-    float *values,
+// Returns the selected threshold key in every thread's register.
+template <typename T, bool Normalize = false>
+__device__ __forceinline__ uint32_t radixselectTopk(
+    uint32_t *values,
     int32_t *indices,
     int count,
     int k,
-    RadixStorage &s) {
+    RadixStorage &s,
+    int keyed_count = 0) {
     // The first histogram initialization barrier publishes candidate writes.
-    const Selection selection = radix_threshold<T>(values, count, k, s);
+    const Selection selection = radix_threshold<T, Normalize>(values, count, k, s, keyed_count);
     int equal_seen = 0;
     int emitted = 0;
     // Each thread owns four adjacent candidates. Register loads precede the
@@ -169,29 +195,35 @@ __device__ __forceinline__ float radixselectTopk(
     // One scan covers 1024 candidates instead of 256.
     constexpr int Items = 4;
     for (int base = 0; base < count; base += Threads * Items) {
-        float value[Items];
+        uint32_t value[Items];
         int32_t index[Items];
         unsigned equals = 0, greater = 0;
         const int first = base + threadIdx.x * Items;
         if (first + Items <= count) {
             // Four adjacent words per lane: wide shared loads avoid the
             // four-way bank conflicts of four separate strided word loads.
-            const float4 v = *reinterpret_cast<const float4 *>(values + first);
+            const uint4 v = *reinterpret_cast<const uint4 *>(values + first);
             const int4 ix = *reinterpret_cast<const int4 *>(indices + first);
-            value[0] = v.x; value[1] = v.y; value[2] = v.z; value[3] = v.w;
-            index[0] = ix.x; index[1] = ix.y; index[2] = ix.z; index[3] = ix.w;
+            value[0] = v.x;
+            value[1] = v.y;
+            value[2] = v.z;
+            value[3] = v.w;
+            index[0] = ix.x;
+            index[1] = ix.y;
+            index[2] = ix.z;
+            index[3] = ix.w;
         } else {
 #pragma unroll
             for (int item = 0; item < Items; ++item) {
                 const int i = first + item;
-                value[item] = i < count ? values[i] : 0.f;
+                value[item] = i < count ? values[i] : 0u;
                 index[item] = i < count ? indices[i] : 0;
             }
         }
 #pragma unroll
         for (int item = 0; item < Items; ++item) {
             const int i = first + item;
-            const uint32_t v = key(value[item]);
+            const uint32_t v = value[item];
             equals |= unsigned(i < count && v == selection.threshold_key) << item;
             greater |= unsigned(i < count && v > selection.threshold_key) << item;
         }
@@ -211,8 +243,6 @@ __device__ __forceinline__ float radixselectTopk(
                 values[destination] = value[item];
                 indices[destination++] = index[item];
             }
-            if (equal && equal_index == 0)
-                s.threshold = value[item];
             local_equal += equal;
         }
         equal_seen += equal_total;
@@ -221,10 +251,7 @@ __device__ __forceinline__ float radixselectTopk(
         // Stable writes never overlap the next tile's input.
     }
     __syncthreads();
-    const float threshold = s.threshold;
-    // A subsequent threshold write is preceded by the next selection's
-    // histogram/scan barriers, after every thread has read this threshold.
-    return threshold;
+    return selection.threshold_key;
 }
 
 __device__ __forceinline__ uint4 load_four(
@@ -301,7 +328,7 @@ __device__ __forceinline__ int filter_mask(
     int n,
     uint32_t threshold,
     bool have_threshold,
-    float *values,
+    uint32_t *values,
     int32_t *indices,
     int count,
     RadixStorage &s) {
@@ -309,17 +336,43 @@ __device__ __forceinline__ int filter_mask(
     const int offset = threadIdx.x * 4;
     const uint4 data = load_four(input + offset);
     const int64_t remaining = int64_t(n) - base - offset;
+    if (!have_threshold) {
+        // Before the first prune every input survives, so its destination is
+        // known without a scan. Earlier full tiles make count a multiple of 4.
+        if (remaining >= 4) {
+            const uint4 raw = make_uint4(__float_as_uint(packed_value(data, 0, input)),
+                __float_as_uint(packed_value(data, 1, input)), __float_as_uint(packed_value(data, 2, input)),
+                __float_as_uint(packed_value(data, 3, input)));
+            const int i = int(base) + offset;
+            *reinterpret_cast<uint4 *>(values + count + offset) = raw;
+            *reinterpret_cast<int4 *>(indices + count + offset) = make_int4(i, i + 1, i + 2, i + 3);
+        } else {
+#pragma unroll
+            for (int bit = 0; bit < 4; ++bit) {
+                if (bit < remaining) {
+                    values[count + offset + bit] = __float_as_uint(packed_value(data, bit, input));
+                    indices[count + offset + bit] = int32_t(base + offset + bit);
+                }
+            }
+        }
+        // All stage reads must finish before any thread issues the next copy.
+        __syncthreads();
+        return count + int(min(int64_t(Block), int64_t(n) - base));
+    }
     const int valid = remaining <= 0 ? 0 : remaining >= 4 ? 4 : int(remaining);
     uint32_t mask =
-        (have_threshold ? packed_mask(data, threshold, input) : 15u) & ((1u << valid) - 1u);
-    const ScanResult scan = block_scan<true, true>(__popc(mask), s);
+        packed_mask(data, threshold, input) & ((1u << valid) - 1u);
+    // The next input wait, radix initialization, or final publication supplies
+    // a CTA barrier before warp_sums can be written again. The scan's first
+    // barrier already protects this stage's reads against its next prefetch.
+    const ScanResult scan = block_scan<false, true>(__popc(mask), s);
     int destination = count + scan.rank;
     // Constant item indices eliminate the bit-scan loop and dynamic packed
     // extraction. Ascending stores preserve stable ordering within a thread.
 #pragma unroll
     for (int bit = 0; bit < 4; ++bit) {
         if (mask & (1u << bit)) {
-            values[destination] = packed_value(data, bit, input);
+            values[destination] = __float_as_uint(packed_value(data, bit, input));
             indices[destination++] = int32_t(base + offset + bit);
         }
     }
@@ -429,7 +482,11 @@ __global__ void topk_buffered(
     extern __shared__ __align__(16) uint32_t buffer[];
     // Before an append count < k+B2; one block can add at most Block entries.
     constexpr int capacity = k + B2 + Block;
-    float *values = reinterpret_cast<float *>(buffer);
+    static_assert(capacity % 4 == 0, "candidate arrays require 16-byte alignment");
+    // Retained candidates are keys; appended candidates are raw FP32 bits.
+    // The first histogram normalizes the suffix once. Later rounds,
+    // compaction, and DSM merges reuse keys rather than reclassifying floats.
+    uint32_t *values = buffer;
     int32_t *indices = reinterpret_cast<int32_t *>(buffer + capacity);
     const int rank = blockIdx.x % Split;
     const int row_id = blockIdx.x / Split;
@@ -472,7 +529,8 @@ __global__ void topk_buffered(
         count = filter_mask(input[stage], base, local_n, threshold,
             have_threshold, values, indices, count, scratch);
         if (count >= k + B2) {
-            threshold = key(radixselectTopk<T>(values, indices, count, k, scratch));
+            threshold = radixselectTopk<T, true>(values, indices, count, k, scratch,
+                have_threshold ? k : 0);
             have_threshold = true;
             count = k;
         }
@@ -480,9 +538,17 @@ __global__ void topk_buffered(
             issue_input(input[stage], row, (block + Stages) * Block, local_n, ready + stage);
     }
     if (count > k) {
-        radixselectTopk<T>(values, indices, count, k, scratch);
+        radixselectTopk<T, true>(values, indices, count, k, scratch,
+            have_threshold ? k : 0);
     } else {
         __syncthreads();
+        if constexpr (Split > 1) {
+            if (!have_threshold) {
+                // Small/empty partitions did not select, but DSM peers expect keys.
+                for (int i = threadIdx.x; i < count; i += Threads)
+                    values[i] = key(__uint_as_float(values[i]));
+            }
+        }
     }
     count = min(count, k);
     for (int i = threadIdx.x; i < count; i += Threads)
@@ -499,7 +565,7 @@ __global__ void topk_buffered(
             cluster.sync();
             if (rank % (2 * stride) == 0) {
                 const int peer = rank + stride;
-                const float *peer_values = cluster.map_shared_rank(values, peer);
+                const uint32_t *peer_values = cluster.map_shared_rank(values, peer);
                 const int32_t *peer_indices = cluster.map_shared_rank(indices, peer);
                 const int peer_count = *cluster.map_shared_rank(&retained, peer);
                 // Both sides retain at most K, so the merge has <= 2*K
@@ -530,7 +596,7 @@ __global__ void topk_buffered(
 template <typename T, int Split>
 void launch_split(
     const T *scores, int32_t *out, int rows, int n, cudaStream_t stream) {
-    const size_t smem = size_t(TopK + B2 + Block) * (sizeof(float) + sizeof(int32_t));
+    const size_t smem = size_t(TopK + B2 + Block) * (sizeof(uint32_t) + sizeof(int32_t));
     constexpr size_t StaticBytes =
         sizeof(RadixStorage) + Stages * Block * sizeof(T) + Stages * sizeof(uint64_t) + 48;
     if (smem + StaticBytes > 48 * 1024)

@@ -103,7 +103,7 @@ class TopKModule:
 
             selection = AutotuneRunner(options).resolve(
                 configs,
-                namespace="topk512_cga_mask_items4_v4",
+                namespace="topk512_cga_stored_keys_v5",
                 key=key,
                 prepare=prepare,
                 benchmark=lambda prepared: _tune_stats(prepared.run, options),

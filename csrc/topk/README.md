@@ -77,11 +77,14 @@ module before CUDA graph capture.
 ### Mask filter
 
 Each thread owns four consecutive elements, retains them in registers, and
-builds a four-bit `uint32_t` mask. One CTA count scan assigns output ranges;
+builds a four-bit `uint32_t` mask. Before the first threshold, every valid
+input survives: direct 128-bit stores append raw FP32 bits and indices without a scan.
+Afterward, one CTA count scan assigns output ranges;
 four unrolled, predicated stores visit selected elements in index order.
 BF16 broadcasts the exact threshold's upper two bytes with `prmt.b32`, then uses packed
 `set.gtu.s32.bf16x2`, `prmt.b32`, and `dp4a.s32.s32`; FP32 uses unordered
-floating greater-than without FTZ, avoiding per-element key generation.
+floating greater-than without FTZ. Only surviving inputs are converted to
+monotonic integer keys, once in the first histogram pass that consumes them.
 A NaN threshold keeps no later candidates. Tail bits are masked, NaNs rank first, and signed zeros tie. This is the
 only Filter implementation; `filter_mode` and `--filter-mode` were removed.
 
@@ -100,7 +103,8 @@ Split 1 uses a normal CTA launch and has no cluster synchronization.
 The default `split_k=None` selects the fastest valid split with
 `AutotuneRunner` and cold-L2 CUDA event timings. The cache key includes device,
 shape, dtype, input alignment, stages, and copy engine. K is fixed at 512;
-a dedicated tuning namespace keeps earlier variable-K choices separate. Candidates that
+the `topk512_cga_stored_keys_v5` tuning namespace invalidates choices measured
+before the stored-key optimization. Candidates that
 would have empty input partitions are excluded from tuning; explicit splits
 still support them. Results use the shared persistent cache plus a module
 memory cache. First-time tuning allocates eviction and optional output
@@ -123,8 +127,8 @@ result; timing uses a fixed selected split outside the runner.
 
 K is a CUDA compile-time constant of 512; candidates live in shared memory. When their count reaches
 K+1024, the device function `radixselectTopk` selects the K largest candidates
-using two 8-bit histogram passes for BF16 or four for FP32, compacts values and indices in place, and
-returns the kth-largest value as the new threshold. A final selection handles
+using two 8-bit histogram passes for BF16 or four for FP32, compacts keys and indices in place, and
+returns the kth-largest key as the new threshold. A final selection handles
 the tail. Later values equal to the threshold are discarded because retained
 ties have smaller original indices. The buffer reserves K+2048 entries to
 cover an entire block append before compaction.
@@ -132,17 +136,24 @@ cover an entire block append before compaction.
 `radixselectTopk` and its scratch storage are local to the `.cu` file. CTA
 prefix sums use ballot/popcount, warp reductions, shuffles and shared memory;
 there is no CUB dependency.
-BF16 candidates are exact FP32 expansions, so two high-byte passes determine
+The candidate buffer keeps normalized `uint32_t` keys for retained elements
+and raw FP32 bits for new elements. The first histogram converts only the new
+suffix; later passes, compaction, and DSM merges reuse the keys. Small cluster
+partitions that never select normalize their candidates before DSM publication.
+BF16 keys originate from exact FP32 expansions, so two high-byte passes determine
 the entire key; the low half is reconstructed, including negative values and
 canonical NaNs. Compaction reads four adjacent candidates per thread into
 registers using aligned 128-bit shared loads for complete groups (scalar
 loads for the tail), packs equal/greater counts into two 11-bit fields, and scans once
 per 1024 candidates. Each thread emits its selected candidates in input order,
 preserving stable ties. General shuffle scans handle these packed counts;
-filter counts use three ballot bit planes with `popc` and `%lanemask_le`. General histogram counts use shuffle prefix steps with the
-hardware validity predicate. Each warp uses `redux.sync.add` for the total
-and for the sum of preceding warps, requiring two CTA barriers per prefix sum. Histogram selection reuses its bucket-publication barrier to
-protect scan scratch, requiring only one barrier inside that scan. In-place
+filter counts use three ballot bit planes with `popc` and `%lanemask_le`.
+Explicit PTX bit tests avoid redundant shifts before ballot. General histogram
+counts use shuffle prefix steps with the hardware validity predicate.
+Filter scans pack total and preceding-warp counts into two 11-bit fields for
+one `redux.sync.add`; general scans use separate reductions. Compaction scans
+retain two CTA barriers. Histogram and filter scans reuse a subsequent caller
+barrier to protect scratch, requiring only one barrier inside each scan. In-place
 compaction publishes output once at the end rather than after every tile.
 The primitive takes a runtime candidate count so it also handles partial
 final blocks. Compaction is safe in place because each tile loads its values
@@ -287,12 +298,179 @@ accuracy is covered by its own benchmarks.
 
 ## Instruction optimization
 
-The 2026-10-15 SASS/PTX review retains unrolled filter stores, aligned
-128-bit candidate loads, and a single `prmt.b32` for the BF16 threshold
-broadcast. Fixed-configuration cold-L2 measurements improve the 12 normal
-workloads by 1.036x geometrically, with larger gains on long rows.
-See [instruction optimization analysis](instruction_optimization.md) for
-SASS evidence, PTX references, measurements, rejected experiments, and commands.
+The second 2026-10-15 SASS/PTX review reuses normalized candidate keys,
+normalizes new candidates in the first histogram, uses a six-instruction PTX
+key transform, bypasses scans before the first threshold, and simplifies
+filter ballots, reductions, and barriers. Four-way histogram loop unrolling
+balances instruction size and independent loads. The earlier review added
+unrolled filter stores, aligned 128-bit candidate loads, and a single
+`prmt.b32` for the BF16 threshold broadcast (1.036x over its earlier baseline).
+
+This round compares against commit `a00c6fba0c64a406735055a25d0b22d293e7ee32`.
+That baseline already includes the earlier unrolled filter stores, vector
+candidate loads, and BF16 threshold `prmt` optimization.
+
+### Retained changes
+
+- Store ordered integer keys for retained candidates. Appended candidates
+  initially hold raw FP32 bits; the first histogram converts only this suffix.
+  Later histogram passes, compaction, and DSM merges reuse the keys. Small
+  partitions that never select explicitly convert before publishing to peers.
+- Return the threshold key directly, eliminating shared threshold traffic and
+  a second float-to-key conversion.
+- Use six instructions for key generation: arithmetic sign shift, `lop3`, two
+  floating-point predicates, and two selects. NaNs map to `0xffffffff`, both
+  zeros map to `0x80000000`; comparisons omit `.ftz` to preserve subnormals.
+- Before the first threshold, every valid input survives. Write aligned groups
+  directly with vector stores instead of running a prefix scan.
+- Express filter bit-plane ballots with explicit predicates. Pack total and
+  preceding-warp counts into two 11-bit fields for a single `redux.sync.add`.
+  Each sum is at most 1024, so no carry crosses the field boundary. Every lane
+  uses the same full member mask; excluded contributions are zero.
+- Remove the filter scan's second barrier. Its first barrier protects input
+  stage reads; the next input wait, radix initialization, or final publication
+  provides a CTA barrier before scan scratch reuse. Compaction retains its
+  reuse protection.
+- Unroll histogram candidate loops four times, avoiding automatic eight-way
+  expansion and its remainder paths. Invalidate old autotuning choices with
+  namespace `topk512_cga_stored_keys_v5`.
+
+### PTX and SASS evidence
+
+Local PTX ISA 9.4 references:
+
+- [lop3](../../docs/ptx-isa-9.4/ptx/9-instruction-set/9.7.9.6-logic-and-shift-instructions-lop3.md):
+  the LUT for `a ^ (b | c)` is `0xf0 ^ (0xcc | 0xaa) = 0x1e`.
+- [setp](../../docs/ptx-isa-9.4/ptx/9-instruction-set/9.7.7.2-comparison-and-selection-instructions-setp.md):
+  zero and NaN classification, without flush-to-zero.
+- [vote.sync](../../docs/ptx-isa-9.4/ptx/9-instruction-set/9.7.15.10-parallel-synchronization-and-communication-instructions-vote.sync.md)
+  and [redux.sync](../../docs/ptx-isa-9.4/ptx/9-instruction-set/9.7.15.13-parallel-synchronization-and-communication-instructions-redux.sync.md):
+  full-warp participation and integer reduction semantics.
+- [barrier](../../docs/ptx-isa-9.4/ptx/9-instruction-set/9.7.15.1-parallel-synchronization-and-communication-instructions-bar-barrier.md):
+  shared-memory publication and scratch reuse.
+
+The final `sm_110a` disassembly contains this key transform (register names
+and scheduling predicates omitted):
+
+```text
+SHF.R.S32.HI
+FSETP.NEU.AND
+LOP3.LUT ... 0x1e
+FSETP.NAN.AND
+SEL
+SEL
+```
+
+The PTX bit reinterpretation needs no separate instruction. The packed filter
+reduction lowers to one `REDUX.SUM.S32`. Final disassembly and resource usage
+are saved as `final.sass` and `final-resources.txt` in the artifact directory
+below; baseline equivalents are saved alongside them.
+
+Nsight Compute, Q=128, N=32768, split=4, stages=2, LDGSTS:
+
+| Metric | BF16 baseline | BF16 final | FP32 baseline | FP32 final |
+|---|---:|---:|---:|---:|
+| `smsp__inst_executed.sum` | 16,152,080 | 13,430,558 | 21,258,654 | 16,678,130 |
+| Registers/thread | 40 | 39 | 40 | 38 |
+
+Dynamic instruction counts decrease **16.85%** and **21.55%** respectively.
+These are executed instruction counts, not static SASS instruction counts.
+Profiles restrict collection to `topk_buffered`, skip two launches, and collect
+one launch. Profiled duration is not used as benchmark timing.
+
+### Cold-L2 measurements
+
+Thor, CUDA 13.2, `sm_110a`; GPC 1575 MHz, EMC 4266 MHz. Each timing uses
+64 MiB dirty L2 eviction, warmup=5, iters=30, samples=7, seed=1234. All cases
+use stages=2 and LDGSTS. Baseline and final runs are serial, with fixed splits
+and accuracy checks enabled.
+
+- Normal inputs: Q in {1,16,128}, N in {4096,32768,131072}, BF16/FP32,
+  split in {1,2,4,8}: 72 cases per version.
+- Ties, constant, ascending, masked, spikes: Q=16, N=32768, BF16/FP32,
+  split in {1,4,8}: 30 cases per version.
+
+Across these 102 matched cases, the geometric mean speedup is **1.155x**;
+**100/102** cases are faster. These are fixed-configuration comparisons, not
+measurements of the autotuner's selected configurations.
+
+| Input group | Split | Geometric mean speedup |
+|---|---:|---:|
+| Normal | 1 | 1.1033x |
+| Normal | 2 | 1.0934x |
+| Normal | 4 | 1.1662x |
+| Normal | 8 | 1.1818x |
+| Other distributions | 1 | 1.1262x |
+| Other distributions | 4 | 1.2078x |
+| Other distributions | 8 | 1.2802x |
+
+Representative normal cases, Q=128, N=32768, split=4:
+
+| Type | Baseline (us) | Final (us) | Time reduction |
+|---|---:|---:|---:|
+| BF16 | 194.723 | 159.334 | 18.2% |
+| FP32 | 270.966 | 216.375 | 20.1% |
+
+The two measured regressions are both normal FP32 inputs with split=1:
+
+| Q | N | Baseline (us) | Final (us) | Time increase |
+|---:|---:|---:|---:|---:|
+| 128 | 32768 | 163.834 | 174.229 | 6.35% |
+| 16 | 131072 | 119.423 | 119.905 | 0.40% |
+
+### Validation
+
+- 24 configurations: stages {2,3,8} × {LDGSTS,TMA} × split {1,2,4,8}.
+  All 29 contract groups pass for each: **696 groups** total.
+- **72 additional groups** cover all 65,536 BF16 encodings and random FP32
+  bit patterns across the same configurations, including negative NaNs.
+  Reference sorting uses explicit integer keys to implement the documented
+  NaNs-first, signed-zero-equal contract. Initial direct Torch floating-point
+  `argsort` disagreed for 127 negative NaNs in one row; the kernel agrees with
+  the explicit contract. Torch float sorting is therefore not used as the
+  oracle for this exhaustive check.
+- Compute Sanitizer racecheck: stages=3, LDGSTS, split=1, 29 contract groups,
+  **0 hazards, 0 errors, 0 warnings**.
+- Memcheck: stages=8, TMA, split=8, 29 groups, **0 errors**.
+- Synccheck: stages=3, TMA, split=4, 29 groups, **0 errors**.
+
+Stages 3/8 and TMA were checked for correctness; the performance table above
+only measures stages=2, LDGSTS. Sanitizer runs cover the listed configurations.
+
+### Experiments not retained
+
+Register-caching all candidate keys increased register pressure; six-ballot
+compaction, 32-bit local loop offsets, selected-warp prefix work, and an extra
+empty-mask gate did not provide consistent gains. Converting keys in the
+filter caused long-sequence regressions; deferring conversion to the first
+histogram reduced that cost. Intermediate results are not included in the
+final performance summary.
+
+### Reproduction and artifacts
+
+Normal sweep command (repeat with split 1, 2, 4, 8 on each source version):
+
+```bash
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_topk.py \
+  --baseline none --split-k 4 --q-lens 1 16 128 \
+  --kv-lens 4096 32768 131072 --dtypes bf16 fp32 \
+  --warmup 5 --iters 30 --samples 7 --json results.json
+```
+
+For the distribution sweep, set `--q-lens 16 --kv-lens 32768` and add
+`--distributions ties constant ascending masked spikes`; repeat split 1, 4, 8.
+Contract checks use `--check-only --stages N --copy-engine ENGINE --split-k S`.
+
+Local temporary artifacts (not committed):
+
+- `/tmp/topk-instruction-opt2/`: baseline/final source snapshots, SASS,
+  resource usage, benchmark JSON/logs, validation scripts/logs, and NCU CSV.
+  Final timings are `baseline-normal-split*.json`, `final-normal-split*.json`,
+  `baseline-distributions-split*.json`, `final-distributions-split*.json`.
+- `/tmp/ncu-reports/topk2-{baseline,final}-{bf16,fp32}.ncu-rep`.
+
+The final stages=2 LDGSTS binary used for disassembly is JIT cache variant
+`sm110a_topk_radix_kernel_2f1f9d8087ade25c`.
 
 ## Previous four-candidate compaction sweep
 
