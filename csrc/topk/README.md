@@ -79,8 +79,9 @@ module before CUDA graph capture.
 Each thread owns four consecutive elements, retains them in registers, and
 builds a four-bit `uint32_t` mask. One CTA count scan assigns output ranges;
 `ffs` and `mask &= mask - 1` visit selected elements. BF16 uses packed
-`set.gtu.s32.bf16x2`, `prmt.b32`, and `dp4a.s32.s32`; FP32 compares monotonic
-keys. Tail bits are masked, NaNs rank first, and signed zeros tie. This is the
+`set.gtu.s32.bf16x2`, `prmt.b32`, and `dp4a.s32.s32`; FP32 uses unordered
+floating greater-than without FTZ, avoiding per-element key generation.
+A NaN threshold keeps no later candidates. Tail bits are masked, NaNs rank first, and signed zeros tie. This is the
 only Filter implementation; `filter_mode` and `--filter-mode` were removed.
 
 ### CGA split-K and autotuning
@@ -89,7 +90,8 @@ only Filter implementation; `filter_mode` and `--filter-mode` were removed.
 number of CTAs per row to 1, 2, 4, or 8. Each CTA streams a contiguous range
 of 1024-element input blocks and retains at most K local candidates. A binary
 tree merges these candidates within the cluster using distributed shared
-memory, compacting bounded chunks through the same radix device function.
+memory. Each merge appends at most 512 peer candidates and selects once from
+at most 1024 entries through the same radix device function.
 There is no global candidate workspace or second merge kernel. Empty
 partitions participate in synchronization; ties preserve smaller indices.
 Split 1 uses a normal CTA launch and has no cluster synchronization.
@@ -120,7 +122,7 @@ result; timing uses a fixed selected split outside the runner.
 
 K is a CUDA compile-time constant of 512; candidates live in shared memory. When their count reaches
 K+1024, the device function `radixselectTopk` selects the K largest candidates
-using four 8-bit histogram passes, compacts values and indices in place, and
+using two 8-bit histogram passes for BF16 or four for FP32, compacts values and indices in place, and
 returns the kth-largest value as the new threshold. A final selection handles
 the tail. Later values equal to the threshold are discarded because retained
 ties have smaller original indices. The buffer reserves K+2048 entries to
@@ -128,6 +130,12 @@ cover an entire block append before compaction.
 
 `radixselectTopk` and its scratch storage are local to the `.cu` file. CTA
 prefix sums use warp shuffles and shared memory; there is no CUB dependency.
+BF16 candidates are exact FP32 expansions, so two high-byte passes determine
+the entire key; the low half is reconstructed, including negative values and
+canonical NaNs. Compaction packs the equal/greater boolean counts into two
+9-bit fields of one integer scan, preserving stable tie order while removing
+one scan and two barriers per tile. Shuffle prefix steps use the hardware
+validity predicate to avoid a separate select instruction.
 Each warp scans the eight warp totals in registers, requiring two CTA
 barriers per prefix sum. Histogram selection reuses its bucket-publication barrier to
 protect scan scratch, requiring only one barrier inside that scan. In-place
@@ -135,6 +143,8 @@ compaction publishes output once at the end rather than after every tile.
 The primitive takes a runtime candidate count so it also handles partial
 final blocks. Compaction is safe in place because each tile loads its values
 and indices into registers before writing earlier output positions.
+Candidate loops use 32-bit offsets within the bounded shared buffer; global
+row and input addresses retain 64-bit arithmetic.
 
 `src/topk_torch_binding.cpp` validates tensors and launches the kernel;
 `sm110a_kernel/kernels/topk.py` owns the split CUDA JIT and Python facade.
@@ -271,7 +281,44 @@ state left by score production. Chains include necessary conversion/padding
 copies. Top-K checks compare with Torch on produced scores; indexer numerical
 accuracy is covered by its own benchmarks.
 
-## Current K=512 sweep after rollback
+## Current compute optimization sweep
+
+2026-10-15, two complete 32-workload sweeps of the optimized kernel, compared
+with a freshly measured pre-optimization baseline. All runs used stages=2,
+LDGSTS, normal inputs, seed=1234, freshly autotuned split-K, locked GPC=1575
+MHz / EMC=4266 MHz, and cold L2 with a 64 MiB dirty write-flush. Warmup=3,
+iters=10, samples=5; accuracy checks were skipped. The final repeat gives:
+
+| dtype | speedup vs pre-optimization | current / DeepSelect time |
+|---|---:|---:|
+| BF16 | 1.370× | 1.929× |
+| FP32 | 1.169× | 1.647× |
+| All | 1.265× | 1.782× |
+
+All 32 workloads improved versus the pre-optimization baseline. The retained
+changes are BF16 two-pass radix, fused compaction scans, shuffle predicates,
+direct FP32 filter comparisons, 32-bit candidate offsets, and simpler CGA
+merges. Complete-block copy/filter specializations were reverted after small-Q
+regressions. The tuning namespace is `topk512_cga_mask_compute_v2`.
+
+NCU/SASS on fixed Q=256, N=131072, split=1 configurations confirms dynamic
+warp instruction reductions of 19.66% for BF16 and 21.94% for FP32. No local
+spills were introduced. Scan dependencies remain a bottleneck; reduced
+instruction counts do not imply lower stall cycles per issued instruction.
+
+```bash
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_topk.py \
+  --baseline deepselect --no-accuracy --force-sweep-ours --debug \
+  --json /tmp/topk-compute-opt/final_sweep.json
+```
+
+Detailed A/B results, source snapshots and logs: `/tmp/topk-compute-opt/`,
+especially `results.md`, `baseline_sweep.json`, and `final_sweep.json`.
+NCU analysis, reports, raw/source CSVs and SASS: `/tmp/ncu-reports/`,
+especially `topk_compute_analysis.md` and `topk_compute_after*.ncu-rep`.
+These artifacts are temporary and are not committed.
+
+## Previous K=512 sweep after rollback
 
 2026-10-15, all 32 default workloads completed with stages=2, LDGSTS,
 cooperative 256-thread prefetch, and freshly autotuned split-K. Common
@@ -409,3 +456,12 @@ compute-sanitizer --tool memcheck --error-exitcode 1 \
   --baseline deepselect --q-lens 1 8 --kv-lens 513 8193 --topks 512 \
   --dtypes bf16 fp32 --warmup 0 --iters 1 --samples 1 --no-lock-clocks
 ```
+
+## Compute optimization accuracy validation
+
+The compute optimization passed all 192 benchmark cases (Q=1/8/64/256,
+N=4096/16384/65536/131072, BF16/FP32, normal/ties/constant/ascending/masked/spikes)
+with exact selected-value checks. Contract checks passed 29 groups for each
+split-k=1/2/4/8 with stage-2 LDGSTS and stage-8 TMA, including partial tiles,
+NaNs, infinities, signed zeros, subnormals, stable ties, streams, and graphs.
+Logs and JSON: `/tmp/topk-scan-opt/accuracy_before*` and `check_before*`.

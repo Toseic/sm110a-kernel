@@ -63,9 +63,10 @@ __device__ __forceinline__ ScanResult block_scan(
     int sum = value;
 #pragma unroll
     for (int offset = 1; offset < 32; offset *= 2) {
-        const int other = __shfl_up_sync(FullWarp, sum, offset);
-        if (lane >= offset)
-            sum += other;
+        asm("{ .reg .pred p; .reg .b32 other;\n"
+            "shfl.sync.up.b32 other|p, %0, %1, 0, 0xffffffff;\n"
+            "@p add.s32 %0, %0, other; }"
+            : "+r"(sum) : "r"(offset));
     }
     if (lane == 31)
         s.warp_sums[warp] = sum;
@@ -73,9 +74,10 @@ __device__ __forceinline__ ScanResult block_scan(
     int warp_sum = lane < Threads / 32 ? s.warp_sums[lane] : 0;
 #pragma unroll
     for (int offset = 1; offset < Threads / 32; offset *= 2) {
-        const int other = __shfl_up_sync(FullWarp, warp_sum, offset);
-        if (lane >= offset)
-            warp_sum += other;
+        asm("{ .reg .pred p; .reg .b32 other;\n"
+            "shfl.sync.up.b32 other|p, %0, %1, 0, 0xffffffff;\n"
+            "@p add.s32 %0, %0, other; }"
+            : "+r"(warp_sum) : "r"(offset));
     }
     const int preceding = __shfl_sync(FullWarp, warp_sum, warp ? warp - 1 : 0);
     const int total = __shfl_sync(FullWarp, warp_sum, Threads / 32 - 1);
@@ -92,6 +94,7 @@ struct Selection {
 
 // Find the threshold among shared-memory FP32 candidates.
 // All 256 consumer threads participate; count >= k > 0.
+template <typename T>
 __device__ __forceinline__ Selection radix_threshold(
     const float *values,
     int count,
@@ -101,10 +104,10 @@ __device__ __forceinline__ Selection radix_threshold(
     uint32_t mask = 0;
     int remaining = k;
 #pragma unroll
-    for (int shift = 24; shift >= 0; shift -= 8) {
+    for (int shift = 24; shift >= (sizeof(T) == 2 ? 16 : 0); shift -= 8) {
         s.histogram[threadIdx.x] = 0;
         __syncthreads();
-        for (int64_t i = threadIdx.x; i < count; i += Threads) {
+        for (int i = threadIdx.x; i < count; i += Threads) {
             const uint32_t v = key(as_float(values[i]));
             if ((v & mask) == prefix)
                 atomicAdd(&s.histogram[(v >> shift) & 255u], 1);
@@ -124,6 +127,13 @@ __device__ __forceinline__ Selection radix_threshold(
         remaining -= s.above;
         // The next round's histogram barriers precede the next digit write.
     }
+    if constexpr (sizeof(T) == 2) {
+        // BF16 candidates are exact FP32 expansions. Once the high half is
+        // known, the low half is zero for nonnegative values, all ones for
+        // negative values and for the canonical NaN key.
+        if (!(prefix & 0x80000000u) || prefix == 0xffff0000u)
+            prefix |= 0xffffu;
+    }
     return {prefix, remaining};
 }
 
@@ -131,6 +141,7 @@ __device__ __forceinline__ Selection radix_threshold(
 // carrying their GMEM indices. Input order is stable, so ties keep lower indices.
 // Each tile is loaded into registers before any overlapping output write.
 // Returns an actual selected threshold in every thread's register.
+template <typename T>
 __device__ __forceinline__ float radixselectTopk(
     float *values,
     int32_t *indices,
@@ -138,27 +149,32 @@ __device__ __forceinline__ float radixselectTopk(
     int k,
     RadixStorage &s) {
     // The first histogram initialization barrier publishes candidate writes.
-    const Selection selection = radix_threshold(values, count, k, s);
+    const Selection selection = radix_threshold<T>(values, count, k, s);
     int equal_seen = 0;
     int emitted = 0;
-    for (int64_t base = 0; base < count; base += Threads) {
-        const int64_t i = base + threadIdx.x;
+    for (int base = 0; base < count; base += Threads) {
+        const int i = base + threadIdx.x;
         const float value = i < count ? values[i] : 0.f;
         const int32_t index = i < count ? indices[i] : 0;
         const uint32_t v = key(value);
         const int equal = i < count && v == selection.threshold_key;
-        const ScanResult eq = block_scan(equal, s);
-        const int take = i < count && (v > selection.threshold_key ||
-                                          (equal && equal_seen + eq.rank < selection.equal_needed));
-        const ScanResult selected = block_scan(take, s);
+        const int greater = i < count && v > selection.threshold_key;
+        // Two independent boolean scans packed into one integer scan. A tile
+        // has at most 256 equals, so the low 9 bits cannot carry into greater.
+        const ScanResult both = block_scan(equal | (greater << 9), s);
+        const int equal_rank = both.rank & 511;
+        const int equal_total = both.total & 511;
+        const int equal_budget = max(0, selection.equal_needed - equal_seen);
+        const int take = greater || (equal && equal_rank < equal_budget);
+        const int selected_rank = (both.rank >> 9) + min(equal_rank, equal_budget);
         if (take) {
-            values[emitted + selected.rank] = value;
-            indices[emitted + selected.rank] = index;
+            values[emitted + selected_rank] = value;
+            indices[emitted + selected_rank] = index;
         }
-        if (equal && equal_seen + eq.rank == 0)
+        if (equal && equal_seen + equal_rank == 0)
             s.threshold = value;
-        equal_seen += eq.total;
-        emitted += selected.total;
+        equal_seen += equal_total;
+        emitted += (both.total >> 9) + min(equal_total, equal_budget);
         // Stable compaction only writes to this tile or earlier tiles. The
         // next tile's reads cannot overlap these writes; its scan barriers
         // protect its register loads before any subsequent compaction write.
@@ -197,10 +213,21 @@ __device__ __forceinline__ uint32_t packed_mask(
     uint4 data,
     uint32_t threshold,
     const float *type) {
+    if (threshold == 0xffffffffu)
+        return 0;
+    const uint32_t bits = threshold ^
+        ((threshold & 0x80000000u) ? 0x80000000u : 0xffffffffu);
+    const float value = __uint_as_float(bits);
     uint32_t mask = 0;
 #pragma unroll
-    for (int bit = 0; bit < 4; ++bit)
-        mask |= uint32_t(key(packed_value(data, bit, type)) > threshold) << bit;
+    for (int bit = 0; bit < 4; ++bit) {
+        uint32_t comparison;
+        // Unordered greater preserves NaN ordering and treats signed zeros
+        // equally. No .ftz: FP32 subnormal scores must retain their ordering.
+        asm("set.gtu.u32.f32 %0, %1, %2;" : "=r"(comparison)
+            : "f"(packed_value(data, bit, type)), "f"(value));
+        mask |= comparison & (1u << bit);
+    }
     return mask;
 }
 __device__ __forceinline__ uint32_t packed_mask(
@@ -399,7 +426,7 @@ __global__ void topk_buffered(
         count = filter_mask(input[stage], base, local_n, threshold,
             have_threshold, values, indices, count, scratch);
         if (count >= k + B2) {
-            threshold = key(radixselectTopk(values, indices, count, k, scratch));
+            threshold = key(radixselectTopk<T>(values, indices, count, k, scratch));
             have_threshold = true;
             count = k;
         }
@@ -407,7 +434,7 @@ __global__ void topk_buffered(
             issue_input(input[stage], row, (block + Stages) * Block, local_n, ready + stage);
     }
     if (count > k) {
-        radixselectTopk(values, indices, count, k, scratch);
+        radixselectTopk<T>(values, indices, count, k, scratch);
     } else {
         __syncthreads();
     }
@@ -429,20 +456,15 @@ __global__ void topk_buffered(
                 const float *peer_values = cluster.map_shared_rank(values, peer);
                 const int32_t *peer_indices = cluster.map_shared_rank(indices, peer);
                 const int peer_count = *cluster.map_shared_rank(&retained, peer);
-                for (int base = 0; base < peer_count; base += Block) {
-                    const int chunk = min(Block, peer_count - base);
-                    for (int i = threadIdx.x; i < chunk; i += Threads) {
-                        values[count + i] = peer_values[base + i];
-                        indices[count + i] = peer_indices[base + i];
-                    }
-                    count += chunk;
-                    if (count >= k + B2) {
-                        radixselectTopk(values, indices, count, k, scratch);
-                        count = k;
-                    }
+                // Both sides retain at most K, so the merge has <= 2*K
+                // candidates and needs only one final selection.
+                for (int i = threadIdx.x; i < peer_count; i += Threads) {
+                    values[count + i] = peer_values[i];
+                    indices[count + i] = peer_indices[i];
                 }
+                count += peer_count;
                 if (count > k) {
-                    radixselectTopk(values, indices, count, k, scratch);
+                    radixselectTopk<T>(values, indices, count, k, scratch);
                     count = k;
                 } else {
                     __syncthreads();
