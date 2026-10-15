@@ -168,6 +168,16 @@ from .kernels.mxfp4_fc1 import (
     prepare_mxfp4_fc1_metadata,
     quantize_mxfp4_fc1_weights,
 )
+from .kernels.mxfp4_fc1fc2 import (
+    Mxfp4Fc1Fc2Config,
+    compact_mxfp4_fc1fc2_weight_scales,
+    compile_mxfp4_fc1fc2,
+    compile_mxfp4_fc1fc2_configs,
+    mxfp4_fc1fc2,
+    mxfp4_fc1fc2_out,
+    mxfp4_fc1fc2_routed_out,
+    prepare_mxfp4_fc1fc2_metadata,
+)
 from .kernels.mxfp4_fc2 import (
     Mxfp4Fc2Config,
     Mxfp4Fc2Metadata,
