@@ -317,7 +317,9 @@ __global__ void indexer_score_decode_kernel(
             wait_barrier(last_mma, (last_task / kPipelineStages) & 1);
         }
 
-        if (warp == 2 && (kDense ? elect_one() : lane == 0)) {
+        // Elect for paged KV too, so ptxas can reuse one issuer across the
+        // tcgen05 instructions instead of inserting repeated election loops.
+        if (warp == 2 && elect_one()) {
             const int q_bar = static_cast<int>(__cvta_generic_to_shared(&q_barrier));
             wait_barrier(q_bar, 0);
             constexpr uint32_t instruction = 0x08A00480U;
