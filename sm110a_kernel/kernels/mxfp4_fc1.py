@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..jit_runtime import SplitCudaJit
+from .pdl import PDL_TRIGGER_POINTS
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SRC = _ROOT / "csrc/mxfp4_moe/src"
@@ -47,7 +48,15 @@ class Mxfp4Fc1Config:
     routing_weight_position: str = "fc2"
     activation_bf16_rounding: bool = False
 
+    # FC2 requires prepare_pdl_out before the producer launch.
+    pdl: bool = False
+    pdl_trigger: str = "entry"
+
     def validate(self) -> None:
+        if self.pdl_trigger not in PDL_TRIGGER_POINTS:
+            raise ValueError(f"pdl_trigger must be one of {tuple(PDL_TRIGGER_POINTS)}")
+        if not isinstance(self.pdl, bool):
+            raise ValueError("pdl must be bool")
         if self.tile_m != 128 or self.tile_n != 256:
             raise ValueError("tile_m must be 128 and tile_n must be 256")
         if self.tile_k != 128:
@@ -239,6 +248,8 @@ def _flags(config: Mxfp4Fc1Config, variant):
     return tuple(
         f"-DSM110A_MXFP4_FC1_{key}={value}"
         for key, value in (
+            ("PDL", int(config.pdl)),
+            ("PDL_TRIGGER", PDL_TRIGGER_POINTS[config.pdl_trigger]),
             ("TILE_M", config.tile_m),
             ("TILE_N", config.tile_n),
             ("TILE_K", config.tile_k),
@@ -265,6 +276,7 @@ _JIT = SplitCudaJit(
     kernel_dependencies=(
         _INC / "mxfp4_moe_fc1.h",
         _INC / "common.h",
+        _INC / "pdl.h",
         _SRC / "mxfp4_fc1_pipeline_delay.cuh",
     ),
     kernel_symbol="sm110a_mxfp4_fc1_launch",

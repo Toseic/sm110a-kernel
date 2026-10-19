@@ -29,3 +29,10 @@ stable expert compaction, and a parallel per-expert task builder. The mainloop
 automatically uses the maximum stage count that fits in shared memory. Scheduler
 traversal and direct/TMA epilogue are available to the benchmark autotuner.
 SiLU always uses the precise implementation.
+
+## FC1 → FC2 PDL
+
+Standalone FC1/FC2 configs accept `pdl=True`. Call the FC2 module's
+`prepare_pdl_out(output, metadata)` before FC1, then launch FC1 and FC2
+adjacently on the same stream. See [PDL usage and overlap benchmark](../../docs/pdl.md)
+for the preparation contract and `benchmarks/benchmark_pdl.py --timeline`.

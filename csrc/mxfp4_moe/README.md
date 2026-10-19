@@ -305,3 +305,10 @@ Reports and disassembly remain under `/tmp/ncu-reports/`. The retained
 compact CM2 tiled / stages5 / acc2 / gather2 / reduce128 path passed memcheck
 with zero errors, bitwise accuracy and graph replay; sanitizer timings are
 excluded.
+
+## FC1 → FC2 PDL
+
+Standalone FC1/FC2 configs accept `pdl=True`. Call the FC2 module's
+`prepare_pdl_out(output, metadata)` before FC1, then launch FC1 and FC2
+adjacently on the same stream. See [PDL usage and overlap benchmark](../../docs/pdl.md)
+for the preparation contract and `benchmarks/benchmark_pdl.py --timeline`.

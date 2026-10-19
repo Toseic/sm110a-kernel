@@ -45,7 +45,20 @@ class Mxfp4Fc2Config:
     routing_weight_position: str = "fc2"
     deterministic: bool = False
 
+    # FC2 requires prepare_pdl_out before the producer launch.
+    pdl: bool = False
+    # before_a overlaps independent B/SFB loads before the producer wait.
+    pdl_wait: str = "init"
+    # Serial control: use the same pre-FC1 preparation without enabling PDL.
+    external_prepare: bool = False
+
     def validate(self) -> None:
+        if self.pdl_wait not in ("init", "before_a"):
+            raise ValueError("pdl_wait must be init or before_a")
+        if not isinstance(self.external_prepare, bool):
+            raise ValueError("external_prepare must be bool")
+        if not isinstance(self.pdl, bool):
+            raise ValueError("pdl must be bool")
         if self.routing_weight_position not in ("fc1", "fc2"):
             raise ValueError("routing_weight_position must be 'fc1' or 'fc2'")
         if not isinstance(self.deterministic, bool):
@@ -118,6 +131,20 @@ class Mxfp4Fc2Module:
             raise ValueError("max_active_clusters must be positive")
         return int(value)
 
+    def prepare_pdl_out(self, out, metadata):
+        """Reset FC2 state/output on the current stream BEFORE launching FC1.
+
+        Required once per PDL invocation (including each CUDA graph replay).
+        Keep preparation, FC1 and FC2 on the same stream with adjacent kernels.
+        """
+        if not (self.config.pdl or self.config.external_prepare):
+            raise ValueError(
+                "prepare_pdl_out requires pdl=True or external_prepare=True"
+            )
+        self._binding.prepare_pdl_out(
+            out, metadata.state, not getattr(self.config, "deterministic", False)
+        )
+
     def mxfp4_fc2(
         self,
         a,
@@ -130,6 +157,8 @@ class Mxfp4Fc2Module:
         topk,
         max_active_clusters=None,
     ):
+        if self.config.pdl or self.config.external_prepare:
+            raise ValueError("PDL requires the out API and prepare_pdl_out before FC1")
         return self._binding.mxfp4_fc2(
             a,
             b,
@@ -179,6 +208,9 @@ def _flags(config: Mxfp4Fc2Config, _variant):
     return tuple(
         f"-DSM110A_MXFP4_FC2_{key}={value}"
         for key, value in (
+            ("PDL", int(config.pdl)),
+            ("EXTERNAL_PREPARE", int(config.pdl or config.external_prepare)),
+            ("PDL_WAIT_BEFORE_A", int(config.pdl_wait == "before_a")),
             ("TILE_M", config.tile_m),
             ("TILE_N", config.tile_n),
             ("TILE_K", config.tile_k),
@@ -203,7 +235,7 @@ _JIT = SplitCudaJit(
     root=_ROOT,
     binding_sources=(_SRC / "mxfp4_fc2_torch_binding.cpp",),
     kernel_sources=(_SRC / "mxfp4_fc2_kernel.cu", _META),
-    kernel_dependencies=(_INC / "mxfp4_moe_fc2.h", _INC / "common.h"),
+    kernel_dependencies=(_INC / "mxfp4_moe_fc2.h", _INC / "common.h", _INC / "pdl.h"),
     kernel_symbol="sm110a_mxfp4_fc2_launch",
     config_key=lambda config: config,
     kernel_cflags=_flags,

@@ -160,9 +160,30 @@ torch::Tensor run(
                  topk, out, address, max_active_clusters, deterministic);
 }
 
+// Use the same CUDA memset operations as the serial launcher, moved ahead
+// of FC1 so no ordinary stream operation breaks the PDL dependency edge.
+void prepare_pdl_out(torch::Tensor out, torch::Tensor state, bool clear_output) {
+  TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.dim() == 2 &&
+                  out.scalar_type() == at::kBFloat16,
+              "output must be a contiguous 2D CUDA BF16 tensor");
+  TORCH_CHECK(state.is_cuda() && state.is_contiguous() && state.dim() == 1 &&
+                  state.scalar_type() == at::kInt && state.numel() >= 2 &&
+                  state.device() == out.device(),
+              "state must be contiguous CUDA int32 with at least two entries on output device");
+  c10::cuda::CUDAGuard guard(out.device());
+  auto stream = c10::cuda::getCurrentCUDAStream(out.device().index());
+  if (clear_output) {
+    C10_CUDA_CHECK(cudaMemsetAsync(out.data_ptr(), 0,
+                                 out.numel() * out.element_size(), stream));
+  }
+  C10_CUDA_CHECK(cudaMemsetAsync(state.data_ptr<int32_t>() + 1, 0,
+                               sizeof(int32_t), stream));
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("prepare_pdl_out", &prepare_pdl_out);
   m.def("prepare_mxfp4_fc2_metadata", &prepare_metadata);
   m.def("mxfp4_fc2", &run);
   m.def("mxfp4_fc2_out", &run_out);

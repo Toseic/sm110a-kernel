@@ -1,3 +1,11 @@
+#include "pdl.h"
+#ifndef SM110A_NVFP4_FC1_PDL
+#define SM110A_NVFP4_FC1_PDL 0
+#endif
+#ifndef SM110A_NVFP4_FC1_PDL_TRIGGER
+#define SM110A_NVFP4_FC1_PDL_TRIGGER 0
+#endif
+
 /*
  * Independent SM110A NVFP4 routed FC1 with fused token permutation.
  *
@@ -837,6 +845,9 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void n
     uint8_t *sfc,
     int n,
     int k) {
+    if constexpr (SM110A_NVFP4_FC1_PDL && SM110A_NVFP4_FC1_PDL_TRIGGER == 0) {
+        if (threadIdx.x == 0) cudaTriggerProgrammaticLaunchCompletion();
+    }
     using Config = KernelConfig<kTileM, kTileN, kTileK, kEpilogueTileN, kClusterM, kClusterN>;
     using Shape = ClusterShape<kClusterM, kClusterN>;
     (void)sizeof(Shape);
@@ -976,6 +987,10 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void n
     }
     asm volatile("barrier.cluster.arrive.release.aligned;");
     asm volatile("barrier.cluster.wait.acquire.aligned;");
+
+    if constexpr (SM110A_NVFP4_FC1_PDL && SM110A_NVFP4_FC1_PDL_TRIGGER == 1) {
+        if (tid == 0) cudaTriggerProgrammaticLaunchCompletion();
+    }
 
     const int tmem_addr = tmem_base[0];
     constexpr uint32_t instruction_desc = (1U << 7U) | (1U << 10U) |
@@ -1149,6 +1164,9 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void n
         }
     };
 
+    // Only the elected TMA lane uses this; signal once in the first local
+    // task. Both ranks issue B TMA, unlike the rank-0-only MMA warp.
+    bool pdl_triggered = false;
     int producer_stage = 0;
     int producer_mma_phase = 1;
     int tma_stage = 0;
@@ -1369,6 +1387,17 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void n
                         }
                         // B/SFB TMA requests have been issued for this stage.
                         sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_NVFP4_FC1_LOAD_B>();
+                    }
+
+                    if constexpr (SM110A_NVFP4_FC1_PDL &&
+                                  SM110A_NVFP4_FC1_PDL_TRIGGER >= 2 &&
+                                  SM110A_NVFP4_FC1_PDL_TRIGGER <= 5) {
+                        if (tid == kTmaWarp * kWarpSize && !pdl_triggered &&
+                            (tile_k + 1) * 4 >=
+                                k_tiles * (SM110A_NVFP4_FC1_PDL_TRIGGER - 1)) {
+                            cudaTriggerProgrammaticLaunchCompletion();
+                            pdl_triggered = true;
+                        }
                     }
 
                     tma_stage = (tma_stage + 1) % kStageCount;
@@ -1762,6 +1791,10 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void n
             }
         }
 
+    }
+
+    if constexpr (SM110A_NVFP4_FC1_PDL && SM110A_NVFP4_FC1_PDL_TRIGGER == 6) {
+        if (tid == 0) cudaTriggerProgrammaticLaunchCompletion();
     }
 
     // No later C-slot acquisition exists to retire the final bulk group(s).

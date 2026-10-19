@@ -1,3 +1,14 @@
+#include "pdl.h"
+#ifndef SM110A_NVFP4_FC2_PDL
+#define SM110A_NVFP4_FC2_PDL 0
+#endif
+#ifndef SM110A_NVFP4_FC2_EXTERNAL_PREPARE
+#define SM110A_NVFP4_FC2_EXTERNAL_PREPARE SM110A_NVFP4_FC2_PDL
+#endif
+#ifndef SM110A_NVFP4_FC2_PDL_WAIT_BEFORE_A
+#define SM110A_NVFP4_FC2_PDL_WAIT_BEFORE_A 0
+#endif
+
 /*
  * Fused SM110A NVFP4 routed FC2: grouped NVFP4 GEMM with token-major routing
  * reduction fused into the epilogue.
@@ -595,6 +606,10 @@ void nvfp4_fc2_fused_kernel(
     asm volatile("barrier.cluster.arrive.release.aligned;");
     asm volatile("barrier.cluster.wait.acquire.aligned;");
 
+    if constexpr (SM110A_NVFP4_FC2_PDL && !SM110A_NVFP4_FC2_PDL_WAIT_BEFORE_A) {
+        cudaGridDependencySynchronize();
+    }
+
     const int tmem_addr = tmem_base[0];
     constexpr uint32_t instruction_desc = (1U << 7U) | (1U << 10U) |
                                           (static_cast<uint32_t>(kTileN) >> 3U << 17U) |
@@ -602,6 +617,7 @@ void nvfp4_fc2_fused_kernel(
 
     const int k_tiles = k / kTileK;
 
+    bool pdl_dependency_ready = false;
     int producer_stage = 0;
     int producer_mma_phase = 1;
     int sfa_stage = 0;
@@ -825,11 +841,40 @@ void nvfp4_fc2_fused_kernel(
                         "r"(Config::kATmaBytes + Config::kBTmaBytes +
                             kSFBSmemBytes + sfa_tma_bytes)
                         : "memory");
+                    // Only A/SFA depend on FC1. Start independent weight
+                    // traffic before waiting; downstream warps remain gated
+                    // by the existing TMA/SFA completion barriers.
+                    if constexpr (SM110A_NVFP4_FC2_PDL && SM110A_NVFP4_FC2_PDL_WAIT_BEFORE_A) {
+                        tma_load_4d<kClusterM>(b_smem, &b_tensor_map, off_k,
+                            tile_col + cta_rank * (kTileN / kClusterM), 0, task.expert,
+                            tma_transaction_mbar_addr);
+                        for (int scale_tile = 0; scale_tile < kSFBScaleTileCount; ++scale_tile) {
+                            const int sfb_tile_smem =
+                                sfb_smem + scale_tile * Config::kMmaStepsPerStage * 512;
+                            const int sfb_tile_index =
+                                task.expert * (n / 128) + tile_col / 128 + scale_tile;
+                            if constexpr (kClusterM == 1) {
+                                tma_load_4d<1>(sfb_tile_smem, &sfb_tensor_map, 0, 0, off_k64,
+                                    sfb_tile_index, tma_transaction_mbar_addr);
+                            } else if (cta_rank == 0) {
+                                constexpr int16_t cta_mask = (1 << kClusterM) - 1;
+                                tma_load_4d_multicast<kClusterM>(sfb_tile_smem, &sfb_tensor_map,
+                                    0, 0, off_k64, sfb_tile_index, tma_transaction_mbar_addr,
+                                    cta_mask);
+                            }
+                        }
+                        if (!pdl_dependency_ready) {
+                            cudaGridDependencySynchronize();
+                            pdl_dependency_ready = true;
+                        }
+                    }
                     tma_load_4d<kClusterM>(a_smem, &a_tensor_map, off_k, cta_row, 0, 0,
                         tma_transaction_mbar_addr);
-                    tma_load_4d<kClusterM>(b_smem, &b_tensor_map, off_k,
-                        tile_col + cta_rank * (kTileN / kClusterM), 0, task.expert,
-                        tma_transaction_mbar_addr);
+                    if constexpr (!(SM110A_NVFP4_FC2_PDL && SM110A_NVFP4_FC2_PDL_WAIT_BEFORE_A)) {
+                        tma_load_4d<kClusterM>(b_smem, &b_tensor_map, off_k,
+                            tile_col + cta_rank * (kTileN / kClusterM), 0, task.expert,
+                            tma_transaction_mbar_addr);
+                    }
                     if constexpr (kClusterM == 1) {
                         if (sfa_aligned) {
                             tma_load_4d<1>(sfa_smem, &sfa_tensor_map,
@@ -871,19 +916,21 @@ void nvfp4_fc2_fused_kernel(
                             }
                         }
                     }
-                    for (int scale_tile = 0; scale_tile < kSFBScaleTileCount; ++scale_tile) {
-                        const int sfb_tile_smem =
-                            sfb_smem + scale_tile * Config::kMmaStepsPerStage * 512;
-                        const int sfb_tile_index =
-                            task.expert * (n / 128) + tile_col / 128 + scale_tile;
-                        if constexpr (kClusterM == 1) {
-                            tma_load_4d<1>(sfb_tile_smem, &sfb_tensor_map, 0, 0, off_k64,
-                                sfb_tile_index, tma_transaction_mbar_addr);
-                        } else if (cta_rank == 0) {
-                            constexpr int16_t cta_mask = (1 << kClusterM) - 1;
-                            tma_load_4d_multicast<kClusterM>(sfb_tile_smem, &sfb_tensor_map,
-                                0, 0, off_k64, sfb_tile_index, tma_transaction_mbar_addr,
-                                cta_mask);
+                    if constexpr (!(SM110A_NVFP4_FC2_PDL && SM110A_NVFP4_FC2_PDL_WAIT_BEFORE_A)) {
+                        for (int scale_tile = 0; scale_tile < kSFBScaleTileCount; ++scale_tile) {
+                            const int sfb_tile_smem =
+                                sfb_smem + scale_tile * Config::kMmaStepsPerStage * 512;
+                            const int sfb_tile_index =
+                                task.expert * (n / 128) + tile_col / 128 + scale_tile;
+                            if constexpr (kClusterM == 1) {
+                                tma_load_4d<1>(sfb_tile_smem, &sfb_tensor_map, 0, 0, off_k64,
+                                    sfb_tile_index, tma_transaction_mbar_addr);
+                            } else if (cta_rank == 0) {
+                                constexpr int16_t cta_mask = (1 << kClusterM) - 1;
+                                tma_load_4d_multicast<kClusterM>(sfb_tile_smem, &sfb_tensor_map,
+                                    0, 0, off_k64, sfb_tile_index, tma_transaction_mbar_addr,
+                                    cta_mask);
+                            }
                         }
                     }
 
@@ -1370,7 +1417,9 @@ void launch_nvfp4_fc2_impl(
     auto *tasks = reinterpret_cast<const ExpertTileTask *>(d_tasks);
     auto *task_count = d_state;
     auto *next_cluster_tile = d_state + 1;
-    cudaMemsetAsync(next_cluster_tile, 0, sizeof(int32_t), stream);
+    if constexpr (!SM110A_NVFP4_FC2_EXTERNAL_PREPARE) {
+        cudaMemsetAsync(next_cluster_tile, 0, sizeof(int32_t), stream);
+    }
 
     const int persistent_clusters =
         (max_tasks + kPersistentTileCount - 1) / kPersistentTileCount;
@@ -1422,7 +1471,8 @@ void launch_nvfp4_fc2_impl(
     const bool use_task_packets =
         m / experts >= kMinRowsPerExpertForTaskPacket;
     auto kernel = use_task_packets ? packet_kernel : single_tile_kernel;
-    kernel<<<kClusterM * launched_clusters, kBlockThreads, kDynamicSmemBytes, stream>>>(
+    launch_config.gridDim = dim3(kClusterM * launched_clusters, 1, 1);
+    sm110a::launch_pdl<SM110A_NVFP4_FC2_PDL>(&launch_config, kernel,
         d_sfa, a_tensor_map, b_tensor_map, sfa_tensor_map, sfb_tensor_map,
         tasks, task_count,
         next_cluster_tile, grouped_assignments, routing_weights, final_output, n, k, topk);
@@ -1463,8 +1513,9 @@ void launch_nvfp4_fc2_main(
     // The fused epilogue accumulates routing-weighted expert outputs directly
     // into the token-major result via cp.reduce.async.bulk add, so the
     // destination must be cleared before the kernel runs.
-    cudaMemsetAsync(c, 0, static_cast<size_t>(tokens) * n * sizeof(__nv_bfloat16),
-                    stream);
+    if constexpr (!SM110A_NVFP4_FC2_EXTERNAL_PREPARE) {
+        cudaMemsetAsync(c, 0, static_cast<size_t>(tokens) * n * sizeof(__nv_bfloat16), stream);
+    }
     launch_nvfp4_fc2_entry(a, b, sfa, sfb, grouped_assignments, tasks,
                            state, c, routing_weights, tokens, m, experts, n, k,
                            topk, max_tasks, max_active_clusters, stream);
