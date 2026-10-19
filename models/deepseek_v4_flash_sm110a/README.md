@@ -6,17 +6,42 @@ keeps checkpoint compatibility with the official readable implementation in
 SM110A kernels from `sm110a_kernel`.
 
 The 32-GiB benchmark configuration contains one ratio-4 CSA layer and one
-ratio-128 HCA layer. Routed experts use the fused W4A8 `mxfp4_fc1` and
-`mxfp4_fc2` kernels directly. Dense projections, activation quantization and
+ratio-128 HCA layer. Routed experts default to separate W4A8 `mxfp4_fc1` and
+`mxfp4_fc2` kernels. An optional `fused` backend executes both in one
+`mxfp4_fc1fc2` kernel. Dense projections, activation quantization and
 sparse MLA use the corresponding SM110A kernels. Missing fused model-level
 operators currently use explicit PyTorch fallbacks marked with
 `TODO(sm110a)` in `model.py`.
+
+Both MoE backends compact static weight scales once during preparation.
+`Transformer(args, compact_moe_scales=False)` or the benchmark flag
+`--moe-weight-scales padded` selects padded scales for comparison.
+The default is `--moe-weight-scales compact`; input and intermediate activation
+scale formats are unchanged.
 
 The default expert path applies FP32 routing weights inside FC1 before
 activation quantization, with the official BF16 rounding boundaries. FC2
 uses a fixed-order FP32 reduction and rounds to BF16 once after summing the
 expert outputs. `--routing-weight-position fc2 --fc2-reduction atomic`
 selects the previous output-weighted path for comparison.
+
+Select the fused backend with `Transformer(args, moe_backend="fused")` or:
+
+```bash
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_dsv4_flash.py --moe-backend fused
+```
+
+`--moe-backend unfused` remains the default. The fused backend keeps the same
+FP4 weight values, gate ordering, FC1 routing weights and BF16 activation
+rounding. It uses row scheduling with cluster_m=1 and statically compacted
+weight scales, releasing the padded scale buffers after preparation.
+It currently uses BF16 atomic expert accumulation, so its default reduction is
+`atomic`; explicitly requesting deterministic reduction or PDL is rejected.
+Use `--moe-backend unfused --fc2-reduction atomic` for a comparison with the same
+reduction semantics. Fused output can vary between replays and is validated
+with a numerical tolerance rather than bitwise equality. It supports positive
+hidden dimensions divisible by 256 and expert intermediate dimension 2048.
+Routing task counts are read on device each invocation, including graph replay.
 
 The default path is bitwise reproducible between eager and CUDA Graph in the
 tested decode runs, but full-model agreement with the official model is not

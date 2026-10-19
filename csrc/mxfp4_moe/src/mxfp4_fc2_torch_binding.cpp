@@ -71,7 +71,7 @@ torch::Tensor run_out(
     torch::Tensor routing, torch::Tensor routing_weights,
     torch::Tensor tasks, torch::Tensor state, int64_t topk,
     torch::Tensor out, uint64_t address, int64_t max_active_clusters,
-    bool deterministic) {
+    bool deterministic, bool compact_weight_scales) {
   check_fp8(a, "A", 2);
   check_fp4(b, "B", 3);
   TORCH_CHECK(routing.is_cuda() && routing.scalar_type() == torch::kInt32 &&
@@ -111,7 +111,7 @@ torch::Tensor run_out(
   // Blocked scales: one 512-byte tile per (128 rows, K=32 step), live byte
   // in column 0.
   check_scale(sfa, m * (k / 32) * 4, "SFA", a.device());
-  check_scale(sfb, experts * n * (k / 32) * 4, "SFB", a.device());
+  check_scale(sfb, experts * n * (k / 32) * (compact_weight_scales ? 1 : 4), "SFB", a.device());
   TORCH_CHECK(a.device() == sfa.device() && a.device() == sfb.device() &&
                   a.device() == routing.device() &&
                   a.device() == routing_weights.device() &&
@@ -152,12 +152,12 @@ torch::Tensor run(
     torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb,
     torch::Tensor routing, torch::Tensor routing_weights,
     torch::Tensor tasks, torch::Tensor state, int64_t topk,
-    uint64_t address, int64_t max_active_clusters, bool deterministic) {
+    uint64_t address, int64_t max_active_clusters, bool deterministic, bool compact_weight_scales) {
   TORCH_CHECK(topk > 0, "topk must be positive");
   auto out = torch::empty({a.size(0) / topk, b.size(1)},
                           a.options().dtype(torch::kBFloat16));
   return run_out(a, b, sfa, sfb, routing, routing_weights, tasks, state,
-                 topk, out, address, max_active_clusters, deterministic);
+                 topk, out, address, max_active_clusters, deterministic, compact_weight_scales);
 }
 
 // Use the same CUDA memset operations as the serial launcher, moved ahead

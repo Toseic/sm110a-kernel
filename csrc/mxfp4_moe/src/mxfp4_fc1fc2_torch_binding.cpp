@@ -65,29 +65,31 @@ torch::Tensor run_out(
     torch::Tensor workspace,
     double swiglu_limit,
     uint64_t address,
-    bool compact_weight_scales) {
+    bool compact_weight_scales,
+    int64_t hidden_dim) {
+    TORCH_CHECK(hidden_dim > 0 && hidden_dim % 256 == 0, "unsupported hidden_dim");
     TORCH_CHECK(
         a.is_cuda() && a.scalar_type() == at::kFloat8_e4m3fn && a.dim() == 2 && a.is_contiguous(),
-        "A must be contiguous CUDA FP8 E4M3 [rows,6144]");
+        "A must be contiguous CUDA FP8 E4M3 [rows,H]");
     check_fp4(w1, "W1", 3);
     check_fp4(w2, "W2", 3);
     const int64_t m = a.size(0);
-    TORCH_CHECK(m > 0 && m % 128 == 0 && a.size(1) == 6144,
-        "A must have shape [M,6144] with M divisible by 128 (256 for cluster_m=2)");
-    TORCH_CHECK(w1.sizes() == torch::IntArrayRef({1, 4096, 3072}),
-        "W1 must have packed shape [1,4096,3072]");
-    TORCH_CHECK(w2.sizes() == torch::IntArrayRef({1, 6144, 1024}),
-        "W2 must have packed shape [1,6144,1024]");
-    check_scale(sfa, "SFA", m * 768, a.device());
+    TORCH_CHECK(m > 0 && m % 128 == 0 && a.size(1) == hidden_dim,
+        "A must have shape [M,H] with M divisible by 128 (256 for cluster_m=2)");
+    TORCH_CHECK(w1.sizes() == torch::IntArrayRef({1, 4096, hidden_dim / 2}),
+        "W1 must have packed shape [1,4096,H/2]");
+    TORCH_CHECK(w2.sizes() == torch::IntArrayRef({1, hidden_dim, 1024}),
+        "W2 must have packed shape [1,H,1024]");
+    check_scale(sfa, "SFA", m * (hidden_dim / 8), a.device());
     const int scale_divisor = compact_weight_scales ? 4 : 1;
-    check_scale(sfw1, "SFW1", 4096 * 768 / scale_divisor, a.device());
-    check_scale(sfw2, "SFW2", 6144 * 256 / scale_divisor, a.device());
+    check_scale(sfw1, "SFW1", 4096 * (hidden_dim / 8) / scale_divisor, a.device());
+    check_scale(sfw2, "SFW2", hidden_dim * 256 / scale_divisor, a.device());
     TORCH_CHECK(a.device() == w1.device() && a.device() == w2.device(),
         "all inputs must share one CUDA device");
     TORCH_CHECK(output.is_cuda() && output.scalar_type() == torch::kBFloat16 &&
-                    output.is_contiguous() && output.sizes() == torch::IntArrayRef({m, 6144}) &&
+                    output.is_contiguous() && output.sizes() == torch::IntArrayRef({m, hidden_dim}) &&
                     output.device() == a.device(),
-        "output must be contiguous CUDA BF16 [M,6144]");
+        "output must be contiguous CUDA BF16 [M,H]");
     TORCH_CHECK(address != 0, "launcher must be valid");
     TORCH_CHECK(workspace.is_cuda() && workspace.scalar_type() == torch::kUInt8 &&
                     workspace.is_contiguous() && workspace.device() == a.device() &&
@@ -140,25 +142,27 @@ torch::Tensor run_routed_out(
     torch::Tensor workspace,
     double swiglu_limit,
     uint64_t address,
-    bool compact_weight_scales) {
+    bool compact_weight_scales,
+    int64_t hidden_dim) {
+    TORCH_CHECK(hidden_dim > 0 && hidden_dim % 256 == 0, "unsupported hidden_dim");
     TORCH_CHECK(
         a.is_cuda() && a.scalar_type() == at::kFloat8_e4m3fn && a.dim() == 2 && a.is_contiguous(),
-        "A must be contiguous CUDA FP8 E4M3 [rows,6144]");
+        "A must be contiguous CUDA FP8 E4M3 [rows,H]");
     check_fp4(w1, "W1", 3);
     check_fp4(w2, "W2", 3);
     const int64_t tokens = a.size(0);
     const int64_t experts = w1.size(0);
     const int64_t m = source_rows.numel();
     TORCH_CHECK(
-        tokens > 0 && tokens % 128 == 0 && topk > 0 && m == tokens * topk && a.size(1) == 6144,
-        "routed A must be [tokens,6144], tokens divisible by 128, and M=tokens*topk");
-    TORCH_CHECK(w1.size(1) == 4096 && w1.size(2) == 3072 &&
-                    w2.sizes() == torch::IntArrayRef({experts, 6144, 1024}),
-        "routed weights must be W1 [E,4096,3072] and W2 [E,6144,1024]");
-    check_scale(sfa, "SFA", tokens * 768, a.device());
+        tokens > 0 && tokens % 128 == 0 && topk > 0 && m == tokens * topk && a.size(1) == hidden_dim,
+        "routed A must be [tokens,H], tokens divisible by 128, and M=tokens*topk");
+    TORCH_CHECK(w1.size(1) == 4096 && w1.size(2) == hidden_dim / 2 &&
+                    w2.sizes() == torch::IntArrayRef({experts, hidden_dim, 1024}),
+        "routed weights must be W1 [E,4096,H/2] and W2 [E,H,1024]");
+    check_scale(sfa, "SFA", tokens * (hidden_dim / 8), a.device());
     const int scale_divisor = compact_weight_scales ? 4 : 1;
-    check_scale(sfw1, "SFW1", experts * 4096 * 768 / scale_divisor, a.device());
-    check_scale(sfw2, "SFW2", experts * 6144 * 256 / scale_divisor, a.device());
+    check_scale(sfw1, "SFW1", experts * 4096 * (hidden_dim / 8) / scale_divisor, a.device());
+    check_scale(sfw2, "SFW2", experts * hidden_dim * 256 / scale_divisor, a.device());
     TORCH_CHECK(source_rows.is_cuda() && source_rows.scalar_type() == torch::kInt32 &&
                     source_rows.is_contiguous(),
         "source_rows must be contiguous CUDA int32");
@@ -178,8 +182,8 @@ torch::Tensor run_routed_out(
                     routing_weights.sizes() == torch::IntArrayRef({tokens, topk}),
         "routing_weights must be contiguous CUDA BF16/FP32 [tokens,topk]");
     TORCH_CHECK(output.is_cuda() && output.scalar_type() == torch::kBFloat16 &&
-                    output.is_contiguous() && output.sizes() == torch::IntArrayRef({tokens, 6144}),
-        "routed output must be contiguous CUDA BF16 [tokens,6144]");
+                    output.is_contiguous() && output.sizes() == torch::IntArrayRef({tokens, hidden_dim}),
+        "routed output must be contiguous CUDA BF16 [tokens,H]");
     TORCH_CHECK(workspace.is_cuda() && workspace.scalar_type() == torch::kUInt8 &&
                     workspace.is_contiguous(),
         "workspace must be contiguous CUDA uint8");

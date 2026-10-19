@@ -85,10 +85,22 @@ def parse_args() -> argparse.Namespace:
         help="compile-time expert weighting mode (default: before FC1 activation quantization)",
     )
     parser.add_argument(
+        "--moe-weight-scales",
+        choices=("padded", "compact"),
+        default="compact",
+        help="static expert weight scale format (default: compact)",
+    )
+    parser.add_argument(
+        "--moe-backend",
+        choices=("unfused", "fused"),
+        default="unfused",
+        help="routed MoE backend (default: separate FC1/FC2 kernels)",
+    )
+    parser.add_argument(
         "--fc2-reduction",
         choices=("deterministic", "atomic"),
-        default="deterministic",
-        help="expert accumulation (default: fixed-order FP32 reduction)",
+        default=None,
+        help="expert accumulation (default: deterministic for unfused, atomic for fused)",
     )
     parser.add_argument(
         "--warmup", type=int, default=2, help="Unmeasured iterations (default: 2)"
@@ -120,7 +132,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print derived config and memory budget without loading weights",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.fc2_reduction is None:
+        args.fc2_reduction = (
+            "atomic" if args.moe_backend == "fused" else "deterministic"
+        )
+    if args.moe_backend == "fused" and args.fc2_reduction != "atomic":
+        parser.error("--moe-backend fused requires --fc2-reduction atomic")
+    if args.moe_backend == "fused" and args.pdl:
+        parser.error("--moe-backend fused does not support --pdl")
+    return args
 
 
 def benchmark_config(args: argparse.Namespace) -> dict:
@@ -173,9 +194,8 @@ def budget_check(config: dict, args: argparse.Namespace) -> tuple[int, int]:
     # our runtime retains BF16, including the single head shared with MTP.
     parameter_bytes -= config["vocab_size"] * config["dim"] * 2
     resident_bytes = parameter_bytes + buffer_bytes
-    # Fused FC1/FC2 use the same packed FP4 payload but a padded 4-byte
-    # hardware scale layout.  The official state stores one byte per logical
-    # K=32 scale, so packing adds three bytes per logical expert scale.
+    # Both backends can retain padded 4-byte scales or pack static scales
+    # once into the original one-byte-per-K32 scale footprint.
     logical_expert_scales = (
         config["n_layers"]
         * config["n_routed_experts"]
@@ -184,7 +204,9 @@ def budget_check(config: dict, args: argparse.Namespace) -> tuple[int, int]:
             + config["dim"] * config["moe_inter_dim"] // 32
         )
     )
-    sm110a_extra_bytes = 3 * logical_expert_scales
+    sm110a_extra_bytes = (
+        3 if args.moe_weight_scales == "padded" else 0
+    ) * logical_expert_scales
     sm110a_resident_bytes = resident_bytes + sm110a_extra_bytes
     budget_bytes = int(args.memory_limit_gib * 2**30)
     reserve_bytes = int(args.runtime_reserve_gib * 2**30)
@@ -503,6 +525,8 @@ def _load_model(config, checkpoint, args):
     with torch.device("cuda"):
         model = Sm110aTransformer(
             Sm110aModelArgs(**config),
+            moe_backend=args.moe_backend,
+            compact_moe_scales=args.moe_weight_scales == "compact",
             routing_weight_position=args.routing_weight_position,
             deterministic_fc2=args.fc2_reduction == "deterministic",
             pdl=args.pdl,
@@ -531,7 +555,7 @@ def _measure_sm110a(config, checkpoint, args, prompt, tokens, decode_start_pos):
         graph_seed = model(prompt, 0).argmax(dim=-1, keepdim=True)
     print(f"[sm110a] capturing fixed decode CUDA Graph ({args.decode_len} steps)")
     print(
-        f"[moe] routing-weight-position={args.routing_weight_position}; "
+        f"[moe] backend={args.moe_backend}; scales={args.moe_weight_scales}; routing-weight-position={args.routing_weight_position}; "
         f"FC2 reduction={args.fc2_reduction}; decode PDL={args.pdl}"
     )
     decode_graph = DecodeCudaGraph(model, graph_seed, decode_start_pos, args.decode_len)
@@ -564,6 +588,8 @@ def _measure_sm110a(config, checkpoint, args, prompt, tokens, decode_start_pos):
         "kernel_stats": backend_stats(),
         "cuda_graph": True,
         "pdl": args.pdl,
+        "moe_backend": args.moe_backend,
+        "moe_weight_scales": args.moe_weight_scales,
     }
     del decode_graph
     del model

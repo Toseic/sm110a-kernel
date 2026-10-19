@@ -171,6 +171,7 @@ from .kernels.mxfp4_fc1 import (
 from .kernels.mxfp4_fc1fc2 import (
     Mxfp4Fc1Fc2Config,
     compact_mxfp4_fc1fc2_weight_scales,
+    compact_mxfp4_weight_scales,
     compile_mxfp4_fc1fc2,
     compile_mxfp4_fc1fc2_configs,
     mxfp4_fc1fc2,

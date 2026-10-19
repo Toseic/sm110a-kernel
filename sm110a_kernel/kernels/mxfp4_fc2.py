@@ -52,7 +52,12 @@ class Mxfp4Fc2Config:
     # Serial control: use the same pre-FC1 preparation without enabling PDL.
     external_prepare: bool = False
 
+    # SFB only: pack once with compact_mxfp4_weight_scales; SFA stays padded.
+    compact_weight_scales: bool = False
+
     def validate(self) -> None:
+        if not isinstance(self.compact_weight_scales, bool):
+            raise ValueError("compact_weight_scales must be bool")
         if self.pdl_wait not in ("init", "before_a"):
             raise ValueError("pdl_wait must be init or before_a")
         if not isinstance(self.external_prepare, bool):
@@ -172,6 +177,7 @@ class Mxfp4Fc2Module:
             self._address,
             self._max_active_clusters(a.device, max_active_clusters),
             self.config.deterministic,
+            self.config.compact_weight_scales,
         )
 
     def mxfp4_fc2_out(
@@ -201,6 +207,7 @@ class Mxfp4Fc2Module:
             self._address,
             self._max_active_clusters(a.device, max_active_clusters),
             self.config.deterministic,
+            self.config.compact_weight_scales,
         )
 
 
@@ -208,6 +215,7 @@ def _flags(config: Mxfp4Fc2Config, _variant):
     return tuple(
         f"-DSM110A_MXFP4_FC2_{key}={value}"
         for key, value in (
+            ("COMPACT_WEIGHT_SCALES", int(config.compact_weight_scales)),
             ("PDL", int(config.pdl)),
             ("EXTERNAL_PREPARE", int(config.pdl or config.external_prepare)),
             ("PDL_WAIT_BEFORE_A", int(config.pdl_wait == "before_a")),
@@ -235,7 +243,12 @@ _JIT = SplitCudaJit(
     root=_ROOT,
     binding_sources=(_SRC / "mxfp4_fc2_torch_binding.cpp",),
     kernel_sources=(_SRC / "mxfp4_fc2_kernel.cu", _META),
-    kernel_dependencies=(_INC / "mxfp4_moe_fc2.h", _INC / "common.h", _INC / "pdl.h"),
+    kernel_dependencies=(
+        _INC / "mxfp4_moe_fc2.h",
+        _INC / "common.h",
+        _INC / "pdl.h",
+        _SRC / "mxfp4_weight_scales.cuh",
+    ),
     kernel_symbol="sm110a_mxfp4_fc2_launch",
     config_key=lambda config: config,
     kernel_cflags=_flags,

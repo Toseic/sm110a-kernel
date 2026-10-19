@@ -55,7 +55,12 @@ class Mxfp4Fc1Config:
     # resetting the scheduler is the caller's responsibility on every replay.
     pdl_input: bool = False
 
+    # SFB only: pack once with compact_mxfp4_weight_scales; SFA stays padded.
+    compact_weight_scales: bool = False
+
     def validate(self) -> None:
+        if not isinstance(self.compact_weight_scales, bool):
+            raise ValueError("compact_weight_scales must be bool")
         if self.pdl_trigger not in PDL_TRIGGER_POINTS:
             raise ValueError(f"pdl_trigger must be one of {tuple(PDL_TRIGGER_POINTS)}")
         if not isinstance(self.pdl_input, bool):
@@ -222,6 +227,7 @@ class Mxfp4Fc1Module:
             self._max_active_clusters(a.device, max_active_clusters),
             metadata.routing,
             routing_weights,
+            self.config.compact_weight_scales,
         )
 
     def mxfp4_fc1(
@@ -263,6 +269,7 @@ def _flags(config: Mxfp4Fc1Config, variant):
     return tuple(
         f"-DSM110A_MXFP4_FC1_{key}={value}"
         for key, value in (
+            ("COMPACT_WEIGHT_SCALES", int(config.compact_weight_scales)),
             ("PDL", int(config.pdl)),
             ("PDL_INPUT", int(config.pdl_input)),
             ("PDL_TRIGGER", PDL_TRIGGER_POINTS[config.pdl_trigger]),
@@ -294,6 +301,7 @@ _JIT = SplitCudaJit(
         _INC / "common.h",
         _INC / "pdl.h",
         _SRC / "mxfp4_fc1_pipeline_delay.cuh",
+        _SRC / "mxfp4_weight_scales.cuh",
     ),
     kernel_symbol="sm110a_mxfp4_fc1_launch",
     config_key=lambda config: config,

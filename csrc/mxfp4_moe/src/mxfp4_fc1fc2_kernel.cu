@@ -21,7 +21,11 @@
 
 namespace {
 
-constexpr int kH = 6144;
+#ifndef SM110A_MXFP4_FC1FC2_HIDDEN_DIM
+#define SM110A_MXFP4_FC1FC2_HIDDEN_DIM 6144
+#endif
+constexpr int kH = SM110A_MXFP4_FC1FC2_HIDDEN_DIM;
+static_assert(kH > 0 && kH % 256 == 0);
 constexpr int kI = 2048;
 constexpr int kPhysicalFc1N = 2 * kI;
 #ifndef SM110A_MXFP4_FC1FC2_H_SPLIT
@@ -44,6 +48,7 @@ constexpr int kPhysicalFc1N = 2 * kI;
 #endif
 constexpr bool kCompactWeightScales = SM110A_MXFP4_FC1FC2_COMPACT_WEIGHT_SCALES;
 constexpr int kHSplit = SM110A_MXFP4_FC1FC2_H_SPLIT;
+static_assert(kH % (256 * kHSplit) == 0);
 #ifndef SM110A_MXFP4_FC1FC2_TILED
 #define SM110A_MXFP4_FC1FC2_TILED 0
 #endif
@@ -528,7 +533,8 @@ void mxfp4_fc1fc2_kernel(
     const int pair_rank = cta_rank;
     const int worker_id = blockIdx.x / kClusterCtas;
     const int worker_count = gridDim.x / kClusterCtas;
-    const int row_task_count = row_task_count_arg;
+    const int row_task_count = kFuseRouting ? task_state[0] / kFc1TasksPerRowTask
+                                           : row_task_count_arg;
     auto *grid_barrier_words =
         reinterpret_cast<uint32_t *>(global_workspace + static_cast<size_t>(row_task_count_arg) *
                                                             kClusterM * kIntermediateBytes);
@@ -1338,7 +1344,8 @@ void mxfp4_fc1fc2_kernel(
             if (cta_rank == 0)
                 for (int stage = 0; stage < kAccumulatorStages; ++stage) {
                     const int last_phase =
-                        ((h_tile_end - h_tile_begin) / kAccumulatorStages - 1) & 1;
+                        ((h_tile_end - h_tile_begin + kAccumulatorStages - 1 - stage) /
+                                kAccumulatorStages - 1) & 1;
                     mbarrier_wait(epilogue_free_addr + stage * sizeof(uint64_t), last_phase);
                     if constexpr (kAccumulatorStages == 2)
                         mbarrier_wait(overlap_free_addr + stage * sizeof(uint64_t), last_phase);

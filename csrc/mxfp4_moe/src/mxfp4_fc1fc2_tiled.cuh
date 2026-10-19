@@ -23,7 +23,8 @@ void mxfp4_fc1fc2_kernel(
     const int pair_rank = cta_rank;
     const int worker_id = blockIdx.x / kClusterCtas;
     const int worker_count = gridDim.x / kClusterCtas;
-    const int row_task_count = row_task_count_arg;
+    const int row_task_count = kFuseRouting ? task_state[0] / kFc1TasksPerRowTask
+                                           : row_task_count_arg;
     auto *grid_barrier_words =
         reinterpret_cast<uint32_t *>(global_workspace + static_cast<size_t>(row_task_count_arg) *
                                                             kClusterM * kIntermediateBytes);

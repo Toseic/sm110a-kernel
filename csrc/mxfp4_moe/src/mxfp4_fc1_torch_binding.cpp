@@ -82,7 +82,7 @@ torch::Tensor run_out(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch
     torch::Tensor source_rows, torch::Tensor tasks, torch::Tensor state,
     torch::Tensor out, torch::Tensor out_scale, double swiglu_limit, uint64_t address,
     int64_t max_active_clusters, torch::Tensor routing,
-    c10::optional<torch::Tensor> routing_weights) {
+    c10::optional<torch::Tensor> routing_weights, bool compact_weight_scales) {
   check_fp8(a, "A", 2); check_fp4(b, "B", 3);
   const int64_t tokens = a.size(0), m = out.size(0);
   const int64_t e = b.size(0), n = b.size(1), k = a.size(1);
@@ -91,7 +91,7 @@ torch::Tensor run_out(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch
   TORCH_CHECK(b.size(2) * 2 == k && a.device() == b.device(), "incompatible A/B");
   // Blocked scales: one 512-byte tile per (128 rows, K=32 step).
   check_scale(sfa, tokens * (k / 32) * 4, "SFA");
-  check_scale(sfb, e * n * (k / 32) * 4, "SFB");
+  check_scale(sfb, e * n * (k / 32) * (compact_weight_scales ? 1 : 4), "SFB");
   TORCH_CHECK(tasks.is_cuda() && tasks.scalar_type() == torch::kInt32 && tasks.size(1) == 5,
       "tasks must be CUDA int32 [T,5]");
   TORCH_CHECK(source_rows.is_cuda() && source_rows.scalar_type() == torch::kInt32 &&
@@ -137,7 +137,7 @@ torch::Tensor run_out(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch
 std::vector<torch::Tensor> run(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb,
     torch::Tensor source_rows, torch::Tensor tasks, torch::Tensor state,
     double swiglu_limit, uint64_t address, int64_t max_active_clusters,
-    torch::Tensor routing, c10::optional<torch::Tensor> routing_weights) {
+    torch::Tensor routing, c10::optional<torch::Tensor> routing_weights, bool compact_weight_scales) {
   const auto m = source_rows.numel();
   const auto logical_n = b.size(1) / 2;
   auto out = torch::empty({m, logical_n},
@@ -145,7 +145,7 @@ std::vector<torch::Tensor> run(torch::Tensor a, torch::Tensor b, torch::Tensor s
   auto out_scale = torch::empty({m * (logical_n / 32) * 4},
       a.options().dtype(at::kFloat8_e8m0fnu));
   run_out(a,b,sfa,sfb,source_rows,tasks,state,out,out_scale,swiglu_limit,address,
-      max_active_clusters,routing,routing_weights);
+      max_active_clusters,routing,routing_weights,compact_weight_scales);
   return {out, out_scale};
 }
 }

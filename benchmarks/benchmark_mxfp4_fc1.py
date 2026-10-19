@@ -36,6 +36,7 @@ from sm110a_kernel import (
     Mxfp4Fc1Config,
     Nvfp4Fc1Config,
     bf16tofp8_quant,
+    compact_mxfp4_weight_scales,
     compile_mxfp4_fc1,
     compile_nvfp4_fc1,
     from_blocked_fp8mxfp4_scales,
@@ -98,6 +99,7 @@ def format_candidate(config):
             f"e{config.epilogue_tile_n}",
             f"c{config.cluster_m}",
             epilogue,
+            "compact" if config.compact_weight_scales else "padded",
         ]
     )
 
@@ -115,6 +117,7 @@ def mxfp4_candidates(args):
     return tuple(
         replace(
             c,
+            compact_weight_scales=args.compact_weight_scales,
             routing_weight_position=args.routing_weight_position,
             activation_bf16_rounding=args.activation_bf16_rounding,
         )
@@ -272,15 +275,16 @@ def mxfp4_fc1_sol_bounds(router, topk, n, k, config):
     )
     task_count = m_tasks * ((2 * n) // (config.tile_n * config.cluster_n))
 
+    weight_scale_divisor = 32 if config.compact_weight_scales else 8
     flops = 4 * m * n * k
     routed_a_bytes = m * (k + k / 8)
-    b_bytes = active_experts * (2 * n) * (k / 2 + k / 8)
+    b_bytes = active_experts * (2 * n) * (k / 2 + k / weight_scale_divisor)
     c_bytes = m * (n + n / 8)
     staged_sfb_n = max(config.tile_n, 128)
     tile_read_bytes = task_count * (
         config.cluster_m * config.tile_m * (k + k / 8)
         + config.tile_n * k / 2
-        + staged_sfb_n * k / 8
+        + staged_sfb_n * k / weight_scale_divisor
     )
     return sol_bounds(
         flops,
@@ -315,6 +319,7 @@ class Mxfp4Fc1Benchmark(BenchmarkBase):
         parser.add_argument("--no-accuracy", action="store_true")
         parser.add_argument("--seed", type=int, default=self.seed)
         parser.add_argument("--tile-k", type=int, choices=(128,))
+        parser.add_argument("--compact-weight-scales", action="store_true")
         parser.add_argument("--cluster-m", type=int, choices=(1, 2))
         parser.add_argument("--direct-gmem", action="store_true")
         parser.add_argument("--tma-epilogue", action="store_true")
@@ -379,6 +384,9 @@ class Mxfp4Fc1Benchmark(BenchmarkBase):
         sol_report = SolReport(debug=args.debug) if args.sol else None
 
         bq, sfb = make_interleaved_weights(args.experts, args.n, args.k)
+        kernel_sfb = (
+            compact_mxfp4_weight_scales(sfb) if args.compact_weight_scales else sfb
+        )
         # NVFP4 parity weights, interleaved the same way.
         nv_bq = None
         nv_sfb = None
@@ -464,7 +472,7 @@ class Mxfp4Fc1Benchmark(BenchmarkBase):
                     aq,  # noqa: F821
                     bq,
                     sfa,  # noqa: F821
-                    sfb,
+                    kernel_sfb,
                     metadata,
                     out,  # noqa: F821
                     out_scale,  # noqa: F821
@@ -507,7 +515,17 @@ class Mxfp4Fc1Benchmark(BenchmarkBase):
             ours_selection = AutotuneRunner(options).resolve(
                 mxfp4_candidates(args),
                 namespace="mxfp4_fc1",
-                key=("v1-w4a8", tokens, args.experts, args.topk, args.n, args.k),
+                key=(
+                    "v2-weight-scales",
+                    tokens,
+                    args.experts,
+                    args.topk,
+                    args.n,
+                    args.k,
+                    args.compact_weight_scales,
+                    args.routing_weight_position,
+                    args.activation_bf16_rounding,
+                ),
                 prepare=prepare_mxfp4,
                 benchmark=lambda prepared: benchmark_with_stats(
                     prepared.run,

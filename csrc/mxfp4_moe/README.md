@@ -6,22 +6,55 @@ The directory contains standalone MXFP4 FC1 and FC2 kernels and the fused
 `prepare_mxfp4_fc1_metadata` / `prepare_mxfp4_fc2_metadata`. Their benchmarks
 are `benchmarks/benchmark_mxfp4_fc1.py` and `benchmark_mxfp4_fc2.py`.
 
+## Standalone compact weight scales
+
+FC1 and FC2 support `compact_weight_scales=True` (default false for API
+compatibility). Pack static SFB once with `compact_mxfp4_weight_scales`:
+
+```python
+from sm110a_kernel import (
+    Mxfp4Fc1Config, Mxfp4Fc2Config, compact_mxfp4_weight_scales,
+    compile_mxfp4_fc1, compile_mxfp4_fc2,
+)
+sfb1 = compact_mxfp4_weight_scales(padded_sfb1)
+sfb2 = compact_mxfp4_weight_scales(padded_sfb2)
+fc1 = compile_mxfp4_fc1(Mxfp4Fc1Config(compact_weight_scales=True))
+fc2 = compile_mxfp4_fc2(Mxfp4Fc2Config(compact_weight_scales=True))
+```
+
+Compact SFB stores `experts * physical_N * K / 32` E8M0 bytes instead of
+four times that size. TMA loads compact tiles; a warp expands them in the
+existing shared-memory slots before MMA. Paired CTA completion is relayed from
+the leader before either CTA publishes expanded scales as ready. Activation
+scales, intermediate data, FP4 weights and effective scale values are unchanged.
+Both direct/TMA FC1 epilogues, deterministic/atomic FC2 reductions and PDL
+retain their interfaces. Bindings validate the selected storage size. The
+config and JIT cache distinguish compact/padded variants.
+
+Individual benchmarks accept `--compact-weight-scales`; their autotune cache
+keys and SOL estimates distinguish the weight scale format. The combined
+benchmark has `--baseline-weight-scales compact` to compare standalone FC1/FC2
+with fused kernels using the same format. Its `--weight-scales` flag controls
+the fused side independently. Static packing is outside repeated timings.
+
 ## Fused FC1/SwiGLU/FC2 inputs
 
-The fused W4A8 kernel targets SM110a and fixes `H=6144`, `I=2048`.
+The fused W4A8 kernel targets SM110a with compile-time `hidden_dim=H`
+(default 6144) and fixed `I=2048`. H must be positive and divisible by
+`256 * h_split`; there is no fixed hidden-size whitelist.
 It computes two FC1 projections, SwiGLU with optional clipping, FP8/E8M0
 requantization, and FC2 in one kernel. FP32 accumulation is retained across
 FC2's entire reduction dimension; output is BF16.
 
 | Tensor | Type | Shape / storage |
 |---|---|---|
-| A | FP8 E4M3 | `[rows, 6144]` |
-| W1 | `float4_e2m1fn_x2` | `[experts, 4096, 3072]`, gate/up interleaved in 64-row blocks |
-| W2 | `float4_e2m1fn_x2` | `[experts, 6144, 1024]` |
-| SFA | E8M0 | `rows * 768` elements, blocked padded scales |
-| SFW1 | E8M0 | `experts * 4096 * 768` elements |
-| SFW2 | E8M0 | `experts * 6144 * 256` elements |
-| Output | BF16 | `[rows, 6144]` |
+| A | FP8 E4M3 | `[rows, H]` |
+| W1 | `float4_e2m1fn_x2` | `[experts, 4096, H/2]`, gate/up interleaved in 64-row blocks |
+| W2 | `float4_e2m1fn_x2` | `[experts, H, 1024]` |
+| SFA | E8M0 | `rows * H/8` elements, blocked padded scales |
+| SFW1 | E8M0 | `experts * 4096 * H/8` elements |
+| SFW2 | E8M0 | `experts * H * 256` elements |
+| Output | BF16 | `[rows, H]` |
 
 All tensors must be contiguous and on the same CUDA device. Scales use groups
 of 32 with the same replicated blocked layout as the standalone MXFP4 FC1/FC2.
@@ -31,6 +64,10 @@ unexpanded token-major A, requires `tokens % 128 == 0`, and returns reduced
 token-major output. FC2-position routing weights are BF16; FC1-position weights
 are FP32. `activation_bf16_rounding=True` matches the corresponding standalone
 FC1 numerical mode.
+
+The standalone fusion benchmark accepts `--hidden-dim H` (default 6144).
+Its autotune/cache keys distinguish hidden dimensions; for example, pass
+`--hidden-dim 4096` for the DeepSeek-V4-Flash model shape.
 
 ## Python and JIT
 
@@ -52,10 +89,9 @@ output = mxfp4_fc1fc2(a, w1, sfa, sfw1, w2, sfw2, swiglu_limit=7.0)
 config = Mxfp4Fc1Fc2Config(fuse_routing=True)
 module = compile_mxfp4_fc1fc2(config)
 metadata = prepare_mxfp4_fc1fc2_metadata(router_scores, topk, config)
-row_tasks = int(metadata.state[0].item()) // 16
 module.run_routed_out(
     a, w1, sfa, sfw1, w2, sfw2, metadata, routing_weights, topk,
-    output, 7.0, row_task_count=row_tasks,
+    output, 7.0,
 )
 ```
 
@@ -116,9 +152,11 @@ defaults to split 1. Performance tuning happens in the benchmark before timing.
 
 Routing metadata must use FC1's matching `cluster_m`, `tile_n=256`, and
 `macro_swizzle_n_major=True`; the dedicated preparation helper supplies these
-settings. Eager routed calls read the current state count on each launch.
-Graph capture requires an explicit `row_task_count` matching the captured
-metadata. Warm up once before capture to allocate the workspace. Workspaces
+settings. Routed calls read the live task count from device metadata in the
+kernel, so graph replays support changing routing distributions without a host
+synchronization. The optional `row_task_count` is a launch/workspace capacity
+bound and must cover the live count; it defaults to metadata capacity.
+Warm up once before capture to allocate the workspace. Workspaces
 are cached per device, stream, and task capacity.
 
 Each CTA writes a reusable global intermediate image of 294,912 bytes

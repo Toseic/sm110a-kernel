@@ -17,6 +17,7 @@ checkpoints load without another conversion step.
 # validate rounding against the current BF16/QAT score producer.
 # TODO(sm110a): fuse FP32 MoE gate projection, scoring, hash/score selection,
 # weight normalization, and metadata construction directly from expert IDs.
+# TODO(sm110a): add deterministic reduction and PDL to the FC1/FC2 fused backend.
 # TODO(sm110a): fuse shared-expert clamp/SwiGLU and shared/routed output addition.
 # TODO(sm110a): fuse index generation, cache writes, padding, and layout
 # conversions where useful; extend the LM-head GEMM to unaligned dimensions.
@@ -52,17 +53,20 @@ from sm110a_kernel import (
     Fp8Mxfp4GemmConfig,
     GroupedMConfig,
     Mxfp4Fc1Config,
+    Mxfp4Fc1Fc2Config,
     Mxfp4Fc2Config,
     bf16_fa4_sparse_mla,
     bf16_fa4_sparse_mla_prefill,
     bf16_gemm_nt_out,
     bf16tofp4_quant_dequant,
     bf16tofp8_quant,
+    compact_mxfp4_weight_scales,
     compile_bf16_grouped_m_gemm,
     compile_bf16tofp8_quant,
     compile_fp8_act_quant,
     compile_fp8_gemm,
     compile_mxfp4_fc1,
+    compile_mxfp4_fc1fc2,
     compile_mxfp4_fc2,
     compile_topk,
     fp8_act_quant,
@@ -591,7 +595,7 @@ class Sm110aIndexer(_official.Indexer):
 
 
 class Sm110aMoE(_official.MoE):
-    """Official MoE state layout executed by fused SM110A FC1 and FC2."""
+    """Official MoE state layout with separate or fused SM110A FC1/FC2."""
 
     def prepare_fused_weights(self) -> None:
         if getattr(self, "_sm110a_prepared", False):
@@ -607,6 +611,8 @@ class Sm110aMoE(_official.MoE):
         experts = self.n_routed_experts
         inter_dim = first.w1.out_features
         dim = self.dim
+        if self._sm110a_moe_backend == "fused" and (dim % 256 or inter_dim != 2048):
+            raise ValueError("fused MoE requires dim divisible by 256, inter_dim=2048")
         device = first.w1.weight.device
         fp4 = torch.float4_e2m1fn_x2
         self._sm110a_swiglu_limit = first.swiglu_limit
@@ -650,6 +656,7 @@ class Sm110aMoE(_official.MoE):
         self._sm110a_fc1 = compile_mxfp4_fc1(
             Mxfp4Fc1Config(
                 cluster_m=1,
+                compact_weight_scales=self._sm110a_compact_weight_scales,
                 routing_weight_position=self._sm110a_weight_position,
                 activation_bf16_rounding=self._sm110a_weight_position == "fc1",
             )
@@ -657,6 +664,7 @@ class Sm110aMoE(_official.MoE):
         self._sm110a_fc2 = compile_mxfp4_fc2(
             Mxfp4Fc2Config(
                 cluster_m=1,
+                compact_weight_scales=self._sm110a_compact_weight_scales,
                 routing_weight_position=self._sm110a_weight_position,
                 deterministic=self._sm110a_deterministic_fc2,
             )
@@ -675,6 +683,27 @@ class Sm110aMoE(_official.MoE):
                 pdl_wait="before_a",
             )
         )
+        if self._sm110a_moe_backend == "fused":
+            self._sm110a_fc1fc2 = compile_mxfp4_fc1fc2(
+                Mxfp4Fc1Fc2Config(
+                    hidden_dim=dim,
+                    cluster_m=1,
+                    stages=3,
+                    tiled_schedule=False,
+                    compact_weight_scales=self._sm110a_compact_weight_scales,
+                    fuse_routing=True,
+                    routing_weight_position=self._sm110a_weight_position,
+                    activation_bf16_rounding=self._sm110a_weight_position == "fc1",
+                )
+            )
+        if self._sm110a_compact_weight_scales:
+            # Static model weights are packed once; release padded scales.
+            self.sm110a_fc1_scale = compact_mxfp4_weight_scales(
+                self.sm110a_fc1_scale
+            )
+            self.sm110a_fc2_scale = compact_mxfp4_weight_scales(
+                self.sm110a_fc2_scale
+            )
         self._sm110a_inter_dim = inter_dim
 
         # The fused tensors now own the routed-expert weights.  Drop the
@@ -682,6 +711,30 @@ class Sm110aMoE(_official.MoE):
         # copy per layer.
         self.experts = torch.nn.ModuleList()
         self._sm110a_prepared = True
+
+    def _fused_experts(self, x, weights, router, topk):
+        metadata = self._sm110a_fc1.prepare_metadata(
+            router, topk, 2 * self._sm110a_inter_dim
+        )
+        aq, sfa = compile_bf16tofp8_quant(blocked=True).quantize(x.contiguous())
+        out = torch.empty_like(x)
+        routing_weights = weights.to(
+            torch.float32 if self._sm110a_weight_position == "fc1" else torch.bfloat16
+        ).contiguous()
+        self._sm110a_fc1fc2.run_routed_out(
+            aq,
+            self.sm110a_fc1_weight,
+            sfa,
+            self.sm110a_fc1_scale,
+            self.sm110a_fc2_weight,
+            self.sm110a_fc2_scale,
+            metadata,
+            routing_weights,
+            topk,
+            out,
+            self._sm110a_swiglu_limit,
+        )
+        return out
 
     def _decode_experts(self, x, weights, router, topk):
         tokens = x.size(0)
@@ -786,7 +839,9 @@ class Sm110aMoE(_official.MoE):
         ).expand(padded_tokens, -1)
         router.scatter_(1, indices_padded.long(), rank_values)
 
-        if _DECODE_ENABLED:
+        if self._sm110a_moe_backend == "fused":
+            out = self._fused_experts(x_padded, weights_padded, router, topk)
+        elif _DECODE_ENABLED:
             out = self._decode_experts(x_padded, weights_padded, router, topk)
         else:
             aq, sfa128 = bf16tofp8_quant(x_padded.contiguous())
@@ -829,8 +884,11 @@ class Sm110aMoE(_official.MoE):
                 topk,
                 out,
             )
-        _STATS["sm110a.mxfp4_fc1"] += 1
-        _STATS["sm110a.mxfp4_fc2"] += 1
+        if self._sm110a_moe_backend == "fused":
+            _STATS["sm110a.mxfp4_fc1fc2"] += 1
+        else:
+            _STATS["sm110a.mxfp4_fc1"] += 1
+            _STATS["sm110a.mxfp4_fc2"] += 1
 
         # The shared expert is dense FP8 in the official checkpoint and goes
         # through the SM110A dense backend installed by the forward context.
@@ -907,11 +965,23 @@ class Transformer(_official.Transformer):
         args: ModelArgs,
         *,
         routing_weight_position: str = "fc1",
-        deterministic_fc2: bool = True,
+        deterministic_fc2: bool | None = None,
+        moe_backend: str = "unfused",
+        compact_moe_scales: bool = True,
         pdl: bool = False,
     ):
         if routing_weight_position not in ("fc1", "fc2"):
             raise ValueError("routing_weight_position must be 'fc1' or 'fc2'")
+        if not isinstance(compact_moe_scales, bool):
+            raise ValueError("compact_moe_scales must be bool")
+        if moe_backend not in ("unfused", "fused"):
+            raise ValueError("moe_backend must be 'unfused' or 'fused'")
+        if deterministic_fc2 is None:
+            deterministic_fc2 = moe_backend == "unfused"
+        if moe_backend == "fused" and deterministic_fc2:
+            raise ValueError("fused MoE currently supports atomic reduction only")
+        if moe_backend == "fused" and pdl:
+            raise ValueError("fused MoE does not support PDL")
         super().__init__(args)
         # Official checkpoints store this parameter in BF16. Allocate in that
         # dtype before loading, retaining the original state-dict key and the
@@ -921,6 +991,8 @@ class Transformer(_official.Transformer):
             torch.empty_like(self.head.weight, dtype=torch.bfloat16),
             requires_grad=self.head.weight.requires_grad,
         )
+        self.compact_moe_scales = compact_moe_scales
+        self.moe_backend = moe_backend
         self.pdl = pdl
         self.routing_weight_position = routing_weight_position
         self.deterministic_fc2 = deterministic_fc2
@@ -930,6 +1002,8 @@ class Transformer(_official.Transformer):
             layer.ffn.__class__ = Sm110aMoE
         for layer in (*self.layers, *self.mtp):
             layer.attn.__class__ = Sm110aAttention
+            layer.ffn._sm110a_compact_weight_scales = compact_moe_scales
+            layer.ffn._sm110a_moe_backend = moe_backend
             layer.ffn._sm110a_pdl = pdl
             layer.ffn._sm110a_weight_position = routing_weight_position
             layer.ffn._sm110a_deterministic_fc2 = deterministic_fc2

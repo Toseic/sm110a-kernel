@@ -71,7 +71,14 @@
 #define SM110A_MXFP4_FC2_DETERMINISTIC 0
 #endif
 
+#include "mxfp4_weight_scales.cuh"
+#ifndef SM110A_MXFP4_FC2_COMPACT_WEIGHT_SCALES
+#define SM110A_MXFP4_FC2_COMPACT_WEIGHT_SCALES 0
+#endif
+
 namespace {
+constexpr bool kCompactWeightScales = SM110A_MXFP4_FC2_COMPACT_WEIGHT_SCALES;
+
 
 constexpr int kMmaK = 32;
 constexpr int kWarpSize = 32;
@@ -487,13 +494,14 @@ inline bool init_b_tensor_map(CUtensorMap *map, const uint8_t *ptr, uint64_t exp
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
 
+template <bool Compact = false>
 inline bool init_scale_tensor_map(CUtensorMap *map, const uint8_t *ptr,
                                   uint64_t row_tiles, uint64_t k_tiles,
                                   uint32_t k_box_tiles) {
     constexpr uint32_t rank = 4;
-    uint64_t dims[rank] = {256, 2, k_tiles, row_tiles};
-    uint64_t strides[rank - 1] = {256, 512, 512 * k_tiles};
-    uint32_t box[rank] = {256, 2, k_box_tiles, 1};
+    uint64_t dims[rank] = {Compact ? 128u : 256u, Compact ? 1u : 2u, k_tiles, row_tiles};
+    uint64_t strides[rank - 1] = {Compact ? 128u : 256u, Compact ? 128u : 512u, (Compact ? 128u : 512u) * k_tiles};
+    uint32_t box[rank] = {Compact ? 128u : 256u, Compact ? 1u : 2u, k_box_tiles, 1};
     uint32_t elem[rank] = {1, 1, 1, 1};
     return cuTensorMapEncodeTiled(map, CU_TENSOR_MAP_DATA_TYPE_UINT8, rank,
         const_cast<uint8_t *>(ptr), dims, strides, box, elem, CU_TENSOR_MAP_INTERLEAVE_NONE,
@@ -569,6 +577,7 @@ void mxfp4_fc2_fused_kernel(
     __shared__ __align__(16) uint4 clc_response[1];
     __shared__ __align__(8) uint64_t clc_mbar[1];
     __shared__ uint64_t tma_mbars[kStageCount];
+    __shared__ uint64_t weight_ready_mbars[kCompactWeightScales && kClusterM > 1 ? kStageCount : 1];
     __shared__ uint64_t sfa_tma_mbars[kStageCount];
     __shared__ uint64_t sfa_mbars[kStageCount];
     __shared__ uint64_t mma_mbars[kStageCount];
@@ -579,6 +588,8 @@ void mxfp4_fc2_fused_kernel(
     extern __shared__ __align__(1024) char dynamic_smem[];
     const int mainloop_smem = static_cast<int>(__cvta_generic_to_shared(dynamic_smem));
     const int base_tma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(tma_mbars));
+    const int base_weight_ready_mbar_addr =
+        static_cast<int>(__cvta_generic_to_shared(weight_ready_mbars));
     const int base_sfa_tma_mbar_addr =
         static_cast<int>(__cvta_generic_to_shared(sfa_tma_mbars));
     const int base_task_ready_mbar_addr =
@@ -595,6 +606,8 @@ void mxfp4_fc2_fused_kernel(
     if (tid == 0) {
         for (int stage = 0; stage < kStageCount; ++stage) {
             mbarrier_init(base_tma_mbar_addr + stage * sizeof(uint64_t), kClusterM);
+            if constexpr (kCompactWeightScales && kClusterM > 1)
+                mbarrier_init(base_weight_ready_mbar_addr + stage * sizeof(uint64_t), 1);
             mbarrier_init(base_sfa_tma_mbar_addr + stage * sizeof(uint64_t), 1);
             // cta_group::2 aggregates one completed SFA gather arrival from
             // each CTA on rank 0. cta_group::1 folds SFA into tma_mbars.
@@ -882,7 +895,7 @@ void mxfp4_fc2_fused_kernel(
                     asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 "
                                  "_, [%0], %1;" ::"r"(tma_transaction_mbar_addr),
                         "r"(Config::kATmaBytes + Config::kBTmaBytes +
-                            kSFBSmemBytes + sfa_tma_bytes)
+                            kSFBSmemBytes / (kCompactWeightScales ? 4 : 1) + sfa_tma_bytes)
                         : "memory");
                     // Only A/SFA depend on FC1. Start independent weight
                     // traffic before waiting; downstream warps remain gated
@@ -1052,6 +1065,28 @@ void mxfp4_fc2_fused_kernel(
                                 }
                             }
                         }
+                    }
+                    if constexpr (kCompactWeightScales) {
+                        // Both CTAs expand their local multicast SFB before
+                        // publishing the existing paired-operand ready event.
+                        if constexpr (kClusterM == 1) {
+                            mbarrier_wait(base_tma_mbar_addr + sfa_stage * sizeof(uint64_t),
+                                sfa_tma_phase);
+                        } else if (cta_rank == 0) {
+                            mbarrier_wait(base_tma_mbar_addr + sfa_stage * sizeof(uint64_t),
+                                sfa_tma_phase);
+                            if (elect_sync())
+                                mbarrier_arrive_on_cluster_cta(
+                                    base_weight_ready_mbar_addr + sfa_stage * sizeof(uint64_t), 1);
+                        } else {
+                            mbarrier_wait(base_weight_ready_mbar_addr + sfa_stage * sizeof(uint64_t),
+                                sfa_tma_phase);
+                        }
+                        auto *scales = reinterpret_cast<uint8_t *>(__cvta_shared_to_generic(
+                            sfa_smem + kSFASmemBytes));
+                        for (int tile = 0; tile < kSFBScaleTileCount; ++tile)
+                            unpack_mxfp4_weight_scales<kMmaStepsPerStage>(
+                                scales + tile * kMmaStepsPerStage * 512);
                     }
                     __syncwarp();
                     if (elect_sync()) {
@@ -1456,7 +1491,7 @@ void launch_mxfp4_fc2_impl(
         init_b_tensor_map<kTileN, kTileK, kClusterM>(&b_tensor_map, d_b, experts, n, k) &&
         init_scale_tensor_map(&sfa_tensor_map, d_sfa, m / 128,
             k / 32, kTileK / 32) &&
-        init_scale_tensor_map(&sfb_tensor_map, d_sfb, experts * (n / 128),
+        init_scale_tensor_map<kCompactWeightScales>(&sfb_tensor_map, d_sfb, experts * (n / 128),
             k / 32, kTileK / 32);
     if (!tensor_maps_ok) {
         return;

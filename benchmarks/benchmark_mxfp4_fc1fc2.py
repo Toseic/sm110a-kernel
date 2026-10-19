@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fixed-shape correctness/performance test for the fused FC1+FC2 kernel."""
+"""MXFP4 FC1+FC2 correctness/performance benchmark (configurable hidden dim)."""
 
 from __future__ import annotations
 
@@ -109,6 +109,7 @@ def compatible_configs(m, args):
     )
     configs = tuple(
         Mxfp4Fc1Fc2Config(
+            hidden_dim=H,
             compact_weight_scales=compact,
             cluster_m=cluster,
             tiled_schedule=tiled,
@@ -132,6 +133,7 @@ def compatible_configs(m, args):
         if (args.fuse_routing or m % (128 * cluster) == 0)
         and (cluster == 2 or stage <= 3)
         and split <= sms // cluster
+        and H % (256 * split) == 0
         and (not tiled or split == 1)
     )
     if not configs:
@@ -1046,6 +1048,7 @@ def run_sweep(args):
 
 
 def main():
+    global H
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--validate", action="store_true", help="run the correctness matrix and exit"
@@ -1059,6 +1062,10 @@ def main():
     parser.add_argument(
         "--sweep-output", type=Path, default=ROOT / "profiles/mxfp4_fc1fc2"
     )
+    parser.add_argument(
+        "--baseline-weight-scales", choices=("padded", "compact"), default="padded"
+    )
+    parser.add_argument("--hidden-dim", type=int, default=6144)
     parser.add_argument("--m", type=int, default=512)
     parser.add_argument("--fuse-routing", action="store_true")
     parser.add_argument(
@@ -1118,6 +1125,11 @@ def main():
     parser.add_argument("--rtol", type=float, default=2e-2)
     parser.add_argument("--max-relative-rmse", type=float, default=5e-3)
     args = parser.parse_args()
+    if args.hidden_dim <= 0 or args.hidden_dim % 256:
+        parser.error("--hidden-dim must be positive and divisible by 256")
+    H = args.hidden_dim
+    if args.hidden_dim != 6144 and (args.sweep or args.validate):
+        parser.error("--sweep and --validate use the fixed 6144 validation suite")
     if args.sweep:
         run_sweep(args)
         return
@@ -1172,6 +1184,7 @@ def main():
         direct_gmem=True,
         routing_weight_position=args.routing_weight_position,
         activation_bf16_rounding=args.activation_bf16_rounding,
+        compact_weight_scales=args.baseline_weight_scales == "compact",
     )
     fc2_config = Mxfp4Fc2Config(
         tile_n=256,
@@ -1179,6 +1192,7 @@ def main():
         epilogue_tile_n=32,
         cluster_m=2,
         routing_weight_position=args.routing_weight_position,
+        compact_weight_scales=args.baseline_weight_scales == "compact",
     )
     compile_mxfp4_fc1(fc1_config)
     compile_mxfp4_fc2(fc2_config)
@@ -1345,6 +1359,13 @@ def main():
 
     fc2_routing_weights = routing_weights.to(torch.bfloat16)
 
+    baseline_sfw1, baseline_sfw2 = sfw1, sfw2
+    if args.baseline_weight_scales == "compact":
+        if compact_sfw1 is None:
+            compact_sfw1 = compact_mxfp4_fc1fc2_weight_scales(sfw1)
+            compact_sfw2 = compact_mxfp4_fc1fc2_weight_scales(sfw2)
+        baseline_sfw1, baseline_sfw2 = compact_sfw1, compact_sfw2
+
     def prepare_baseline(candidate):
         config1, config2 = candidate.fc1, candidate.fc2
         metadata1 = prepare_mxfp4_fc1_metadata(router, topk, 2 * intermediate, config1)
@@ -1357,7 +1378,7 @@ def main():
                 aq,
                 w1q,
                 sfa,
-                sfw1,
+                baseline_sfw1,
                 metadata1,
                 intermediate_packed,
                 intermediate_scales,
@@ -1373,7 +1394,7 @@ def main():
                 intermediate_packed,
                 w2q,
                 intermediate_scales,
-                sfw2,
+                baseline_sfw2,
                 metadata1.routing,
                 fc2_routing_weights,
                 metadata2,
@@ -1406,7 +1427,9 @@ def main():
         baseline_candidates,
         namespace="mxfp4_fc1fc2_standalone",
         key=(
-            "v2-cold-l2",
+            "v4-weight-scale-format-cold-l2",
+            args.baseline_weight_scales,
+            H,
             tokens,
             experts,
             topk,
@@ -1421,7 +1444,7 @@ def main():
         if args.force_sweep
         else lambda prepared: quick_probe(prepared.run, args.iters, cold_l2_flush),
         format_candidate=lambda candidate: (
-            f"fc1_c={candidate.fc1.cluster_m},fc2_c={candidate.fc2.cluster_m},epi={candidate.fc2.epilogue_tile_n}"
+            f"fc1_c={candidate.fc1.cluster_m},fc2_c={candidate.fc2.cluster_m},epi={candidate.fc2.epilogue_tile_n},compact={int(candidate.fc1.compact_weight_scales)}"
         ),
         pre_jit=lambda candidate: (
             compile_mxfp4_fc1(candidate.fc1),

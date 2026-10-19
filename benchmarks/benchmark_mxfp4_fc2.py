@@ -32,6 +32,7 @@ from sm110a_kernel import (  # noqa: E402
     Mxfp4Fc2Config,
     Nvfp4Fc2Config,
     bf16tofp8_quant,
+    compact_mxfp4_weight_scales,
     compile_mxfp4_fc2,
     compile_nvfp4_fc2,
     mxfp4_fc2_out,
@@ -90,7 +91,7 @@ def format_candidate(config):
     return (
         f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
         f"/e{config.epilogue_tile_n}/c{config.cluster_m}/persistent"
-        f"/r{config.reduce_tile_n}"
+        f"/r{config.reduce_tile_n}/sf={'compact' if config.compact_weight_scales else 'padded'}"
     )
 
 
@@ -107,6 +108,7 @@ def mxfp4_candidates(args):
     return tuple(
         replace(
             c,
+            compact_weight_scales=args.compact_weight_scales,
             routing_weight_position=args.routing_weight_position,
             deterministic=args.deterministic,
         )
@@ -122,9 +124,10 @@ def mxfp4_fc2_sol_bounds(router_scores, topk, n, k, config):
     active_experts = int((expert_rows > 0).sum().item())
     m = tokens * topk
 
+    weight_scale_divisor = 32 if config.compact_weight_scales else 8
     flops = 2 * m * n * k
     a_bytes = m * (k + k / 8)
-    b_bytes = active_experts * n * (k / 2 + k / 8)
+    b_bytes = active_experts * n * (k / 2 + k / weight_scale_divisor)
     output_bytes = 2 * tokens * n
     compulsory_bytes = a_bytes + b_bytes + output_bytes
 
@@ -136,7 +139,9 @@ def mxfp4_fc2_sol_bounds(router_scores, topk, n, k, config):
     )
     staged_sfb_n = max(config.tile_n, 128)
     tile_read_bytes = task_count * (
-        cluster_tile_m * (k + k / 8) + config.tile_n * k / 2 + staged_sfb_n * k / 8
+        cluster_tile_m * (k + k / 8)
+        + config.tile_n * k / 2
+        + staged_sfb_n * k / weight_scale_divisor
     )
     return sol_bounds(
         flops,
@@ -289,6 +294,7 @@ class Mxfp4Fc2Benchmark(BenchmarkBase):
         parser.add_argument("--no-accuracy", action="store_true")
         parser.add_argument("--debug", action="store_true")
         parser.add_argument("--tile-k", type=int, choices=(128,))
+        parser.add_argument("--compact-weight-scales", action="store_true")
         parser.add_argument("--cluster-m", type=int, choices=(1, 2))
         parser.add_argument("--reduce-tile-n", type=int, choices=(32, 64, 128, 256))
         parser.add_argument(
@@ -361,6 +367,9 @@ class Mxfp4Fc2Benchmark(BenchmarkBase):
                 routing_weights,
                 router_scores,
             ) = case
+            kernel_sfb = (
+                compact_mxfp4_weight_scales(sfb) if args.compact_weight_scales else sfb
+            )
             out = torch.empty((tokens, args.n), device="cuda", dtype=torch.bfloat16)
             nv_out = torch.empty_like(out)
             m = tokens * args.topk
@@ -376,7 +385,7 @@ class Mxfp4Fc2Benchmark(BenchmarkBase):
                     aq,
                     bq,
                     sfa,
-                    sfb,
+                    kernel_sfb,
                     routing,
                     routing_weights,
                     metadata,
@@ -421,7 +430,17 @@ class Mxfp4Fc2Benchmark(BenchmarkBase):
             ours_selection = AutotuneRunner(options).resolve(
                 mxfp4_candidates(args),
                 namespace="mxfp4_fc2",
-                key=("v1-w4a8", tokens, args.experts, args.topk, args.n, args.k),
+                key=(
+                    "v2-weight-scales",
+                    tokens,
+                    args.experts,
+                    args.topk,
+                    args.n,
+                    args.k,
+                    args.compact_weight_scales,
+                    args.routing_weight_position,
+                    args.deterministic,
+                ),
                 prepare=prepare_mxfp4,
                 benchmark=lambda prepared: benchmark_with_stats(
                     prepared.run,

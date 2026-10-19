@@ -77,7 +77,14 @@
 #ifndef SM110A_MXFP4_FC1_ACTIVATION_BF16_ROUNDING
 #define SM110A_MXFP4_FC1_ACTIVATION_BF16_ROUNDING 0
 #endif
+#include "mxfp4_weight_scales.cuh"
+#ifndef SM110A_MXFP4_FC1_COMPACT_WEIGHT_SCALES
+#define SM110A_MXFP4_FC1_COMPACT_WEIGHT_SCALES 0
+#endif
+
 namespace {
+constexpr bool kCompactWeightScales = SM110A_MXFP4_FC1_COMPACT_WEIGHT_SCALES;
+
 
 constexpr int kMmaK = 32;
 constexpr int kWarpSize = 32;
@@ -766,13 +773,14 @@ inline bool init_b_tensor_map(CUtensorMap *map, const uint8_t *ptr, uint64_t exp
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
 
+template <bool Compact = false>
 inline bool init_scale_tensor_map(CUtensorMap *map, const uint8_t *ptr,
                                   uint64_t row_tiles, uint64_t k_tiles,
                                   uint32_t k_box_tiles) {
     constexpr uint32_t rank = 4;
-    uint64_t dims[rank] = {256, 2, k_tiles, row_tiles};
-    uint64_t strides[rank - 1] = {256, 512, 512 * k_tiles};
-    uint32_t box[rank] = {256, 2, k_box_tiles, 1};
+    uint64_t dims[rank] = {Compact ? 128u : 256u, Compact ? 1u : 2u, k_tiles, row_tiles};
+    uint64_t strides[rank - 1] = {Compact ? 128u : 256u, Compact ? 128u : 512u, (Compact ? 128u : 512u) * k_tiles};
+    uint32_t box[rank] = {Compact ? 128u : 256u, Compact ? 1u : 2u, k_box_tiles, 1};
     uint32_t elem[rank] = {1, 1, 1, 1};
     return cuTensorMapEncodeTiled(map, CU_TENSOR_MAP_DATA_TYPE_UINT8, rank,
         const_cast<uint8_t *>(ptr), dims, strides, box, elem, CU_TENSOR_MAP_INTERLEAVE_NONE,
@@ -884,6 +892,7 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void m
     __shared__ uint64_t task_free_mbars[kTaskPipelineStageCount];
     __shared__ int task_source_rows[kTileM];
     __shared__ uint64_t tma_mbars[kStageCount];
+    __shared__ uint64_t weight_ready_mbars[kCompactWeightScales && kClusterM > 1 ? kStageCount : 1];
     __shared__ uint64_t tma_issue_mbars[kStageCount];
     __shared__ uint64_t a_mbars[kStageCount];
     // In the cluster-N path, SFA uses a second transaction barrier. A single
@@ -902,6 +911,8 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void m
     const int mainloop_smem = static_cast<int>(__cvta_generic_to_shared(dynamic_smem));
     const int epilogue_smem = mainloop_smem + kMainloopSmemBytes;
     const int base_tma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(tma_mbars));
+    const int base_weight_ready_mbar_addr =
+        static_cast<int>(__cvta_generic_to_shared(weight_ready_mbars));
     const int base_task_ready_mbar_addr =
         static_cast<int>(__cvta_generic_to_shared(task_ready_mbars));
     const int base_task_free_mbar_addr =
@@ -920,6 +931,8 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void m
     if (tid == 0) {
         for (int stage = 0; stage < kStageCount; ++stage) {
             mbarrier_init(base_tma_mbar_addr + stage * sizeof(uint64_t), kClusterM);
+            if constexpr (kCompactWeightScales && kClusterM > 1)
+                mbarrier_init(base_weight_ready_mbar_addr + stage * sizeof(uint64_t), 1);
             mbarrier_init(base_tma_issue_mbar_addr + stage * sizeof(uint64_t), 1);
             // In an N cluster, only rank 0 gathers A/SFA. Each peer receives
             // A via its local A barrier and SFA via the separate barrier below.
@@ -1338,7 +1351,7 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void m
                         const int off_k32 = tile_k * Config::kMmaStepsPerStage;
                         asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 "
                                      "_, [%0], %1;" ::"r"(tma_transaction_mbar_addr),
-                            "r"(Config::kBTmaBytes + kSFBSmemBytes) : "memory");
+                            "r"(Config::kBTmaBytes + kSFBSmemBytes / (kCompactWeightScales ? 4 : 1)) : "memory");
                         tma_load_4d<kClusterM>(b_smem, &b_tensor_map, off_k,
                             tile_col + m_rank * (kTileN / kClusterM), 0, task.expert,
                             tma_transaction_mbar_addr);
@@ -1386,7 +1399,7 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void m
         // for a whole cta_group::2 A operand instead of participating in the
         // local completion protocol itself.
         if constexpr (kClusterM > 1) {
-            if (warp_id == kSyncTransformWarp && elect_sync()) {
+            if (warp_id == kSyncTransformWarp && (kCompactWeightScales || elect_sync())) {
                 for (int cluster_bid = first_cluster_bid; cluster_bid < last_cluster_bid;
                     ++cluster_bid) {
                     for (int tile_k = 0; tile_k < k_tiles; ++tile_k) {
@@ -1400,9 +1413,33 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void m
                                     consumer_a_phase);
                             }
                         }
-                        mbarrier_arrive_on_cluster_cta(
-                            base_a_cluster_mbar_addr + consumer_stage * sizeof(uint64_t),
-                            n_rank * kClusterM);
+                        if constexpr (kCompactWeightScales) {
+                            // Group-2 TMA completes on the leader only.
+                            // Relay completion to the peer before it expands SFB.
+                            if (m_rank == 0) {
+                                mbarrier_wait_tma_ready(
+                                    base_tma_mbar_addr + consumer_stage * sizeof(uint64_t),
+                                    consumer_tma_phase);
+                                if (elect_sync())
+                                    mbarrier_arrive_on_cluster_cta(
+                                        base_weight_ready_mbar_addr + consumer_stage * sizeof(uint64_t),
+                                        n_rank * kClusterM + 1);
+                            } else {
+                                mbarrier_wait_tma_ready(
+                                    base_weight_ready_mbar_addr + consumer_stage * sizeof(uint64_t),
+                                    consumer_tma_phase);
+                            }
+                            auto *scales = reinterpret_cast<uint8_t *>(__cvta_shared_to_generic(
+                                mainloop_smem + consumer_stage * kStageSmemBytes +
+                                kASmemBytes + kBSmemBytes + kSFASmemBytes));
+                            for (int tile = 0; tile < kSFBScaleTileCount; ++tile)
+                                unpack_mxfp4_weight_scales<kMmaStepsPerStage>(
+                                    scales + tile * kMmaStepsPerStage * 512);
+                        }
+                        if (!kCompactWeightScales || elect_sync())
+                            mbarrier_arrive_on_cluster_cta(
+                                base_a_cluster_mbar_addr + consumer_stage * sizeof(uint64_t),
+                                n_rank * kClusterM);
                         consumer_stage = (consumer_stage + 1) % kStageCount;
                         if (consumer_stage == 0) {
                             consumer_a_phase ^= 1;
@@ -1415,7 +1452,8 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void m
 
         // The consumer advances independently and releases each stage after MMA has
         // finished reading it.
-        if (m_rank == 0 && warp_id == kMmaWarp && elect_sync()) {
+        if (m_rank == 0 && warp_id == kMmaWarp &&
+            ((kCompactWeightScales && kClusterM == 1) || elect_sync())) {
             for (int cluster_bid = first_cluster_bid; cluster_bid < last_cluster_bid;
                 ++cluster_bid) {
                 mbarrier_wait_epilogue_slot(
@@ -1484,34 +1522,44 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void m
                     sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_MXFP4_FC1_CONSUMER_WAIT_A>();
                     mbarrier_wait_tma_ready(tma_mbar_addr, consumer_tma_phase);
                     sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_MXFP4_FC1_CONSUMER_WAIT_B>();
-                    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
-                    {
-                        const int a_smem = mainloop_smem + consumer_stage * kStageSmemBytes;
-                        const int b_smem = a_smem + kASmemBytes;
-                        const int sfa_smem = b_smem + kBSmemBytes;
-                        const int sfb_smem = sfa_smem + kSFASmemBytes;
-                        for (int mma_k = 0; mma_k < kMmaStepsPerStage; ++mma_k) {
-                            const int scale_slot = kTileN < 256
-                                ? consumer_stage * kMmaStepsPerStage + mma_k
-                                : 0;
-                            const int scale_addr = tmem_addr + Config::kAccumulatorTmemCols +
-                                scale_slot * Config::kScaleColsPerMma;
-                            tcgen05_cp_scale<kClusterM>(scale_addr,
-                                make_scale_desc(sfa_smem + mma_k * 512));
-                            for (int scale_tile = 0; scale_tile < kSFBScaleTileCount; ++scale_tile)
-                                tcgen05_cp_scale<kClusterM>(scale_addr + 4 + scale_tile * 4,
-                                    make_scale_desc(sfb_smem +
-                                        (scale_tile * kMmaStepsPerStage + mma_k) * 512));
-                            const int accumulate = tile_k != 0 || mma_k != 0;
-                            tcgen05_mma_mxfp4_w4a8<kClusterM>(stage_tmem_addr,
-                                make_k_major_128b_desc(a_smem + mma_k * 32),
-                                make_k_major_128b_desc(b_smem + mma_k * 32),
-                                instruction_desc, scale_addr,
-                                scale_addr + 4 + (tile_col % 128) / 32, accumulate);
-                        }
+                    if constexpr (kCompactWeightScales && kClusterM == 1) {
+                        auto *scales = reinterpret_cast<uint8_t *>(__cvta_shared_to_generic(
+                            mainloop_smem + consumer_stage * kStageSmemBytes +
+                            kASmemBytes + kBSmemBytes + kSFASmemBytes));
+                        for (int tile = 0; tile < kSFBScaleTileCount; ++tile)
+                            unpack_mxfp4_weight_scales<kMmaStepsPerStage>(
+                                scales + tile * kMmaStepsPerStage * 512);
                     }
-                    tcgen05_commit<kClusterM>(mma_mbar_addr, cta_rank);
-                    sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_MXFP4_FC1_MMA>();
+                    if (!kCompactWeightScales || kClusterM > 1 || elect_sync()) {
+                        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+                        {
+                            const int a_smem = mainloop_smem + consumer_stage * kStageSmemBytes;
+                            const int b_smem = a_smem + kASmemBytes;
+                            const int sfa_smem = b_smem + kBSmemBytes;
+                            const int sfb_smem = sfa_smem + kSFASmemBytes;
+                            for (int mma_k = 0; mma_k < kMmaStepsPerStage; ++mma_k) {
+                                const int scale_slot = kTileN < 256
+                                    ? consumer_stage * kMmaStepsPerStage + mma_k
+                                    : 0;
+                                const int scale_addr = tmem_addr + Config::kAccumulatorTmemCols +
+                                    scale_slot * Config::kScaleColsPerMma;
+                                tcgen05_cp_scale<kClusterM>(scale_addr,
+                                    make_scale_desc(sfa_smem + mma_k * 512));
+                                for (int scale_tile = 0; scale_tile < kSFBScaleTileCount; ++scale_tile)
+                                    tcgen05_cp_scale<kClusterM>(scale_addr + 4 + scale_tile * 4,
+                                        make_scale_desc(sfb_smem +
+                                            (scale_tile * kMmaStepsPerStage + mma_k) * 512));
+                                const int accumulate = tile_k != 0 || mma_k != 0;
+                                tcgen05_mma_mxfp4_w4a8<kClusterM>(stage_tmem_addr,
+                                    make_k_major_128b_desc(a_smem + mma_k * 32),
+                                    make_k_major_128b_desc(b_smem + mma_k * 32),
+                                    instruction_desc, scale_addr,
+                                    scale_addr + 4 + (tile_col % 128) / 32, accumulate);
+                            }
+                        }
+                        tcgen05_commit<kClusterM>(mma_mbar_addr, cta_rank);
+                        sm110a::pipeline_delay<SM110A_PIPELINE_DELAY_MXFP4_FC1_MMA>();
+                    }
 
                     consumer_stage = (consumer_stage + 1) % kStageCount;
                     if (consumer_stage == 0) {
@@ -1522,7 +1570,8 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void m
 
                 const int mainloop_mbar_addr =
                     base_mainloop_mbar_addr + consumer_mainloop_stage * sizeof(uint64_t);
-                tcgen05_commit<kClusterM>(mainloop_mbar_addr, cta_rank);
+                if (!kCompactWeightScales || kClusterM > 1 || elect_sync())
+                    tcgen05_commit<kClusterM>(mainloop_mbar_addr, cta_rank);
 
                 consumer_mainloop_stage = (consumer_mainloop_stage + 1) % kTmemStageCount;
                 if (consumer_mainloop_stage == 0) {
@@ -1810,7 +1859,7 @@ void launch_mxfp4_fc1_impl(
         init_b_tensor_map<kTileN, kTileK, kClusterM>(&b_tensor_map, d_b, experts, n, k) &&
         init_scale_tensor_map(&sfa_tensor_map, d_sfa, tokens / 128,
             k / 32, kTileK / 32) &&
-        init_scale_tensor_map(&sfb_tensor_map, d_sfb, experts * (n / 128),
+        init_scale_tensor_map<kCompactWeightScales>(&sfb_tensor_map, d_sfb, experts * (n / 128),
             k / 32, kTileK / 32) &&
         init_c_tensor_map<kTileM>(
             &c_tensor_map, d_c, m, n / 2);

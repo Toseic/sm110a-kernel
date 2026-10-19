@@ -1,4 +1,4 @@
-"""Fixed H=6144, I=2048 MXFP4 W4A8 FC1/SwiGLU/FC2 fusion."""
+"""Configurable H, I=2048 MXFP4 W4A8 FC1/SwiGLU/FC2 fusion."""
 
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ class Mxfp4Fc1Fc2Config:
     activation_bf16_rounding: bool = False
     reduce_tile_n: int = 64
     compact_weight_scales: bool = False
+    hidden_dim: int = 6144
 
     def validate(self):
         if self.reduce_tile_n not in (64, 128):
@@ -50,6 +51,14 @@ class Mxfp4Fc1Fc2Config:
             raise ValueError("tiled_schedule requires h_split=1")
         if self.h_split not in (1, 2, 4):
             raise ValueError("h_split must be 1, 2, or 4")
+        if (
+            not isinstance(self.hidden_dim, int)
+            or self.hidden_dim <= 0
+            or self.hidden_dim % (256 * self.h_split)
+        ):
+            raise ValueError(
+                "hidden_dim must be positive and divisible by 256 * h_split"
+            )
         if self.accumulator_stages not in (1, 2):
             raise ValueError("accumulator_stages must be 1 or 2")
         if self.stages not in (2, 3, 4, 5):
@@ -90,13 +99,17 @@ class Mxfp4Fc1Fc2Module:
             torch.cuda.get_device_properties(a.device).multi_processor_count
             // self.config.cluster_m
         )
+        if a.size(1) != self.config.hidden_dim:
+            raise ValueError("A hidden dimension must match the compiled config")
         if row_tasks <= 0 or self.config.h_split > capacity:
             raise ValueError(
                 f"each row requires {self.config.h_split} resident clusters; capacity={capacity}, rows={row_tasks}"
             )
 
     def run(self, a, w1, sfa, sfw1, w2, sfw2, swiglu_limit=0.0):
-        output = torch.empty((a.size(0), 6144), device=a.device, dtype=torch.bfloat16)
+        output = torch.empty(
+            (a.size(0), self.config.hidden_dim), device=a.device, dtype=torch.bfloat16
+        )
         return self.run_out(a, w1, sfa, sfw1, w2, sfw2, output, swiglu_limit)
 
     def run_out(self, a, w1, sfa, sfw1, w2, sfw2, output, swiglu_limit=0.0):
@@ -119,6 +132,7 @@ class Mxfp4Fc1Fc2Module:
             float(swiglu_limit),
             self._address,
             self.config.compact_weight_scales,
+            self.config.hidden_dim,
         )
 
     def run_routed_out(
@@ -146,12 +160,10 @@ class Mxfp4Fc1Fc2Module:
         )
         if routing_weights.dtype != expected_dtype:
             raise TypeError(f"routing_weights must have dtype {expected_dtype}")
-        # Read live state each eager launch; do not cache mutable metadata counts.
-        # For CUDA Graph capture supply the fixed row_task_count explicitly.
+        # Launch a capacity-sized persistent grid; the kernel reads the live
+        # count from device metadata. Routing may change on every graph replay.
         if row_task_count is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise ValueError("CUDA Graph capture requires explicit row_task_count")
-            row_task_count = int(metadata.state[0].item()) // 16
+            row_task_count = metadata.tasks.size(0) // 16
         self._validate_launch(a, row_task_count)
         return self._binding.mxfp4_fc1fc2_routed_out(
             a,
@@ -172,6 +184,7 @@ class Mxfp4Fc1Fc2Module:
             float(swiglu_limit),
             self._address,
             self.config.compact_weight_scales,
+            self.config.hidden_dim,
         )
 
 
@@ -191,6 +204,7 @@ _JIT = SplitCudaJit(
     kernel_cflags=lambda config, _variant: tuple(
         f"-DSM110A_MXFP4_FC1FC2_{key}={value}"
         for key, value in (
+            ("HIDDEN_DIM", config.hidden_dim),
             ("GATHER_WARPS", config.gather_warps),
             ("REDUCE_TILE_N", config.reduce_tile_n),
             ("COMPACT_WEIGHT_SCALES", int(config.compact_weight_scales)),
@@ -209,7 +223,7 @@ _JIT = SplitCudaJit(
 )
 
 
-def compact_mxfp4_fc1fc2_weight_scales(scales: torch.Tensor) -> torch.Tensor:
+def compact_mxfp4_weight_scales(scales: torch.Tensor) -> torch.Tensor:
     """Pack padded blocked weight scales once, without changing their bits.
 
     The returned flat E8M0 tensor uses one quarter of the padded storage.
@@ -230,6 +244,10 @@ def compact_mxfp4_fc1fc2_weight_scales(scales: torch.Tensor) -> torch.Tensor:
         .contiguous()
         .view(torch.float8_e8m0fnu)
     )
+
+
+# Backward-compatible name for the original fused-only entry point.
+compact_mxfp4_fc1fc2_weight_scales = compact_mxfp4_weight_scales
 
 
 def compile_mxfp4_fc1fc2(config: Mxfp4Fc1Fc2Config | None = None):
@@ -271,11 +289,18 @@ def prepare_mxfp4_fc1fc2_metadata(router_scores, topk, config=None):
 
 
 def _default_config(a, row_tasks, **kwargs):
+    kwargs.setdefault("hidden_dim", a.size(1))
     capacity = torch.cuda.get_device_properties(
         a.device
     ).multi_processor_count // kwargs.get("cluster_m", 2)
     split = next(
-        (split for split in (4, 2, 1) if split == 1 or row_tasks * split <= capacity), 1
+        (
+            split
+            for split in (4, 2, 1)
+            if kwargs["hidden_dim"] % (256 * split) == 0
+            and (split == 1 or row_tasks * split <= capacity)
+        ),
+        1,
     )
     return Mxfp4Fc1Fc2Config(h_split=split, **kwargs)
 
@@ -324,9 +349,7 @@ def mxfp4_fc1fc2_routed_out(
 ):
     if config is None:
         if row_task_count is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise ValueError("CUDA Graph capture requires explicit row_task_count")
-            row_task_count = int(metadata.state[0].item()) // 16
+            row_task_count = metadata.tasks.size(0) // 16
         config = _default_config(a, row_task_count, fuse_routing=True)
     return compile_mxfp4_fc1fc2(config).run_routed_out(
         a,
