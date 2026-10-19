@@ -18,8 +18,8 @@ def _check_scores(scores, k):
         raise RuntimeError("scores must be contiguous CUDA [Qlen, KVlen]")
     if scores.dtype not in (torch.float32, torch.bfloat16):
         raise RuntimeError("scores must be float32 or bfloat16")
-    if k != 512 or scores.size(1) < 512:
-        raise RuntimeError("k is fixed at 512 and KVlen must be >= 512")
+    if k not in (512, min(512, scores.size(1))):
+        raise RuntimeError("k must be 512 or min(512, KVlen)")
 
 
 @dataclass(frozen=True)
@@ -59,8 +59,14 @@ class TopKModule:
         _check_scores(scores, k)
         if out is None:
             out = torch.empty(
-                (scores.size(0), k), device=scores.device, dtype=torch.int32
+                (scores.size(0), min(512, scores.size(1))),
+                device=scores.device,
+                dtype=torch.int32,
             )
+        if scores.size(1) <= 512:
+            # No tuning or lazy allocations: this path also works during capture.
+            self._binding.topk_out(scores, out, k, 1, self._launcher)
+            return 1
         key = (
             scores.device.index,
             tuple(scores.shape),
@@ -119,12 +125,19 @@ class TopKModule:
         if split_k is not None:
             return self._binding.topk(scores, k, split_k, self._launcher)
         _check_scores(scores, k)
-        out = torch.empty((scores.size(0), k), device=scores.device, dtype=torch.int32)
+        out = torch.empty(
+            (scores.size(0), min(512, scores.size(1))),
+            device=scores.device,
+            dtype=torch.int32,
+        )
         return self.topk_out(scores, out, k)
 
     def topk_out(self, scores, out, k=512, *, split_k=None):
         if split_k is None:
-            split_k = self.select_split_k(scores, k, out)
+            _check_scores(scores, k)
+            split_k = (
+                1 if scores.size(1) <= 512 else self.select_split_k(scores, k, out)
+            )
         return self._binding.topk_out(scores, out, k, split_k, self._launcher)
 
 
@@ -154,10 +167,12 @@ def compile_topk(*, stages=2, copy_engine="ldgsts") -> TopKModule:
 
 
 def topk(scores, k=512, *, split_k=None):
-    """Return unordered int32 [Qlen, 512] indices; KVlen must be >= 512.
+    """Return unordered int32 [Qlen, min(512, KVlen)] indices.
 
-    split_k=None autotunes 1/2/4/8. Ties choose smaller indices; NaNs rank
-    above +inf. Masked -inf entries participate when necessary.
+    k may be 512 (default) or min(512, KVlen). KVlen <= 512 returns all
+    candidate indices in ascending order without reading scores or autotuning.
+    Otherwise split_k=None autotunes 1/2/4/8. Ties choose smaller indices;
+    NaNs rank above +inf. Masked -inf entries participate when necessary.
     """
     return compile_topk().topk(scores, k, split_k=split_k)
 

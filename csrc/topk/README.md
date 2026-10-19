@@ -1,13 +1,13 @@
 # SM110A row Top-K
 
 `topk(scores, k)` selects the largest K scores in each row and returns CUDA
-INT32 indices `[Qlen, k]`, unordered by score. It is a separate selection
+INT32 indices `[Qlen, min(512, KVlen)]`, unordered by score. It is a separate selection
 step after the MXFP4 indexer score kernel.
 
 ```python
 from sm110a_kernel import compile_topk, topk, topk_out
 
-indices = topk(scores)  # K is fixed at 512
+indices = topk(scores)  # Select up to 512 candidates per row.
 
 # Precompile before CUDA graph capture; reuse the output buffer.
 module = compile_topk()
@@ -19,9 +19,15 @@ topk_out(scores, indices, 512)
 The API accepts:
 
 - `scores`: contiguous CUDA BF16 or FP32 `[Qlen, KVlen]`.
-- `k`: defaults to 512; only 512 is supported. `KVlen` must be >= 512.
-- `out` for `topk_out`: contiguous CUDA INT32 `[Qlen, k]`, on the scores
+- `k`: defaults to 512; accepts 512 or `min(512, KVlen)`.
+- `out` for `topk_out`: contiguous CUDA INT32 `[Qlen, min(512, KVlen)]`, on the scores
   device, without aliasing scores.
+
+For `KVlen <= 512`, every candidate is returned in ascending index order
+without reading scores or allocating selection scratch. This path skips
+split-K autotuning and supports graph capture directly with `topk_out`.
+Zero-length KV produces an empty output without a kernel launch. Causal
+masking and cache-index offsets remain the model adapter's responsibility.
 
 Empty query batches are supported. Scores are unchanged; ties choose
 smaller indices, signed zeros compare equal, and NaNs rank above +inf. The

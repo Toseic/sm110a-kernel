@@ -14,13 +14,6 @@ namespace {
 constexpr int Stages = SM110A_TOPK_STAGES;
 constexpr bool UseTma = SM110A_TOPK_TMA;
 static_assert(Stages >= 2 && Stages <= 8, "TopK supports 2 through 8 stages");
-// TODO(sm110a): support short candidate lists (KVlen < 512). Both the Python
-// facade and C++ binding currently require k == 512 and KVlen >= 512, matching
-// this compile-time constant. The DSV4 ratio-4 CSA indexer therefore rejects
-// contexts shorter than 2048 tokens, even though Qlen == 1 decode is supported.
-// When selecting min(512, KVlen), KVlen <= 512 needs no selection: return all
-// candidate indices. Add that fast path and update the API checks/output shape;
-// keep prefill causal masking and cache-index offsets in the model adapter.
 constexpr int TopK = 512;
 constexpr int Threads = 256;
 constexpr int Block = 1024;
@@ -600,6 +593,14 @@ __global__ void topk_buffered(
     }
 }
 
+// Every candidate survives for short rows; scores and selection scratch are
+// unnecessary. One CTA fills each output row in ascending index order.
+__global__ void all_candidate_indices(int32_t *out, int n) {
+    int32_t *row = out + int64_t(blockIdx.x) * n;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        row[i] = i;
+}
+
 template <typename T, int Split>
 void launch_split(
     const T *scores, int32_t *out, int rows, int n, cudaStream_t stream) {
@@ -640,8 +641,12 @@ void launch(const T *scores, int32_t *out, int rows, int n, int split,
 extern "C" void sm110a_topk_launch(
     const void *scores, int32_t *out, int rows, int n, int dtype,
     int split, cudaStream_t stream) {
-    if (!rows)
+    if (!rows || !n)
         return;
+    if (n <= TopK) {
+        all_candidate_indices<<<rows, Threads, 0, stream>>>(out, n);
+        return;
+    }
     if (dtype == 0)
         launch(static_cast<const float *>(scores), out, rows, n, split, stream);
     else

@@ -1,6 +1,7 @@
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <algorithm>
 #include <climits>
 #include <cstdint>
 #include <torch/extension.h>
@@ -18,12 +19,13 @@ torch::Tensor topk_out(
         "scores must be float32 or bfloat16");
     TORCH_CHECK(scores.size(0) <= INT_MAX && scores.size(1) <= INT_MAX,
         "dimensions must fit int32");
-    TORCH_CHECK(k == 512 && scores.size(1) >= 512,
-        "topk is fixed at 512 and KVlen must be >= 512");
+    const int64_t selected = std::min<int64_t>(512, scores.size(1));
+    TORCH_CHECK(k == 512 || k == selected,
+        "k must be 512 or min(512, KVlen)");
     TORCH_CHECK(out.is_cuda() && out.device() == scores.device() && out.scalar_type() == at::kInt &&
                     out.is_contiguous() && out.dim() == 2 && out.size(0) == scores.size(0) &&
-                    out.size(1) == k,
-        "out must be contiguous CUDA int32 [Qlen, topk] on the scores device");
+                    out.size(1) == selected,
+        "out must be contiguous CUDA int32 [Qlen, min(512, KVlen)] on the scores device");
     TORCH_CHECK(!out.is_alias_of(scores), "out must not alias scores");
     TORCH_CHECK(split_k == 1 || split_k == 2 || split_k == 4 || split_k == 8,
         "split_k must be 1, 2, 4, or 8");
@@ -45,10 +47,10 @@ torch::Tensor topk(
     int64_t k,
     int64_t split_k,
     uint64_t address) {
-    TORCH_CHECK(scores.dim() == 2 && k == 512 && scores.size(1) >= 512,
-        "scores must be 2D and topk is fixed at 512 and KVlen must be >= 512");
+    TORCH_CHECK(scores.dim() == 2, "scores must be 2D");
     return topk_out(scores,
-        torch::empty({scores.size(0), k}, scores.options().dtype(at::kInt)),
+        torch::empty({scores.size(0), std::min<int64_t>(512, scores.size(1))},
+            scores.options().dtype(at::kInt)),
         k,
         split_k,
         address);
