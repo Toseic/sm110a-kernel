@@ -18,6 +18,7 @@ from enum import IntEnum
 from pathlib import Path
 
 from ..jit_runtime import SplitCudaJit
+from ..runner import BaseKernelRunner, PreparedKernel
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_DIR = _ROOT / "csrc/bf16_fa4/src"
@@ -239,3 +240,77 @@ def bf16_fa4_mha_out(
         max_q_len,
         max_kv_len,
     )
+
+
+class Bf16Fa4MhaRunner(BaseKernelRunner):
+    namespace = "bf16_fa4_mha_runner_v1"
+
+    def __init__(
+        self,
+        q,
+        k,
+        v,
+        out,
+        *,
+        causal=False,
+        scale=None,
+        block_table=None,
+        cu_seqlens_q=None,
+        kv_seqlens=None,
+        max_q_len=0,
+        max_kv_len=0,
+    ):
+        super().__init__(q.device)
+        _require_paged(block_table, kv_seqlens, max_kv_len)
+        self.q, self.k, self.v, self.out = q, k, v, out
+        self.causal, self.scale = bool(causal), _resolve_scale(q, scale)
+        self.block_table, self.cu_seqlens_q, self.kv_seqlens = (
+            block_table,
+            cu_seqlens_q,
+            kv_seqlens,
+        )
+        self.max_q_len, self.max_kv_len = max_q_len, max_kv_len
+
+    @property
+    def workload_key(self):
+        return (
+            tuple(self.q.shape),
+            tuple(self.k.shape),
+            tuple(self.v.shape),
+            tuple(self.block_table.shape),
+            self.cu_seqlens_q is not None,
+            self.max_q_len,
+            self.max_kv_len,
+            self.causal,
+            self.scale,
+        )
+
+    def compatible_candidates(self):
+        tactics = (
+            (Bf16Fa4MhaTactic.WARP_12,)
+            if self.q.ndim == 3
+            else (Bf16Fa4MhaTactic.WARP_12, Bf16Fa4MhaTactic.WARP_16)
+        )
+        return tuple(Bf16Fa4MhaConfig(tactic=t) for t in tactics)
+
+    def pre_jit(self, candidate):
+        return compile_bf16_fa4_mha(candidate)
+
+    def prepare(self, candidate):
+        module = self.pre_jit(candidate)
+        return PreparedKernel(
+            candidate,
+            lambda: module.fa_mha_out(
+                self.q,
+                self.k,
+                self.v,
+                self.out,
+                self.causal,
+                self.scale,
+                self.block_table,
+                self.cu_seqlens_q,
+                self.kv_seqlens,
+                self.max_q_len,
+                self.max_kv_len,
+            ),
+        )

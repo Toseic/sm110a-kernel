@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
 
+import torch
+
 from ..jit_runtime import SplitCudaJit
+from ..runner import BaseKernelRunner, PreparedKernel
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SRC = _ROOT / "csrc/fp8mxfp4_gemm/src"
@@ -336,3 +340,113 @@ def fp8mxfp4_gemm_scaled_out(a, b, sfa, sfb, out, config=None):
     return _compiled_facade(config or _default(a, b)).fp8mxfp4_gemm_scaled_out(
         a, b, sfa, sfb, out
     )
+
+
+FP8MXFP4_GEMM_CONFIGS = tuple(
+    Fp8Mxfp4GemmConfig(
+        tile_n=tile_n,
+        tile_k=tile_k,
+        cluster_m=cluster_m,
+        epilogue_block_n=epilogue_block_n,
+        split_k=split_k,
+        use_prefetch=use_prefetch,
+        compact_b_gmem=tile_k == 128,
+    )
+    for cluster_m in (1, 2)
+    for split_k in (1, 2, 4, 8)
+    for tile_n in (64, 128, 256)
+    for tile_k in (64, 128)
+    for epilogue_block_n in (32, 64, 128)
+    for use_prefetch in (False, True)
+    if tile_n % epilogue_block_n == 0 and cluster_m * split_k <= 8
+    if not (
+        # Two-mainloop-stage SMEM check from Fp8Mxfp4GemmConfig.validate.
+        (
+            232448
+            - 1024
+            - 256
+            - 2 * 128 * epilogue_block_n * 2
+            - (128 * epilogue_block_n * 4 if split_k > 1 else 0)
+        )
+        // (
+            (
+                128 * 128
+                + (tile_n // cluster_m) * 128
+                + 128 * (tile_k // 8)
+                + (tile_k // 32) * ((tile_n + 127) // 128) * 512
+                + 1023
+            )
+            & ~1023
+        )
+        < 2
+    )
+)
+
+
+def fp8mxfp4_candidates(m, n, k, compact_b_gmem):
+    sm_count = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+    return tuple(
+        config
+        for config in FP8MXFP4_GEMM_CONFIGS
+        if config.compact_b_gmem == compact_b_gmem
+        and m % (config.tile_m * config.cluster_m) == 0
+        and n % config.tile_n == 0
+        and k % (config.tile_k * config.split_k) == 0
+        # Rolling L2 prefetch is a tactic for large K or an incomplete CTA
+        # wave, rather than a universally profitable instruction stream.
+        and (
+            not config.use_prefetch
+            or k >= 8192
+            or 0.5
+            < (
+                math.ceil(m / (config.tile_m * config.cluster_m))
+                * math.ceil(n / config.tile_n)
+                / sm_count
+            )
+            < 1.0
+        )
+    )
+
+
+def format_fp8mxfp4_candidate(config):
+    return (
+        f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
+        f"/c{config.cluster_m}/e{config.epilogue_block_n}/sk{config.split_k}"
+        f"/{'prefetch' if config.use_prefetch else 'noprefetch'}"
+        f"/{'compact' if config.compact_b_gmem else 'padded'}"
+    )
+
+
+class Fp8Mxfp4GemmRunner(BaseKernelRunner):
+    namespace = "fp8mxfp4_gemm_v1"
+    format_candidate = staticmethod(format_fp8mxfp4_candidate)
+
+    def __init__(self, a, b, sfb, out, *, sfa=None, compact_b_gmem=True):
+        super().__init__(a.device)
+        self.a, self.b, self.sfa, self.sfb, self.out = a, b, sfa, sfb, out
+        self.m, self.k, self.n = a.size(0), a.size(1), b.size(0)
+        self.compact_b_gmem = compact_b_gmem
+        if sfa is not None:
+            self.namespace = "fp8mxfp4_gemm_scaled_v1"
+
+    @property
+    def workload_key(self):
+        return (self.m, self.n, self.k, self.compact_b_gmem)
+
+    def compatible_candidates(self):
+        return fp8mxfp4_candidates(self.m, self.n, self.k, self.compact_b_gmem)
+
+    def pre_jit(self, candidate):
+        return compile_fp8mxfp4_gemm(candidate)
+
+    def prepare(self, candidate):
+        module = self.pre_jit(candidate)
+        if self.sfa is None:
+            run = lambda: module.fp8mxfp4_gemm_out(self.a, self.b, self.sfb, self.out)
+        else:
+            run = lambda: module.fp8mxfp4_gemm_scaled_out(
+                self.a, self.b, self.sfa, self.sfb, self.out
+            )
+        return PreparedKernel(candidate, run)

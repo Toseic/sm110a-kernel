@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..jit_runtime import SplitCudaJit
+from ..runner import BaseKernelRunner, PreparedKernel
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SRC = _ROOT / "csrc/nvfp4_moe/src"
@@ -290,3 +291,110 @@ def nvfp4_fc2_out(
         out,
         max_active_clusters,
     )
+
+
+NVFP4_FC2_CONFIGS = tuple(
+    Nvfp4Fc2Config(
+        tile_n=tile_n,
+        tile_k=tile_k,
+        epilogue_tile_n=epilogue_tile_n,
+        cluster_m=cluster_m,
+    )
+    for tile_n in (64, 128, 256)
+    for tile_k in (64, 128, 256)
+    for epilogue_tile_n in (32, 64, 128)
+    for cluster_m in (1, 2)
+    if tile_n % epilogue_tile_n == 0
+)
+
+
+def format_candidate(config):
+    order = "n" if config.macro_swizzle_n_major else "m"
+    if config.macro_swizzle_serpentine:
+        order += "s"
+    return (
+        f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
+        f"/e{config.epilogue_tile_n}/c{config.cluster_m}/persistent"
+        f"/r{config.reduce_tile_n}/{order}{config.macro_swizzle_m}x{config.macro_swizzle_n}"
+    )
+
+
+def nvfp4_fc2_candidates(n, k):
+    return tuple(
+        c
+        for c in NVFP4_FC2_CONFIGS
+        if n % c.tile_n == 0 and n % 128 == 0 and k % c.tile_k == 0
+    )
+
+
+class Nvfp4Fc2Runner(BaseKernelRunner):
+    namespace = "nvfp4_fc2_runner_v1"
+    format_candidate = staticmethod(format_candidate)
+
+    def __init__(
+        self,
+        a,
+        b,
+        sfa,
+        sfb,
+        routing,
+        routing_weights,
+        layout,
+        topk,
+        out,
+        *,
+        dynamic_metadata=True,
+    ):
+        super().__init__(a.device)
+        (
+            self.a,
+            self.b,
+            self.sfa,
+            self.sfb,
+            self.routing,
+            self.routing_weights,
+            self.layout,
+            self.topk,
+            self.out,
+        ) = a, b, sfa, sfb, routing, routing_weights, layout, topk, out
+        self.dynamic_metadata = dynamic_metadata
+        self.metadata_by_candidate = {}
+        if dynamic_metadata:
+            self.namespace += "_dynamic_v1"
+            self.graph_timing = True
+
+    @property
+    def workload_key(self):
+        return (tuple(self.a.shape), tuple(self.b.shape), self.topk)
+
+    def compatible_candidates(self):
+        return nvfp4_fc2_candidates(self.b.size(1), self.a.size(1) * 2)
+
+    def pre_jit(self, candidate):
+        return compile_nvfp4_fc2(candidate)
+
+    def prepare(self, candidate):
+        module = self.pre_jit(candidate)
+
+        def metadata():
+            return module.prepare_metadata(self.layout, self.b.size(0), self.b.size(1))
+
+        md = None if self.dynamic_metadata else metadata()
+        if md is not None:
+            self.metadata_by_candidate[candidate] = md
+
+        def run():
+            module.nvfp4_fc2_out(
+                self.a,
+                self.b,
+                self.sfa,
+                self.sfb,
+                self.routing,
+                self.routing_weights,
+                metadata() if self.dynamic_metadata else md,
+                self.topk,
+                self.out,
+            )
+            return self.out
+
+        return PreparedKernel(candidate, run)

@@ -15,7 +15,8 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from common import BenchmarkBase, TablePrinter, benchmark_with_stats
-from sm110a_kernel import compile_topk
+from sm110a_kernel import TopKRunner, compile_topk
+from sm110a_kernel.kernels.topk import TopKConfig
 
 
 def check_topk(scores, indices, k):
@@ -234,31 +235,26 @@ def prepare_indexer(args, rows, n, scores):
         make_packed_rows,
     )
 
-    from sm110a_kernel import (
-        compile_indexer_score_decode,
-        compile_indexer_score_prefill,
+    from sm110a_kernel import IndexerScoreDecodeRunner, IndexerScorePrefillRunner
+    from sm110a_kernel.kernels.mxfp4_indexer_score import (
+        IndexerScoreDecodeConfig,
+        IndexerScorePrefillConfig,
     )
 
     q = make_packed_rows(rows * HEADS).view(rows, HEADS, DIM // 2)
     weight = torch.randn(rows, HEADS, device="cuda", dtype=torch.bfloat16)
     if args.score_source == "indexer-decode":
-        module = compile_indexer_score_decode()
         k = make_packed_rows(rows * n).view(rows, n, DIM // 2)
         qs = torch.cat([make_blocked_scales(HEADS) for _ in range(rows)])
         ks = torch.cat([make_blocked_scales(n) for _ in range(rows)])
-
-        def run():
-            module.indexer_score_decode_out(q, k, qs, ks, weight, scores, args.split_kv)
+        runner = IndexerScoreDecodeRunner(q, k, qs, ks, weight, scores)
+        prepared = runner.prepare(IndexerScoreDecodeConfig(args.split_kv))
     else:
-        module = compile_indexer_score_prefill()
         k = make_packed_rows(n)
         qs, ks = make_blocked_scales(rows * HEADS), make_blocked_scales(n)
-
-        def run():
-            module.indexer_score_prefill_out(
-                q, k, qs, ks, weight, scores, args.cluster_m, causal=False
-            )
-
+        runner = IndexerScorePrefillRunner(q, k, qs, ks, weight, scores, causal=False)
+        prepared = runner.prepare(IndexerScorePrefillConfig(args.cluster_m))
+    run = prepared.run
     run()
     return run
 
@@ -404,15 +400,20 @@ class TopKBenchmark(BenchmarkBase):
                 else None
             )
             out = torch.empty((rows, k), device="cuda", dtype=torch.int32)
-            split_k = args.split_k
-            if split_k is None:
-                split_k = module.select_split_k(
-                    scores, k, out, options=self.make_tune_options(args)
-                )
+            runner = TopKRunner(
+                scores,
+                out,
+                k,
+                stages=args.stages,
+                copy_engine=args.copy_engine,
+            )
+            if args.split_k is None:
+                prepared = runner.tune(self.make_tune_options(args)).prepared
+            else:
+                prepared = runner.prepare(TopKConfig(args.split_k))
+            split_k = prepared.candidate.split_k
             print(f"[topk] Q={rows} N={n} K={k} {dtype_name}: split_k={split_k}")
-            cases = [
-                ("radix", lambda: module.topk_out(scores, out, k, split_k=split_k), out)
-            ]
+            cases = [("radix", prepared.run, out)]
             if args.baseline in ("torch", "all"):
                 values = torch.empty((rows, k), device="cuda", dtype=dtype)
                 torch_out = torch.empty((rows, k), device="cuda", dtype=torch.int64)

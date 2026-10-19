@@ -24,7 +24,7 @@ from common import (
     benchmark_with_stats,
     sol_bounds,
 )
-from sm110a_kernel import bf16_fa4_mla_out
+from sm110a_kernel import Bf16Fa4MlaConfig, Bf16Fa4MlaRunner
 
 H = 128
 D_KV = 512
@@ -134,15 +134,11 @@ class Bf16Fa4MlaBenchmark(BenchmarkBase):
             q, k, v = make_inputs(batch, args.kv_len)
             out = torch.empty((batch, H, 1, D_KV), device=q.device, dtype=q.dtype)
 
-            def kernel():
-                return bf16_fa4_mla_out(
-                    q,
-                    k,
-                    v,
-                    out,
-                    scale=args.scale,
-                    implementation=args.impl,
-                )
+            kernel = (
+                Bf16Fa4MlaRunner(q, k, v, out, scale=args.scale)
+                .prepare(Bf16Fa4MlaConfig(args.impl))
+                .run
+            )
 
             kernel()
             torch.cuda.synchronize()

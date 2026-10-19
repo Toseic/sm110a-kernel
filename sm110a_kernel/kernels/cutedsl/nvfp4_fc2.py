@@ -436,6 +436,7 @@ class CuteDslNvfp4Fc2Runner:
             compiled = cute.compile(
                 gemm.wrapper,
                 *compile_args,
+                expert_capacity=cutlass.Int32(0),  # Explicit tile metadata.
                 tile_size=config.mma_tile_m,
                 scaling_vector_size=16,
                 max_active_clusters=max_active_clusters,
@@ -536,6 +537,7 @@ class CuteDslNvfp4Fc2Runner:
                 self.experts,
                 self.tokens,
                 self.topk,
+                expert_capacity=cutlass.Int32(0),
                 stream=self.stream,
             )
 

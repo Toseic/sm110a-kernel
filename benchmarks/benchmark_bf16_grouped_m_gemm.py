@@ -21,12 +21,13 @@ from common import (
     tflops_from_ms,
 )
 from sm110a_kernel import (
-    GroupedMConfig,
     bf16_grouped_m_gemm_out,
-    compile_bf16_grouped_m_gemm,
     prepare_grouped_m_metadata,
 )
-from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
+from sm110a_kernel.kernels.grouped_m_gemm import (
+    Bf16GroupedMGemmRunner,
+    format_candidate,
+)
 
 """
 roofline analysis:
@@ -50,24 +51,6 @@ EXPERTS = 256
 N = 4096
 K = 6144
 DEFAULT_TOKENS_PER_EXPERT_VALUES = (64, 128, 256, 512, 1024)
-GROUPED_M_CONFIGS = tuple(
-    GroupedMConfig(
-        tile_m=128,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        epilogue_tile_n=epilogue_tile_n,
-        cluster_m=cluster_m,
-        mode=mode,
-        direct_gmem=direct_gmem,
-    )
-    for tile_n in (128, 256)
-    for tile_k in (64, 128)
-    for epilogue_tile_n in (32, 64)
-    for cluster_m in (1, 2)
-    for mode in (0, 1, 2)
-    for direct_gmem in (False,)
-    if tile_n % epilogue_tile_n == 0
-)
 
 
 def build_layout(tokens_per_expert, experts):
@@ -167,34 +150,6 @@ def probe_grouped_kernel(a, b, layout, out, config, swap_ab, args):
         args.iters,
         cold_l2_flush=getattr(args, "_cold_l2_flush", None),
     )
-
-
-def compatible_candidates(n, k):
-    candidates = []
-    for config in GROUPED_M_CONFIGS:
-        if k % config.tile_k:
-            continue
-        if n % config.tile_n == 0:
-            candidates.append((config, False))
-        # if config.cluster_m == 1 and n % (config.cluster_m * config.tile_m) == 0:
-        #     candidates.append((config, True)) # disable swapab [tmp]
-    return tuple(candidates)
-
-
-_MODE_LABELS = {0: "np", 1: "pe", 2: "clc"}
-
-
-def format_config(config):
-    base = (
-        f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
-        f"/e{config.epilogue_tile_n}/c{config.cluster_m}"
-        f"/{_MODE_LABELS[config.mode]}"
-    )
-    return base + "+dg" if getattr(config, "direct_gmem", False) else base
-
-
-def format_candidate(config, swap_ab):
-    return f"{format_config(config)}/{'swap' if swap_ab else 'noswap'}"
 
 
 def max_valid_abs_diff(ref, test):
@@ -397,36 +352,15 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
             sol_report.print()
 
     def resolve_grouped_kernel(self, a, b, layout, out, args):
-        candidates = compatible_candidates(b.size(1), a.size(1))
-        if not candidates:
-            raise RuntimeError(
-                f"no grouped M config supports N={b.size(1)}, K={a.size(1)}"
-            )
-
-        tokens_per_expert = layout.numel() // b.size(0)
-        n = b.size(1)
-        k = a.size(1)
-
-        def prepare(candidate):
-            config, swap_ab = candidate
-            metadata = prepare_grouped_m_metadata(
-                layout, b.size(0), b.size(1), config=config, swap_ab=swap_ab
-            )
-            run = lambda: bf16_grouped_m_gemm_out(
-                a, b, metadata, out, config=config, swap_ab=swap_ab
-            )
-            run()
-            torch.cuda.synchronize()
-            return PreparedKernel(candidate, run)
-
+        kernel_runner = Bf16GroupedMGemmRunner(a, b, layout, out)
+        candidates = kernel_runner.compatible_candidates()
+        n, k = (b.size(1), a.size(1))
         options = self.make_tune_options(
-            args,
-            role="ours",
-            pre_parallel_jit=args.pre_parallel_jit,
+            args, role="ours", pre_parallel_jit=args.pre_parallel_jit
         )
-        return AutotuneRunner(options).resolve(
-            candidates,
-            prepare=prepare,
+        return kernel_runner.tune(
+            options,
+            candidates=candidates,
             benchmark=lambda prepared: benchmark_with_stats(
                 prepared.run,
                 args.warmup,
@@ -439,15 +373,9 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
                 args.iters,
                 cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             ),
-            format_candidate=lambda candidate: format_candidate(
-                candidate[0], candidate[1]
-            ),
-            namespace="bf16_grouped_m_gemm",
-            key=(n, k, tokens_per_expert),
             metric_formatter=lambda _candidate, stats: (
                 f"{tflops_from_ms(a.size(0), n, k, stats['median_ms']):.1f} TF/s"
             ),
-            pre_jit=lambda candidate: compile_bf16_grouped_m_gemm(candidate[0]),
         )
 
 

@@ -12,7 +12,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from common import BenchmarkBase, SolReport, benchmark_with_stats, sol_bounds
-from sm110a_kernel import bf16tofp8_quant_out, compile_bf16tofp8_quant
+from sm110a_kernel import (
+    Bf16ToFp8QuantRunner,
+    compile_bf16tofp8_quant,
+)
 
 TOKENS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
 BLOCK_SIZE = 128
@@ -99,8 +102,10 @@ class QuantBenchmark(BenchmarkBase):
                 device="cuda",
                 dtype=torch.float8_e8m0fnu,
             )
+            kernel_runner = Bf16ToFp8QuantRunner(input, output, scales)
+            kernel_runner.run()
             stats = benchmark_with_stats(
-                lambda: bf16tofp8_quant_out(input, output, scales),
+                kernel_runner.run,
                 args.warmup,
                 args.iters,
                 args.samples,

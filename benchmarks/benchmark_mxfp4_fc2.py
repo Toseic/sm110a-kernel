@@ -29,22 +29,17 @@ from common import (  # noqa: E402
     sol_bounds,
 )
 from sm110a_kernel import (  # noqa: E402
-    Mxfp4Fc2Config,
     Nvfp4Fc2Config,
     bf16tofp8_quant,
     compact_mxfp4_weight_scales,
-    compile_mxfp4_fc2,
-    compile_nvfp4_fc2,
-    mxfp4_fc2_out,
-    nvfp4_fc2_out,
     pack_routing_metadata,
-    prepare_mxfp4_fc2_metadata,
-    prepare_nvfp4_fc2_metadata,
     quantize_fp8mxfp4_weights,
     quantize_nvfp4_rows,
     to_blocked_mxfp4_sfa,
 )
-from sm110a_kernel.runner import AutotuneRunner, PreparedKernel  # noqa: E402
+from sm110a_kernel.kernels.mxfp4_fc2 import MXFP4_FC2_CONFIGS, Mxfp4Fc2Runner
+from sm110a_kernel.kernels.mxfp4_fc2 import format_fc2_candidate as format_candidate
+from sm110a_kernel.kernels.nvfp4_fc2 import Nvfp4Fc2Runner  # noqa: E402
 
 DEFAULT_EXPERTS = 256
 DEFAULT_N = 6144
@@ -60,15 +55,6 @@ MXFP4_W4A8_MMA_PEAK_TFLOPS = 2.0 * 250.0
 
 # Task metadata carries the cluster-M tile geometry and is prepared for each
 # candidate below.  Keep both cluster shapes in the normal sweep.
-MXFP4_FC2_CONFIGS = tuple(
-    Mxfp4Fc2Config(
-        tile_k=128,
-        epilogue_tile_n=epilogue_tile_n,
-        cluster_m=cluster_m,
-    )
-    for epilogue_tile_n in (32, 64)
-    for cluster_m in (1, 2)
-)
 
 # NVFP4 parity reference candidates (tile_n=256 persistent family).
 NVFP4_FC2_PARITY_CONFIGS = tuple(
@@ -85,14 +71,6 @@ NVFP4_FC2_PARITY_CONFIGS = tuple(
 
 def fc2_tflops(tokens, topk, n, k, elapsed_ms):
     return 2.0 * tokens * topk * n * k / (elapsed_ms * 1e-3) / 1e12
-
-
-def format_candidate(config):
-    return (
-        f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
-        f"/e{config.epilogue_tile_n}/c{config.cluster_m}/persistent"
-        f"/r{config.reduce_tile_n}/sf={'compact' if config.compact_weight_scales else 'padded'}"
-    )
 
 
 def mxfp4_candidates(args):
@@ -377,49 +355,32 @@ class Mxfp4Fc2Benchmark(BenchmarkBase):
             # FC2 task packets are parameterized by cluster_m as well.  Build
             # them with the candidate rather than using default cluster-1
             # metadata for the cluster-2 NVFP4 parity candidates.
-            def prepare_mxfp4(config):
-                metadata = prepare_mxfp4_fc2_metadata(
-                    grouped_layout, args.experts, args.n, config=config
-                )
-                run = lambda: mxfp4_fc2_out(
-                    aq,
-                    bq,
-                    sfa,
-                    kernel_sfb,
-                    routing,
-                    routing_weights,
-                    metadata,
-                    args.topk,
-                    out,  # noqa: F821
-                    config=config,
-                )
-                # The fused epilogue scatter-adds into the destination.
-                # Start each tactic from zero without timing the memset.
-                out.zero_()  # noqa: F821
-                run()
-                torch.cuda.synchronize()
-                return PreparedKernel(config, run)
+            kernel_runner = Mxfp4Fc2Runner(
+                aq,
+                bq,
+                sfa,
+                kernel_sfb,
+                routing,
+                routing_weights,
+                grouped_layout,
+                args.topk,
+                out,
+                config=mxfp4_candidates(args)[0],
+                dynamic_metadata=False,
+            )
 
-            def prepare_nvfp4(config):
-                metadata = prepare_nvfp4_fc2_metadata(
-                    grouped_layout, args.experts, args.n, config=config
-                )
-                run = lambda: nvfp4_fc2_out(
-                    nv_aq,
-                    nv_bq,
-                    nv_sfa,
-                    nv_sfb,
-                    routing,
-                    routing_weights,
-                    metadata,
-                    args.topk,
-                    nv_out,  # noqa: F821
-                    config=config,
-                )
-                nv_out.zero_()  # noqa: F821
-                run()
-                torch.cuda.synchronize()
-                return PreparedKernel(config, run)
+            nv_runner = Nvfp4Fc2Runner(
+                nv_aq,
+                nv_bq,
+                nv_sfa,
+                nv_sfb,
+                routing,
+                routing_weights,
+                grouped_layout,
+                args.topk,
+                nv_out,
+                dynamic_metadata=False,
+            )
 
             options = self.make_tune_options(
                 args, role="ours", pre_parallel_jit=args.pre_parallel_jit
@@ -427,21 +388,9 @@ class Mxfp4Fc2Benchmark(BenchmarkBase):
             nv_options = self.make_tune_options(
                 args, role="baseline", pre_parallel_jit=args.pre_parallel_jit
             )
-            ours_selection = AutotuneRunner(options).resolve(
-                mxfp4_candidates(args),
-                namespace="mxfp4_fc2",
-                key=(
-                    "v2-weight-scales",
-                    tokens,
-                    args.experts,
-                    args.topk,
-                    args.n,
-                    args.k,
-                    args.compact_weight_scales,
-                    args.routing_weight_position,
-                    args.deterministic,
-                ),
-                prepare=prepare_mxfp4,
+            ours_selection = kernel_runner.tune(
+                options,
+                candidates=mxfp4_candidates(args),
                 benchmark=lambda prepared: benchmark_with_stats(
                     prepared.run,
                     args.warmup,
@@ -452,17 +401,13 @@ class Mxfp4Fc2Benchmark(BenchmarkBase):
                 probe=lambda prepared: quick_probe(
                     prepared.run, args.iters, cold_l2_flush=args._cold_l2_flush
                 ),
-                format_candidate=format_candidate,
                 metric_formatter=lambda _c, stats: (
                     f"{fc2_tflops(tokens, args.topk, args.n, args.k, stats['median_ms']):.1f} TF/s"
                 ),
-                pre_jit=compile_mxfp4_fc2,
             )
-            nv_selection = AutotuneRunner(nv_options).resolve(
-                NVFP4_FC2_PARITY_CONFIGS,
-                namespace="nvfp4_fc2",
-                key=("mxfp4-parity", tokens, args.experts, args.topk, args.n, args.k),
-                prepare=prepare_nvfp4,
+            nv_selection = nv_runner.tune(
+                nv_options,
+                candidates=NVFP4_FC2_PARITY_CONFIGS,
                 benchmark=lambda prepared: benchmark_with_stats(
                     prepared.run,
                     args.warmup,
@@ -473,11 +418,9 @@ class Mxfp4Fc2Benchmark(BenchmarkBase):
                 probe=lambda prepared: quick_probe(
                     prepared.run, args.iters, cold_l2_flush=args._cold_l2_flush
                 ),
-                format_candidate=format_candidate,
                 metric_formatter=lambda _c, stats: (
                     f"{fc2_tflops(tokens, args.topk, args.n, args.k, stats['median_ms']):.1f} TF/s"
                 ),
-                pre_jit=compile_nvfp4_fc2,
             )
 
             max_abs_diff = float("nan")

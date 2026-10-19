@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import math
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -39,29 +39,18 @@ from sm110a_kernel import (  # noqa: E402
     quantize_fp8mxfp4_weights,
     to_blocked_mxfp4_sfa,
 )
+from sm110a_kernel.kernels.mxfp4_fc1fc2 import (
+    Mxfp4Fc1Fc2Runner,
+    Mxfp4StandaloneRunner,
+    fused_candidates,
+)
 from sm110a_kernel.runner import (  # noqa: E402
-    AutotuneRunner,
-    PreparedKernel,
     TuneOptions,
 )
 
 H = 6144
 INTERMEDIATE = 2048
 ROUTER_POWERLAW_ALPHA = 0.8
-
-
-@dataclass(frozen=True)
-class StandaloneConfig:
-    """Serializable pair of independently tuned baseline configurations."""
-
-    fc1: Mxfp4Fc1Config
-    fc2: Mxfp4Fc2Config
-
-    def __post_init__(self):
-        if isinstance(self.fc1, dict):
-            object.__setattr__(self, "fc1", Mxfp4Fc1Config(**self.fc1))
-        if isinstance(self.fc2, dict):
-            object.__setattr__(self, "fc2", Mxfp4Fc2Config(**self.fc2))
 
 
 def fused_tflops(m, elapsed_ms):
@@ -86,55 +75,26 @@ def row_tasks_for_cluster(args, cluster):
 
 
 def compatible_configs(m, args):
-    splits = (args.h_split,) if args.h_split else (1, 2, 4)
-    stages = (args.stages,) if args.stages else (2, 3, 4, 5)
-    accumulators = (args.accumulator_stages,) if args.accumulator_stages else (1, 2)
-    clusters = (args.cluster_m,) if args.cluster_m else (1, 2)
-    schedules = (
-        (args.schedule == "tiled",) if args.schedule != "auto" else (False, True)
-    )
-    sms = torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).multi_processor_count
-    gathers = (
-        (args.gather_warps,)
-        if args.gather_warps
-        else ((2, 4) if args.fuse_routing else (4,))
-    )
-    reductions = (args.reduce_tile_n,) if args.reduce_tile_n else (64, 128)
-    compact_formats = (
-        (False, True)
+    configs = fused_candidates(
+        m,
+        H,
+        compact_formats=(False, True)
         if args.weight_scales == "auto"
-        else (args.weight_scales == "compact",)
-    )
-    configs = tuple(
-        Mxfp4Fc1Fc2Config(
-            hidden_dim=H,
-            compact_weight_scales=compact,
-            cluster_m=cluster,
-            tiled_schedule=tiled,
-            gather_warps=gather,
-            reduce_tile_n=reduce,
-            h_split=split,
-            stages=stage,
-            accumulator_stages=accumulator,
-            fuse_routing=args.fuse_routing,
-            routing_weight_position=args.routing_weight_position,
-            activation_bf16_rounding=args.activation_bf16_rounding,
-        )
-        for compact in compact_formats
-        for reduce in reductions
-        for gather in gathers
-        for tiled in schedules
-        for cluster in clusters
-        for split in splits
-        for stage in stages
-        for accumulator in accumulators
-        if (args.fuse_routing or m % (128 * cluster) == 0)
-        and (cluster == 2 or stage <= 3)
-        and split <= sms // cluster
-        and H % (256 * split) == 0
-        and (not tiled or split == 1)
+        else (args.weight_scales == "compact",),
+        reductions=(args.reduce_tile_n,) if args.reduce_tile_n else (64, 128),
+        gathers=(args.gather_warps,)
+        if args.gather_warps
+        else ((2, 4) if args.fuse_routing else (4,)),
+        schedules=(args.schedule == "tiled",)
+        if args.schedule != "auto"
+        else (False, True),
+        clusters=(args.cluster_m,) if args.cluster_m else (1, 2),
+        splits=(args.h_split,) if args.h_split else (1, 2, 4),
+        stages=(args.stages,) if args.stages else (2, 3, 4, 5),
+        accumulators=(args.accumulator_stages,) if args.accumulator_stages else (1, 2),
+        fuse_routing=args.fuse_routing,
+        routing_weight_position=args.routing_weight_position,
+        activation_bf16_rounding=args.activation_bf16_rounding,
     )
     if not configs:
         raise SystemExit("no resident fused configurations match the filters")
@@ -1222,9 +1182,6 @@ def main():
         expert_counts.cpu().tolist() if args.fuse_routing else [args.m]
     )
     args._row_task_count = row_task_count
-    fc1_metadata = prepare_mxfp4_fc1_metadata(
-        router, topk, 2 * intermediate, fc1_config
-    )
     intermediate_packed = torch.empty(
         (args.m, intermediate),
         device="cuda",
@@ -1257,48 +1214,30 @@ def main():
             flush=True,
         )
 
-    fused_metadata = {2: fc1_metadata}
-
-    def prepare_fused(config):
-        fused_sfw1 = compact_sfw1 if config.compact_weight_scales else sfw1
-        fused_sfw2 = compact_sfw2 if config.compact_weight_scales else sfw2
-        module = compile_mxfp4_fc1fc2(config)
-        local_rows = row_tasks_for_cluster(args, config.cluster_m)
-        if config.cluster_m not in fused_metadata:
-            fused_metadata[config.cluster_m] = prepare_mxfp4_fc1_metadata(
-                router,
-                topk,
-                2 * intermediate,
-                replace(fc1_config, cluster_m=config.cluster_m),
-            )
-        metadata = fused_metadata[config.cluster_m]
-        if args.fuse_routing:
-            run = lambda: module.run_routed_out(
-                aq,
-                w1q,
-                sfa,
-                fused_sfw1,
-                w2q,
-                fused_sfw2,
-                metadata,
-                routing_weights,
-                topk,
-                output,
-                args.swiglu_limit,
-                row_task_count=local_rows,
-            )
-        else:
-            run = lambda: module.run_out(
-                aq, w1q, sfa, fused_sfw1, w2q, fused_sfw2, output, args.swiglu_limit
-            )
-        run()
-        torch.cuda.synchronize()
-        return PreparedKernel(config, run)
+    kernel_runner = Mxfp4Fc1Fc2Runner(
+        aq,
+        w1q,
+        sfa,
+        {False: sfw1, True: compact_sfw1},
+        w2q,
+        {False: sfw2, True: compact_sfw2},
+        output,
+        router=router if args.fuse_routing else None,
+        routing_weights=routing_weights,
+        topk=topk,
+        swiglu_limit=args.swiglu_limit,
+        routing_weight_position=args.routing_weight_position,
+        activation_bf16_rounding=args.activation_bf16_rounding,
+        row_task_counts={
+            cluster: row_tasks_for_cluster(args, cluster) for cluster in (1, 2)
+        },
+    )
 
     tune_options = TuneOptions(
         warmup=args.warmup,
         iters=args.iters,
         samples=args.samples,
+        cold_l2_flush=cold_l2_flush,
         cache_path=args.cache_path,
         force_sweep=args.force_sweep,
         debug=args.debug,
@@ -1319,45 +1258,22 @@ def main():
         measurements[kind].append({"config": config, "stats": stats})
         return stats
 
-    selection = AutotuneRunner(tune_options).resolve(
-        candidates,
-        namespace="mxfp4_fc1fc2",
-        key=(
-            "v10-compact-weight-scales-w4a8-cold-l2",
-            args.m,
-            H,
-            INTERMEDIATE,
-            experts,
-            topk,
-            row_task_count,
-            args.fuse_routing,
-            args.cluster_m,
-            args.accumulator_stages,
-            args.reduce_tile_n,
-            args.weight_scales,
-            args.swiglu_limit,
-            args.routing_weight_position,
-            args.activation_bf16_rounding,
-            args.clean_l2,
-        ),
-        prepare=prepare_fused,
+    selection = kernel_runner.tune(
+        tune_options,
+        candidates=candidates,
         benchmark=lambda prepared: measure(prepared, "fused"),
         probe=None
         if args.force_sweep
         else lambda prepared: quick_probe(prepared.run, args.iters, cold_l2_flush),
-        format_candidate=format_config,
         metric_formatter=lambda _config, stats: (
             f"{fused_tflops(args.m, stats['median_ms']):.1f} TF/s"
         ),
-        pre_jit=compile_mxfp4_fc1fc2,
     )
     fused_config = selection.candidate
     row_task_count = row_tasks_for_cluster(args, fused_config.cluster_m)
 
     def run_fused():
         return selection.prepared.run()
-
-    fc2_routing_weights = routing_weights.to(torch.bfloat16)
 
     baseline_sfw1, baseline_sfw2 = sfw1, sfw2
     if args.baseline_weight_scales == "compact":
@@ -1366,90 +1282,37 @@ def main():
             compact_sfw2 = compact_mxfp4_fc1fc2_weight_scales(sfw2)
         baseline_sfw1, baseline_sfw2 = compact_sfw1, compact_sfw2
 
-    def prepare_baseline(candidate):
-        config1, config2 = candidate.fc1, candidate.fc2
-        metadata1 = prepare_mxfp4_fc1_metadata(router, topk, 2 * intermediate, config1)
-        metadata2 = prepare_mxfp4_fc2_metadata(
-            metadata1.routing.narrow(0, 2 * experts, args.m), experts, h, config2
-        )
-
-        def fc1():
-            return mxfp4_fc1_out(
-                aq,
-                w1q,
-                sfa,
-                baseline_sfw1,
-                metadata1,
-                intermediate_packed,
-                intermediate_scales,
-                args.swiglu_limit,
-                config1,
-                routing_weights=routing_weights
-                if args.routing_weight_position == "fc1"
-                else None,
-            )
-
-        def fc2():
-            return mxfp4_fc2_out(
-                intermediate_packed,
-                w2q,
-                intermediate_scales,
-                baseline_sfw2,
-                metadata1.routing,
-                fc2_routing_weights,
-                metadata2,
-                topk,
-                reference,
-                config2,
-            )
-
-        def run():
-            fc1()
-            return fc2()
-
-        run()
-        torch.cuda.synchronize()
-        prepared = PreparedKernel(candidate, run)
-        prepared.fc1, prepared.fc2 = fc1, fc2
-        return prepared
-
-    clusters = (args.baseline_cluster_m,) if args.baseline_cluster_m else (1, 2)
-    baseline_candidates = tuple(
-        StandaloneConfig(
-            replace(fc1_config, cluster_m=c1),
-            replace(fc2_config, cluster_m=c2, epilogue_tile_n=epi),
-        )
-        for c1 in clusters
-        for c2 in clusters
-        for epi in (32, 64)
+    baseline_runner = Mxfp4StandaloneRunner(
+        aq,
+        w1q,
+        sfa,
+        baseline_sfw1,
+        w2q,
+        baseline_sfw2,
+        router,
+        routing_weights,
+        topk,
+        intermediate_packed,
+        intermediate_scales,
+        reference,
+        swiglu_limit=args.swiglu_limit,
+        fc1_config=fc1_config,
+        fc2_config=fc2_config,
     )
-    baseline = AutotuneRunner(tune_options).resolve(
-        baseline_candidates,
-        namespace="mxfp4_fc1fc2_standalone",
-        key=(
-            "v4-weight-scale-format-cold-l2",
-            args.baseline_weight_scales,
-            H,
-            tokens,
-            experts,
-            topk,
-            args.swiglu_limit,
-            args.routing_weight_position,
-            args.activation_bf16_rounding,
-            args.clean_l2,
-        ),
-        prepare=prepare_baseline,
+
+    baseline_candidates = tuple(
+        candidate
+        for candidate in baseline_runner.compatible_candidates()
+        if not args.baseline_cluster_m
+        or candidate.fc1.cluster_m == candidate.fc2.cluster_m == args.baseline_cluster_m
+    )
+    baseline = baseline_runner.tune(
+        tune_options,
+        candidates=baseline_candidates,
         benchmark=lambda prepared: measure(prepared, "standalone"),
         probe=None
         if args.force_sweep
         else lambda prepared: quick_probe(prepared.run, args.iters, cold_l2_flush),
-        format_candidate=lambda candidate: (
-            f"fc1_c={candidate.fc1.cluster_m},fc2_c={candidate.fc2.cluster_m},epi={candidate.fc2.epilogue_tile_n},compact={int(candidate.fc1.compact_weight_scales)}"
-        ),
-        pre_jit=lambda candidate: (
-            compile_mxfp4_fc1(candidate.fc1),
-            compile_mxfp4_fc2(candidate.fc2),
-        ),
     )
     run_standalone = baseline.prepared.run
     run_fc1 = baseline.prepared.fc1
@@ -1493,26 +1356,42 @@ def main():
             )
 
     if args.graph_check:
-        # Workspace and compiled modules are already initialized before capture.
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            run_fused()
-        graph.replay()
-        torch.cuda.synchronize()
-        if not args.no_accuracy:
-            if topk == 1:
-                if not torch.equal(output, reference):
-                    raise AssertionError("graph output differs from FC1+FC2")
-            else:
-                relative_l2 = torch.linalg.vector_norm(
-                    output.float() - reference.float()
-                ) / torch.linalg.vector_norm(reference.float()).clamp_min(1e-12)
-                if (
-                    not torch.isfinite(output).all()
-                    or relative_l2.item() > args.max_relative_rmse
-                ):
-                    raise AssertionError("graph output exceeds the relative-RMSE bound")
-        print("[graph] capture/replay passed")
+        expected = reference.clone() if not args.no_accuracy else None
+        current = torch.cuda.current_stream()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(current)
+        for name, run, actual in (
+            ("fused", run_fused, output),
+            ("standalone", run_standalone, reference),
+        ):
+            # Initialize stream-local workspaces before capture.
+            with torch.cuda.stream(stream):
+                run()
+                run()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    run()
+                graph.replay()
+            current.wait_stream(stream)
+            torch.cuda.synchronize()
+            if expected is not None:
+                if topk == 1:
+                    if not torch.equal(actual, expected):
+                        raise AssertionError(
+                            f"{name} graph output differs from FC1+FC2"
+                        )
+                else:
+                    relative_l2 = torch.linalg.vector_norm(
+                        actual.float() - expected.float()
+                    ) / torch.linalg.vector_norm(expected.float()).clamp_min(1e-12)
+                    if (
+                        not torch.isfinite(actual).all()
+                        or relative_l2.item() > args.max_relative_rmse
+                    ):
+                        raise AssertionError(
+                            f"{name} graph output exceeds the relative-RMSE bound"
+                        )
+            print(f"[graph] {name} capture/replay passed")
 
     fused_ms = selection.stats["median_ms"]
     standalone_stats = baseline.stats

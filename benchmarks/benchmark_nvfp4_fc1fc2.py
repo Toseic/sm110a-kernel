@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from common import (  # noqa: E402
+    BenchmarkBase,
     SolReport,
     benchmark_with_stats,
     powerlaw_router_scores,
@@ -23,10 +24,8 @@ from common import (  # noqa: E402
 )
 from sm110a_kernel import (  # noqa: E402
     Nvfp4Fc1Config,
-    Nvfp4Fc1Fc2Config,
     Nvfp4Fc2Config,
     compile_nvfp4_fc1,
-    compile_nvfp4_fc1fc2,
     compile_nvfp4_fc2,
     nvfp4_fc1_out,
     nvfp4_fc2_out,
@@ -34,9 +33,8 @@ from sm110a_kernel import (  # noqa: E402
     prepare_nvfp4_fc2_metadata,
     quantize_nvfp4_rows,
 )
+from sm110a_kernel.kernels.nvfp4_fc1fc2 import Nvfp4Fc1Fc2Runner, nvfp4_fused_candidates
 from sm110a_kernel.runner import (  # noqa: E402
-    AutotuneRunner,
-    PreparedKernel,
     TuneOptions,
 )
 
@@ -62,55 +60,15 @@ def format_config(config):
 
 
 def compatible_configs(m, args):
-    """Return config-filtered candidates that can launch for this M."""
-    # Splitting I into multiple FC2 reductions rounds each partial sum to
-    # BF16 and is not bit-equivalent to the unfused FP32 accumulation. Keep
-    # those experimental configs addressable explicitly, but never let the
-    # correctness-preserving autotuner select them.
-    buffers = (args.buffer_i,) if args.buffer_i else (2048,)
-    h_splits = (args.h_split,) if args.h_split else (1, 2, 3, 4)
-    cluster_pairs = (args.cluster_pairs,) if args.cluster_pairs else (1, 2, 4)
-    sm_count = torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).multi_processor_count
-    row_tasks = getattr(args, "_row_task_count", m // 256)
-    candidates = []
-    for buffer_i in buffers:
-        for h_split in h_splits:
-            for pairs in cluster_pairs:
-                caches = (
-                    (
-                        (0, 1, 2)
-                        if args.cache_source_rows < 0
-                        else (args.cache_source_rows,)
-                    )
-                    if args.fuse_routing
-                    else (0,)
-                )
-                for cache_source_rows in caches:
-                    if h_split > 1 and (buffer_i != 2048 or pairs != 1):
-                        continue
-                    config = Nvfp4Fc1Fc2Config(
-                        buffer_i=buffer_i,
-                        h_split=h_split,
-                        cluster_pairs=pairs,
-                        fuse_routing=args.fuse_routing,
-                        cache_source_rows=cache_source_rows,
-                    )
-                    try:
-                        config.validate()
-                    except ValueError:
-                        continue
-                    if h_split > 1:
-                        tasks = row_tasks * h_split
-                        if h_split == 3 and row_tasks == 4:
-                            tasks = 10
-                        if tasks > sm_count // (2 * pairs) and h_split != 2:
-                            continue
-                    candidates.append(config)
-    if not candidates:
-        raise SystemExit("no compatible fused FC1+FC2 configs match the filters")
-    return tuple(candidates)
+    return nvfp4_fused_candidates(
+        m,
+        buffers=(args.buffer_i,) if args.buffer_i else (2048,),
+        h_splits=(args.h_split,) if args.h_split else (1, 2, 3, 4),
+        cluster_pairs=(args.cluster_pairs,) if args.cluster_pairs else (1, 2, 4),
+        fuse_routing=args.fuse_routing,
+        caches=(0, 1, 2) if args.cache_source_rows < 0 else (args.cache_source_rows,),
+        row_tasks=getattr(args, "_row_task_count", m // 256),
+    )
 
 
 def fused_sol_bounds(m, config, *, tokens=None, experts=1, row_tasks=None):
@@ -187,18 +145,6 @@ def quantize_expert_weights(experts, h, intermediate):
     return w1q, sfw1_all, w2q, sfw2_all
 
 
-def time_ms(call, warmup, iterations):
-    for _ in range(warmup):
-        call()
-    start, end = torch.cuda.Event(True), torch.cuda.Event(True)
-    start.record()
-    for _ in range(iterations):
-        call()
-    end.record()
-    end.synchronize()
-    return start.elapsed_time(end) / iterations
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--m", type=int, default=512)
@@ -221,6 +167,7 @@ def main():
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=5)
     parser.add_argument("--samples", type=int, default=3)
+    parser.add_argument("--clean-l2", action="store_true")
     parser.add_argument(
         "--buffer-i",
         type=int,
@@ -277,6 +224,10 @@ def main():
         parser.error("invalid warmup/iteration count")
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
+
+    cache = BenchmarkBase()
+    cache.configure_cold_l2(args)
+    cold_l2_flush = args._cold_l2_flush
 
     h, intermediate = H, INTERMEDIATE
     torch.manual_seed(1234)
@@ -347,59 +298,40 @@ def main():
 
     candidates = compatible_configs(args.m, args)
 
-    def prepare_fused(config):
-        module = compile_nvfp4_fc1fc2(config)
-        if args.fuse_routing:
-            run = lambda: module.run_routed_out(
-                aq,
-                w1q,
-                sfa,
-                sfw1,
-                w2q,
-                sfw2,
-                fc1_metadata,
-                routing_weights,
-                topk,
-                output,
-            )
-        else:
-            run = lambda: module.run_out(aq, w1q, sfa, sfw1, w2q, sfw2, output)
-        run()
-        torch.cuda.synchronize()
-        return PreparedKernel(config, run)
+    kernel_runner = Nvfp4Fc1Fc2Runner(
+        aq,
+        w1q,
+        sfa,
+        sfw1,
+        w2q,
+        sfw2,
+        output,
+        metadata=fc1_metadata if args.fuse_routing else None,
+        routing_weights=routing_weights,
+        topk=topk,
+        row_task_count=row_task_count,
+    )
 
     tune_options = TuneOptions(
         warmup=args.warmup,
         iters=args.iters,
         samples=args.samples,
+        cold_l2_flush=cold_l2_flush,
         cache_path=args.cache_path,
         force_sweep=args.force_sweep,
         debug=args.debug,
         pre_parallel_jit=args.pre_parallel_jit,
     )
-    selection = AutotuneRunner(tune_options).resolve(
-        candidates,
-        namespace="nvfp4_fc1fc2",
-        key=(
-            "v6-routing-fusion",
-            args.m,
-            H,
-            INTERMEDIATE,
-            experts,
-            topk,
-            row_task_count,
-            args.fuse_routing,
-        ),
-        prepare=prepare_fused,
+    selection = kernel_runner.tune(
+        tune_options,
+        candidates=candidates,
         benchmark=lambda prepared: benchmark_with_stats(
-            prepared.run, args.warmup, args.iters, args.samples
+            prepared.run, args.warmup, args.iters, args.samples, cold_l2_flush
         ),
-        probe=lambda prepared: quick_probe(prepared.run, args.iters),
-        format_candidate=format_config,
+        probe=lambda prepared: quick_probe(prepared.run, args.iters, cold_l2_flush),
         metric_formatter=lambda _config, stats: (
             f"{fused_tflops(args.m, stats['median_ms']):.1f} TF/s"
         ),
-        pre_jit=compile_nvfp4_fc1fc2,
     )
     fused_config = selection.candidate
 
@@ -480,11 +412,15 @@ def main():
 
     fused_ms = selection.stats["median_ms"]
     standalone_stats = benchmark_with_stats(
-        run_standalone, args.warmup, args.iters, args.samples
+        run_standalone, args.warmup, args.iters, args.samples, cold_l2_flush
     )
     standalone_ms = standalone_stats["median_ms"]
-    fc1_ms = time_ms(run_fc1, args.warmup, args.iters)
-    fc2_ms = time_ms(run_fc2, args.warmup, args.iters)
+    fc1_ms = benchmark_with_stats(
+        run_fc1, args.warmup, args.iters, args.samples, cold_l2_flush
+    )["median_ms"]
+    fc2_ms = benchmark_with_stats(
+        run_fc2, args.warmup, args.iters, args.samples, cold_l2_flush
+    )["median_ms"]
     print(f"[config] {format_config(fused_config)}; cache_hit={selection.cache_hit}")
     print(
         f"[workload] tokens={tokens}; M={args.m}; experts={experts}; "

@@ -28,7 +28,8 @@ from common import (
     benchmark_with_stats,
     sol_bounds,
 )
-from sm110a_kernel import compile_indexer_score_decode
+from sm110a_kernel import IndexerScoreDecodeRunner
+from sm110a_kernel.kernels.mxfp4_indexer_score import IndexerScoreDecodeConfig
 
 BATCHES = (1, 2, 4, 8, 16, 32, 64, 128)
 KV_LENGTHS = (16384,)
@@ -206,7 +207,6 @@ class IndexerScoreDecodeBenchmark(BenchmarkBase):
     def run_with_args(self, args):
         torch.manual_seed(args.seed)
         length_generator = torch.Generator().manual_seed(args.seed)
-        module = compile_indexer_score_decode()
         columns = (
             ("B", 7),
             ("KVs", 8),
@@ -302,37 +302,29 @@ class IndexerScoreDecodeBenchmark(BenchmarkBase):
                         for row, b in enumerate(indices):
                             expected[row, lengths[b] :] = float("-inf")
 
-                cases = [(str(split), split) for split in valid_splits]
+                runner = IndexerScoreDecodeRunner(
+                    q,
+                    k,
+                    q_scales,
+                    k_scales,
+                    head_weight,
+                    out,
+                    block_table=block_table,
+                    kv_seqlens=kv_seqlens,
+                    max_kv_len=kv_capacity,
+                )
+                cases = [
+                    (str(split), runner.prepare(IndexerScoreDecodeConfig(split)))
+                    for split in valid_splits
+                ]
                 if args.auto:
-                    selected = module.select_split_kv(
-                        q,
-                        k,
-                        q_scales,
-                        k_scales,
-                        head_weight,
-                        out,
-                        block_table=block_table,
-                        kv_seqlens=kv_seqlens,
-                        max_kv_len=kv_capacity,
-                        options=self.make_tune_options(args),
-                    )
-                    cases.append((f"auto({selected})", selected))
+                    selection = runner.tune(self.make_tune_options(args))
+                    selected = selection.candidate.split_kv
+                    cases.append((f"auto({selected})", selection.prepared))
 
-                for split_label, split_kv in cases:
-
-                    def kernel():
-                        return module.indexer_score_decode_out(
-                            q,
-                            k,
-                            q_scales,
-                            k_scales,
-                            head_weight,
-                            out,
-                            split_kv,
-                            block_table=block_table,
-                            kv_seqlens=kv_seqlens,
-                            max_kv_len=kv_capacity,
-                        )
+                for split_label, prepared in cases:
+                    split_kv = prepared.candidate.split_kv
+                    kernel = prepared.run
 
                     max_diff = "skipped"
                     baseline_diff = "skipped"

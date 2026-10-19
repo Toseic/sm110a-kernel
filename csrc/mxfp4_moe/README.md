@@ -348,5 +348,5 @@ excluded.
 
 Standalone FC1/FC2 configs accept `pdl=True`. Call the FC2 module's
 `prepare_pdl_out(output, metadata)` before FC1, then launch FC1 and FC2
-adjacently on the same stream. See [PDL usage and overlap benchmark](../../docs/pdl.md)
-for the preparation contract and `benchmarks/benchmark_pdl.py --timeline`.
+adjacently on the same stream. Use `benchmarks/benchmark_pdl.py --timeline`
+to inspect overlap; include output preparation before FC1 on every replay.

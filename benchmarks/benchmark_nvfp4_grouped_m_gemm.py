@@ -23,50 +23,18 @@ from common import (
 )
 from sm110a_kernel import (
     CuteDslNvfp4GroupedMGemmRunner,
-    Nvfp4GroupedMConfig,
-    compile_nvfp4_grouped_m_gemm,
-    nvfp4_grouped_m_gemm_out,
-    prepare_nvfp4_grouped_m_metadata,
     quantize_nvfp4_rows,
 )
-from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
+from sm110a_kernel.kernels.nvfp4_grouped_m_gemm import (
+    Nvfp4GroupedMGemmRunner,
+    format_candidate,
+)
 
 EXPERTS = 256
 N = 4096
 K = 6144
 DEFAULT_TOKENS_PER_EXPERT = (128, 256, 512, 1024)
-NVFP4_GROUPED_M_CONFIGS = tuple(
-    Nvfp4GroupedMConfig(
-        tile_n=tile_n,
-        tile_k=tile_k,
-        epilogue_tile_n=epilogue_tile_n,
-        cluster_m=cluster_m,
-        mode=mode,
-    )
-    for tile_n in (64, 128, 256)
-    for tile_k in (64, 128, 256)
-    for epilogue_tile_n in (32, 64, 128)
-    for cluster_m in (1, 2)
-    for mode in (1, 2)
-    if tile_n % epilogue_tile_n == 0
-)
-_MODE_LABELS = {0: "np", 1: "pe", 2: "clc"}
 NVFP4_MMA_PEAK_TFLOPS = 4.0 * 250.0
-
-
-def compatible_candidates(n, k):
-    return tuple(
-        config
-        for config in NVFP4_GROUPED_M_CONFIGS
-        if n % config.tile_n == 0 and n % 128 == 0 and k % config.tile_k == 0
-    )
-
-
-def format_candidate(config):
-    return (
-        f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
-        f"/e{config.epilogue_tile_n}/c{config.cluster_m}/{_MODE_LABELS[config.mode]}"
-    )
 
 
 def nvfp4_grouped_m_gemm_sol_bounds(tokens_per_expert, experts, n, k, config):
@@ -291,22 +259,10 @@ class Nvfp4GroupedMGemmBenchmark(BenchmarkBase):
             sol_report.print()
 
     def resolve_kernel(self, aq, bq, sfa, sfb, layout, out, tokens, args):
-        candidates = compatible_candidates(args.n, args.k)
-        if not candidates:
-            raise RuntimeError(
-                f"no NVFP4 grouped config supports N={args.n}, K={args.k}"
-            )
-
-        def prepare(config):
-            metadata = prepare_nvfp4_grouped_m_metadata(
-                layout, args.experts, args.n, config=config
-            )
-            run = lambda: nvfp4_grouped_m_gemm_out(
-                aq, bq, sfa, sfb, metadata, out, config=config
-            )
-            run()
-            torch.cuda.synchronize()
-            return PreparedKernel(config, run)
+        kernel_runner = Nvfp4GroupedMGemmRunner(
+            aq, bq, sfa, sfb, layout, out, dynamic_metadata=False
+        )
+        candidates = kernel_runner.compatible_candidates()
 
         options = self.make_tune_options(
             args,
@@ -314,11 +270,9 @@ class Nvfp4GroupedMGemmBenchmark(BenchmarkBase):
             pre_parallel_jit=args.pre_parallel_jit,
         )
         m = tokens * args.experts
-        return AutotuneRunner(options).resolve(
-            candidates,
-            namespace="nvfp4_grouped_m_gemm",
-            key=(args.experts, args.n, args.k, tokens),
-            prepare=prepare,
+        return kernel_runner.tune(
+            options,
+            candidates=candidates,
             benchmark=lambda prepared: benchmark_with_stats(
                 prepared.run,
                 args.warmup,
@@ -329,11 +283,9 @@ class Nvfp4GroupedMGemmBenchmark(BenchmarkBase):
             probe=lambda prepared: quick_probe(
                 prepared.run, args.iters, cold_l2_flush=args._cold_l2_flush
             ),
-            format_candidate=format_candidate,
             metric_formatter=lambda _config, stats: (
                 f"{tflops_from_ms(m, args.n, args.k, stats['median_ms']):.1f} TF/s"
             ),
-            pre_jit=compile_nvfp4_grouped_m_gemm,
         )
 
 

@@ -18,15 +18,15 @@ from common import (
     sol_bounds,
 )
 from sm110a_kernel import (
-    Fc1BlockInterleavedSwiGLUConfig,
     GroupedMConfig,
     bf16_grouped_m_gemm_out,
     prepare_grouped_m_metadata,
 )
 from sm110a_kernel.kernels.fc1_block_interleaved_swiglu import (
-    compile_fc1_block_interleaved_swiglu,
+    Fc1BlockInterleavedSwiGLURunner,
+    compatible_candidates,
+    format_candidate,
 )
-from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
 
 DEFAULT_EXPERTS = 256
 DEFAULT_N = 2048
@@ -34,24 +34,6 @@ DEFAULT_K = 6144
 DEFAULT_TOKEN_VALUES = (64 * 32, 128 * 32, 256 * 32, 512 * 32, 1024 * 32)
 DEFAULT_TOPK = 8
 INTERLEAVE_BLOCK = 32
-FC1_CONFIGS = tuple(
-    Fc1BlockInterleavedSwiGLUConfig(
-        tile_m=128,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        cluster_m=cluster_m,
-        cluster_n=cluster_n,
-        direct_gmem=direct_gmem,
-    )
-    for tile_n in (64, 128, 256)
-    for tile_k in (64, 128)
-    for cluster_m in (1, 2)
-    for cluster_n in (1, 2)
-    for direct_gmem in (False, True)
-    if tile_n % (8 * cluster_m) == 0
-    and tile_n % (2 * INTERLEAVE_BLOCK) == 0
-    and (cluster_n == 1 or cluster_m == 2)
-)
 
 
 def routed_fc1_swiglu_tflops_from_ms(tokens, topk, n, k, elapsed_ms):
@@ -153,32 +135,6 @@ def resolve_fused_impl():
     return None, None
 
 
-def run_fused(a, interleaved_w, metadata, out, config):
-    impl_name, impl = resolve_fused_impl()
-    if impl is None:
-        raise RuntimeError(
-            "fused fc1_block_interleaved_swiglu_out binding is unavailable"
-        )
-    impl(a, interleaved_w, metadata, out, config=config)
-    return impl_name
-
-
-def format_candidate(config):
-    epilogue = "direct-gmem" if config.direct_gmem else "tmem-smem-tma"
-    return (
-        f"{config.tile_m}x{config.tile_n}x{config.tile_k}/c{config.cluster_m}n{config.cluster_n}/"
-        f"{epilogue}"
-    )
-
-
-def compatible_candidates(n, k):
-    return tuple(
-        config
-        for config in FC1_CONFIGS
-        if n % (config.tile_n // 2) == 0 and k % config.tile_k == 0
-    )
-
-
 def selected_candidates(n, k, args):
     candidates = compatible_candidates(n, k)
     if args.tile_n is not None:
@@ -192,30 +148,6 @@ def selected_candidates(n, k, args):
     if args.direct_gmem:
         candidates = tuple(c for c in candidates if c.direct_gmem)
     return candidates
-
-
-def benchmark_fused_kernel(a, interleaved_w, router_scores, topk, out, config, args):
-    metadata = ext.prepare_fc1_metadata(router_scores, topk, out.size(1), config=config)
-    run_fused(a, interleaved_w, metadata, out, config)
-    torch.cuda.synchronize()
-    return benchmark_with_stats(
-        lambda: run_fused(a, interleaved_w, metadata, out, config),
-        args.warmup,
-        args.iters,
-        args.samples,
-        cold_l2_flush=getattr(args, "_cold_l2_flush", None),
-    )
-
-
-def probe_fused_kernel(a, interleaved_w, router_scores, topk, out, config, args):
-    metadata = ext.prepare_fc1_metadata(router_scores, topk, out.size(1), config=config)
-    run_fused(a, interleaved_w, metadata, out, config)
-    torch.cuda.synchronize()
-    return quick_probe(
-        lambda: run_fused(a, interleaved_w, metadata, out, config),
-        args.iters,
-        cold_l2_flush=getattr(args, "_cold_l2_flush", None),
-    )
 
 
 class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
@@ -320,29 +252,19 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
         )
 
     def resolve_fused_kernel(self, a, interleaved_w, router_scores, topk, out, args):
+        kernel_runner = Fc1BlockInterleavedSwiGLURunner(
+            a, interleaved_w, router_scores, topk, out, dynamic_metadata=False
+        )
         candidates = selected_candidates(interleaved_w.size(1) // 2, a.size(1), args)
-        if not candidates:
-            raise RuntimeError(
-                f"no fc1 config supports N={interleaved_w.size(1) // 2}, K={a.size(1)}"
-            )
-
-        def prepare(config):
-            metadata = ext.prepare_fc1_metadata(
-                router_scores, topk, out.size(1), config=config
-            )
-            run = lambda: run_fused(a, interleaved_w, metadata, out, config)
-            run()
-            torch.cuda.synchronize()
-            return PreparedKernel(config, run)
 
         options = self.make_tune_options(
             args,
             role="ours",
             pre_parallel_jit=args.pre_parallel_jit,
         )
-        return AutotuneRunner(options).resolve(
-            candidates,
-            prepare=prepare,
+        return kernel_runner.tune(
+            options,
+            candidates=candidates,
             benchmark=lambda prepared: benchmark_with_stats(
                 prepared.run,
                 args.warmup,
@@ -355,10 +277,6 @@ class Fc1BlockInterleavedSwiGLUBenchmark(BenchmarkBase):
                 args.iters,
                 cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             ),
-            format_candidate=format_candidate,
-            namespace="fc1_block_interleaved_swiglu",
-            key=(a.size(0), interleaved_w.size(1) // 2, a.size(1), topk),
-            pre_jit=compile_fc1_block_interleaved_swiglu,
             metric_formatter=lambda _config, stats: (
                 f"{routed_fc1_swiglu_tflops_from_ms(a.size(0), topk, interleaved_w.size(1) // 2, a.size(1), stats['median_ms']):.1f} TF/s"
             ),

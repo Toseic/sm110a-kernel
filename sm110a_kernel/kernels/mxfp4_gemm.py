@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+import torch
+
 from ..jit_runtime import SplitCudaJit
+from ..runner import BaseKernelRunner, PreparedKernel
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_DIR = _ROOT / "csrc/mxfp4_gemm/src"
@@ -307,3 +311,109 @@ def mxfp4_gemm_out(a, b, sfa, sfb, out, config: Mxfp4GemmConfig | None = None):
     return compile_mxfp4_gemm(config or _default_config(a, b)).mxfp4_gemm_out(
         a, b, sfa, sfb, out
     )
+
+
+MXFP4_GEMM_CONFIGS = tuple(
+    Mxfp4GemmConfig(
+        tile_n=tile_n,
+        tile_k=tile_k,
+        cluster_m=cluster_m,
+        epilogue_block_n=epilogue_block_n,
+        split_k=split_k,
+        use_prefetch=use_prefetch,
+    )
+    for cluster_m in (1, 2)
+    for split_k in (1, 2, 4, 8)
+    for tile_n in (64, 128, 256)
+    for tile_k in (64, 128, 256)
+    for epilogue_block_n in (32, 64, 128)
+    for use_prefetch in (False, True)
+    if tile_n % epilogue_block_n == 0 and cluster_m * split_k <= 8
+    if not (
+        # Mirror Mxfp4GemmConfig.validate without constructing invalid
+        # candidates during module import.
+        (
+            232448
+            - 1024
+            - 256
+            - 2 * 128 * epilogue_block_n * 2
+            - (128 * epilogue_block_n * 4 if split_k > 1 else 0)
+        )
+        // (
+            (
+                128 * 128
+                + (tile_n // cluster_m) * 128
+                +
+                # MXFP4 stores each K=64 pair in a padded 128x4 scale tile.
+                128 * (tile_k // 16)
+                + (tile_k // 64) * ((tile_n + 127) // 128) * 512
+                + 1023
+            )
+            & ~1023
+        )
+        < 2
+    )
+)
+
+
+def compatible_candidates(m, n, k):
+    sm_count = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+    return tuple(
+        config
+        for config in MXFP4_GEMM_CONFIGS
+        if m % (config.tile_m * config.cluster_m) == 0
+        and n % config.tile_n == 0
+        and n % 128 == 0
+        and k % (config.tile_k * config.split_k) == 0
+        # Match CuTE's pruning: rolling L2 prefetch is a tactic for large K
+        # or an incomplete CTA wave, rather than a universally profitable
+        # instruction stream.
+        and (
+            not config.use_prefetch
+            or k >= 8192
+            or 0.5
+            < (
+                math.ceil(m / (config.tile_m * config.cluster_m))
+                * math.ceil(n / config.tile_n)
+                / sm_count
+            )
+            < 1.0
+        )
+    )
+
+
+def format_candidate(config):
+    return (
+        f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
+        f"/c{config.cluster_m}/e{config.epilogue_block_n}/sk{config.split_k}"
+        f"/{'prefetch' if config.use_prefetch else 'noprefetch'}"
+    )
+
+
+class Mxfp4GemmRunner(BaseKernelRunner):
+    namespace = "mxfp4_gemm_splitk_v1"
+    format_candidate = staticmethod(format_candidate)
+
+    def __init__(self, a, b, sfa, sfb, out):
+        super().__init__(a.device)
+        self.a, self.b, self.sfa, self.sfb, self.out = a, b, sfa, sfb, out
+        self.m, self.n, self.k = a.size(0), b.size(0), a.size(1) * 2
+
+    @property
+    def workload_key(self):
+        return (self.m, self.n, self.k)
+
+    def compatible_candidates(self):
+        return compatible_candidates(self.m, self.n, self.k)
+
+    def pre_jit(self, candidate):
+        return compile_mxfp4_gemm(candidate)
+
+    def prepare(self, candidate):
+        module = self.pre_jit(candidate)
+        return PreparedKernel(
+            candidate,
+            lambda: module.mxfp4_gemm_out(self.a, self.b, self.sfa, self.sfb, self.out),
+        )

@@ -28,12 +28,11 @@ from common import (
     sol_bounds,
 )
 from sm110a_kernel import (
-    compile_indexer_score_prefill,
+    IndexerScorePrefillRunner,
     from_blocked_mxfp4_scales,
     pack_indexer_score_prefill_scales,
     to_blocked_mxfp4_scales,
 )
-from sm110a_kernel.runner import TuneOptions
 
 HEADS = 64
 DIM = 128
@@ -478,7 +477,6 @@ class IndexerScoreBenchmark(BenchmarkBase):
 
     def run_with_args(self, args):
         torch.manual_seed(args.seed)
-        module = compile_indexer_score_prefill()
         columns = (
             ("Seq", 8),
             ("Batch", 8),
@@ -561,51 +559,31 @@ class IndexerScoreBenchmark(BenchmarkBase):
             # Match DeepGEMM: adapt scale layout once, before tuning and timing.
             compact_q_scales = pack_indexer_score_prefill_scales(q_scales)
             compact_k_scales = pack_indexer_score_prefill_scales(k_scales)
-            if args.sweep_cluster_m:
-                cluster_m = module.select_cluster_m(
-                    q,
-                    k,
-                    compact_q_scales,
-                    compact_k_scales,
-                    head_weight,
-                    out,
-                    causal=not args.non_causal,
-                    **extra,
-                    options=TuneOptions(
-                        warmup=args.warmup,
-                        iters=args.iters,
-                        samples=args.samples,
-                        cold_l2_flush=args._cold_l2_flush,
-                        force_sweep=True,
-                        debug=True,
-                    ),
-                )
-            elif args.cluster_m:
-                cluster_m = args.cluster_m
-            else:
-                cluster_m = module.select_cluster_m(
-                    q,
-                    k,
-                    compact_q_scales,
-                    compact_k_scales,
-                    head_weight,
-                    out,
-                    causal=not args.non_causal,
-                    **extra,
+            runner = IndexerScorePrefillRunner(
+                q,
+                k,
+                compact_q_scales,
+                compact_k_scales,
+                head_weight,
+                out,
+                causal=not args.non_causal,
+                **extra,
+            )
+            if args.cluster_m:
+                from sm110a_kernel.kernels.mxfp4_indexer_score import (
+                    IndexerScorePrefillConfig,
                 )
 
-            def kernel():
-                return module.indexer_score_prefill_out(
-                    q,
-                    k,
-                    compact_q_scales,
-                    compact_k_scales,
-                    head_weight,
-                    out,
-                    cluster_m,
-                    causal=not args.non_causal,
-                    **extra,
+                prepared = runner.prepare(IndexerScorePrefillConfig(args.cluster_m))
+            else:
+                options = self.make_tune_options(
+                    args,
+                    force_sweep=args.sweep_cluster_m,
+                    debug=args.sweep_cluster_m,
                 )
+                prepared = runner.tune(options).prepared
+            cluster_m = prepared.candidate.cluster_m
+            kernel = prepared.run
 
             baseline = None
             baseline_out = None

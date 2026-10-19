@@ -23,15 +23,15 @@ from common import (  # noqa: E402
 )
 from sm110a_kernel import (  # noqa: E402
     CuteDslNvfp4Fc2Runner,
-    Nvfp4Fc2Config,
-    compile_nvfp4_fc2,
     from_blocked_nvfp4_scales,
-    nvfp4_fc2_out,
     pack_routing_metadata,
-    prepare_nvfp4_fc2_metadata,
     quantize_nvfp4_rows,
 )
-from sm110a_kernel.runner import AutotuneRunner, PreparedKernel  # noqa: E402
+from sm110a_kernel.kernels.nvfp4_fc2 import (
+    Nvfp4Fc2Runner,
+    format_candidate,
+    nvfp4_fc2_candidates,
+)
 
 DEFAULT_EXPERTS = 256
 DEFAULT_N = 6144
@@ -42,42 +42,14 @@ DEFAULT_TOKEN_VALUES = (64 * 32, 128 * 32, 256 * 32, 512 * 32, 1024 * 32)
 DEFAULT_TOPK = 8
 ROUTER_POWERLAW_ALPHA = 0.8
 NVFP4_MMA_PEAK_TFLOPS = 4.0 * 250.0
-NVFP4_FC2_CONFIGS = tuple(
-    Nvfp4Fc2Config(
-        tile_n=tile_n,
-        tile_k=tile_k,
-        epilogue_tile_n=epilogue_tile_n,
-        cluster_m=cluster_m,
-    )
-    for tile_n in (64, 128, 256)
-    for tile_k in (64, 128, 256)
-    for epilogue_tile_n in (32, 64, 128)
-    for cluster_m in (1, 2)
-    if tile_n % epilogue_tile_n == 0
-)
 
 
 def fc2_tflops(tokens, topk, n, k, elapsed_ms):
     return 2.0 * tokens * topk * n * k / (elapsed_ms * 1e-3) / 1e12
 
 
-def format_candidate(config):
-    order = "n" if config.macro_swizzle_n_major else "m"
-    if config.macro_swizzle_serpentine:
-        order += "s"
-    return (
-        f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
-        f"/e{config.epilogue_tile_n}/c{config.cluster_m}/persistent"
-        f"/r{config.reduce_tile_n}/{order}{config.macro_swizzle_m}x{config.macro_swizzle_n}"
-    )
-
-
 def compatible_candidates(n, k, args):
-    candidates = tuple(
-        config
-        for config in NVFP4_FC2_CONFIGS
-        if n % config.tile_n == 0 and n % 128 == 0 and k % config.tile_k == 0
-    )
+    candidates = nvfp4_fc2_candidates(n, k)
     if args.tile_n is not None:
         candidates = tuple(c for c in candidates if c.tile_n == args.tile_n)
     if args.tile_k is not None:
@@ -329,7 +301,6 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
             ) = case
             out = torch.empty((tokens, args.n), device="cuda", dtype=torch.bfloat16)
             baseline_out = torch.empty_like(out)
-            prepared_metadata = {}
 
             # Sweep the CuTE DSL baseline before the native FC2 candidates, as
             # in benchmark_nvfp4_fc1.py.  The native sweep prints many more
@@ -360,36 +331,25 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
                 cold_l2_flush=args._cold_l2_flush,
             )
 
-            def prepare(config):
-                metadata = prepare_nvfp4_fc2_metadata(
-                    grouped_layout, args.experts, args.n, config=config
-                )
-                run = lambda: nvfp4_fc2_out(
-                    aq,
-                    bq,
-                    sfa,
-                    sfb,
-                    routing,
-                    routing_weights,
-                    metadata,
-                    args.topk,
-                    out,
-                    config=config,
-                )
-                # The fused epilogue scatter-adds into ``out``.  Start each
-                # tactic from zero without putting the memset in the timed path.
-                out.zero_()
-                run()
-                torch.cuda.synchronize()
-                prepared_metadata[config] = metadata
-                return PreparedKernel(config, run)
+            kernel_runner = Nvfp4Fc2Runner(
+                aq,
+                bq,
+                sfa,
+                sfb,
+                routing,
+                routing_weights,
+                grouped_layout,
+                args.topk,
+                out,
+                dynamic_metadata=False,
+            )
 
             options = self.make_tune_options(
                 args, role="ours", pre_parallel_jit=args.pre_parallel_jit
             )
-            selection = AutotuneRunner(options).resolve(
-                candidates,
-                prepare=prepare,
+            selection = kernel_runner.tune(
+                options,
+                candidates=candidates,
                 benchmark=lambda prepared: benchmark_with_stats(
                     prepared.run,
                     args.warmup,
@@ -400,15 +360,6 @@ class Nvfp4Fc2Benchmark(BenchmarkBase):
                 probe=lambda prepared: quick_probe(
                     prepared.run, args.iters, cold_l2_flush=args._cold_l2_flush
                 ),
-                format_candidate=format_candidate,
-                namespace="nvfp4_fc2",
-                # v5 retunes for the power-law router distribution after v4
-                # enabled the 2-CTA scheduler pipeline and
-                # removing its redundant SFA forwarding warp.  The environment
-                # fingerprint only contains Git HEAD, so dirty kernel changes
-                # do not otherwise invalidate an existing 1-CTA winner.
-                key=("v5", tokens, args.experts, args.topk, args.n, args.k),
-                pre_jit=compile_nvfp4_fc2,
                 metric_formatter=lambda config, stats: (
                     f"{fc2_tflops(tokens, args.topk, args.n, args.k, stats['median_ms']):.1f} TF/s"
                 ),

@@ -3,7 +3,6 @@
 
 import argparse
 import importlib.util
-import math
 import sys
 from pathlib import Path
 
@@ -20,13 +19,16 @@ from common import (
     tflops_from_ms,
 )
 from sm110a_kernel import (
-    Fp8Mxfp4GemmConfig,
-    compile_fp8mxfp4_gemm,
     fp8mxfp4_gemm_reference,
     from_blocked_fp8mxfp4_scales,
     quantize_fp8mxfp4_gemm,
 )
-from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
+from sm110a_kernel.kernels.fp8mxfp4_gemm import (
+    Fp8Mxfp4GemmRunner,
+)
+from sm110a_kernel.kernels.fp8mxfp4_gemm import (
+    format_fp8mxfp4_candidate as format_candidate,
+)
 
 DEFAULT_SHAPES = (
     (128, 4096, 4096),
@@ -164,86 +166,6 @@ def deepgemm_mxfp4_baseline(x8, w4, sfb, out, *, compact_b_gmem):
     return run
 
 
-# Mirror Fp8Mxfp4GemmConfig.validate without constructing invalid candidates
-# during module import.  compact_b_gmem is bound to tile_k: the TMA
-# b4x16_p64 expansion of compact B requires tile_k=128.
-FP8MXFP4_GEMM_CONFIGS = tuple(
-    Fp8Mxfp4GemmConfig(
-        tile_n=tile_n,
-        tile_k=tile_k,
-        cluster_m=cluster_m,
-        epilogue_block_n=epilogue_block_n,
-        split_k=split_k,
-        use_prefetch=use_prefetch,
-        compact_b_gmem=tile_k == 128,
-    )
-    for cluster_m in (1, 2)
-    for split_k in (1, 2, 4, 8)
-    for tile_n in (64, 128, 256)
-    for tile_k in (64, 128)
-    for epilogue_block_n in (32, 64, 128)
-    for use_prefetch in (False, True)
-    if tile_n % epilogue_block_n == 0 and cluster_m * split_k <= 8
-    if not (
-        # Two-mainloop-stage SMEM check from Fp8Mxfp4GemmConfig.validate.
-        (
-            232448
-            - 1024
-            - 256
-            - 2 * 128 * epilogue_block_n * 2
-            - (128 * epilogue_block_n * 4 if split_k > 1 else 0)
-        )
-        // (
-            (
-                128 * 128
-                + (tile_n // cluster_m) * 128
-                + 128 * (tile_k // 8)
-                + (tile_k // 32) * ((tile_n + 127) // 128) * 512
-                + 1023
-            )
-            & ~1023
-        )
-        < 2
-    )
-)
-
-
-def compatible_candidates(m, n, k, compact_b_gmem):
-    sm_count = torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).multi_processor_count
-    return tuple(
-        config
-        for config in FP8MXFP4_GEMM_CONFIGS
-        if config.compact_b_gmem == compact_b_gmem
-        and m % (config.tile_m * config.cluster_m) == 0
-        and n % config.tile_n == 0
-        and k % (config.tile_k * config.split_k) == 0
-        # Rolling L2 prefetch is a tactic for large K or an incomplete CTA
-        # wave, rather than a universally profitable instruction stream.
-        and (
-            not config.use_prefetch
-            or k >= 8192
-            or 0.5
-            < (
-                math.ceil(m / (config.tile_m * config.cluster_m))
-                * math.ceil(n / config.tile_n)
-                / sm_count
-            )
-            < 1.0
-        )
-    )
-
-
-def format_candidate(config):
-    return (
-        f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
-        f"/c{config.cluster_m}/e{config.epilogue_block_n}/sk{config.split_k}"
-        f"/{'prefetch' if config.use_prefetch else 'noprefetch'}"
-        f"/{'compact' if config.compact_b_gmem else 'padded'}"
-    )
-
-
 class Fp8Mxfp4GemmBenchmark(BenchmarkBase):
     def build_parser(self):
         parser = argparse.ArgumentParser()
@@ -303,30 +225,16 @@ class Fp8Mxfp4GemmBenchmark(BenchmarkBase):
         return args
 
     def resolve_kernel(self, x8, w4, sfb, out, m, n, k, compact_b_gmem, args):
-        candidates = compatible_candidates(m, n, k, compact_b_gmem)
-        if not candidates:
-            raise RuntimeError(
-                f"no FP8xMXFP4 config supports M={m}, N={n}, K={k} "
-                f"(compact_b_gmem={compact_b_gmem})"
-            )
-
-        def prepare(config):
-            module = compile_fp8mxfp4_gemm(config)
-            run = lambda: module.fp8mxfp4_gemm_out(x8, w4, sfb, out)
-            run()
-            torch.cuda.synchronize()
-            return PreparedKernel(config, run)
-
-        options = self.make_tune_options(
-            args,
-            role="ours",
-            pre_parallel_jit=args.pre_parallel_jit,
+        kernel_runner = Fp8Mxfp4GemmRunner(
+            x8, w4, sfb, out, compact_b_gmem=compact_b_gmem
         )
-        return AutotuneRunner(options).resolve(
-            candidates,
-            namespace="fp8mxfp4_gemm_v1",
-            key=(m, n, k, compact_b_gmem),
-            prepare=prepare,
+        candidates = kernel_runner.compatible_candidates()
+        options = self.make_tune_options(
+            args, role="ours", pre_parallel_jit=args.pre_parallel_jit
+        )
+        return kernel_runner.tune(
+            options,
+            candidates=candidates,
             benchmark=lambda prepared: benchmark_with_stats(
                 prepared.run,
                 args.warmup,
@@ -339,11 +247,9 @@ class Fp8Mxfp4GemmBenchmark(BenchmarkBase):
                 args.iters,
                 cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             ),
-            format_candidate=format_candidate,
             metric_formatter=lambda _config, stats: (
                 f"{tflops_from_ms(m, n, k, stats['median_ms']):.1f} TF/s"
             ),
-            pre_jit=compile_fp8mxfp4_gemm,
         )
 
     def run_with_args(self, args):

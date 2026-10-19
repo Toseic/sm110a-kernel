@@ -38,10 +38,8 @@ from common import (
 from sm110a_kernel import (
     Bf16Fa4GqaConfig,
     Bf16Fa4GqaTactic,
-    bf16_fa4_gqa_out,
-    compile_bf16_fa4_gqa,
 )
-from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
+from sm110a_kernel.kernels.bf16_fa4_gqa import Bf16Fa4GqaRunner
 
 PREFILL_LENGTHS = (1024, 2048, 4096, 8192, 16384)
 DECODE_BATCH_SIZES = (32, 64, 128)
@@ -279,31 +277,17 @@ class Bf16Fa4GqaBenchmark(BenchmarkBase):
                 False,
             )
 
-    def resolve_config(self, case, args, kernel_factory):
-        def prepare(config):
-            run = kernel_factory(config)
-            run()
-            torch.cuda.synchronize()
-            return PreparedKernel(config, run)
+    def resolve_config(self, case, args, kernel_runner):
+        candidates = kernel_runner.compatible_candidates()
 
         options = self.make_tune_options(
             args,
             role="ours",
             pre_parallel_jit=args.pre_parallel_jit,
         )
-        return AutotuneRunner(options).resolve(
-            ALL_CONFIGS,
-            namespace="bf16_fa4_gqa",
-            key=(
-                case.batch,
-                case.q_heads,
-                case.kv_heads,
-                case.q_len,
-                case.kv_len,
-                case.head_dim,
-                case.causal,
-            ),
-            prepare=prepare,
+        return kernel_runner.tune(
+            options,
+            candidates=candidates,
             benchmark=lambda prepared: benchmark_with_stats(
                 prepared.run,
                 args.warmup,
@@ -316,11 +300,9 @@ class Bf16Fa4GqaBenchmark(BenchmarkBase):
                 args.iters,
                 cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             ),
-            format_candidate=format_config,
             metric_formatter=lambda _config, stats: (
                 f"{attention_tflops(case, stats['median_ms']):.3f} TF/s"
             ),
-            pre_jit=compile_bf16_fa4_gqa,
         )
 
     def run_with_args(self, args):
@@ -367,10 +349,12 @@ class Bf16Fa4GqaBenchmark(BenchmarkBase):
             out_fa4 = torch.empty_like(q_fa4)
             scale = args.scale or 1.0 / math.sqrt(case.head_dim)
 
+            kernel_runner = Bf16Fa4GqaRunner(
+                q, k, v, out, causal=case.causal, scale=scale
+            )
+
             def make_kernel(config):
-                return lambda: bf16_fa4_gqa_out(
-                    q, k, v, out, causal=case.causal, scale=scale, tactic=config
-                )
+                return kernel_runner.prepare(config).run
 
             def fa4():
                 fa4_fwd(
@@ -383,7 +367,7 @@ class Bf16Fa4GqaBenchmark(BenchmarkBase):
                 )
 
             if autotune:
-                selection = self.resolve_config(case, args, make_kernel)
+                selection = self.resolve_config(case, args, kernel_runner)
                 config = selection.candidate
                 kernel_stats = selection.stats
             else:

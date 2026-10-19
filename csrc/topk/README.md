@@ -44,8 +44,7 @@ positions fill the remaining slots; this API does not emit `-1` padding.
 
 ## Buffered radix implementation
 
-`src/topk_kernel.cu` implements the full loop in
-[`docs/note/.topk.design.md`](../../docs/note/.topk.design.md), with a cluster
+`src/topk_kernel.cu` implements buffered radix selection with a cluster
 of 1, 2, 4, or 8 256-thread CTAs per row. Each iteration reads 1024 scores and
 stably appends values above the threshold, carrying original indices.
 Before the first selection, all values participate, including `-inf`.

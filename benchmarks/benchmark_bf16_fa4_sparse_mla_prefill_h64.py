@@ -20,7 +20,7 @@ from common import (
     benchmark_with_stats,
     sol_bounds,
 )
-from sm110a_kernel import bf16_fa4_sparse_mla_prefill_out
+from sm110a_kernel import Bf16Fa4SparseMlaPrefillRunner
 
 H = 64
 D = 512
@@ -202,10 +202,9 @@ class SparseMlaPrefillBenchmark(BenchmarkBase):
         )
         out = torch.empty_like(q)
 
-        def kernel():
-            return bf16_fa4_sparse_mla_prefill_out(
-                q, kv, indices, sink, out, scale=args.scale
-            )
+        kernel = Bf16Fa4SparseMlaPrefillRunner(
+            q, kv, indices, sink, out, scale=args.scale
+        ).run
 
         kernel()
         torch.cuda.synchronize()

@@ -23,7 +23,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from common import BenchmarkBase, SolReport, benchmark_with_stats, sol_bounds
-from sm110a_kernel import bf16_fa4_mqa_out
+from sm110a_kernel import Bf16Fa4MqaRunner
 
 PREFILL_LENGTHS = (1024, 2048, 4096, 8192, 16384)
 DECODE_BATCH_SIZES = (32, 64, 128)
@@ -266,8 +266,8 @@ class Bf16Fa4MqaBenchmark(BenchmarkBase):
             out_fa4 = torch.empty_like(q_fa4)
             scale = args.scale or 1.0 / math.sqrt(case.head_dim)
 
-            def kernel():
-                return bf16_fa4_mqa_out(q, k, v, out, causal=case.causal, scale=scale)
+            kernel = Bf16Fa4MqaRunner(q, k, v, out, causal=case.causal, scale=scale).run
+            kernel()
 
             def fa4():
                 fa4_fwd(

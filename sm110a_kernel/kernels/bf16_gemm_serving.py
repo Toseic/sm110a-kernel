@@ -7,7 +7,10 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+import torch
+
 from ..jit_runtime import SplitCudaJit
+from ..runner import BaseKernelRunner, PreparedKernel
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_DIR = _ROOT / "csrc/bf16_gemm_serving/src"
@@ -155,7 +158,6 @@ class Bf16GemmPersistentServingQueue:
         persistent_stream=None,
         control_stream=None,
     ):
-        import torch
 
         config = module._config
         if config != Bf16GemmServingConfig():
@@ -227,7 +229,6 @@ class Bf16GemmPersistentServingQueue:
         )
 
     def start(self):
-        import torch
 
         if self._started:
             raise RuntimeError("serving queue has already been started")
@@ -252,7 +253,6 @@ class Bf16GemmPersistentServingQueue:
         return self
 
     def request_drain(self):
-        import torch
 
         if self._stopped:
             return
@@ -272,7 +272,6 @@ class Bf16GemmPersistentServingQueue:
         only runs the queue state machine, so timing reflects the serving
         kernel and queue rather than the test I/O path.
         """
-        import torch
 
         if self._drain_requested:
             raise RuntimeError("cannot publish after drain has been requested")
@@ -312,7 +311,6 @@ class Bf16GemmPersistentServingQueue:
         With ``bypass=True`` the consumer skips the C-ring payload copy and
         only waits for OUTPUT_READY plus the recycle step.
         """
-        import torch
 
         if ticket is None:
             ticket = self._next_consume_ticket
@@ -349,7 +347,6 @@ class Bf16GemmPersistentServingQueue:
         return rows
 
     def wait_stopped(self):
-        import torch
 
         if not self._started:
             raise RuntimeError("serving queue has not been started")
@@ -450,3 +447,53 @@ def bf16_gemm_serving_nt_out(
     return compile_bf16_gemm_serving(config).bf16_gemm_serving_nt_out(
         a, b_nt, out, swap_ab, max_active_clusters
     )
+
+
+class Bf16GemmServingRunner(BaseKernelRunner):
+    namespace = "bf16_gemm_serving_runner_v1"
+
+    def __init__(self, a, b_nt, out, *, max_active_clusters=None):
+        super().__init__(a.device)
+        self.a, self.b, self.out = a, b_nt, out
+        self.max_active_clusters = max_active_clusters
+
+    @property
+    def workload_key(self):
+        return (tuple(self.a.shape), tuple(self.b.shape), self.max_active_clusters)
+
+    def compatible_candidates(self):
+        candidates = []
+        m, k = self.a.shape
+        n = self.b.size(0)
+        for tn in (64, 128, 256):
+            for tk in (64, 128):
+                for cm in (1, 2):
+                    for en in (32, 64, 128):
+                        config = Bf16GemmServingConfig(
+                            tile_n=tn, tile_k=tk, cluster_m=cm, epilogue_block_n=en
+                        )
+                        try:
+                            config.validate()
+                        except ValueError:
+                            continue
+                        if n % tn == 0 and k % tk == 0 and m % (128 * cm) == 0:
+                            candidates.append(config)
+        return tuple(candidates)
+
+    def pre_jit(self, candidate):
+        return compile_bf16_gemm_serving(candidate)
+
+    def prepare(self, candidate):
+        module = self.pre_jit(candidate)
+        return PreparedKernel(
+            candidate,
+            lambda: module.bf16_gemm_serving_nt_out(
+                self.a, self.b, self.out, False, self.max_active_clusters
+            ),
+        )
+
+    def create_queue(self, **kwargs):
+        """Create the persistent queue, whose native ABI supports one fixed tactic."""
+        return compile_bf16_gemm_serving(Bf16GemmServingConfig()).create_queue(
+            self.b, **kwargs
+        )

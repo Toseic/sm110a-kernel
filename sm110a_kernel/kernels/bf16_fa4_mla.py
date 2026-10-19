@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..jit_runtime import SplitCudaJit
+from ..runner import BaseKernelRunner, PreparedKernel
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_DIR = _ROOT / "csrc/bf16_fa4_mla/src"
@@ -126,3 +127,37 @@ def bf16_fa4_mla_out(q, k, v, out, *, causal=False, scale=None, implementation="
     return compile_bf16_fa4_mla(Bf16Fa4MlaConfig(implementation)).fa_mla_out(
         q, k, v, out, bool(causal), _resolve_scale(q, scale)
     )
+
+
+class Bf16Fa4MlaRunner(BaseKernelRunner):
+    namespace = "bf16_fa4_mla_runner_v1"
+
+    def __init__(self, q, k, v, out, *, causal=False, scale=None):
+        super().__init__(q.device)
+        self.q, self.k, self.v, self.out = q, k, v, out
+        self.causal, self.scale = bool(causal), _resolve_scale(q, scale)
+
+    @property
+    def workload_key(self):
+        return (
+            tuple(self.q.shape),
+            tuple(self.k.shape),
+            tuple(self.v.shape),
+            self.causal,
+            self.scale,
+        )
+
+    def compatible_candidates(self):
+        return (Bf16Fa4MlaConfig("1cta"), Bf16Fa4MlaConfig("2cta"))
+
+    def pre_jit(self, candidate):
+        return compile_bf16_fa4_mla(candidate)
+
+    def prepare(self, candidate):
+        module = self.pre_jit(candidate)
+        return PreparedKernel(
+            candidate,
+            lambda: module.fa_mla_out(
+                self.q, self.k, self.v, self.out, self.causal, self.scale
+            ),
+        )

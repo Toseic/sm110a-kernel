@@ -7,7 +7,10 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+import torch
+
 from ..jit_runtime import SplitCudaJit
+from ..runner import BaseKernelRunner, PreparedKernel
 from .pdl import PDL_TRIGGER_POINTS
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -75,7 +78,6 @@ class Nvfp4Fc1Module:
         self._routing_address = ctypes.cast(routing_symbol, ctypes.c_void_p).value
 
     def prepare_metadata(self, router_scores, topk: int, n: int) -> Nvfp4Fc1Metadata:
-        import torch
 
         if router_scores.ndim != 2 or router_scores.dtype != torch.bfloat16:
             raise TypeError("router_scores must be a 2D BF16 tensor")
@@ -137,7 +139,6 @@ class Nvfp4Fc1Module:
     def nvfp4_fc1(
         self, a, b, sfa, sfb, metadata: Nvfp4Fc1Metadata, max_active_clusters=None
     ):
-        import torch
 
         m = metadata.source_rows.numel()
         logical_n = b.size(1) // 2
@@ -228,3 +229,103 @@ def nvfp4_fc1_out(
     return compile_nvfp4_fc1(config).nvfp4_fc1_out(
         a, b, sfa, sfb, metadata, out, out_scale, max_active_clusters
     )
+
+
+NVFP4_FC1_CONFIGS = tuple(
+    Nvfp4Fc1Config(
+        tile_n=tile_n,
+        tile_k=tile_k,
+        epilogue_tile_n=epilogue_tile_n,
+        cluster_m=cluster_m,
+        cluster_n=cluster_n,
+        direct_gmem=direct_gmem,
+    )
+    for tile_n in (128, 256)
+    for tile_k in (256,)
+    for epilogue_tile_n in (128,)
+    for cluster_m in (1, 2)
+    for direct_gmem in (False, True)
+    for cluster_n in (1,)
+    if tile_n % epilogue_tile_n == 0
+)
+
+
+def format_candidate(config):
+    epilogue = "dg" if config.direct_gmem else "tma"
+    fields = [
+        f"{config.tile_m}x{config.tile_n}x{config.tile_k}",
+        f"e{config.epilogue_tile_n}",
+        f"c{config.cluster_m}n{config.cluster_n}",
+        epilogue,
+        "nmaj" if config.macro_swizzle_n_major else "mmaj",
+    ]
+    return "/".join(fields)
+
+
+def compatible_candidates(n, k):
+    return tuple(
+        config
+        for config in NVFP4_FC1_CONFIGS
+        if n % (config.tile_n * config.cluster_n) == 0
+        and n % 128 == 0
+        and k % config.tile_k == 0
+    )
+
+
+class Nvfp4Fc1Runner(BaseKernelRunner):
+    namespace = "nvfp4_fc1"
+    format_candidate = staticmethod(format_candidate)
+
+    def __init__(
+        self, a, b, sfa, sfb, router, topk, out, out_scale, *, dynamic_metadata=True
+    ):
+        super().__init__(a.device)
+        (
+            self.a,
+            self.b,
+            self.sfa,
+            self.sfb,
+            self.router,
+            self.topk,
+            self.out,
+            self.out_scale,
+        ) = a, b, sfa, sfb, router, topk, out, out_scale
+        self.dynamic_metadata = dynamic_metadata
+        self.metadata_by_candidate = {}
+        if dynamic_metadata:
+            self.namespace += "_dynamic_v1"
+            self.graph_timing = True
+
+    @property
+    def workload_key(self):
+        return (tuple(self.a.shape), tuple(self.b.shape), self.topk)
+
+    def compatible_candidates(self):
+        return compatible_candidates(self.b.size(1), self.a.size(1) * 2)
+
+    def pre_jit(self, candidate):
+        return compile_nvfp4_fc1(candidate)
+
+    def prepare(self, candidate):
+        module = self.pre_jit(candidate)
+
+        def metadata():
+            return module.prepare_metadata(self.router, self.topk, self.b.size(1))
+
+        md = None if self.dynamic_metadata else metadata()
+        if md is not None:
+            self.metadata_by_candidate[candidate] = md
+
+        def run():
+            module.nvfp4_fc1_out(
+                self.a,
+                self.b,
+                self.sfa,
+                self.sfb,
+                metadata() if self.dynamic_metadata else md,
+                self.out,
+                self.out_scale,
+            )
+            return self.out, self.out_scale
+
+        return PreparedKernel(candidate, run)

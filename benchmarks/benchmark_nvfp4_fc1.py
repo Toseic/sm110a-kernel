@@ -25,14 +25,15 @@ from common import (
 )
 from sm110a_kernel import (
     CuteDslNvfp4Fc1Runner,
-    Nvfp4Fc1Config,
-    compile_nvfp4_fc1,
     from_blocked_nvfp4_scales,
-    nvfp4_fc1_out,
     prepare_nvfp4_fc1_metadata,
     quantize_nvfp4_rows,
 )
-from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
+from sm110a_kernel.kernels.nvfp4_fc1 import (
+    Nvfp4Fc1Runner,
+    compatible_candidates,
+    format_candidate,
+)
 
 DEFAULT_EXPERTS = 256
 DEFAULT_N = 2048
@@ -46,46 +47,6 @@ NVFP4_MMA_PEAK_TFLOPS = 4.0 * 250.0
 # cannot hide a systematic output error.
 MAX_ADJACENT_CODE_MISMATCH_RATE = 1e-6
 MIN_ADJACENT_CODE_MISMATCHES = 16
-
-NVFP4_FC1_CONFIGS = tuple(
-    Nvfp4Fc1Config(
-        tile_n=tile_n,
-        tile_k=tile_k,
-        epilogue_tile_n=epilogue_tile_n,
-        cluster_m=cluster_m,
-        cluster_n=cluster_n,
-        direct_gmem=direct_gmem,
-    )
-    for tile_n in (128, 256)
-    for tile_k in (256,)
-    for epilogue_tile_n in (128,)
-    for cluster_m in (1, 2)
-    for direct_gmem in (False, True)
-    for cluster_n in (1,)
-    if tile_n % epilogue_tile_n == 0
-)
-
-
-def format_candidate(config):
-    epilogue = "dg" if config.direct_gmem else "tma"
-    fields = [
-        f"{config.tile_m}x{config.tile_n}x{config.tile_k}",
-        f"e{config.epilogue_tile_n}",
-        f"c{config.cluster_m}n{config.cluster_n}",
-        epilogue,
-        "nmaj" if config.macro_swizzle_n_major else "mmaj",
-    ]
-    return "/".join(fields)
-
-
-def compatible_candidates(n, k):
-    return tuple(
-        config
-        for config in NVFP4_FC1_CONFIGS
-        if n % (config.tile_n * config.cluster_n) == 0
-        and n % 128 == 0
-        and k % config.tile_k == 0
-    )
 
 
 def selected_candidates(n, k, args):
@@ -345,25 +306,11 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
         return args
 
     def resolve_kernel(self, aq, bq, sfa, sfb, router, out, out_scale, args):
+        kernel_runner = Nvfp4Fc1Runner(
+            aq, bq, sfa, sfb, router, args.topk, out, out_scale, dynamic_metadata=False
+        )
         candidates = selected_candidates(2 * args.n, args.k, args)
-
-        def prepare(config):
-            metadata = prepare_nvfp4_fc1_metadata(
-                router, args.topk, 2 * args.n, config=config
-            )
-            run = lambda: nvfp4_fc1_out(
-                aq, bq, sfa, sfb, metadata, out, out_scale, config=config
-            )
-            run()
-            torch.cuda.synchronize()
-            return PreparedKernel(config, run), metadata
-
-        prepared_metadata = {}
-
-        def prepare_for_runner(config):
-            prepared, metadata = prepare(config)
-            prepared_metadata[config] = metadata
-            return prepared
+        prepared_metadata = kernel_runner.metadata_by_candidate
 
         options = self.make_tune_options(
             args,
@@ -371,21 +318,9 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
             pre_parallel_jit=args.pre_parallel_jit,
         )
         routed_m = aq.size(0) * args.topk
-        selection = AutotuneRunner(options).resolve(
-            candidates,
-            namespace="nvfp4_fc1",
-            # v12 hoists the block-scale reciprocal in the NVFP4 epilogue.
-            # That changes the relative ranking of direct-GMEM and TMA-store
-            # candidates, so do not reuse selections made by the older path.
-            key=(
-                "v12-fp4-output-recip",
-                aq.size(0),
-                args.experts,
-                args.topk,
-                args.n,
-                args.k,
-            ),
-            prepare=prepare_for_runner,
+        selection = kernel_runner.tune(
+            options,
+            candidates=candidates,
             benchmark=lambda prepared: benchmark_with_stats(
                 prepared.run,
                 args.warmup,
@@ -396,11 +331,9 @@ class Nvfp4Fc1Benchmark(BenchmarkBase):
             probe=lambda prepared: quick_probe(
                 prepared.run, args.iters, cold_l2_flush=args._cold_l2_flush
             ),
-            format_candidate=format_candidate,
             metric_formatter=lambda _config, stats: (
                 f"{fc1_tflops_from_ms(routed_m, args.n, args.k, stats['median_ms']):.1f} TF/s"
             ),
-            pre_jit=compile_nvfp4_fc1,
         )
         return selection, prepared_metadata[selection.candidate]
 

@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 
 from ..jit_runtime import SplitCudaJit
+from ..runner import BaseKernelRunner, PreparedKernel
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SRC = _ROOT / "csrc/nvfp4_moe/src"
@@ -251,3 +252,118 @@ def nvfp4_fc1fc2_routed_out(
     return compile_nvfp4_fc1fc2(config).run_routed_out(
         a, w1, sfa, sfw1, w2, sfw2, metadata, routing_weights, topk, output
     )
+
+
+def nvfp4_fused_candidates(
+    m,
+    *,
+    buffers=(2048,),
+    h_splits=(1, 2, 3, 4),
+    cluster_pairs=(1, 2, 4),
+    fuse_routing=False,
+    caches=(0, 1, 2),
+    row_tasks=None,
+):
+    # Smaller buffers change BF16 rounding; expose them only by explicit filter.
+    sm_count = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+    row_tasks = m // 256 if row_tasks is None else row_tasks
+    candidates = []
+    for buffer_i in buffers:
+        for h_split in h_splits:
+            for pairs in cluster_pairs:
+                for cache in caches if fuse_routing else (0,):
+                    config = Nvfp4Fc1Fc2Config(
+                        buffer_i, h_split, pairs, fuse_routing, cache
+                    )
+                    try:
+                        config.validate()
+                    except ValueError:
+                        continue
+                    tasks = (
+                        10 if h_split == 3 and row_tasks == 4 else row_tasks * h_split
+                    )
+                    if h_split > 1 and tasks > sm_count // (2 * pairs) and h_split != 2:
+                        continue
+                    candidates.append(config)
+    return tuple(candidates)
+
+
+class Nvfp4Fc1Fc2Runner(BaseKernelRunner):
+    namespace = "nvfp4_fc1fc2_runner_v1"
+
+    def __init__(
+        self,
+        a,
+        w1,
+        sfa,
+        sfw1,
+        w2,
+        sfw2,
+        out,
+        *,
+        metadata=None,
+        routing_weights=None,
+        topk=1,
+        row_task_count=None,
+    ):
+        super().__init__(a.device)
+        self.a, self.w1, self.sfa, self.sfw1, self.w2, self.sfw2, self.out = (
+            a,
+            w1,
+            sfa,
+            sfw1,
+            w2,
+            sfw2,
+            out,
+        )
+        self.metadata, self.routing_weights, self.topk = metadata, routing_weights, topk
+        # Capacity is a safe conservative bound if the live count is unknown.
+        self.row_tasks = (
+            (metadata.tasks.size(0) // 32 if metadata is not None else a.size(0) // 256)
+            if row_task_count is None
+            else row_task_count
+        )
+
+    @property
+    def workload_key(self):
+        return (
+            tuple(self.a.shape),
+            tuple(self.w1.shape),
+            tuple(self.w2.shape),
+            self.metadata is not None,
+            self.topk,
+            self.row_tasks,
+        )
+
+    def compatible_candidates(self):
+        return nvfp4_fused_candidates(
+            self.a.size(0),
+            fuse_routing=self.metadata is not None,
+            row_tasks=self.row_tasks,
+        )
+
+    def pre_jit(self, candidate):
+        return compile_nvfp4_fc1fc2(candidate)
+
+    def prepare(self, candidate):
+        module = self.pre_jit(candidate)
+        if self.metadata is None:
+            run = lambda: module.run_out(
+                self.a, self.w1, self.sfa, self.sfw1, self.w2, self.sfw2, self.out
+            )
+        else:
+            run = lambda: module.run_routed_out(
+                self.a,
+                self.w1,
+                self.sfa,
+                self.sfw1,
+                self.w2,
+                self.sfw2,
+                self.metadata,
+                self.routing_weights,
+                self.topk,
+                self.out,
+            )
+        return PreparedKernel(candidate, run)

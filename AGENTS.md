@@ -78,8 +78,8 @@ Values must be non-negative integers. Per-point variables override packed
 settings. The JIT forwards configured point names without a global registry;
 the target kernel's local `.cuh` owns its supported macros. Use the lowercase
 name in the packed form, or its uppercase form after `SM110A_PIPELINE_DELAY_`
-for an individual variable. Kernel-specific documentation belongs in
-`docs/pipeline_delay.md`.
+for an individual variable. Kernel-specific point names and defaults belong in
+the kernel's local `*_pipeline_delay.cuh`.
 
 For critical-path experiments, record a zero-delay baseline and perturb one
 point at a time; start near 512 cycles, then try 2048 and 8192. No timing
@@ -89,18 +89,17 @@ scheduling overhead, so interpret relative changes rather than exact latency.
 
 Confirm a nonzero probe in SASS with `cuobjdump --dump-sass <kernel.so>`: look
 for `CS2R ... SR_CLOCKLO`, comparison with the configured immediate, and a
-backward branch. A zero-delay binary should not contain that loop. See
-`docs/pipeline_delay.md` for the public API reference.
+backward branch. A zero-delay binary should not contain that loop.
 
 ## Reference documentation
 
-The latest PTX ISA documentation (version 9.4) lives in `docs/`:
+PTX ISA 9.4 reference documentation is available in `docs/ptx-isa-9.4/`.
+Use `INDEX.md` for the chapter index and `ptx/_images/` for instruction layouts.
+For example:
 
-- `docs/ptx_isa_9.4.pdf` — official NVIDIA PDF.
-- `docs/ptx-isa-9.4/` — markdown tree split by chapter (`ptx/9-instruction-set/`,
-  `ptx/_images/` for mma/wgmma register layouts and TMA swizzle diagrams), with
-  `INDEX.md` as the entry point. Look instructions up with grep, e.g.
-  `grep -rl 'cp.async.bulk.tensor' docs/ptx-isa-9.4/ptx/`.
+```bash
+rg -l 'cp.async.bulk.tensor' docs/ptx-isa-9.4/ptx/
+```
 
 ## Exclusive GPU launch handling
 

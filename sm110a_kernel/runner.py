@@ -15,10 +15,12 @@ import json
 import os
 import subprocess
 import sys
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from statistics import median
 from typing import Generic, TypeVar
 
 import torch
@@ -304,36 +306,203 @@ class AutotuneRunner:
         return Selection(best_candidate, best_prepared, best_stats, False)
 
 
+# Hold configurations, never workload tensors or graph allocations.
+_SELECTIONS = {}
+
+
+def clear_kernel_runner_cache():
+    """Forget process-local selections without deleting the persistent cache."""
+    _SELECTIONS.clear()
+
+
+def measure_stats(run, options):
+    for _ in range(options.warmup):
+        run()
+    timings = []
+    for _ in range(options.samples):
+        events = []
+        for _ in range(options.iters):
+            if options.cold_l2_flush is not None:
+                options.cold_l2_flush()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            run()
+            end.record()
+            events.append((start, end))
+        events[-1][1].synchronize()
+        timings.append(sum(a.elapsed_time(b) for a, b in events) / options.iters)
+    return {
+        "min_ms": min(timings),
+        "median_ms": median(timings),
+        "max_ms": max(timings),
+    }
+
+
+class BaseKernelRunner(ABC):
+    """Bind a workload, tune once, then launch its prepared callable.
+
+    Subclasses own candidates, cache keys, compilation and argument binding.
+    Benchmarks may supply their timing/report callbacks to ``tune``. ``run``
+    automatically tunes on its first eager invocation; warm up every intended
+    workload before CUDA Graph capture. New instances share configurations,
+    while always binding their own current inputs and outputs.
+    """
+
+    namespace: str
+    graph_timing = False
+
+    def __init__(self, device):
+        self.device = torch.device(device)
+        self.selection = None
+        self._prepared = None
+
+    @abstractmethod
+    def compatible_candidates(self): ...
+
+    @property
+    @abstractmethod
+    def workload_key(self): ...
+
+    @abstractmethod
+    def prepare(self, candidate) -> PreparedKernel: ...
+
+    @abstractmethod
+    def pre_jit(self, candidate): ...
+
+    @staticmethod
+    def format_candidate(candidate):
+        return str(candidate)
+
+    def _benchmark(self, prepared, options):
+        if not self.graph_timing:
+            return measure_stats(prepared.run, options)
+        current = torch.cuda.current_stream()
+        stream = torch.cuda.Stream(device=self.device)
+        stream.wait_stream(current)
+        with torch.cuda.stream(stream):
+            for _ in range(max(2, options.warmup)):
+                prepared.run()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                prepared.run()
+            stats = measure_stats(graph.replay, options)
+        current.wait_stream(stream)
+        return stats
+
+    def tune(
+        self,
+        options=None,
+        *,
+        candidates=None,
+        benchmark=None,
+        probe=None,
+        metric_formatter=None,
+    ):
+        """Return a Selection, honoring benchmark timing/cache/JIT options."""
+        with torch.cuda.device(self.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"warm up {self.namespace} eagerly before CUDA graph capture"
+                )
+            options = options or TuneOptions()
+            if options.warmup < 0 or options.iters < 1 or options.samples < 1:
+                raise ValueError(
+                    "warmup must be non-negative; iters and samples must be positive"
+                )
+            if options.cold_l2_flush is None:
+                l2 = torch.cuda.get_device_properties(self.device).L2_cache_size
+                eviction = torch.empty(
+                    max(2 * l2, 64 << 20), device=self.device, dtype=torch.uint8
+                )
+                options = replace(options, cold_l2_flush=lambda: eviction.zero_())
+            selection = AutotuneRunner(options).resolve(
+                self.compatible_candidates() if candidates is None else candidates,
+                namespace=self.namespace,
+                key=(self.workload_key, self._runtime_key()[3]),
+                prepare=self.prepare,
+                benchmark=benchmark
+                or (lambda prepared: self._benchmark(prepared, options)),
+                probe=probe,
+                format_candidate=self.format_candidate,
+                metric_formatter=metric_formatter,
+                pre_jit=self.pre_jit,
+            )
+            self.selection = selection
+            self._prepared = selection.prepared
+            _SELECTIONS[self._runtime_key()] = selection.candidate
+            return selection
+
+    def _runtime_key(self):
+        from .jit_runtime import pipeline_delay_variant
+
+        return (
+            self.namespace,
+            self.device.index,
+            self.workload_key,
+            pipeline_delay_variant(),
+            os.environ.get("CUDA_ARCH", "sm_110a"),
+            os.environ.get("COMPUTE_CUDA_ARCH", "compute_110a"),
+        )
+
+    def run(self):
+        if self._prepared is None:
+            candidate = _SELECTIONS.get(self._runtime_key())
+            if candidate is None:
+                self.tune()
+            else:
+                self._prepared = self.prepare(candidate)
+        return self._prepared.run()
+
+
+@dataclass(frozen=True)
+class FixedKernelConfig:
+    """The sole implementation of an operator with no tunable tactics."""
+
+
+class FixedKernelRunner(BaseKernelRunner):
+    """Uniform preparation for kernels with a single supported configuration."""
+
+    def __init__(self, device, namespace, key, compile_fn, bind):
+        super().__init__(device)
+        self.namespace, self._key = namespace, key
+        self._compile_fn, self._bind = compile_fn, bind
+
+    @property
+    def workload_key(self):
+        return self._key
+
+    def compatible_candidates(self):
+        return (FixedKernelConfig(),)
+
+    def pre_jit(self, candidate):
+        return self._compile_fn()
+
+    def prepare(self, candidate):
+        return PreparedKernel(candidate, self._bind(self.pre_jit(candidate)))
+
+    def run(self):
+        if self._prepared is None:
+            with torch.cuda.device(self.device):
+                if (
+                    self._runtime_key() not in _SELECTIONS
+                    and torch.cuda.is_current_stream_capturing()
+                ):
+                    raise RuntimeError(
+                        f"warm up {self.namespace} eagerly before CUDA graph capture"
+                    )
+                self._prepared = self.prepare(FixedKernelConfig())
+                _SELECTIONS[self._runtime_key()] = FixedKernelConfig()
+        return self._prepared.run()
+
+
 def main():
     """Run a benchmark through its runner-backed CLI to prewarm a cache."""
     parser = argparse.ArgumentParser(description="SM110A autotune runner")
-    parser.add_argument(
-        "workload",
-        choices=(
-            "bf16-gemm",
-            "bf16-gemm-serving",
-            "nvfp4-gemm",
-            "mxfp4-gemm",
-            "fp8mxfp4-gemm",
-            "grouped-m-gemm",
-            "nvfp4-grouped-m-gemm",
-            "fc1-swiglu",
-            "nvfp4-fc1",
-            "nvfp4-fc1fc2",
-            "mxfp4-fc1fc2",
-            "fc2-finalize",
-            "nvfp4-fc2",
-            "bf16-fa4-gqa",
-        ),
-        help="workload to resolve and cache",
-    )
-    parser.add_argument(
-        "args", nargs=argparse.REMAINDER, help="arguments forwarded to the benchmark"
-    )
-    parsed = parser.parse_args()
     scripts = {
         "bf16-gemm": "benchmark_bf16_gemm.py",
         "bf16-gemm-serving": "benchmark_bf16_gemm_serving.py",
+        "fp8-gemm": "benchmark_fp8_gemm.py",
         "nvfp4-gemm": "benchmark_nvfp4_gemm.py",
         "mxfp4-gemm": "benchmark_mxfp4_gemm.py",
         "fp8mxfp4-gemm": "benchmark_fp8mxfp4_gemm.py",
@@ -341,12 +510,34 @@ def main():
         "nvfp4-grouped-m-gemm": "benchmark_nvfp4_grouped_m_gemm.py",
         "fc1-swiglu": "benchmark_bf16_fc1_block_interleaved_swiglu.py",
         "nvfp4-fc1": "benchmark_nvfp4_fc1.py",
+        "mxfp4-fc1": "benchmark_mxfp4_fc1.py",
         "nvfp4-fc1fc2": "benchmark_nvfp4_fc1fc2.py",
         "mxfp4-fc1fc2": "benchmark_mxfp4_fc1fc2.py",
         "fc2-finalize": "benchmark_bf16_fc2_finalize.py",
         "nvfp4-fc2": "benchmark_nvfp4_fc2.py",
+        "mxfp4-fc2": "benchmark_mxfp4_fc2.py",
         "bf16-fa4-gqa": "benchmark_bf16_fa4_gqa.py",
+        "bf16-fa4-mha": "benchmark_bf16_fa4_mha.py",
+        "bf16-fa4-mla": "benchmark_bf16_fa4_mla.py",
+        "bf16-fa4-mqa": "benchmark_bf16_fa4_mqa.py",
+        "bf16-fa4-sparse-mla": "benchmark_bf16_fa4_sparse_mla_h64.py",
+        "bf16-fa4-sparse-mla-prefill": "benchmark_bf16_fa4_sparse_mla_prefill_h64.py",
+        "bf16tofp4-quant": "benchmark_bf16tofp4_quant.py",
+        "bf16tofp8-quant": "benchmark_bf16tofp8_quant.py",
+        "bf16tonvfp4-quant": "benchmark_bf16tonvfp4_quant.py",
+        "fp8-act-quant": "benchmark_fp8_act_quant.py",
+        "indexer-score-prefill": "benchmark_mxfp4_indexer_score_prefill.py",
+        "indexer-score-decode": "benchmark_mxfp4_indexer_score_decode.py",
+        "topk": "benchmark_topk.py",
+        "nccl-lsa": "benchmark_nccl_lsa.py",
     }
+    parser.add_argument(
+        "workload", choices=tuple(scripts), help="workload to resolve and cache"
+    )
+    parser.add_argument(
+        "args", nargs=argparse.REMAINDER, help="arguments forwarded to the benchmark"
+    )
+    parsed = parser.parse_args()
     forwarded = parsed.args[1:] if parsed.args[:1] == ["--"] else parsed.args
     raise SystemExit(
         subprocess.call(

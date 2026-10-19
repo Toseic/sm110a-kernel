@@ -6,7 +6,10 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+import torch
+
 from ..jit_runtime import SplitCudaJit
+from ..runner import BaseKernelRunner, PreparedKernel
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_DIR = _ROOT / "csrc/bf16_gemm/src"
@@ -207,3 +210,120 @@ def bf16_gemm_nt_out(
     return compile_bf16_gemm(config or _default_config(a, b_nt)).bf16_gemm_nt_out(
         a, b_nt, out, swap_ab, max_active_clusters
     )
+
+
+def _bf16_gemm_configs(output_fp32=False):
+    for tile_m in (64, 128):
+        for tile_n in (128, 256):
+            for tile_k in (64, 128):
+                for cluster_m in (1, 2):
+                    for epilogue_block_n in (32, 64, 128):
+                        if tile_n % epilogue_block_n:
+                            continue
+                        for split_k in (1, 2, 4, 8):
+                            config = Bf16GemmConfig(
+                                tile_m=tile_m,
+                                tile_n=tile_n,
+                                tile_k=tile_k,
+                                cluster_m=cluster_m,
+                                epilogue_block_n=epilogue_block_n,
+                                split_k=split_k,
+                                output_fp32=output_fp32,
+                            )
+                            try:
+                                config.validate()
+                            except ValueError:
+                                continue
+                            yield config
+
+
+BF16_GEMM_CONFIGS = tuple(_bf16_gemm_configs())
+
+
+def bf16_candidates(m, n, k, output_fp32=False):
+    return tuple(
+        (config, swap_ab)
+        for config in (_bf16_gemm_configs(True) if output_fp32 else BF16_GEMM_CONFIGS)
+        for swap_ab in ((False, True) if config.split_k == 1 else (False,))
+        if k % (config.tile_k * config.split_k) == 0
+        and (
+            (
+                not swap_ab
+                and (
+                    m % (config.tile_m * config.cluster_m) == 0
+                    or (config.cluster_m == 1 and 0 < m < config.tile_m)
+                )
+                and n % config.tile_n == 0
+            )
+            or (
+                swap_ab
+                and n % (config.tile_m * config.cluster_m) == 0
+                and m % config.tile_n == 0
+            )
+        )
+    )
+
+
+def format_bf16_candidate(candidate):
+    config, swap_ab = candidate
+    return (
+        f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
+        f"/c{config.cluster_m}"
+        f"/e{config.epilogue_block_n}"
+        f"/sk{config.split_k}"
+        f"/{'swap' if swap_ab else 'noswap'}"
+        f"/{'fp32' if config.output_fp32 else 'bf16'}"
+    )
+
+
+class Bf16GemmRunner(BaseKernelRunner):
+    namespace = "bf16_gemm_nt_v6"
+    format_candidate = staticmethod(format_bf16_candidate)
+
+    def __init__(self, a, b_nt, out, *, max_active_clusters=None):
+        super().__init__(a.device)
+        self.a, self.b, self.out = a, b_nt, out
+        self.m, self.k, self.n = a.size(0), a.size(1), b_nt.size(0)
+        self.max_active_clusters = max_active_clusters
+
+    @property
+    def workload_key(self):
+        return (self.m, self.n, self.k, self.max_active_clusters, str(self.out.dtype))
+
+    def compatible_candidates(self):
+        candidates = bf16_candidates(
+            self.m, self.n, self.k, self.out.dtype == torch.float32
+        )
+        # Model projections may be narrower than the benchmark's N>=128 family.
+        if not candidates:
+            candidates = tuple(
+                (
+                    Bf16GemmConfig(
+                        tile_m=tm,
+                        tile_n=tn,
+                        tile_k=tk,
+                        cluster_m=1,
+                        output_fp32=self.out.dtype == torch.float32,
+                    ),
+                    False,
+                )
+                for tm in (64, 128)
+                for tn in (32, 64)
+                for tk in (64, 128)
+                if self.n % tn == 0
+                and self.k % tk == 0
+                and (self.m % tm == 0 or self.m < tm)
+            )
+        return candidates
+
+    def pre_jit(self, candidate):
+        return compile_bf16_gemm(candidate[0])
+
+    def prepare(self, candidate):
+        module = self.pre_jit(candidate)
+        return PreparedKernel(
+            candidate,
+            lambda: module.bf16_gemm_nt_out(
+                self.a, self.b, self.out, candidate[1], self.max_active_clusters
+            ),
+        )

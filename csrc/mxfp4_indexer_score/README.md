@@ -144,6 +144,10 @@ computes the same score for one query per batch and returns BF16 `[B, KVs]`.
 The CUDA implementation and binding are in separate `indexer_score_decode_*`
 files; `compile_indexer_score_decode` precompiles their JIT module.
 
+The decode MMA issuer in warp 2 uses `elect_one()` for both dense and paged
+layouts. This issue point needs one active lane, not a particular lane ID;
+lane-dependent reductions and shuffle broadcasts must retain their lane identity.
+
 - `q`: contiguous CUDA MXFP4 `[B, 64, 64]` (packed D=128).
 - `k`: contiguous CUDA MXFP4 `[B, KVs, 64]`, or paged
   `[num_pages, page_size, 64]` with `page_size` 128 or 256.

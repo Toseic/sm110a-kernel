@@ -17,6 +17,7 @@ for path in (ROOT, BENCH):
 from benchmark_nvfp4_fc1 import make_quantized_interleaved_weights
 from benchmark_nvfp4_fc2 import make_case
 
+from common import BenchmarkBase, benchmark_once
 from sm110a_kernel import (
     Nvfp4Fc1Config,
     Nvfp4Fc2Config,
@@ -71,6 +72,8 @@ def main():
     args = parse_args()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
+    cache = BenchmarkBase()
+    cache.configure_cold_l2(args)
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     sm_per_context = args.sm_per_context or props.multi_processor_count // 2
     if 2 * sm_per_context > props.multi_processor_count:
@@ -193,18 +196,31 @@ def main():
             ctx.synchronize()
         samples = [[], []]
         for _ in range(args.samples):
-            start = [torch.cuda.Event(True) for _ in contexts]
-            end = [torch.cuda.Event(True) for _ in contexts]
-            for stream, event in zip(streams, start):
-                event.record(stream)
+            events = [[], []]
             for _ in range(args.iters):
+                # Evict on the first Green Context, then gate both launches.
+                with torch.cuda.stream(streams[0]):
+                    if args._cold_l2_flush is not None:
+                        args._cold_l2_flush()
+                    gate = torch.cuda.Event()
+                    gate.record()
+                start = [torch.cuda.Event(True) for _ in contexts]
+                end = [torch.cuda.Event(True) for _ in contexts]
+                for stream, event in zip(streams, start):
+                    stream.wait_event(gate)
+                    event.record(stream)
                 enqueue()
-            for stream, event in zip(streams, end):
-                event.record(stream)
+                for stream, event in zip(streams, end):
+                    event.record(stream)
+                    streams[0].wait_event(event)
+                for i in range(2):
+                    events[i].append((start[i], end[i], gate))
             for ctx in contexts:
                 ctx.synchronize()
-            for i, (s, e) in enumerate(zip(start, end)):
-                samples[i].append(s.elapsed_time(e) / args.iters)
+            for i in range(2):
+                samples[i].append(
+                    sum(s.elapsed_time(e) for s, e, _gate in events[i]) / args.iters
+                )
     finally:
         for ctx in contexts:
             ctx.close()
@@ -213,16 +229,15 @@ def main():
     full_clusters = props.multi_processor_count // (
         config.cluster_m * getattr(config, "cluster_n", 1)
     )
-    baseline = []
-    for _ in range(args.samples):
-        start, end = torch.cuda.Event(True), torch.cuda.Event(True)
-        start.record()
-        for _ in range(args.iters):
-            for item in work:
-                launch(item, full_clusters)
-        end.record()
-        end.synchronize()
-        baseline.append(start.elapsed_time(end) / args.iters)
+
+    def serial_pair():
+        for item in work:
+            launch(item, full_clusters)
+
+    baseline = [
+        benchmark_once(serial_pair, 0, args.iters, args._cold_l2_flush)
+        for _ in range(args.samples)
+    ]
     baseline_ms = statistics.median(baseline)
     baseline_tflops = 2 * flops / (baseline_ms * 1e9)
     print(f"[op] {args.op}; shared B/SFB; config={config}")

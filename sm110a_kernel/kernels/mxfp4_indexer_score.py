@@ -1,13 +1,12 @@
 """MXFP4 indexer score for prefill and batched decoding."""
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
-from statistics import median
 
 import torch
 
 from ..jit_runtime import SplitCudaJit, source_digest
-from ..runner import AutotuneRunner, PreparedKernel, TuneOptions
+from ..runner import BaseKernelRunner, PreparedKernel
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE = _ROOT / "csrc/mxfp4_indexer_score/src"
@@ -59,83 +58,37 @@ class IndexerScoreModule:
         max_kv_len=None,
         options=None,
     ):
-        use_default_options = options is None
-        q_len, kv_len, batch = _prefill_shape(
+        q_len, kv_len, _ = _prefill_shape(
             q, k, block_table, cu_seqlens_q, max_q_len, max_kv_len
         )
-        key = (
-            q.device.index,
-            batch,
-            q_len,
-            kv_len,
-            k.size(1) if block_table is not None else 0,
-            cu_seqlens_q is not None,
-            kv_seqlens is not None,
-            bool(causal),
-        )
-        if use_default_options and key in self._cluster_m_cache:
-            return self._cluster_m_cache[key]
+        if q_len <= 2:
+            return 1
         if out is None:
             shape = (
                 (q.size(0), q.size(1), kv_len) if q.ndim == 4 else (q.size(0), kv_len)
             )
             out = torch.empty(shape, device=q.device, dtype=torch.bfloat16)
-        configs = (IndexerScorePrefillConfig(1), IndexerScorePrefillConfig(2))
-        if q_len <= 2:
-            return 1
-        with torch.cuda.device(q.device):
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "autotune indexer score prefill before CUDA graph capture"
-                )
-            if options is None:
-                options = TuneOptions()
-            if options.cold_l2_flush is None:
-                l2_bytes = torch.cuda.get_device_properties(q.device).L2_cache_size
-                eviction = (
-                    torch.empty((2 * l2_bytes,), device=q.device, dtype=torch.uint8)
-                    if l2_bytes > 0
-                    else None
-                )
-                options = replace(
-                    options,
-                    cold_l2_flush=(lambda: eviction.zero_())
-                    if eviction is not None
-                    else None,
-                )
-
-            def prepare(config):
-                def run():
-                    return self._binding.indexer_score_prefill_out(
-                        q,
-                        k,
-                        q_scales,
-                        k_scales,
-                        head_weight,
-                        out,
-                        config.cluster_m,
-                        bool(causal),
-                        block_table,
-                        cu_seqlens_q,
-                        kv_seqlens,
-                        q_len,
-                        kv_len,
-                        self._launcher,
-                    )
-
-                return PreparedKernel(config, run)
-
-            selection = AutotuneRunner(options).resolve(
-                configs,
-                namespace=_PREFILL_TUNE_NAMESPACE,
-                key=key,
-                prepare=prepare,
-                benchmark=lambda prepared: _tune_stats(prepared.run, options),
-                probe=None,
-                format_candidate=lambda config: f"cluster_m={config.cluster_m}",
-            )
+        runner = IndexerScorePrefillRunner(
+            q,
+            k,
+            q_scales,
+            k_scales,
+            head_weight,
+            out,
+            causal=causal,
+            block_table=block_table,
+            cu_seqlens_q=cu_seqlens_q,
+            kv_seqlens=kv_seqlens,
+            max_q_len=q_len,
+            max_kv_len=kv_len,
+            _module=self,
+        )
+        key = runner.workload_key
+        if options is None and key in self._cluster_m_cache:
+            return self._cluster_m_cache[key]
+        selection = runner.tune(options)
         winner = selection.candidate.cluster_m
-        if use_default_options:
+        if options is None:
             self._cluster_m_cache[key] = winner
         return winner
 
@@ -409,78 +362,29 @@ class IndexerScoreDecodeModule:
         max_kv_len=None,
         options=None,
     ):
-        """Measure valid split counts once per (device, B, KVs), then cache the winner."""
         kv_len = _decode_kv_len(k, block_table, max_kv_len)
-        use_default_options = options is None
-        key = (
-            q.device.index,
-            q.size(0),
-            kv_len,
-            k.size(1) if block_table is not None else 0,
-            kv_seqlens is not None,
-        )
-        if use_default_options and key in self._split_kv_cache:
-            return self._split_kv_cache[key]
         if out is None:
             out = torch.empty(
                 (q.size(0), kv_len), device=q.device, dtype=torch.bfloat16
             )
-        splits = (1, 2, 4, 8)
-        configs = tuple(
-            IndexerScoreDecodeConfig(split)
-            for split in splits
-            if split <= (kv_len + 127) // 128
+        runner = IndexerScoreDecodeRunner(
+            q,
+            k,
+            q_scales,
+            k_scales,
+            head_weight,
+            out,
+            block_table=block_table,
+            kv_seqlens=kv_seqlens,
+            max_kv_len=kv_len,
+            _module=self,
         )
-        if not configs:
-            raise ValueError("KVs must be positive")
-
-        with torch.cuda.device(q.device):
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "autotune this decoding shape before CUDA graph capture"
-                )
-            if use_default_options:
-                l2_bytes = torch.cuda.get_device_properties(q.device).L2_cache_size
-                eviction = (
-                    torch.empty((2 * l2_bytes,), device=q.device, dtype=torch.uint8)
-                    if l2_bytes > 0
-                    else None
-                )
-                options = TuneOptions(
-                    cold_l2_flush=(lambda: eviction.zero_())
-                    if eviction is not None
-                    else None
-                )
-
-            def prepare(config):
-                def run():
-                    return self._binding.indexer_score_decode_out(
-                        q,
-                        k,
-                        q_scales,
-                        k_scales,
-                        head_weight,
-                        out,
-                        config.split_kv,
-                        block_table,
-                        kv_seqlens,
-                        kv_len,
-                        self._launcher,
-                    )
-
-                return PreparedKernel(config, run)
-
-            selection = AutotuneRunner(options).resolve(
-                configs,
-                namespace=_DECODE_TUNE_NAMESPACE,
-                key=key,
-                prepare=prepare,
-                benchmark=lambda prepared: _tune_stats(prepared.run, options),
-                probe=None,
-                format_candidate=lambda config: f"split_kv={config.split_kv}",
-            )
+        key = runner.workload_key
+        if options is None and key in self._split_kv_cache:
+            return self._split_kv_cache[key]
+        selection = runner.tune(options)
         winner = selection.candidate.split_kv
-        if use_default_options:
+        if options is None:
             self._split_kv_cache[key] = winner
         return winner
 
@@ -577,33 +481,6 @@ class IndexerScoreDecodeConfig:
     split_kv: int
 
 
-def _tune_stats(run, options):
-    for _ in range(options.warmup):
-        run()
-    torch.cuda.synchronize()
-    timings = []
-    for _ in range(options.samples):
-        events = []
-        for _ in range(options.iters):
-            if options.cold_l2_flush is not None:
-                options.cold_l2_flush()
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            run()
-            end.record()
-            events.append((start, end))
-        events[-1][1].synchronize()
-        timings.append(
-            sum(start.elapsed_time(end) for start, end in events) / options.iters
-        )
-    return {
-        "min_ms": min(timings),
-        "median_ms": median(timings),
-        "max_ms": max(timings),
-    }
-
-
 _DECODE_JIT = SplitCudaJit(
     name="sm110a_indexer_score_decode",
     root=_ROOT,
@@ -698,3 +575,155 @@ def indexer_score_decode_out(
         kv_seqlens=kv_seqlens,
         max_kv_len=max_kv_len,
     )
+
+
+class IndexerScorePrefillRunner(BaseKernelRunner):
+    namespace = _PREFILL_TUNE_NAMESPACE
+
+    def __init__(
+        self,
+        q,
+        k,
+        q_scales,
+        k_scales,
+        head_weight,
+        out,
+        *,
+        causal=True,
+        block_table=None,
+        cu_seqlens_q=None,
+        kv_seqlens=None,
+        max_q_len=None,
+        max_kv_len=None,
+        _module=None,
+    ):
+        super().__init__(q.device)
+        self.q, self.k, self.q_scales, self.k_scales, self.head_weight, self.out = (
+            q,
+            k,
+            q_scales,
+            k_scales,
+            head_weight,
+            out,
+        )
+        self.causal, self.block_table, self.cu_seqlens_q, self.kv_seqlens = (
+            causal,
+            block_table,
+            cu_seqlens_q,
+            kv_seqlens,
+        )
+        self.q_len, self.kv_len, self.batch = _prefill_shape(
+            q, k, block_table, cu_seqlens_q, max_q_len, max_kv_len
+        )
+        self.module = _module
+
+    @property
+    def workload_key(self):
+        return (
+            self.device.index,
+            self.batch,
+            self.q_len,
+            self.kv_len,
+            self.k.size(1) if self.block_table is not None else 0,
+            self.cu_seqlens_q is not None,
+            self.kv_seqlens is not None,
+            bool(self.causal),
+        )
+
+    def compatible_candidates(self):
+        return tuple(
+            IndexerScorePrefillConfig(c) for c in ((1,) if self.q_len <= 2 else (1, 2))
+        )
+
+    def pre_jit(self, candidate):
+        return self.module or compile_indexer_score_prefill()
+
+    def prepare(self, candidate):
+        module = self.pre_jit(candidate)
+        return PreparedKernel(
+            candidate,
+            lambda: module.indexer_score_prefill_out(
+                self.q,
+                self.k,
+                self.q_scales,
+                self.k_scales,
+                self.head_weight,
+                self.out,
+                candidate.cluster_m,
+                causal=self.causal,
+                block_table=self.block_table,
+                cu_seqlens_q=self.cu_seqlens_q,
+                kv_seqlens=self.kv_seqlens,
+                max_q_len=self.q_len,
+                max_kv_len=self.kv_len,
+            ),
+        )
+
+
+class IndexerScoreDecodeRunner(BaseKernelRunner):
+    namespace = _DECODE_TUNE_NAMESPACE
+
+    def __init__(
+        self,
+        q,
+        k,
+        q_scales,
+        k_scales,
+        head_weight,
+        out,
+        *,
+        block_table=None,
+        kv_seqlens=None,
+        max_kv_len=None,
+        _module=None,
+    ):
+        super().__init__(q.device)
+        self.q, self.k, self.q_scales, self.k_scales, self.head_weight, self.out = (
+            q,
+            k,
+            q_scales,
+            k_scales,
+            head_weight,
+            out,
+        )
+        self.block_table, self.kv_seqlens = block_table, kv_seqlens
+        self.kv_len = _decode_kv_len(k, block_table, max_kv_len)
+        self.module = _module
+
+    @property
+    def workload_key(self):
+        return (
+            self.device.index,
+            self.q.size(0),
+            self.kv_len,
+            self.k.size(1) if self.block_table is not None else 0,
+            self.kv_seqlens is not None,
+        )
+
+    def compatible_candidates(self):
+        return tuple(
+            IndexerScoreDecodeConfig(s)
+            for s in (1, 2, 4, 8)
+            if s <= (self.kv_len + 127) // 128
+        )
+
+    def pre_jit(self, candidate):
+        return self.module or compile_indexer_score_decode()
+
+    def prepare(self, candidate):
+        module = self.pre_jit(candidate)
+        return PreparedKernel(
+            candidate,
+            lambda: module.indexer_score_decode_out(
+                self.q,
+                self.k,
+                self.q_scales,
+                self.k_scales,
+                self.head_weight,
+                self.out,
+                candidate.split_kv,
+                block_table=self.block_table,
+                kv_seqlens=self.kv_seqlens,
+                max_kv_len=self.kv_len,
+            ),
+        )

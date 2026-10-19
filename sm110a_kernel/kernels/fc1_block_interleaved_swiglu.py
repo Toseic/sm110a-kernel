@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..jit_runtime import SplitCudaJit
+from ..runner import BaseKernelRunner, PreparedKernel
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_DIR = _ROOT / "csrc/bf16_moe/src"
@@ -164,3 +165,82 @@ def fc1_block_interleaved_swiglu(a, b_interleaved, metadata, config=None):
     return get_fc1_block_interleaved_swiglu_module(
         a, b_interleaved, config
     ).fc1_block_interleaved_swiglu(a, b_interleaved, metadata)
+
+
+INTERLEAVE_BLOCK = 32
+FC1_CONFIGS = tuple(
+    Fc1BlockInterleavedSwiGLUConfig(
+        tile_m=128,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        cluster_m=cluster_m,
+        cluster_n=cluster_n,
+        direct_gmem=direct_gmem,
+    )
+    for tile_n in (64, 128, 256)
+    for tile_k in (64, 128)
+    for cluster_m in (1, 2)
+    for cluster_n in (1, 2)
+    for direct_gmem in (False, True)
+    if tile_n % (8 * cluster_m) == 0
+    and tile_n % (2 * INTERLEAVE_BLOCK) == 0
+    and (cluster_n == 1 or cluster_m == 2)
+)
+
+
+def compatible_candidates(n, k):
+    return tuple(
+        config
+        for config in FC1_CONFIGS
+        if n % (config.tile_n // 2) == 0 and k % config.tile_k == 0
+    )
+
+
+def format_candidate(config):
+    epilogue = "direct-gmem" if config.direct_gmem else "tmem-smem-tma"
+    return (
+        f"{config.tile_m}x{config.tile_n}x{config.tile_k}/c{config.cluster_m}n{config.cluster_n}/"
+        f"{epilogue}"
+    )
+
+
+class Fc1BlockInterleavedSwiGLURunner(BaseKernelRunner):
+    namespace = "fc1_block_interleaved_swiglu_runner_v1"
+    format_candidate = staticmethod(format_candidate)
+
+    def __init__(self, a, b, router, topk, out, *, dynamic_metadata=True):
+        super().__init__(a.device)
+        self.a, self.b, self.router, self.topk, self.out = a, b, router, topk, out
+        self.dynamic_metadata = dynamic_metadata
+        self.metadata_by_candidate = {}
+        if dynamic_metadata:
+            self.namespace += "_dynamic"
+            self.graph_timing = True
+
+    @property
+    def workload_key(self):
+        return (tuple(self.a.shape), tuple(self.b.shape), self.topk)
+
+    def compatible_candidates(self):
+        return compatible_candidates(self.b.size(1) // 2, self.a.size(1))
+
+    def pre_jit(self, candidate):
+        return compile_fc1_block_interleaved_swiglu(candidate)
+
+    def prepare(self, candidate):
+        module = self.pre_jit(candidate)
+
+        def metadata():
+            return module.prepare_metadata(self.router, self.topk, self.out.size(1))
+
+        md = None if self.dynamic_metadata else metadata()
+        if md is not None:
+            self.metadata_by_candidate[candidate] = md
+
+        def run():
+            module.fc1_block_interleaved_swiglu_out(
+                self.a, self.b, metadata() if self.dynamic_metadata else md, self.out
+            )
+            return self.out
+
+        return PreparedKernel(candidate, run)

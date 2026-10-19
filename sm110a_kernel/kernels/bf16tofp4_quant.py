@@ -6,6 +6,7 @@ import ctypes
 from pathlib import Path
 
 from ..jit_runtime import SplitCudaJit
+from ..runner import FixedKernelRunner
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_DIR = _ROOT / "csrc/bf16tofp4_quant/src"
@@ -73,3 +74,20 @@ def bf16tofp4_quant_dequant(input):
 def bf16tofp4_quant_dequant_out(input, output, scales):
     """Out variant of :func:`bf16tofp4_quant_dequant`."""
     return compile_bf16tofp4_quant().quantize_dequant_out(input, output, scales)
+
+
+class Bf16ToFp4QuantRunner(FixedKernelRunner):
+    def __init__(self, input, output, scales, *, dequant=False):
+        super().__init__(
+            input.device,
+            "bf16tofp4_quant",
+            (tuple(input.shape), str(input.dtype), dequant),
+            compile_bf16tofp4_quant,
+            lambda module: (
+                lambda: (
+                    module.quantize_dequant_out(input, output, scales)
+                    if dequant
+                    else module.quantize_out(input, output, scales)
+                )
+            ),
+        )

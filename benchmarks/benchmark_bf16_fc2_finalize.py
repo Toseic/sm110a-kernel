@@ -18,31 +18,19 @@ from common import (
     sol_bounds,
 )
 from sm110a_kernel import (
-    Fc2FinalizeConfig,
-    GroupedMConfig,
-    compile_bf16_grouped_m_gemm,
-    compile_fc2_finalize,
-    fc2_finalize_with_routing_out,
     pack_routing_metadata,
-    prepare_grouped_m_metadata,
 )
-from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
+from sm110a_kernel.kernels.fc2_finalize import (
+    Fc2FinalizeRunner,
+    fc2_candidates,
+    format_candidate,
+)
 
 DEFAULT_EXPERTS = 256
 DEFAULT_H = 6144
 DEFAULT_I = 2048
 DEFAULT_TOKEN_VALUES = (64 * 32, 128 * 32, 256 * 32, 512 * 32, 1024 * 32)
 DEFAULT_TOPK = 8
-FC2_CONFIGS = tuple(
-    Fc2FinalizeConfig(
-        tile_n=tile_n,
-        tile_k=tile_k,
-        cluster_m=cluster_m,
-    )
-    for tile_n in (64, 128, 256)
-    for tile_k in (64, 128)
-    for cluster_m in (1, 2)
-)
 
 
 def fc2_tflops(tokens, topk, h, i, elapsed_ms):
@@ -84,16 +72,8 @@ def fc2_sol_bounds(router_scores, topk, h, i, config):
     )
 
 
-def format_candidate(config):
-    return f"128x{config.tile_n}x{config.tile_k}/c{config.cluster_m}/persistent/fusion"
-
-
 def compatible_candidates(h, i, args):
-    candidates = tuple(
-        config
-        for config in FC2_CONFIGS
-        if h % config.tile_n == 0 and i % config.tile_k == 0
-    )
+    candidates = fc2_candidates(h, i)
     if args.tile_n is not None:
         candidates = tuple(
             config for config in candidates if config.tile_n == args.tile_n
@@ -129,61 +109,6 @@ def make_fc1_layout(tokens, experts, topk, i):
         -1.0, 1.0
     )
     return (fc1, routing, routing_weights, router_scores, selected, grouped_order)
-
-
-def prepare_fc2_metadata(routing, weights, fc1, config):
-    experts, h, _ = weights.shape
-    grouped_layout = routing.narrow(0, 2 * experts, fc1.size(0))
-    grouped_config = GroupedMConfig(
-        tile_m=config.tile_m,
-        tile_n=config.tile_n,
-        tile_k=config.tile_k,
-        epilogue_tile_n=config.epilogue_tile_n,
-        cluster_m=config.cluster_m,
-        mode=1,
-    )
-    return prepare_grouped_m_metadata(grouped_layout, experts, h, grouped_config)
-
-
-def run_fc2(
-    fc1, weights, routing_weights, routing, grouped_metadata, topk, out, config
-):
-    fc2_finalize_with_routing_out(
-        fc1,
-        weights,
-        topk,
-        routing_weights,
-        routing,
-        grouped_metadata,
-        out,
-        config=config,
-    )
-
-
-def benchmark_fc2(fc1, weights, routing_weights, routing, topk, out, config, args):
-    grouped_metadata = prepare_fc2_metadata(routing, weights, fc1, config)
-    run_fc2(fc1, weights, routing_weights, routing, grouped_metadata, topk, out, config)
-    torch.cuda.synchronize()
-    return benchmark_with_stats(
-        lambda: run_fc2(
-            fc1, weights, routing_weights, routing, grouped_metadata, topk, out, config
-        ),
-        args.warmup,
-        args.iters,
-        args.samples,
-        cold_l2_flush=args._cold_l2_flush,
-    )
-
-
-def probe_fc2(fc1, weights, routing_weights, routing, topk, out, config, args):
-    grouped_metadata = prepare_fc2_metadata(routing, weights, fc1, config)
-    return quick_probe(
-        lambda: run_fc2(
-            fc1, weights, routing_weights, routing, grouped_metadata, topk, out, config
-        ),
-        args.iters,
-        cold_l2_flush=args._cold_l2_flush,
-    )
 
 
 def reference_fc2(
@@ -271,30 +196,24 @@ class Fc2FinalizeBenchmark(BenchmarkBase):
             )
             out = torch.empty((tokens, args.h), device="cuda", dtype=torch.bfloat16)
 
-            def prepare(config):
-                metadata = prepare_fc2_metadata(routing, weights, fc1, config)
-                run = lambda: run_fc2(
-                    fc1,
-                    weights,
-                    routing_weights,
-                    routing,
-                    metadata,
-                    args.topk,
-                    out,
-                    config,
-                )
-                run()
-                torch.cuda.synchronize()
-                return PreparedKernel(config, run)
+            kernel_runner = Fc2FinalizeRunner(
+                fc1,
+                weights,
+                args.topk,
+                out,
+                routing=routing,
+                routing_weights=routing_weights,
+                dynamic_metadata=False,
+            )
 
             options = self.make_tune_options(
                 args,
                 role="ours",
                 pre_parallel_jit=args.pre_parallel_jit,
             )
-            selection = AutotuneRunner(options).resolve(
-                candidates,
-                prepare=prepare,
+            selection = kernel_runner.tune(
+                options,
+                candidates=candidates,
                 benchmark=lambda prepared: benchmark_with_stats(
                     prepared.run,
                     args.warmup,
@@ -303,25 +222,7 @@ class Fc2FinalizeBenchmark(BenchmarkBase):
                     cold_l2_flush=args._cold_l2_flush,
                 ),
                 probe=lambda prepared: quick_probe(
-                    prepared.run,
-                    args.iters,
-                    cold_l2_flush=args._cold_l2_flush,
-                ),
-                format_candidate=format_candidate,
-                namespace="fc2_finalize",
-                key=(tokens, args.experts, args.topk, args.h, args.i),
-                pre_jit=lambda config: (
-                    compile_fc2_finalize(config),
-                    compile_bf16_grouped_m_gemm(
-                        GroupedMConfig(
-                            tile_m=config.tile_m,
-                            tile_n=config.tile_n,
-                            tile_k=config.tile_k,
-                            epilogue_tile_n=config.epilogue_tile_n,
-                            cluster_m=config.cluster_m,
-                            mode=1,
-                        )
-                    ),
+                    prepared.run, args.iters, cold_l2_flush=args._cold_l2_flush
                 ),
                 metric_formatter=lambda _config, result: (
                     f"{fc2_tflops(tokens, args.topk, args.h, args.i, result['median_ms']):.1f} TF/s"

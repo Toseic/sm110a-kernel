@@ -33,22 +33,17 @@ from common import (
     tflops_from_ms,
 )
 from sm110a_kernel import (
-    Mxfp4Fc1Config,
     Nvfp4Fc1Config,
     bf16tofp8_quant,
     compact_mxfp4_weight_scales,
-    compile_mxfp4_fc1,
-    compile_nvfp4_fc1,
     from_blocked_fp8mxfp4_scales,
-    mxfp4_fc1_out,
-    nvfp4_fc1_out,
-    prepare_mxfp4_fc1_metadata,
-    prepare_nvfp4_fc1_metadata,
     quantize_mxfp4_fc1_weights,
     quantize_nvfp4_rows,
     to_blocked_mxfp4_sfa,
 )
-from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
+from sm110a_kernel.kernels.mxfp4_fc1 import MXFP4_FC1_CONFIGS, Mxfp4Fc1Runner
+from sm110a_kernel.kernels.mxfp4_fc1 import format_fc1_candidate as format_candidate
+from sm110a_kernel.kernels.nvfp4_fc1 import Nvfp4Fc1Runner
 
 DEFAULT_EXPERTS = 256
 DEFAULT_N = 2048
@@ -66,15 +61,6 @@ MXFP4_W4A8_MMA_PEAK_TFLOPS = 2.0 * 250.0
 MAX_ADJACENT_CODE_MISMATCH_RATE = 4e-3
 MIN_ADJACENT_CODE_MISMATCHES = 64
 
-MXFP4_FC1_CONFIGS = tuple(
-    Mxfp4Fc1Config(
-        tile_k=128,
-        cluster_m=cluster_m,
-        direct_gmem=direct_gmem,
-    )
-    for cluster_m in (1, 2)
-    for direct_gmem in (False, True)
-)
 
 # NVFP4 parity reference: tile_n=256 candidates (the measured winner family in
 # benchmark_nvfp4_fc1.py) across cluster and epilogue variants.
@@ -89,19 +75,6 @@ NVFP4_FC1_PARITY_CONFIGS = tuple(
     for cluster_m in (1, 2)
     for direct_gmem in (False, True)
 )
-
-
-def format_candidate(config):
-    epilogue = "dg" if config.direct_gmem else "tma"
-    return "/".join(
-        [
-            f"{config.tile_m}x{config.tile_n}x{config.tile_k}",
-            f"e{config.epilogue_tile_n}",
-            f"c{config.cluster_m}",
-            epilogue,
-            "compact" if config.compact_weight_scales else "padded",
-        ]
-    )
 
 
 def mxfp4_candidates(args):
@@ -462,49 +435,36 @@ class Mxfp4Fc1Benchmark(BenchmarkBase):
             # list.  Keep each runner's metadata paired with the exact JIT
             # configuration it prepares.
             mxfp4_metadata = {}
-            nvfp4_metadata = {}
 
-            def prepare_mxfp4(config):
-                metadata = prepare_mxfp4_fc1_metadata(
-                    router, args.topk, 2 * args.n, config=config
-                )
-                run = lambda: mxfp4_fc1_out(
-                    aq,  # noqa: F821
-                    bq,
-                    sfa,  # noqa: F821
-                    kernel_sfb,
-                    metadata,
-                    out,  # noqa: F821
-                    out_scale,  # noqa: F821
-                    swiglu_limit=args.swiglu_limit,
-                    config=config,
-                    routing_weights=routing_weights
-                    if args.routing_weight_position == "fc1"
-                    else None,
-                )
-                run()
-                torch.cuda.synchronize()
-                mxfp4_metadata[config] = metadata
-                return PreparedKernel(config, run)
+            kernel_runner = Mxfp4Fc1Runner(
+                aq,
+                bq,
+                sfa,
+                kernel_sfb,
+                router,
+                args.topk,
+                out,
+                out_scale,
+                swiglu_limit=args.swiglu_limit,
+                routing_weights=routing_weights
+                if args.routing_weight_position == "fc1"
+                else None,
+                config=mxfp4_candidates(args)[0],
+                dynamic_metadata=False,
+            )
+            mxfp4_metadata = kernel_runner.metadata_by_candidate
 
-            def prepare_nvfp4(config):
-                metadata = prepare_nvfp4_fc1_metadata(
-                    router, args.topk, 2 * args.n, config=config
-                )
-                run = lambda: nvfp4_fc1_out(
-                    nv_aq,  # noqa: F821
-                    nv_bq,
-                    nv_sfa,  # noqa: F821
-                    nv_sfb,
-                    metadata,
-                    nv_out,  # noqa: F821
-                    nv_out_scale,  # noqa: F821
-                    config=config,
-                )
-                run()
-                torch.cuda.synchronize()
-                nvfp4_metadata[config] = metadata
-                return PreparedKernel(config, run)
+            nv_runner = Nvfp4Fc1Runner(
+                nv_aq,
+                nv_bq,
+                nv_sfa,
+                nv_sfb,
+                router,
+                args.topk,
+                nv_out,
+                nv_out_scale,
+                dynamic_metadata=False,
+            )
 
             options = self.make_tune_options(
                 args, role="ours", pre_parallel_jit=args.pre_parallel_jit
@@ -512,21 +472,9 @@ class Mxfp4Fc1Benchmark(BenchmarkBase):
             nv_options = self.make_tune_options(
                 args, role="baseline", pre_parallel_jit=args.pre_parallel_jit
             )
-            ours_selection = AutotuneRunner(options).resolve(
-                mxfp4_candidates(args),
-                namespace="mxfp4_fc1",
-                key=(
-                    "v2-weight-scales",
-                    tokens,
-                    args.experts,
-                    args.topk,
-                    args.n,
-                    args.k,
-                    args.compact_weight_scales,
-                    args.routing_weight_position,
-                    args.activation_bf16_rounding,
-                ),
-                prepare=prepare_mxfp4,
+            ours_selection = kernel_runner.tune(
+                options,
+                candidates=mxfp4_candidates(args),
                 benchmark=lambda prepared: benchmark_with_stats(
                     prepared.run,
                     args.warmup,
@@ -537,17 +485,13 @@ class Mxfp4Fc1Benchmark(BenchmarkBase):
                 probe=lambda prepared: quick_probe(
                     prepared.run, args.iters, cold_l2_flush=args._cold_l2_flush
                 ),
-                format_candidate=format_candidate,
                 metric_formatter=lambda _c, stats: (
                     f"{fc1_tflops_from_ms(routed_m, args.n, args.k, stats['median_ms']):.1f} TF/s"
                 ),
-                pre_jit=compile_mxfp4_fc1,
             )
-            nv_selection = AutotuneRunner(nv_options).resolve(
-                nv_candidates,
-                namespace="nvfp4_fc1",
-                key=("mxfp4-parity", tokens, args.experts, args.topk, args.n, args.k),
-                prepare=prepare_nvfp4,
+            nv_selection = nv_runner.tune(
+                nv_options,
+                candidates=nv_candidates,
                 benchmark=lambda prepared: benchmark_with_stats(
                     prepared.run,
                     args.warmup,
@@ -558,11 +502,9 @@ class Mxfp4Fc1Benchmark(BenchmarkBase):
                 probe=lambda prepared: quick_probe(
                     prepared.run, args.iters, cold_l2_flush=args._cold_l2_flush
                 ),
-                format_candidate=format_candidate,
                 metric_formatter=lambda _c, stats: (
                     f"{fc1_tflops_from_ms(routed_m, args.n, args.k, stats['median_ms']):.1f} TF/s"
                 ),
-                pre_jit=compile_nvfp4_fc1,
             )
 
             max_diff = float("nan")

@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..jit_runtime import SplitCudaJit
+from ..runner import FixedKernelRunner
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_DIR = _ROOT / "csrc/bf16tofp8_quant/src"
@@ -62,3 +63,14 @@ def bf16tofp8_quant(input):
 def bf16tofp8_quant_out(input, output, scales):
     """Out variant of :func:`bf16tofp8_quant`."""
     return compile_bf16tofp8_quant().quantize_out(input, output, scales)
+
+
+class Bf16ToFp8QuantRunner(FixedKernelRunner):
+    def __init__(self, input, output, scales, *, blocked=False, pdl=False):
+        super().__init__(
+            input.device,
+            "bf16tofp8_quant",
+            (tuple(input.shape), str(input.dtype), blocked, pdl),
+            lambda: compile_bf16tofp8_quant(blocked=blocked, pdl=pdl),
+            lambda module: lambda: module.quantize_out(input, output, scales),
+        )

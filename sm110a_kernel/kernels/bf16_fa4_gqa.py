@@ -21,6 +21,7 @@ from enum import IntEnum
 from pathlib import Path
 
 from ..jit_runtime import SplitCudaJit
+from ..runner import BaseKernelRunner, PreparedKernel
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_DIR = _ROOT / "csrc/bf16_fa4/src"
@@ -151,3 +152,41 @@ def bf16_fa4_gqa_out(
     return compile_bf16_fa4_gqa(_config_for(tactic, pack_gqa)).fa_gqa_out(
         q, k, v, out, bool(causal), _resolve_scale(q, scale)
     )
+
+
+class Bf16Fa4GqaRunner(BaseKernelRunner):
+    namespace = "bf16_fa4_gqa_runner_v1"
+
+    def __init__(self, q, k, v, out, *, causal=False, scale=None):
+        super().__init__(q.device)
+        self.q, self.k, self.v, self.out = q, k, v, out
+        self.causal, self.scale = bool(causal), _resolve_scale(q, scale)
+
+    @property
+    def workload_key(self):
+        return (
+            tuple(self.q.shape),
+            tuple(self.k.shape),
+            tuple(self.v.shape),
+            self.causal,
+            self.scale,
+        )
+
+    def compatible_candidates(self):
+        return tuple(
+            Bf16Fa4GqaConfig(tactic=t, pack_gqa=p)
+            for t in Bf16Fa4GqaTactic
+            for p in (False, True)
+        )
+
+    def pre_jit(self, candidate):
+        return compile_bf16_fa4_gqa(candidate)
+
+    def prepare(self, candidate):
+        module = self.pre_jit(candidate)
+        return PreparedKernel(
+            candidate,
+            lambda: module.fa_gqa_out(
+                self.q, self.k, self.v, self.out, self.causal, self.scale
+            ),
+        )

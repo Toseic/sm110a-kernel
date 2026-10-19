@@ -19,7 +19,7 @@ if str(ROOT) not in sys.path:
 
 from common import BenchmarkBase, SolReport, benchmark_with_stats, sol_bounds
 from sm110a_kernel import (
-    bf16tonvfp4_quant_out,
+    Bf16ToNvfp4QuantRunner,
     compile_bf16tonvfp4_quant,
     quantize_nvfp4_rows,
 )
@@ -81,8 +81,10 @@ class QuantBenchmark(BenchmarkBase):
                 scales = torch.empty(
                     tokens * d // BLOCK_SIZE, device="cuda", dtype=torch.float8_e4m3fn
                 )
+                kernel_runner = Bf16ToNvfp4QuantRunner(input, packed, scales)
+                kernel_runner.run()
                 stats = benchmark_with_stats(
-                    lambda: bf16tonvfp4_quant_out(input, packed, scales),  # noqa: F821
+                    kernel_runner.run,  # noqa: F821
                     args.warmup,
                     args.iters,
                     args.samples,

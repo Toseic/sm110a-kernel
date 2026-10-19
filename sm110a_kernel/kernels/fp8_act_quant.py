@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..jit_runtime import SplitCudaJit
+from ..runner import FixedKernelRunner
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_DIR = _ROOT / "csrc/fp8_act_quant/src"
@@ -92,3 +93,24 @@ def fp8_act_quant(input, block_size=128, scale="ue8m0"):
 def fp8_act_quant_out(input, output, scales, block_size=128, scale="ue8m0"):
     """Out variant of :func:`fp8_act_quant`."""
     return compile_fp8_act_quant(block_size, scale).quantize_out(input, output, scales)
+
+
+class Fp8ActQuantRunner(FixedKernelRunner):
+    def __init__(
+        self,
+        input,
+        output,
+        scales,
+        block_size=128,
+        scale="ue8m0",
+        *,
+        blocked=False,
+        pdl=False,
+    ):
+        super().__init__(
+            input.device,
+            "fp8_act_quant",
+            (tuple(input.shape), str(input.dtype), block_size, scale, blocked, pdl),
+            lambda: compile_fp8_act_quant(block_size, scale, blocked=blocked, pdl=pdl),
+            lambda module: lambda: module.quantize_out(input, output, scales),
+        )

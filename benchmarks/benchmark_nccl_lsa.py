@@ -12,10 +12,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
-def _run_rank(rank, world_size, unique_id, count, warmup, iters, results):
+def _run_rank(rank, world_size, unique_id, count, warmup, iters, results, barrier):
     import torch
 
-    from sm110a_kernel.kernels.nccl_lsa import NcclLsaAllReduce
+    from sm110a_kernel.kernels.nccl_lsa import NcclLsaAllReduce, NcclLsaRunner
 
     torch.cuda.set_device(0)
     values = torch.arange(1, count + 1, device="cuda", dtype=torch.float32)
@@ -30,25 +30,34 @@ def _run_rank(rank, world_size, unique_id, count, warmup, iters, results):
         device=0,
     )
     try:
-        output = communicator.all_reduce(values)
+        runner = NcclLsaRunner(communicator, values, output)
+        runner.run()
         for _ in range(warmup):
-            communicator.all_reduce_out(values, output)
+            runner.run()
         torch.cuda.synchronize()
 
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
+        l2 = torch.cuda.get_device_properties(0).L2_cache_size
+        eviction = torch.empty(max(64 << 20, 2 * l2), device="cuda", dtype=torch.uint8)
+        timings = []
         for _ in range(iters):
-            communicator.all_reduce_out(values, output)
-        end.record()
-        end.synchronize()
+            eviction.zero_()
+            torch.cuda.synchronize()
+            # Complete both ranks' evictions before either records a timed event.
+            barrier.wait(timeout=30)
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            runner.run()
+            end.record()
+            end.synchronize()
+            timings.append(start.elapsed_time(end))
 
         expected = world_size * torch.arange(
             1, count + 1, device="cuda", dtype=torch.float32
         )
         expected.add_(100.0 * world_size * (world_size - 1) / 2)
         max_abs_diff = (output - expected).abs().max().item()
-        results.put((rank, start.elapsed_time(end) / iters, max_abs_diff))
+        results.put((rank, sum(timings) / iters, max_abs_diff))
     finally:
         torch.cuda.synchronize()
         communicator.close()
@@ -75,6 +84,7 @@ def main():
     unique_id = nccl_unique_id()
     context = mp.get_context("spawn")
     results = context.Queue()
+    barrier = context.Barrier(world_size)
     processes = [
         context.Process(
             target=_run_rank,
@@ -86,23 +96,32 @@ def main():
                 args.warmup,
                 args.iters,
                 results,
+                barrier,
             ),
         )
         for rank in range(world_size)
     ]
-    for process in processes:
-        process.start()
-    for process in processes:
-        process.join(timeout=60)
-    for process in processes:
-        if process.is_alive():
-            process.terminate()
-            process.join()
-            raise SystemExit(f"rank process {process.pid} timed out")
-        if process.exitcode != 0:
-            raise SystemExit(
-                f"rank process {process.pid} exited with {process.exitcode}"
-            )
+    try:
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=60)
+        for process in processes:
+            if process.is_alive():
+                raise SystemExit(f"rank process {process.pid} timed out")
+            if process.exitcode != 0:
+                raise SystemExit(
+                    f"rank process {process.pid} exited with {process.exitcode}"
+                )
+    finally:
+        # A failed rank can leave its peer blocked inside NCCL initialization.
+        # Reap every child before exiting, including when the first rank fails.
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+        for process in processes:
+            if process.pid is not None:
+                process.join()
 
     rows = []
     try:
@@ -111,6 +130,7 @@ def main():
     except queue.Empty as exc:
         raise SystemExit("rank result queue was incomplete") from exc
 
+    print("[cache] cold L2: evicted on both ranks before each collective")
     print("Rank    Time (ms)    Max abs diff")
     for rank, elapsed_ms, max_abs_diff in sorted(rows):
         print(f"{rank:<8}{elapsed_ms:<13.4f}{max_abs_diff:.6f}")

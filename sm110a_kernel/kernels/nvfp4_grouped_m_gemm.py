@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..jit_runtime import SplitCudaJit
+from ..runner import BaseKernelRunner, PreparedKernel
 from .grouped_m_gemm import GroupedMMetadata
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -144,3 +145,88 @@ def nvfp4_grouped_m_gemm_out(a, b, sfa, sfb, metadata, out, config=None):
     return compile_nvfp4_grouped_m_gemm(config).nvfp4_grouped_m_gemm_out(
         a, b, sfa, sfb, metadata, out
     )
+
+
+NVFP4_GROUPED_M_CONFIGS = tuple(
+    Nvfp4GroupedMConfig(
+        tile_n=tile_n,
+        tile_k=tile_k,
+        epilogue_tile_n=epilogue_tile_n,
+        cluster_m=cluster_m,
+        mode=mode,
+    )
+    for tile_n in (64, 128, 256)
+    for tile_k in (64, 128, 256)
+    for epilogue_tile_n in (32, 64, 128)
+    for cluster_m in (1, 2)
+    for mode in (1, 2)
+    if tile_n % epilogue_tile_n == 0
+)
+
+_MODE_LABELS = {0: "np", 1: "pe", 2: "clc"}
+
+
+def compatible_candidates(n, k):
+    return tuple(
+        config
+        for config in NVFP4_GROUPED_M_CONFIGS
+        if n % config.tile_n == 0 and n % 128 == 0 and k % config.tile_k == 0
+    )
+
+
+def format_candidate(config):
+    return (
+        f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
+        f"/e{config.epilogue_tile_n}/c{config.cluster_m}/{_MODE_LABELS[config.mode]}"
+    )
+
+
+class Nvfp4GroupedMGemmRunner(BaseKernelRunner):
+    namespace = "nvfp4_grouped_m_gemm"
+    format_candidate = staticmethod(format_candidate)
+
+    def __init__(self, a, b, sfa, sfb, layout, out, *, dynamic_metadata=True):
+        super().__init__(a.device)
+        self.a, self.b, self.sfa, self.sfb, self.layout, self.out = (
+            a,
+            b,
+            sfa,
+            sfb,
+            layout,
+            out,
+        )
+        self.dynamic_metadata = dynamic_metadata
+        if dynamic_metadata:
+            self.namespace += "_dynamic_v1"
+            self.graph_timing = True
+
+    @property
+    def workload_key(self):
+        return (tuple(self.a.shape), tuple(self.b.shape), self.dynamic_metadata)
+
+    def compatible_candidates(self):
+        return compatible_candidates(self.b.size(1), self.a.size(1) * 2)
+
+    def pre_jit(self, candidate):
+        return compile_nvfp4_grouped_m_gemm(candidate)
+
+    def prepare(self, candidate):
+        module = self.pre_jit(candidate)
+
+        def metadata():
+            return module.prepare_metadata(self.layout, self.b.size(0), self.b.size(1))
+
+        md = None if self.dynamic_metadata else metadata()
+
+        def run():
+            module.nvfp4_grouped_m_gemm_out(
+                self.a,
+                self.b,
+                self.sfa,
+                self.sfb,
+                metadata() if self.dynamic_metadata else md,
+                self.out,
+            )
+            return self.out
+
+        return PreparedKernel(candidate, run)

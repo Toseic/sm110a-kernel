@@ -13,8 +13,7 @@ if str(ROOT) not in sys.path:
 
 from common import BenchmarkBase, SolReport, benchmark_with_stats, sol_bounds
 from sm110a_kernel import (
-    bf16tofp4_quant_dequant_out,
-    bf16tofp4_quant_out,
+    Bf16ToFp4QuantRunner,
     compile_bf16tofp4_quant,
 )
 
@@ -174,12 +173,11 @@ class QuantBenchmark(BenchmarkBase):
                     device="cuda",
                     dtype=torch.float8_e8m0fnu,
                 )
-                if dequant:
-                    run_ours = lambda: bf16tofp4_quant_dequant_out(
-                        input, output, scales
-                    )
-                else:
-                    run_ours = lambda: bf16tofp4_quant_out(input, output, scales)
+                kernel_runner = Bf16ToFp4QuantRunner(
+                    input, output, scales, dequant=dequant
+                )
+                kernel_runner.run()
+                run_ours = kernel_runner.run
                 stats = benchmark_with_stats(
                     run_ours,
                     args.warmup,

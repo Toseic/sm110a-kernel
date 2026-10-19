@@ -2,12 +2,11 @@
 
 from dataclasses import dataclass
 from pathlib import Path
-from statistics import median
 
 import torch
 
 from ..jit_runtime import SplitCudaJit
-from ..runner import AutotuneRunner, PreparedKernel, TuneOptions
+from ..runner import BaseKernelRunner, PreparedKernel
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE = _ROOT / "csrc/topk/src"
@@ -27,26 +26,6 @@ class TopKConfig:
     split_k: int
 
 
-def _tune_stats(run, options):
-    for _ in range(options.warmup):
-        run()
-    timings = []
-    for _ in range(options.samples):
-        events = []
-        for _ in range(options.iters):
-            if options.cold_l2_flush is not None:
-                options.cold_l2_flush()
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            run()
-            end.record()
-            events.append((start, end))
-        events[-1][1].synchronize()
-        timings.append(sum(a.elapsed_time(b) for a, b in events) / options.iters)
-    return {"min_ms": min(timings), "median_ms": median(timings)}
-
-
 class TopKModule:
     def __init__(self, binding, library, config):
         self._binding = binding
@@ -55,7 +34,6 @@ class TopKModule:
         self._split_k_cache = {}
 
     def select_split_k(self, scores, k=512, out=None, *, options=None):
-        """Resolve 1/2/4/8 CTAs per row using cold-L2 timings and runner cache."""
         _check_scores(scores, k)
         if out is None:
             out = torch.empty(
@@ -63,61 +41,23 @@ class TopKModule:
                 device=scores.device,
                 dtype=torch.int32,
             )
-        if scores.size(1) <= 512:
-            # No tuning or lazy allocations: this path also works during capture.
+        if scores.size(1) <= 512 or not scores.size(0):
             self._binding.topk_out(scores, out, k, 1, self._launcher)
             return 1
-        key = (
-            scores.device.index,
-            tuple(scores.shape),
-            str(scores.dtype),
+        runner = TopKRunner(
+            scores,
+            out,
             k,
-            scores.data_ptr() % 16,
-            self._config,
+            stages=self._config[0],
+            copy_engine=self._config[1],
+            _module=self,
         )
-        use_default = options is None
-        if use_default and key in self._split_k_cache:
+        key = runner.workload_key
+        if options is None and key in self._split_k_cache:
             return self._split_k_cache[key]
-        with torch.cuda.device(scores.device):
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "autotune this TopK shape before CUDA graph capture, or specify split_k"
-                )
-            self._binding.topk_out(scores, out, k, 1, self._launcher)
-            if not scores.size(0):
-                self._split_k_cache[key] = 1
-                return 1
-            if options is None:
-                l2_bytes = torch.cuda.get_device_properties(scores.device).L2_cache_size
-                eviction = torch.empty(
-                    max(2 * l2_bytes, 64 << 20), device=scores.device, dtype=torch.uint8
-                )
-                options = TuneOptions(cold_l2_flush=lambda: eviction.zero_())
-            configs = tuple(
-                TopKConfig(split)
-                for split in (1, 2, 4, 8)
-                if split <= (scores.size(1) + 1023) // 1024
-            )
-
-            def prepare(config):
-                return PreparedKernel(
-                    config,
-                    lambda: self._binding.topk_out(
-                        scores, out, k, config.split_k, self._launcher
-                    ),
-                )
-
-            selection = AutotuneRunner(options).resolve(
-                configs,
-                namespace="topk512_cga_stored_keys_v5",
-                key=key,
-                prepare=prepare,
-                benchmark=lambda prepared: _tune_stats(prepared.run, options),
-                probe=None,
-                format_candidate=lambda config: f"split_k={config.split_k}",
-            )
+        selection = runner.tune(options)
         winner = selection.candidate.split_k
-        if use_default:
+        if options is None:
             self._split_k_cache[key] = winner
         return winner
 
@@ -180,3 +120,49 @@ def topk(scores, k=512, *, split_k=None):
 def topk_out(scores, out, k=512, *, split_k=None):
     """Reuse output; prewarm autotuning or fix split_k before graph capture."""
     return compile_topk().topk_out(scores, out, k, split_k=split_k)
+
+
+class TopKRunner(BaseKernelRunner):
+    namespace = "topk512_cga_stored_keys_v5"
+
+    def __init__(
+        self, scores, out, k=512, *, stages=2, copy_engine="ldgsts", _module=None
+    ):
+        super().__init__(scores.device)
+        _check_scores(scores, k)
+        self.scores, self.out, self.k = scores, out, k
+        self.stages, self.copy_engine, self.module = stages, copy_engine, _module
+
+    @property
+    def workload_key(self):
+        return (
+            self.scores.device.index,
+            tuple(self.scores.shape),
+            str(self.scores.dtype),
+            self.k,
+            self.scores.data_ptr() % 16,
+            (self.stages, self.copy_engine),
+        )
+
+    def compatible_candidates(self):
+        if self.scores.size(1) <= 512 or not self.scores.size(0):
+            return (TopKConfig(1),)
+        return tuple(
+            TopKConfig(s)
+            for s in (1, 2, 4, 8)
+            if s <= (self.scores.size(1) + 1023) // 1024
+        )
+
+    def pre_jit(self, candidate):
+        return self.module or compile_topk(
+            stages=self.stages, copy_engine=self.copy_engine
+        )
+
+    def prepare(self, candidate):
+        module = self.pre_jit(candidate)
+        return PreparedKernel(
+            candidate,
+            lambda: module._binding.topk_out(
+                self.scores, self.out, self.k, candidate.split_k, module._launcher
+            ),
+        )

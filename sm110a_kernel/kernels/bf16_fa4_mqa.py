@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..jit_runtime import SplitCudaJit
+from ..runner import FixedKernelRunner
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_DIR = _ROOT / "csrc/bf16_fa4_mqa/src"
@@ -99,3 +100,15 @@ def bf16_fa4_mqa_out(q, k, v, out, *, causal=False, scale=None):
     return compile_bf16_fa4_mqa().fa_mqa_out(
         q, k, v, out, bool(causal), _resolve_scale(q, scale)
     )
+
+
+class Bf16Fa4MqaRunner(FixedKernelRunner):
+    def __init__(self, q, k, v, out, *, causal=False, scale=None):
+        scale = _resolve_scale(q, scale)
+        super().__init__(
+            q.device,
+            "bf16_fa4_mqa",
+            (tuple(q.shape), tuple(k.shape), tuple(v.shape), causal, scale),
+            compile_bf16_fa4_mqa,
+            lambda module: lambda: module.fa_mqa_out(q, k, v, out, causal, scale),
+        )

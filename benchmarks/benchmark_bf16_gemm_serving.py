@@ -245,6 +245,11 @@ def run_producer_speed_sweep(args):
     producer_stream = contexts[1].torch_stream()
     consumer_stream = contexts[2].torch_stream()
     queue = None
+    eviction = torch.empty(
+        max(64 << 20, 2 * torch.cuda.get_device_properties(b_nt.device).L2_cache_size),
+        device=b_nt.device,
+        dtype=torch.uint8,
+    )
     queues = [
         module.create_queue(
             b_nt,
@@ -268,7 +273,7 @@ def run_producer_speed_sweep(args):
         warm_gpu_clocks(b_nt)
         clock_hz = measure_sm_clock_hz()
         print(f"[clock] calibrated SM clock during pacing: {clock_hz / 1.0e6:.0f} MHz")
-        print("[serving] producer arrival-rate sweep")
+        print("[serving] producer arrival-rate sweep (cold L2 at phase start)")
         print("[resources] serving=16 SM (8 clusters), producer=2 SM, consumer=2 SM")
         print(
             f"[queue] capacity={args.capacity} groups, groups/run={args.groups}, "
@@ -286,6 +291,9 @@ def run_producer_speed_sweep(args):
         throughputs = []
         for delay_us, queue in zip(args.producer_delays_us, queues):
             warm_gpu_clocks(b_nt)
+            # The complete streaming phase starts cold; intra-phase reuse is part of the workload.
+            eviction.zero_()
+            torch.cuda.synchronize()
             queue.start()
             delay_cycles = round(delay_us * clock_hz / 1.0e6)
             started = time.perf_counter()

@@ -13,6 +13,29 @@ sparse MLA use the corresponding SM110A kernels. Missing fused model-level
 operators currently use explicit PyTorch fallbacks marked with
 `TODO(sm110a)` in `model.py`.
 
+Dense BF16/FP8/FP8xMXFP4 GEMMs, grouped wo_a projection, routed MoE,
+quantizers, sparse MLA, and indexer top-k execute through public runner
+classes in `sm110a_kernel/kernels/*.py`; `model.py` does not call `compile_*`.
+These inherit `BaseKernelRunner` in `sm110a_kernel/runner.py`, which uses
+`AutotuneRunner` for selection and persistent caching. Benchmarks share the
+same candidate policies and execution bindings.
+The first eager call for each shape and numerical/PDL mode selects a compatible
+configuration using cold-L2 timings (CUDA Graph timings for pipelines) and persists it in
+`profiles/autotune_cache.json`. Later calls reuse the configuration with the
+current tensors; the shared selection cache retains only configurations.
+MoE tuning measures the complete quantization/routing/FC1/FC2 chain, rebuilding
+configuration-specific metadata on every invocation. Routing weights, BF16
+rounding, compact scales, and deterministic reduction remain fixed during tuning.
+Top-k uses `TopKRunner` for configuration selection. Quantizers and sparse MLA
+use fixed runners, which prepare their single implementation without a timing
+sweep. See the [runner guide](../../docs/kernel_runners.md) for the full API.
+
+Warm up each intended shape and mode eagerly before capturing a CUDA Graph.
+`prepare_for_inference()` packs static weights; input-dependent tuning happens
+on the first forward. The benchmark already runs eager decode before capture.
+`clear_backend_cache()` also clears in-process kernel runner selections; the
+persistent autotune cache remains available.
+
 Both MoE backends compact static weight scales once during preparation.
 `Transformer(args, compact_moe_scales=False)` or the benchmark flag
 `--moe-weight-scales padded` selects padded scales for comparison.
@@ -33,8 +56,9 @@ Select the fused backend with `Transformer(args, moe_backend="fused")` or:
 
 `--moe-backend unfused` remains the default. The fused backend keeps the same
 FP4 weight values, gate ordering, FC1 routing weights and BF16 activation
-rounding. It uses row scheduling with cluster_m=1 and statically compacted
-weight scales, releasing the padded scale buffers after preparation.
+rounding. It autotunes row scheduling across compatible cluster and hidden-split
+configurations, with statically compacted weight scales, releasing the padded
+scale buffers after preparation.
 It currently uses BF16 atomic expert accumulation, so its default reduction is
 `atomic`; explicitly requesting deterministic reduction or PDL is rejected.
 Use `--moe-backend unfused --fc2-reduction atomic` for a comparison with the same
@@ -45,8 +69,8 @@ Routing task counts are read on device each invocation, including graph replay.
 
 The default path is bitwise reproducible between eager and CUDA Graph in the
 tested decode runs, but full-model agreement with the official model is not
-yet validated. See [precision re-evaluation](../../docs/dsv4_flash_accuracy.md)
-for measured residual differences and controlled experiments.
+yet validated. Graph self-consistency does not establish agreement with the
+official model or real-checkpoint quality.
 
 The LM head keeps the checkpoint's BF16 weights and uses the native BF16
 GEMM with FP32 output. It projects only the last sequence position, so GEMM M

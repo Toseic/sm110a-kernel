@@ -6,6 +6,7 @@ length Q sequences with --batched-q. All metadata is built outside timing.
 """
 
 import argparse
+import gc
 import math
 import random
 import sys
@@ -31,9 +32,8 @@ from common import (
 from sm110a_kernel import (
     Bf16Fa4MhaConfig,
     Bf16Fa4MhaTactic,
-    compile_bf16_fa4_mha,
 )
-from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
+from sm110a_kernel.kernels.bf16_fa4_mha import Bf16Fa4MhaRunner
 
 DEFAULT_PAGE_SIZE = 128
 PREFILL_LENGTHS = (1024, 2048, 4096, 8192, 16384)
@@ -345,25 +345,22 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
             q_input = q.permute(0, 2, 1, 3).contiguous()
         out = torch.empty_like(q_input)
 
+        kernel_runner = Bf16Fa4MhaRunner(
+            q_input,
+            k_pages,
+            v_pages,
+            out,
+            causal=case.causal,
+            scale=scale,
+            block_table=block_table,
+            cu_seqlens_q=cu_seqlens_q,
+            kv_seqlens=kv_seqlens,
+            max_q_len=case.q_len,
+            max_kv_len=case.kv_len,
+        )
+
         def make_kernel_run(tactic):
-            module = compile_bf16_fa4_mha(Bf16Fa4MhaConfig(tactic=tactic))
-
-            def run():
-                module.fa_mha_out(
-                    q_input,
-                    k_pages,
-                    v_pages,
-                    out,
-                    causal=case.causal,
-                    scale=scale,
-                    block_table=block_table,
-                    cu_seqlens_q=cu_seqlens_q,
-                    kv_seqlens=kv_seqlens,
-                    max_q_len=case.q_len,
-                    max_kv_len=case.kv_len,
-                )
-
-            return run
+            return kernel_runner.prepare(Bf16Fa4MhaConfig(tactic=tactic)).run
 
         if args.baseline == "fa4":
             fa4_k_pages, fa4_v_pages = (
@@ -452,27 +449,9 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
                     Bf16Fa4MhaConfig(tactic=Bf16Fa4MhaTactic.WARP_16),
                 )
             )
-            selection = AutotuneRunner(
-                self.make_tune_options(args, role="ours")
-            ).resolve(
-                candidates,
-                namespace="bf16_fa4_mha",
-                key=(
-                    "v1",
-                    case.batch,
-                    case.heads,
-                    case.q_len,
-                    case.kv_len,
-                    case.head_dim,
-                    args.page_size,
-                    case.causal,
-                    packed_q,
-                    q_lengths,
-                    kv_lengths,
-                ),
-                prepare=lambda config: PreparedKernel(
-                    config, make_kernel_run(config.tactic)
-                ),
+            selection = kernel_runner.tune(
+                self.make_tune_options(args, role="ours"),
+                candidates=candidates,
                 benchmark=lambda prepared: benchmark_with_stats(
                     prepared.run,
                     args.warmup,
@@ -481,9 +460,6 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
                     cold_l2_flush=args._cold_l2_flush,
                 ),
                 probe=None,
-                format_candidate=lambda config: (
-                    "12warp" if config.tactic == Bf16Fa4MhaTactic.WARP_12 else "16warp"
-                ),
             )
             run_kernel, selected_tactic = (
                 selection.prepared.run,
@@ -590,6 +566,10 @@ class Bf16Fa4MhaBenchmark(BenchmarkBase):
         table.print_header()
         sol_report = SolReport(debug=args.debug) if args.sol else None
         for case in self.cases(args):
+            # Prepared callables can keep their runner alive until cyclic GC.
+            # Reclaim the preceding shape before allocating another paged KV copy.
+            gc.collect()
+            torch.cuda.empty_cache()
             kernel_ms, baseline_ms, diff, flops, bounds, selected_tactic = (
                 self.run_case(case, args)
             )

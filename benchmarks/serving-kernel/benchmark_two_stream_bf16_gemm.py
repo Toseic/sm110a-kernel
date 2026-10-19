@@ -12,6 +12,8 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+sys.path.insert(0, str(ROOT / "benchmarks"))
+from common import BenchmarkBase, benchmark_once
 from sm110a_kernel import Bf16GemmConfig, bf16_gemm_nt_out, compile_bf16_gemm
 
 CONFIG = Bf16GemmConfig(
@@ -65,6 +67,9 @@ def main():
     args = parse_args()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
+
+    cache = BenchmarkBase()
+    cache.configure_cold_l2(args)
 
     config = CONFIG
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
@@ -127,37 +132,33 @@ def main():
         enqueue_full()
     torch.cuda.synchronize()
 
-    # A gate event makes the independently timed work on both ordinary streams
-    # ready at the same point. Start/end events live on their respective
-    # streams, so their elapsed times do not include the other stream's work.
-    gate = torch.cuda.Event(enable_timing=True)
-    start = [torch.cuda.Event(enable_timing=True) for _ in range(STREAMS)]
-    done = [torch.cuda.Event(enable_timing=True) for _ in range(STREAMS)]
-
     def timed_batch():
-        for stream, event in zip(streams, start):
-            stream.wait_event(gate)
-            event.record(stream)
-        gate.record()
+        timings = [[], []]
         for _ in range(args.iters):
+            cache_flush = args._cold_l2_flush
+            if cache_flush is not None:
+                cache_flush()
+            gate = torch.cuda.Event()
+            gate.record()
+            start = [torch.cuda.Event(enable_timing=True) for _ in streams]
+            done = [torch.cuda.Event(enable_timing=True) for _ in streams]
+            for stream, event in zip(streams, start):
+                stream.wait_event(gate)
+                event.record(stream)
             enqueue_pair()
-        for stream, event in zip(streams, done):
-            event.record(stream)
-        # One synchronization is sufficient for all per-stream event pairs.
+            for stream, event in zip(streams, done):
+                event.record(stream)
+                torch.cuda.current_stream().wait_event(event)
+            for i in range(STREAMS):
+                timings[i].append((start[i], done[i], gate))
         torch.cuda.synchronize()
-        return [begin.elapsed_time(end) / args.iters for begin, end in zip(start, done)]
+        return [
+            sum(begin.elapsed_time(end) for begin, end, _gate in events) / args.iters
+            for events in timings
+        ]
 
     def timed_full():
-        start, done = (
-            torch.cuda.Event(enable_timing=True),
-            torch.cuda.Event(enable_timing=True),
-        )
-        start.record()
-        for _ in range(args.iters):
-            enqueue_full()
-        done.record()
-        done.synchronize()
-        return start.elapsed_time(done) / args.iters
+        return benchmark_once(enqueue_full, 0, args.iters, args._cold_l2_flush)
 
     samples_ms = list(zip(*(timed_batch() for _ in range(args.samples))))
     full_samples_ms = [timed_full() for _ in range(args.samples)]

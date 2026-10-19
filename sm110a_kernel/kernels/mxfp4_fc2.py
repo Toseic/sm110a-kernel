@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import ctypes
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
+import torch
+
 from ..jit_runtime import SplitCudaJit
+from ..runner import BaseKernelRunner, PreparedKernel
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SRC = _ROOT / "csrc/mxfp4_moe/src"
@@ -285,7 +288,6 @@ def to_blocked_mxfp4_sfa(scales):
     consumed by ``tcgen05.cp`` (live byte in column 0, as in
     ``fp8mxfp4_gemm``).
     """
-    import torch
 
     from .fp8mxfp4_gemm import to_blocked_fp8mxfp4_scales
 
@@ -361,7 +363,6 @@ def to_blocked_mxfp4_scales(scales):
     all four SWIZZLE_32_4_4 columns are live. Storage is one byte per
     (row, K=32) scale — four times smaller than the padded fp8mxfp4 layout.
     """
-    import torch
 
     if scales.ndim != 2 or scales.dtype != torch.float8_e8m0fnu:
         raise TypeError("scales must be a 2D torch.float8_e8m0fnu tensor")
@@ -381,7 +382,6 @@ def to_blocked_mxfp4_scales(scales):
 
 def from_blocked_mxfp4_scales(scales, rows: int, k: int):
     """Inverse of :func:`to_blocked_mxfp4_scales`, mainly for references."""
-    import torch
 
     if scales.dtype != torch.float8_e8m0fnu or rows % 128 or k % 128:
         raise ValueError("expected E8M0 scales with rows % 128 == 0 and K % 128 == 0")
@@ -395,3 +395,111 @@ def from_blocked_mxfp4_scales(scales, rows: int, k: int):
         .view(torch.float8_e8m0fnu)
         .contiguous()
     )
+
+
+MXFP4_FC2_CONFIGS = tuple(
+    Mxfp4Fc2Config(
+        tile_k=128,
+        epilogue_tile_n=epilogue_tile_n,
+        cluster_m=cluster_m,
+    )
+    for epilogue_tile_n in (32, 64)
+    for cluster_m in (1, 2)
+)
+
+
+def format_fc2_candidate(config):
+    return (
+        f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
+        f"/e{config.epilogue_tile_n}/c{config.cluster_m}/persistent"
+        f"/r{config.reduce_tile_n}/sf={'compact' if getattr(config, 'compact_weight_scales', False) else 'padded'}"
+    )
+
+
+class Mxfp4Fc2Runner(BaseKernelRunner):
+    namespace = "mxfp4_fc2"
+    format_candidate = staticmethod(format_fc2_candidate)
+
+    def __init__(
+        self,
+        a,
+        b,
+        sfa,
+        sfb,
+        routing,
+        routing_weights,
+        layout,
+        topk,
+        out,
+        *,
+        config=None,
+        dynamic_metadata=True,
+    ):
+        super().__init__(a.device)
+        self.a, self.b, self.sfa, self.sfb = a, b, sfa, sfb
+        self.routing, self.routing_weights, self.layout = (
+            routing,
+            routing_weights,
+            layout,
+        )
+        self.topk, self.out = topk, out
+        self.dynamic_metadata = dynamic_metadata
+        if dynamic_metadata:
+            self.namespace += "_dynamic_v1"
+            self.graph_timing = True
+        self.config = config or Mxfp4Fc2Config()
+        if self.config.pdl or self.config.external_prepare:
+            raise ValueError("use Mxfp4MoeRunner to tune the complete PDL chain")
+
+    @property
+    def workload_key(self):
+        return (
+            "v3-runner",
+            self.out.size(0),
+            self.b.size(0),
+            self.topk,
+            self.b.size(1),
+            self.a.size(1),
+            self.config.compact_weight_scales,
+            self.config.routing_weight_position,
+            self.config.deterministic,
+        )
+
+    def compatible_candidates(self):
+        return tuple(
+            replace(
+                c,
+                compact_weight_scales=self.config.compact_weight_scales,
+                routing_weight_position=self.config.routing_weight_position,
+                deterministic=self.config.deterministic,
+            )
+            for c in MXFP4_FC2_CONFIGS
+        )
+
+    def pre_jit(self, candidate):
+        return compile_mxfp4_fc2(candidate)
+
+    def prepare(self, candidate):
+        module = self.pre_jit(candidate)
+
+        def prepare_metadata():
+            return module.prepare_metadata(self.layout, self.b.size(0), self.b.size(1))
+
+        metadata = None if self.dynamic_metadata else prepare_metadata()
+
+        def run():
+            current_metadata = prepare_metadata() if self.dynamic_metadata else metadata
+            module.mxfp4_fc2_out(
+                self.a,
+                self.b,
+                self.sfa,
+                self.sfb,
+                self.routing,
+                self.routing_weights,
+                current_metadata,
+                self.topk,
+                self.out,
+            )
+            return self.out
+
+        return PreparedKernel(candidate, run)

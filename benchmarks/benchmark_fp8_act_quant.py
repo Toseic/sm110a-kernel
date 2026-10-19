@@ -17,7 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from common import BenchmarkBase, SolReport, benchmark_with_stats, sol_bounds
-from sm110a_kernel import compile_fp8_act_quant
+from sm110a_kernel import Fp8ActQuantRunner, compile_fp8_act_quant
 
 TOKENS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
 BLOCK_SIZES = (64, 128)
@@ -142,9 +142,12 @@ class Fp8ActQuantBenchmark(BenchmarkBase):
                 scales = torch.empty(
                     (tokens, args.d // block_size), device="cuda", dtype=scale_dtype
                 )
-                module = compile_fp8_act_quant(block_size, scale)
+                kernel_runner = Fp8ActQuantRunner(
+                    input, output, scales, block_size, scale
+                )
+                kernel_runner.run()
                 stats = benchmark_with_stats(
-                    lambda: module.quantize_out(input, output, scales),
+                    kernel_runner.run,
                     args.warmup,
                     args.iters,
                     args.samples,

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..jit_runtime import SplitCudaJit
+from ..runner import BaseKernelRunner, PreparedKernel
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_DIR = _ROOT / "csrc/bf16_grouped_m_gemm/src"
@@ -188,3 +189,101 @@ def bf16_grouped_m_gemm_out(a, b, metadata, out, config=None, swap_ab=False):
     return get_bf16_grouped_m_gemm_module(a, b, config).bf16_grouped_m_gemm_out(
         a, b, metadata, out, swap_ab
     )
+
+
+GROUPED_M_CONFIGS = tuple(
+    GroupedMConfig(
+        tile_m=128,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        epilogue_tile_n=epilogue_tile_n,
+        cluster_m=cluster_m,
+        mode=mode,
+        direct_gmem=direct_gmem,
+    )
+    for tile_n in (128, 256)
+    for tile_k in (64, 128)
+    for epilogue_tile_n in (32, 64)
+    for cluster_m in (1, 2)
+    for mode in (0, 1, 2)
+    for direct_gmem in (False,)
+    if tile_n % epilogue_tile_n == 0
+)
+
+
+def compatible_candidates(n, k):
+    candidates = []
+    for config in GROUPED_M_CONFIGS:
+        if k % config.tile_k:
+            continue
+        if n % config.tile_n == 0:
+            candidates.append((config, False))
+        # if config.cluster_m == 1 and n % (config.cluster_m * config.tile_m) == 0:
+        #     candidates.append((config, True)) # disable swapab [tmp]
+    return tuple(candidates)
+
+
+_MODE_LABELS = {0: "np", 1: "pe", 2: "clc"}
+
+
+def format_config(config):
+    base = (
+        f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
+        f"/e{config.epilogue_tile_n}/c{config.cluster_m}"
+        f"/{_MODE_LABELS[config.mode]}"
+    )
+    return base + "+dg" if getattr(config, "direct_gmem", False) else base
+
+
+def format_candidate(config, swap_ab):
+    return f"{format_config(config)}/{'swap' if swap_ab else 'noswap'}"
+
+
+class Bf16GroupedMGemmRunner(BaseKernelRunner):
+    namespace = "bf16_grouped_m_gemm"
+
+    def __init__(self, a, b, layout, out, *, dynamic_metadata=False):
+        super().__init__(a.device)
+        self.a, self.b, self.layout, self.out = a, b, layout, out
+        self.dynamic_metadata = dynamic_metadata
+        if dynamic_metadata:
+            self.namespace = "bf16_grouped_m_gemm_dynamic_v1"
+            self.graph_timing = True
+
+    @property
+    def workload_key(self):
+        if self.dynamic_metadata:
+            return (tuple(self.a.shape), tuple(self.b.shape))
+        return (self.b.size(1), self.a.size(1), self.layout.numel() // self.b.size(0))
+
+    def compatible_candidates(self):
+        return compatible_candidates(self.b.size(1), self.a.size(1))
+
+    @staticmethod
+    def format_candidate(candidate):
+        return format_candidate(*candidate)
+
+    def pre_jit(self, candidate):
+        return compile_bf16_grouped_m_gemm(candidate[0])
+
+    def prepare(self, candidate):
+        module = self.pre_jit(candidate)
+
+        def metadata():
+            return module.prepare_metadata(
+                self.layout, self.b.size(0), self.b.size(1), candidate[1]
+            )
+
+        prepared_metadata = None if self.dynamic_metadata else metadata()
+
+        def run():
+            module.bf16_grouped_m_gemm_out(
+                self.a,
+                self.b,
+                metadata() if self.dynamic_metadata else prepared_metadata,
+                self.out,
+                candidate[1],
+            )
+            return self.out
+
+        return PreparedKernel(candidate, run)

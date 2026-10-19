@@ -24,13 +24,15 @@ from common import (
     tflops_from_ms,
 )
 from sm110a_kernel import (
-    Bf16GemmConfig,
-    bf16_gemm_nt_out,
-    compile_bf16_gemm,
     cublaslt_gemm_out,
     cublaslt_gemm_out_batched,
 )
-from sm110a_kernel.runner import AutotuneRunner, PreparedKernel
+from sm110a_kernel.kernels.bf16_gemm import (
+    Bf16GemmRunner,
+)
+from sm110a_kernel.kernels.bf16_gemm import (
+    format_bf16_candidate as format_candidate,
+)
 
 DEFAULT_SHAPES = [
     (1, 4096, 4096),
@@ -50,70 +52,6 @@ DEFAULT_SHAPES = [
 ]
 ACCURACY_SHAPE = (512, 512, 512)
 CUBLASLT_WORKSPACE_BYTES = 32 * 1024 * 1024
-
-
-def _bf16_gemm_configs(output_fp32=False):
-    for tile_m in (64, 128):
-        for tile_n in (128, 256):
-            for tile_k in (64, 128):
-                for cluster_m in (1, 2):
-                    for epilogue_block_n in (32, 64, 128):
-                        if tile_n % epilogue_block_n:
-                            continue
-                        for split_k in (1, 2, 4, 8):
-                            config = Bf16GemmConfig(
-                                tile_m=tile_m,
-                                tile_n=tile_n,
-                                tile_k=tile_k,
-                                cluster_m=cluster_m,
-                                epilogue_block_n=epilogue_block_n,
-                                split_k=split_k,
-                                output_fp32=output_fp32,
-                            )
-                            try:
-                                config.validate()
-                            except ValueError:
-                                continue
-                            yield config
-
-
-BF16_GEMM_CONFIGS = tuple(_bf16_gemm_configs())
-
-
-def compatible_candidates(m, n, k, output_fp32=False):
-    return tuple(
-        (config, swap_ab)
-        for config in (_bf16_gemm_configs(True) if output_fp32 else BF16_GEMM_CONFIGS)
-        for swap_ab in ((False, True) if config.split_k == 1 else (False,))
-        if k % (config.tile_k * config.split_k) == 0
-        and (
-            (
-                not swap_ab
-                and (
-                    m % (config.tile_m * config.cluster_m) == 0
-                    or (config.cluster_m == 1 and 0 < m < config.tile_m)
-                )
-                and n % config.tile_n == 0
-            )
-            or (
-                swap_ab
-                and n % (config.tile_m * config.cluster_m) == 0
-                and m % config.tile_n == 0
-            )
-        )
-    )
-
-
-def format_candidate(candidate):
-    config, swap_ab = candidate
-    return (
-        f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
-        f"/c{config.cluster_m}"
-        f"/e{config.epilogue_block_n}"
-        f"/sk{config.split_k}"
-        f"/{'swap' if swap_ab else 'noswap'}"
-        f"/{'fp32' if config.output_fp32 else 'bf16'}"
-    )
 
 
 def gemm_sol_bounds(m, n, k, config, swap_ab=False):
@@ -412,35 +350,16 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
         )
 
     def resolve_kernel(self, a, b_kernel, out, m, n, k, args):
-        candidates = compatible_candidates(m, n, k, output_fp32=args.output_fp32)
-        if not candidates:
-            raise RuntimeError(f"no JIT config supports M={m}, N={n}, K={k}")
-
-        def prepare(candidate):
-            config, swap_ab = candidate
-            run = lambda: bf16_gemm_nt_out(
-                a,
-                b_kernel,
-                out,
-                config=config,
-                swap_ab=swap_ab,
-                max_active_clusters=args.max_active_clusters or None,
-            )
-            run()
-            torch.cuda.synchronize()
-            return PreparedKernel(candidate, run)
-
-        options = self.make_tune_options(
-            args,
-            role="ours",
-            pre_parallel_jit=args.pre_parallel_jit,
+        kernel_runner = Bf16GemmRunner(
+            a, b_kernel, out, max_active_clusters=args.max_active_clusters or None
         )
-        return AutotuneRunner(options).resolve(
-            candidates,
-            # Output dtype changes epilogue resources and must tune independently.
-            namespace="bf16_gemm_nt_v6",
-            key=(m, n, k, args.max_active_clusters, str(out.dtype)),
-            prepare=prepare,
+        candidates = kernel_runner.compatible_candidates()
+        options = self.make_tune_options(
+            args, role="ours", pre_parallel_jit=args.pre_parallel_jit
+        )
+        return kernel_runner.tune(
+            options,
+            candidates=candidates,
             benchmark=lambda prepared: benchmark_with_stats(
                 prepared.run,
                 args.warmup,
@@ -453,11 +372,9 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
                 args.iters,
                 cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             ),
-            format_candidate=format_candidate,
             metric_formatter=lambda _candidate, stats: (
                 f"{tflops_from_ms(m, n, k, stats['median_ms']):.1f} TF/s"
             ),
-            pre_jit=lambda candidate: compile_bf16_gemm(candidate[0]),
         )
 
     def print_result(self, shape, result):

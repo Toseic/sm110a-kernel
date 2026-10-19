@@ -8,6 +8,8 @@ from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 
+from ..runner import FixedKernelRunner
+
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_DIR = _ROOT / "csrc/nccl_lsa/src"
 _INCLUDE_DIR = _ROOT / "include"
@@ -134,3 +136,16 @@ class NcclLsaAllReduce:
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.close()
+
+
+class NcclLsaRunner(FixedKernelRunner):
+    """Bind an existing collective; all ranks must invoke it in the same order."""
+
+    def __init__(self, communicator, input, output):
+        super().__init__(
+            input.device,
+            "nccl_lsa_all_reduce",
+            (tuple(input.shape), str(input.dtype), communicator.world_size),
+            lambda: communicator,
+            lambda comm: lambda: comm.all_reduce_out(input, output),
+        )

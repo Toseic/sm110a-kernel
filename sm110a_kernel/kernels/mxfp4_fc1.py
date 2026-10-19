@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import ctypes
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
+import torch
+
 from ..jit_runtime import SplitCudaJit
+from ..runner import BaseKernelRunner, PreparedKernel
 from .pdl import PDL_TRIGGER_POINTS
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -103,7 +106,6 @@ def quantize_mxfp4_fc1_weights(gate, up):
     ``[gate:64, up:64]`` block order, low nibble = even element) and the
     blocked UE8M0 K=32 scale tensor consumed as SFB.
     """
-    import torch
 
     from .fp8mxfp4_gemm import quantize_fp8mxfp4_weights
 
@@ -148,7 +150,6 @@ class Mxfp4Fc1Module:
         self._routing_address = ctypes.cast(routing_symbol, ctypes.c_void_p).value
 
     def prepare_metadata(self, router_scores, topk: int, n: int) -> Mxfp4Fc1Metadata:
-        import torch
 
         if router_scores.ndim != 2 or router_scores.dtype != torch.bfloat16:
             raise TypeError("router_scores must be a 2D BF16 tensor")
@@ -242,7 +243,6 @@ class Mxfp4Fc1Module:
         *,
         routing_weights=None,
     ):
-        import torch
 
         m = metadata.source_rows.numel()
         logical_n = b.size(1) // 2
@@ -383,3 +383,117 @@ def mxfp4_fc1_out(
         max_active_clusters,
         routing_weights=routing_weights,
     )
+
+
+MXFP4_FC1_CONFIGS = tuple(
+    Mxfp4Fc1Config(
+        tile_k=128,
+        cluster_m=cluster_m,
+        direct_gmem=direct_gmem,
+    )
+    for cluster_m in (1, 2)
+    for direct_gmem in (False, True)
+)
+
+
+def format_fc1_candidate(config):
+    epilogue = "dg" if config.direct_gmem else "tma"
+    return "/".join(
+        [
+            f"{config.tile_m}x{config.tile_n}x{config.tile_k}",
+            f"e{config.epilogue_tile_n}",
+            f"c{config.cluster_m}",
+            epilogue,
+            "compact" if getattr(config, "compact_weight_scales", False) else "padded",
+        ]
+    )
+
+
+class Mxfp4Fc1Runner(BaseKernelRunner):
+    namespace = "mxfp4_fc1"
+    format_candidate = staticmethod(format_fc1_candidate)
+
+    def __init__(
+        self,
+        a,
+        b,
+        sfa,
+        sfb,
+        router,
+        topk,
+        out,
+        out_scale,
+        *,
+        swiglu_limit=0.0,
+        routing_weights=None,
+        config=None,
+        dynamic_metadata=True,
+    ):
+        super().__init__(a.device)
+        self.a, self.b, self.sfa, self.sfb = a, b, sfa, sfb
+        self.router, self.topk, self.out, self.out_scale = router, topk, out, out_scale
+        self.swiglu_limit, self.routing_weights = swiglu_limit, routing_weights
+        self.dynamic_metadata = dynamic_metadata
+        if dynamic_metadata:
+            self.namespace += "_dynamic_v1"
+            self.graph_timing = True
+        self.config = config or Mxfp4Fc1Config()
+        if self.config.pdl or self.config.pdl_input:
+            raise ValueError("use Mxfp4MoeRunner to tune the complete PDL chain")
+        self.metadata_by_candidate = {}
+
+    @property
+    def workload_key(self):
+        return (
+            "v3-runner",
+            self.a.size(0),
+            self.b.size(0),
+            self.topk,
+            self.b.size(1) // 2,
+            self.a.size(1),
+            self.config.compact_weight_scales,
+            self.config.routing_weight_position,
+            self.config.activation_bf16_rounding,
+            self.swiglu_limit,
+        )
+
+    def compatible_candidates(self):
+        return tuple(
+            replace(
+                c,
+                compact_weight_scales=self.config.compact_weight_scales,
+                routing_weight_position=self.config.routing_weight_position,
+                activation_bf16_rounding=self.config.activation_bf16_rounding,
+            )
+            for c in MXFP4_FC1_CONFIGS
+        )
+
+    def pre_jit(self, candidate):
+        return compile_mxfp4_fc1(candidate)
+
+    def prepare(self, candidate):
+        module = self.pre_jit(candidate)
+
+        def prepare_metadata():
+            return module.prepare_metadata(self.router, self.topk, self.b.size(1))
+
+        metadata = None if self.dynamic_metadata else prepare_metadata()
+        if metadata is not None:
+            self.metadata_by_candidate[candidate] = metadata
+
+        def run():
+            current_metadata = prepare_metadata() if self.dynamic_metadata else metadata
+            module.mxfp4_fc1_out(
+                self.a,
+                self.b,
+                self.sfa,
+                self.sfb,
+                current_metadata,
+                self.out,
+                self.out_scale,
+                self.swiglu_limit,
+                routing_weights=self.routing_weights,
+            )
+            return self.out, self.out_scale
+
+        return PreparedKernel(candidate, run)

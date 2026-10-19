@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 
 from ..jit_runtime import SplitCudaJit
+from ..runner import FixedKernelRunner
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_DIR = _ROOT / "csrc/bf16_fa4_sparse_mla/src"
@@ -97,3 +98,24 @@ def bf16_fa4_sparse_mla_prefill_out(q, kv, indices, sink, out, *, scale=None):
     return compile_bf16_fa4_sparse_mla_prefill().sparse_mla_out(
         q, kv, indices, sink, out, _resolve_scale(scale)
     )
+
+
+class Bf16Fa4SparseMlaRunner(FixedKernelRunner):
+    def __init__(self, q, kv, indices, sink, out, *, scale=None, prefill=False):
+        scale = _resolve_scale(scale)
+        super().__init__(
+            q.device,
+            "bf16_fa4_sparse_mla",
+            (tuple(q.shape), tuple(kv.shape), tuple(indices.shape), prefill, scale),
+            compile_bf16_fa4_sparse_mla_prefill
+            if prefill
+            else compile_bf16_fa4_sparse_mla,
+            lambda module: (
+                lambda: module.sparse_mla_out(q, kv, indices, sink, out, scale)
+            ),
+        )
+
+
+class Bf16Fa4SparseMlaPrefillRunner(Bf16Fa4SparseMlaRunner):
+    def __init__(self, q, kv, indices, sink, out, *, scale=None):
+        super().__init__(q, kv, indices, sink, out, scale=scale, prefill=True)

@@ -42,10 +42,17 @@ _utils = types.ModuleType("sm110a_trtllm._torch.utils")
 class _ActivationType(IntEnum):
     Swiglu = 5
     Relu2 = 8
+    SiTu = 9
 
 
 _utils.ActivationType = _ActivationType
-_utils.is_gated_activation = lambda activation: activation == _ActivationType.Swiglu
+_utils.is_gated_activation = lambda activation: (
+    activation
+    in (
+        _ActivationType.Swiglu,
+        _ActivationType.SiTu,
+    )
+)
 sys.modules.setdefault("sm110a_trtllm._torch.utils", _utils)
 
 from sm110a_trtllm._torch.cute_dsl_kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
@@ -191,6 +198,7 @@ def _launch_fc1(
         token_id_mapping,
         num_non_exiting_tiles,
         alpha,
+        cutlass.Int32(0),  # Unused by the explicit tile-metadata scheduling path.
         max_active_clusters,
         stream,
     )
