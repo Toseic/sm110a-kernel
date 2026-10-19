@@ -1,3 +1,7 @@
+#include "pdl.h"
+#ifndef SM110A_FP8_PDL
+#define SM110A_FP8_PDL 0
+#endif
 // =============================================================================
 // SM110A FP8 GEMM — Overview
 // =============================================================================
@@ -964,6 +968,7 @@ void fp8_gemm_kernel(
         __syncthreads();
     }
 
+    if constexpr (SM110A_FP8_PDL) cudaGridDependencySynchronize();
     const int taddr = tmem_addr[0];
 
     // Hint the exact tiles consumed by a future TMA load into L2.  This has
@@ -1696,7 +1701,12 @@ void launch_fp8_gemm_impl(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     }
 
-    kernel<<<grid, kBlockThreads, smem_size, stream>>>(
+    cudaLaunchConfig_t config{};
+    config.gridDim = grid;
+    config.blockDim = dim3(kBlockThreads);
+    config.dynamicSmemBytes = smem_size;
+    config.stream = stream;
+    sm110a::launch_pdl<SM110A_FP8_PDL>(&config, kernel,
         A_tmap, B_tmap, SFA_tmap, SFB_tmap, C_tmap, M, N, K);
 }
 

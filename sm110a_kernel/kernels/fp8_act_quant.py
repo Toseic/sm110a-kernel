@@ -21,7 +21,7 @@ BLOCK_SIZES = (64, 128)
 
 class Fp8ActQuantModule:
     def __init__(self, binding, library, config):
-        block_size, scale = config
+        block_size, scale, self.blocked, self.pdl = config
         if block_size not in BLOCK_SIZES:
             raise ValueError(f"unsupported block_size: {block_size}")
         if scale not in SCALE_MODES:
@@ -33,12 +33,18 @@ class Fp8ActQuantModule:
 
     def quantize(self, input):
         return self._binding.fp8_act_quant(
-            input, self._block_size, self._scale_mode, self._launcher
+            input, self._block_size, self._scale_mode, self._launcher, self.blocked
         )
 
     def quantize_out(self, input, output, scales):
         return self._binding.fp8_act_quant_out(
-            input, output, scales, self._block_size, self._scale_mode, self._launcher
+            input,
+            output,
+            scales,
+            self._block_size,
+            self._scale_mode,
+            self._launcher,
+            self.blocked,
         )
 
 
@@ -47,18 +53,31 @@ _JIT = SplitCudaJit(
     root=_ROOT,
     binding_sources=(_SOURCE_DIR / "fp8_act_quant_torch_binding.cpp",),
     kernel_sources=(_SOURCE_DIR / "fp8_act_quant_kernel.cu",),
-    kernel_dependencies=(_INCLUDE_DIR / "fp8_act_quant.h", _INCLUDE_DIR / "common.h"),
+    kernel_dependencies=(
+        _INCLUDE_DIR / "fp8_act_quant.h",
+        _INCLUDE_DIR / "common.h",
+        _INCLUDE_DIR / "blocked_quant.h",
+    ),
     kernel_symbol="sm110a_fp8_act_quant_launch",
-    config_key=lambda config: (config[0], config[1]),
-    kernel_cflags=lambda _config, _variant: (),
+    config_key=lambda config: config,
+    kernel_cflags=lambda c, _variant: (
+        f"-DSM110A_QUANT_BLOCKED={int(c[2])}",
+        f"-DSM110A_QUANT_PDL={int(c[3])}",
+    ),
     kernel_ldflags=("-lcuda",),
     make_facade=Fp8ActQuantModule,
     include_paths=(_INCLUDE_DIR,),
 )
 
 
-def compile_fp8_act_quant(block_size=128, scale="ue8m0") -> Fp8ActQuantModule:
-    return _JIT.compile((block_size, scale))
+def compile_fp8_act_quant(
+    block_size=128, scale="ue8m0", *, blocked=False, pdl=False
+) -> Fp8ActQuantModule:
+    if blocked and (block_size != 128 or scale != "ue8m0"):
+        raise ValueError("blocked scales require block_size=128 and scale=ue8m0")
+    if not isinstance(blocked, bool) or not isinstance(pdl, bool):
+        raise ValueError("blocked and pdl must be bool")
+    return _JIT.compile((block_size, scale, blocked, pdl))
 
 
 def fp8_act_quant(input, block_size=128, scale="ue8m0"):

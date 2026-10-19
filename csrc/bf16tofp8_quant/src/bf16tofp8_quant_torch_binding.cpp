@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <vector>
 
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAFunctions.h>
@@ -25,7 +26,7 @@ void check_input(const torch::Tensor& input) {
 }
 
 void check_output(const torch::Tensor& output, const torch::Tensor& scales,
-                  const torch::Tensor& input) {
+                  const torch::Tensor& input, bool blocked) {
   TORCH_CHECK(output.is_cuda() && output.is_contiguous() &&
                   output.scalar_type() == at::kFloat8_e4m3fn,
               "output must be a contiguous CUDA torch.float8_e4m3fn tensor");
@@ -34,18 +35,20 @@ void check_output(const torch::Tensor& output, const torch::Tensor& scales,
   TORCH_CHECK(scales.is_cuda() && scales.is_contiguous() &&
                   scales.scalar_type() == at::kFloat8_e8m0fnu,
               "scales must be a contiguous CUDA torch.float8_e8m0fnu tensor");
-  TORCH_CHECK(scales.device() == input.device() && scales.dim() == 2 &&
-                  scales.size(0) == input.size(0) &&
-                  scales.size(1) == input.size(1) / kBlockSize,
+  TORCH_CHECK(scales.device() == input.device() &&
+                  (blocked ? (input.size(0) % 128 == 0 && scales.dim() == 1 &&
+                              scales.numel() == input.numel() / 8)
+                           : (scales.dim() == 2 && scales.size(0) == input.size(0) &&
+                              scales.size(1) == input.size(1) / kBlockSize)),
               "scales must have shape [tokens, D/128]");
 }
 
 std::tuple<torch::Tensor, torch::Tensor> bf16tofp8_quant_out(
     torch::Tensor input, torch::Tensor output, torch::Tensor scales,
-    uint64_t launcher_address) {
+    uint64_t launcher_address, bool blocked) {
   TORCH_CHECK(launcher_address != 0, "BF16-to-FP8 launcher is null");
   check_input(input);
-  check_output(output, scales, input);
+  check_output(output, scales, input, blocked);
   c10::cuda::CUDAGuard guard(input.device());
   const auto launcher = reinterpret_cast<QuantLauncher>(
       static_cast<uintptr_t>(launcher_address));
@@ -59,12 +62,12 @@ std::tuple<torch::Tensor, torch::Tensor> bf16tofp8_quant_out(
 }
 
 std::tuple<torch::Tensor, torch::Tensor> bf16tofp8_quant(
-    torch::Tensor input, uint64_t launcher_address) {
+    torch::Tensor input, uint64_t launcher_address, bool blocked) {
   check_input(input);
   auto output = torch::empty(input.sizes(), input.options().dtype(torch::kFloat8_e4m3fn));
-  auto scales = torch::empty({input.size(0), input.size(1) / kBlockSize},
+  auto scales = torch::empty(blocked ? std::vector<int64_t>{input.numel() / 8} : std::vector<int64_t>{input.size(0), input.size(1) / kBlockSize},
                              input.options().dtype(torch::kFloat8_e8m0fnu));
-  return bf16tofp8_quant_out(input, output, scales, launcher_address);
+  return bf16tofp8_quant_out(input, output, scales, launcher_address, blocked);
 }
 
 }  // namespace

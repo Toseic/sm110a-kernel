@@ -23,8 +23,11 @@ class Fp8GemmConfig:
     epilogue_block_n: int = 32
     split_k: int = 1
     use_prefetch: bool = False
+    pdl: bool = False
 
     def validate(self) -> None:
+        if self.pdl and (self.cluster_m != 1 or self.split_k != 1):
+            raise ValueError("PDL currently supports cluster_m=1, split_k=1")
         if (
             self.tile_m != 128
             or self.tile_n not in (64, 128, 256)
@@ -72,6 +75,7 @@ def _cflags(c: Fp8GemmConfig, _variant) -> tuple[str, ...]:
             ("SPLIT_K", c.split_k),
             ("EPILOGUE_BLOCK_N", c.epilogue_block_n),
             ("USE_TMA_PREFETCH", int(c.use_prefetch)),
+            ("PDL", int(c.pdl)),
         )
     )
 
@@ -100,7 +104,7 @@ _JIT = SplitCudaJit(
     root=_ROOT,
     binding_sources=(_SRC / "fp8_gemm_split_torch_binding.cpp",),
     kernel_sources=(_SRC / "fp8_gemm_kernel.cu",),
-    kernel_dependencies=(_INC / "fp8_gemm.h", _INC / "common.h"),
+    kernel_dependencies=(_INC / "fp8_gemm.h", _INC / "common.h", _INC / "pdl.h"),
     kernel_symbol="sm110a_fp8_gemm_launch",
     config_key=lambda c: c,
     kernel_cflags=_cflags,

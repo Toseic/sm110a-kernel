@@ -17,6 +17,11 @@ CUDA_ARCH=sm_90a COMPUTE_CUDA_ARCH=compute_90a \
 python3 -c "import sm110a_kernel"
 ```
 
+## Unit tests
+
+Do not add new unit tests (UT), including pytest/unittest test files or test
+cases, unless the user explicitly requests them.
+
 ## Benchmarks
 
 Pass benchmark arguments directly to the benchmark script:

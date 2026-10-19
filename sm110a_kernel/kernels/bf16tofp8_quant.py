@@ -12,15 +12,18 @@ _INCLUDE_DIR = _ROOT / "include"
 
 
 class Bf16ToFp8QuantModule:
-    def __init__(self, binding, library, _config):
+    def __init__(self, binding, library, config):
+        self.blocked, self.pdl = config
         self._binding = binding
         self._launcher = library.entry_address
 
     def quantize(self, input):
-        return self._binding.bf16tofp8_quant(input, self._launcher)
+        return self._binding.bf16tofp8_quant(input, self._launcher, self.blocked)
 
     def quantize_out(self, input, output, scales):
-        return self._binding.bf16tofp8_quant_out(input, output, scales, self._launcher)
+        return self._binding.bf16tofp8_quant_out(
+            input, output, scales, self._launcher, self.blocked
+        )
 
 
 _JIT = SplitCudaJit(
@@ -28,18 +31,27 @@ _JIT = SplitCudaJit(
     root=_ROOT,
     binding_sources=(_SOURCE_DIR / "bf16tofp8_quant_torch_binding.cpp",),
     kernel_sources=(_SOURCE_DIR / "bf16tofp8_quant_kernel.cu",),
-    kernel_dependencies=(_INCLUDE_DIR / "bf16tofp8_quant.h", _INCLUDE_DIR / "common.h"),
+    kernel_dependencies=(
+        _INCLUDE_DIR / "bf16tofp8_quant.h",
+        _INCLUDE_DIR / "common.h",
+        _INCLUDE_DIR / "blocked_quant.h",
+    ),
     kernel_symbol="sm110a_bf16tofp8_quant_launch",
-    config_key=lambda _config: 128,
-    kernel_cflags=lambda _config, _variant: (),
+    config_key=lambda config: config,
+    kernel_cflags=lambda c, _variant: (
+        f"-DSM110A_QUANT_BLOCKED={int(c[0])}",
+        f"-DSM110A_QUANT_PDL={int(c[1])}",
+    ),
     kernel_ldflags=("-lcuda",),
     make_facade=Bf16ToFp8QuantModule,
     include_paths=(_INCLUDE_DIR,),
 )
 
 
-def compile_bf16tofp8_quant() -> Bf16ToFp8QuantModule:
-    return _JIT.compile(128)
+def compile_bf16tofp8_quant(*, blocked=False, pdl=False) -> Bf16ToFp8QuantModule:
+    if not isinstance(blocked, bool) or not isinstance(pdl, bool):
+        raise ValueError("blocked and pdl must be bool")
+    return _JIT.compile((blocked, pdl))
 
 
 def bf16tofp8_quant(input):

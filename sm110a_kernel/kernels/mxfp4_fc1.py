@@ -51,10 +51,15 @@ class Mxfp4Fc1Config:
     # FC2 requires prepare_pdl_out before the producer launch.
     pdl: bool = False
     pdl_trigger: str = "entry"
+    # Incoming quantizer dependency. Task metadata must be prepared first;
+    # resetting the scheduler is the caller's responsibility on every replay.
+    pdl_input: bool = False
 
     def validate(self) -> None:
         if self.pdl_trigger not in PDL_TRIGGER_POINTS:
             raise ValueError(f"pdl_trigger must be one of {tuple(PDL_TRIGGER_POINTS)}")
+        if not isinstance(self.pdl_input, bool):
+            raise ValueError("pdl_input must be bool")
         if not isinstance(self.pdl, bool):
             raise ValueError("pdl must be bool")
         if self.tile_m != 128 or self.tile_n != 256:
@@ -163,6 +168,16 @@ class Mxfp4Fc1Module:
         )
         return Mxfp4Fc1Metadata(routing, source_rows, tasks, state)
 
+    def prepare_pdl_input(self, metadata):
+        """Reset the scheduler before a quantizer -> FC1 PDL chain.
+
+        Call once per invocation (inside graph capture). Fresh prepare_metadata
+        already performs this reset, so no extra call is needed in that case.
+        """
+        if not self.config.pdl_input:
+            raise ValueError("prepare_pdl_input requires pdl_input=True")
+        metadata.state.narrow(0, 1, 1).zero_()
+
     def _max_active_clusters(self, device, value):
         if value is None:
             import torch
@@ -249,6 +264,7 @@ def _flags(config: Mxfp4Fc1Config, variant):
         f"-DSM110A_MXFP4_FC1_{key}={value}"
         for key, value in (
             ("PDL", int(config.pdl)),
+            ("PDL_INPUT", int(config.pdl_input)),
             ("PDL_TRIGGER", PDL_TRIGGER_POINTS[config.pdl_trigger]),
             ("TILE_M", config.tile_m),
             ("TILE_N", config.tile_n),

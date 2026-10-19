@@ -14,6 +14,13 @@ namespace {
 constexpr int Stages = SM110A_TOPK_STAGES;
 constexpr bool UseTma = SM110A_TOPK_TMA;
 static_assert(Stages >= 2 && Stages <= 8, "TopK supports 2 through 8 stages");
+// TODO(sm110a): support short candidate lists (KVlen < 512). Both the Python
+// facade and C++ binding currently require k == 512 and KVlen >= 512, matching
+// this compile-time constant. The DSV4 ratio-4 CSA indexer therefore rejects
+// contexts shorter than 2048 tokens, even though Qlen == 1 decode is supported.
+// When selecting min(512, KVlen), KVlen <= 512 needs no selection: return all
+// candidate indices. Add that fast path and update the API checks/output shape;
+// keep prefill causal masking and cache-index offsets in the model adapter.
 constexpr int TopK = 512;
 constexpr int Threads = 256;
 constexpr int Block = 1024;

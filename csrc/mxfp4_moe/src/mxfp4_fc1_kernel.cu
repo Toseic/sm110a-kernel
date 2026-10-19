@@ -1,4 +1,7 @@
 #include "pdl.h"
+#ifndef SM110A_MXFP4_FC1_PDL_INPUT
+#define SM110A_MXFP4_FC1_PDL_INPUT 0
+#endif
 #ifndef SM110A_MXFP4_FC1_PDL
 #define SM110A_MXFP4_FC1_PDL 0
 #endif
@@ -978,6 +981,7 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void m
         if (tid == 0) cudaTriggerProgrammaticLaunchCompletion();
     }
 
+    if constexpr (SM110A_MXFP4_FC1_PDL_INPUT) cudaGridDependencySynchronize();
     const int tmem_addr = tmem_base[0];
     // kind::mxf8f6f4 instruction descriptor: atype = E4M3 (field 0) and
     // btype = E2M1 (field 5), input-D enabled. Identical encoding to
@@ -1841,7 +1845,8 @@ void launch_mxfp4_fc1_impl(
     auto *tasks = reinterpret_cast<const ExpertTileTask *>(d_tasks);
     auto *task_count = d_state;
     auto *next_cluster_tile = d_state + 1;
-    cudaMemsetAsync(next_cluster_tile, 0, sizeof(int32_t), stream);
+    if constexpr (!SM110A_MXFP4_FC1_PDL_INPUT)
+        cudaMemsetAsync(next_cluster_tile, 0, sizeof(int32_t), stream);
 
     const int persistent_clusters =
         (max_tasks + kPersistentTileCount - 1) / kPersistentTileCount;
@@ -1876,8 +1881,8 @@ void launch_mxfp4_fc1_impl(
     const int cluster_limit = max_active_clusters > 0 ? max_active_clusters : resident_clusters;
     const int launched_clusters = cluster_limit < persistent_clusters
         ? cluster_limit : persistent_clusters;
-    kernel<<<dim3(kClusterM * launched_clusters, kClusterN, 1), kBlockThreads,
-        kDynamicSmemBytes, stream>>>(
+    launch_config.gridDim = dim3(kClusterM * launched_clusters, kClusterN, 1);
+    sm110a::launch_pdl<SM110A_MXFP4_FC1_PDL_INPUT>(&launch_config, kernel,
         d_a, a_tensor_map, b_tensor_map, d_sfa, sfa_tensor_map, sfb_tensor_map, c_tensor_map, d_source_rows, tasks, task_count,
         next_cluster_tile, d_c, d_sfc, n, k, swiglu_limit,
         grouped_assignments, routing_weights);

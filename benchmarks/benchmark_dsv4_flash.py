@@ -91,6 +91,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--iters", type=int, default=5, help="Measured iterations (default: 5)"
     )
+    parser.add_argument(
+        "--pdl",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="enable quant->GEMM and quant->FC1->FC2 PDL in graphed decode (default: off)",
+    )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--memory-limit-gib", type=float, default=32.0)
     parser.add_argument(
@@ -491,6 +497,7 @@ def _load_model(config, checkpoint, args):
             Sm110aModelArgs(**config),
             routing_weight_position=args.routing_weight_position,
             deterministic_fc2=args.fc2_reduction == "deterministic",
+            pdl=args.pdl,
         ).eval()
     if checkpoint is None:
         initialize_random_weights(model, config["n_routed_experts"])
@@ -517,7 +524,7 @@ def _measure_sm110a(config, checkpoint, args, prompt, tokens, decode_start_pos):
     print(f"[sm110a] capturing fixed decode CUDA Graph ({args.decode_len} steps)")
     print(
         f"[moe] routing-weight-position={args.routing_weight_position}; "
-        f"FC2 reduction={args.fc2_reduction}"
+        f"FC2 reduction={args.fc2_reduction}; decode PDL={args.pdl}"
     )
     decode_graph = DecodeCudaGraph(model, graph_seed, decode_start_pos, args.decode_len)
 
@@ -548,6 +555,7 @@ def _measure_sm110a(config, checkpoint, args, prompt, tokens, decode_start_pos):
         "peak_bytes": torch.cuda.max_memory_allocated(),
         "kernel_stats": backend_stats(),
         "cuda_graph": True,
+        "pdl": args.pdl,
     }
     del decode_graph
     del model

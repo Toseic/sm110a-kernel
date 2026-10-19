@@ -249,3 +249,40 @@ is excluded from performance conclusions. NVFP4 cluster_m=1 also passed the
 three-replay accuracy check with `--no-cuda-graph` and before-A waiting.
 The main MXFP4 benchmark validates the cluster_m=2 atomic-reduction path.
 Python compilation and `git diff --check` passed.
+
+## DeepSeek-V4-Flash decode chains
+
+`models/deepseek_v4_flash_sm110a` supports opt-in PDL for fixed CUDA Graph
+single-token decode with `Transformer(args, pdl=True)`. The model benchmark
+accepts `--pdl` / `--no-pdl` (default off). Both modes use quantizers that
+write padded, blocked activation scales directly, so the switch compares
+PDL on the same decode computation/layout rather than introducing scale
+conversion kernels in the serial control. Prefill retains its serial path.
+
+The enabled edges are:
+
+- `fp8_act_quant -> fp8_gemm`: `compile_fp8_act_quant(blocked=True, pdl=True)`
+  signals every CTA at entry; `Fp8GemmConfig(pdl=True, cluster_m=1, split_k=1)`
+  enables dependent launch and waits after shared memory/TMEM initialization,
+  before activation accesses (including optional data prefetches).
+- `bf16tofp8_quant -> mxfp4_fc1`:
+  `compile_bf16tofp8_quant(blocked=True, pdl=True)` signals at entry;
+  `Mxfp4Fc1Config(pdl_input=True)` enables dependent launch, skips the normal
+  scheduler memset, and waits after initialization before consuming A/SFA.
+- `mxfp4_fc1 -> mxfp4_fc2`: the existing `pdl=True` switches apply, with
+  FC2's `pdl_wait="before_a"`. Deterministic finalize remains a normal
+  completion dependency after FC2.
+
+Blocked quantization requires 128-aligned rows and K; the generalized
+quantizer additionally requires block size 128 and UE8M0 scales. It returns
+one-dimensional scale storage of `rows * K / 8` bytes, including replicated
+K=32 scales and zero padding. The `_out` APIs accept this storage as well.
+
+For repeated calls with reused FC1 metadata, call
+`fc1.prepare_pdl_input(metadata1)` once per invocation **before the quantizer**,
+inside graph capture. Preparing fresh FC1 metadata already resets the same
+scheduler, so the model needs no additional reset. Prepare FC2 metadata,
+output and routing-weight conversions before the quantizer as well, and
+call `fc2.prepare_pdl_out(output, metadata2)` there. Keep all three kernels
+adjacent on the same stream. Enabling FC1's incoming `pdl_input` is separate
+from its outgoing `pdl` trigger so either edge can be used independently.

@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 
 #include "fp8_act_quant.h"
+#include "blocked_quant.h"
 
 namespace {
 
@@ -95,6 +96,10 @@ void fp8_act_quant_kernel(const __grid_constant__ CUtensorMap input_map,
                           uint8_t* __restrict__ ue8m0_scales,
                           float* __restrict__ fp32_scales,
                           int tokens, int d, int tiles, int stages) {
+    if constexpr (SM110A_QUANT_PDL) {
+        if (threadIdx.x == 0) cudaTriggerProgrammaticLaunchCompletion();
+    }
+
     constexpr int kLanesPerRow = lanes_per_row(kBlockSize);
     constexpr int kValuesPerLane = kBlockSize / kLanesPerRow;
     constexpr int kRows = rows_per_tile(kBlockSize);
@@ -243,8 +248,10 @@ void fp8_act_quant_kernel(const __grid_constant__ CUtensorMap input_map,
                                 ((bits & 0x007FFFFFu) != 0u ? 1 : 0);
                             const uint8_t byte = static_cast<uint8_t>(
                                 min(254, max(0, exponent)));
-                            ue8m0_scales[static_cast<size_t>(row) * k_blocks + k_tile] =
-                                byte;
+                            if constexpr (SM110A_QUANT_BLOCKED)
+                                store_blocked_quant_scale(ue8m0_scales, row, k_tile, k_blocks, byte);
+                            else
+                                ue8m0_scales[static_cast<size_t>(row) * k_blocks + k_tile] = byte;
                             scale = ldexpf(1.0f, 127 - static_cast<int>(byte));
                         } else {
                             const float clamped = fmaxf(amax, kAmaxFloor);
@@ -305,7 +312,9 @@ void fp8_act_quant_kernel(const __grid_constant__ CUtensorMap input_map,
 }  // namespace
 
 template <int kBlockSize, int kScaleMode>
-void launch_fp8_act_quant_impl(const __nv_bfloat16* input, uint8_t* output,
+// Keep the function-local configuration state private to each JIT library.
+// External inline/template statics can be coalesced across blocked/PDL variants.
+static void launch_fp8_act_quant_impl(const __nv_bfloat16* input, uint8_t* output,
                                uint8_t* ue8m0_scales, float* fp32_scales,
                                int tokens, int d, cudaStream_t stream) {
     constexpr int kRows = rows_per_tile(kBlockSize);

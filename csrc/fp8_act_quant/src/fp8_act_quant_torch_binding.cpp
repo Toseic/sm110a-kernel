@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <vector>
 #include <tuple>
 
 #include <c10/cuda/CUDAException.h>
@@ -37,7 +38,7 @@ void check_input(const torch::Tensor& input, int64_t block_size) {
 
 void check_output(const torch::Tensor& output, const torch::Tensor& scales,
                   const torch::Tensor& input, int64_t block_size,
-                  int64_t scale_mode) {
+                  int64_t scale_mode, bool blocked) {
   TORCH_CHECK(output.is_cuda() && output.is_contiguous() &&
                   output.scalar_type() == at::kFloat8_e4m3fn,
               "output must be a contiguous CUDA torch.float8_e4m3fn tensor");
@@ -51,19 +52,21 @@ void check_output(const torch::Tensor& output, const torch::Tensor& scales,
               (scale_mode == kScaleModeUe8m0 ? "torch.float8_e8m0fnu"
                                              : "torch.float32"),
               " tensor");
-  TORCH_CHECK(scales.device() == input.device() && scales.dim() == 2 &&
-                  scales.size(0) == input.size(0) &&
-                  scales.size(1) == input.size(1) / block_size,
+  TORCH_CHECK(scales.device() == input.device() &&
+                  (blocked ? (block_size == 128 && scale_mode == 0 && input.size(0) % 128 == 0 &&
+                              scales.dim() == 1 && scales.numel() == input.numel() / 8)
+                           : (scales.dim() == 2 && scales.size(0) == input.size(0) &&
+                              scales.size(1) == input.size(1) / block_size)),
               "scales must have shape [tokens, D/", block_size, "]");
 }
 
 std::tuple<torch::Tensor, torch::Tensor> fp8_act_quant_out(
     torch::Tensor input, torch::Tensor output, torch::Tensor scales,
-    int64_t block_size, int64_t scale_mode, uint64_t launcher_address) {
+    int64_t block_size, int64_t scale_mode, uint64_t launcher_address, bool blocked) {
   TORCH_CHECK(valid_scale_mode(scale_mode), "scale_mode must be 0 (ue8m0) or 1 (fp32)");
   TORCH_CHECK(launcher_address != 0, "FP8 activation quant launcher is null");
   check_input(input, block_size);
-  check_output(output, scales, input, block_size, scale_mode);
+  check_output(output, scales, input, block_size, scale_mode, blocked);
   c10::cuda::CUDAGuard guard(input.device());
   const auto launcher = reinterpret_cast<QuantLauncher>(
       static_cast<uintptr_t>(launcher_address));
@@ -86,16 +89,16 @@ std::tuple<torch::Tensor, torch::Tensor> fp8_act_quant_out(
 
 std::tuple<torch::Tensor, torch::Tensor> fp8_act_quant(
     torch::Tensor input, int64_t block_size, int64_t scale_mode,
-    uint64_t launcher_address) {
+    uint64_t launcher_address, bool blocked) {
   check_input(input, block_size);
   auto output = torch::empty(input.sizes(), input.options().dtype(torch::kFloat8_e4m3fn));
   auto scales = torch::empty(
-      {input.size(0), input.size(1) / block_size},
+      blocked ? std::vector<int64_t>{input.numel() / 8} : std::vector<int64_t>{input.size(0), input.size(1) / block_size},
       input.options().dtype(scale_mode == kScaleModeUe8m0
                                 ? torch::kFloat8_e8m0fnu
                                 : torch::kFloat32));
   return fp8_act_quant_out(input, output, scales, block_size, scale_mode,
-                           launcher_address);
+                           launcher_address, blocked);
 }
 
 }  // namespace

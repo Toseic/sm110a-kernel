@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 
 #include "bf16tofp8_quant.h"
+#include "blocked_quant.h"
 
 namespace {
 
@@ -72,6 +73,10 @@ void bf16tofp8_quant_kernel(const __grid_constant__ CUtensorMap input_map,
                             const __grid_constant__ CUtensorMap output_map,
                             uint8_t* __restrict__ scales,
                             int tokens, int d, int tiles, int stages) {
+    if constexpr (SM110A_QUANT_PDL) {
+        if (threadIdx.x == 0) cudaTriggerProgrammaticLaunchCompletion();
+    }
+
     // Stage barriers: input ready/free, output ready/free. Loader and storer
     // each own a TMA warp; four other warps convert 32 rows per tile.
     extern __shared__ __align__(128) uint8_t shared[];
@@ -201,7 +206,10 @@ void bf16tofp8_quant_kernel(const __grid_constant__ CUtensorMap input_map,
                         fabsf(__bfloat162float(amax2.y)));
                     const __nv_fp8_e8m0 e8m0(amax / kE4M3Max);
                     if (row < tokens && k_tile < k_blocks) {
-                        scales[static_cast<size_t>(row) * k_blocks + k_tile] = e8m0.__x;
+                        if constexpr (SM110A_QUANT_BLOCKED)
+                            store_blocked_quant_scale(scales, row, k_tile, k_blocks, e8m0.__x);
+                        else
+                            scales[static_cast<size_t>(row) * k_blocks + k_tile] = e8m0.__x;
                     }
                     scale = ldexpf(1.0f, 127 - static_cast<int>(e8m0.__x));
                 }

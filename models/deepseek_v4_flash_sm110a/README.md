@@ -32,3 +32,20 @@ graph replay. Run the SM110A model with:
 ```bash
 /home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_dsv4_flash.py
 ```
+
+Decode PDL is opt-in with `Transformer(args, pdl=True)` or the benchmark's
+`--pdl` flag (`--no-pdl`, the default, is the serial control):
+
+```bash
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_dsv4_flash.py --decode-only --seq-len 2184 --decode-len 16 --warmup 1 --iters 3 --no-pdl
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_dsv4_flash.py --decode-only --seq-len 2184 --decode-len 16 --warmup 1 --iters 3 --pdl
+```
+
+The single-token decode path directly writes blocked activation scales in
+both modes. PDL enables `fp8_act_quant -> fp8_gemm` and
+`bf16tofp8_quant -> mxfp4_fc1 -> mxfp4_fc2`. Routing metadata, weight
+conversions and output/scheduler preparation precede the chain on every
+CUDA Graph replay. Prefill uses the existing serial backend. Eager decode
+also executes the selected kernels to warm up and validate graph capture;
+performance comparisons target fixed decode CUDA Graphs. The deterministic
+FC2 finalize kernel remains serial after FC2.
