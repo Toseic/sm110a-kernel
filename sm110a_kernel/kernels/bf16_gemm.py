@@ -21,8 +21,11 @@ class Bf16GemmConfig:
     cluster_m: int = 2
     epilogue_block_n: int = 32
     split_k: int = 1
+    output_fp32: bool = False
 
     def validate(self) -> None:
+        if not isinstance(self.output_fp32, bool):
+            raise TypeError("output_fp32 must be a bool")
         if self.tile_m not in (64, 128):
             raise ValueError("tile_m must be 64 or 128")
         if self.cluster_m not in (1, 2):
@@ -43,7 +46,9 @@ class Bf16GemmConfig:
             raise ValueError("tile_n must be divisible by cluster_m")
         if self.tile_k <= 0 or self.tile_k % 64:
             raise ValueError("tile_k must be a positive multiple of 64")
-        epilogue_smem = 2 * self.tile_m * self.epilogue_block_n * 2
+        epilogue_smem = (
+            2 * self.tile_m * self.epilogue_block_n * (4 if self.output_fp32 else 2)
+        )
         mainloop_stage_smem = (
             (self.tile_m + self.tile_n // self.cluster_m) * self.tile_k * 2
         )
@@ -92,22 +97,40 @@ class Bf16GemmModule:
 
     def bf16_gemm(self, a, b, swap_ab=False, max_active_clusters=None):
         return self._binding.bf16_gemm(
-            a, b, *self._args(a.device, max_active_clusters), swap_ab
+            a,
+            b,
+            *self._args(a.device, max_active_clusters),
+            swap_ab,
+            self._config.output_fp32,
         )
 
     def bf16_gemm_out(self, a, b, out, swap_ab=False, max_active_clusters=None):
         return self._binding.bf16_gemm_out(
-            a, b, out, *self._args(a.device, max_active_clusters), swap_ab
+            a,
+            b,
+            out,
+            *self._args(a.device, max_active_clusters),
+            swap_ab,
+            self._config.output_fp32,
         )
 
     def bf16_gemm_nt(self, a, b_nt, swap_ab=False, max_active_clusters=None):
         return self._binding.bf16_gemm_nt(
-            a, b_nt, *self._args(a.device, max_active_clusters), swap_ab
+            a,
+            b_nt,
+            *self._args(a.device, max_active_clusters),
+            swap_ab,
+            self._config.output_fp32,
         )
 
     def bf16_gemm_nt_out(self, a, b_nt, out, swap_ab=False, max_active_clusters=None):
         return self._binding.bf16_gemm_nt_out(
-            a, b_nt, out, *self._args(a.device, max_active_clusters), swap_ab
+            a,
+            b_nt,
+            out,
+            *self._args(a.device, max_active_clusters),
+            swap_ab,
+            self._config.output_fp32,
         )
 
 
@@ -120,6 +143,7 @@ def _kernel_cflags(config, _variant):
             ("TILE_K", config.tile_k),
             ("CLUSTER_M", config.cluster_m),
             ("SPLIT_K", config.split_k),
+            ("OUTPUT_FP32", int(config.output_fp32)),
             ("EPILOGUE_BLOCK_N", config.epilogue_block_n),
         )
     )

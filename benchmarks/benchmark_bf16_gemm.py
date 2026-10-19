@@ -25,7 +25,6 @@ from common import (
 )
 from sm110a_kernel import (
     Bf16GemmConfig,
-    CuteDslBf16GemmRunner,
     bf16_gemm_nt_out,
     compile_bf16_gemm,
     cublaslt_gemm_out,
@@ -53,7 +52,7 @@ ACCURACY_SHAPE = (512, 512, 512)
 CUBLASLT_WORKSPACE_BYTES = 32 * 1024 * 1024
 
 
-def _bf16_gemm_configs():
+def _bf16_gemm_configs(output_fp32=False):
     for tile_m in (64, 128):
         for tile_n in (128, 256):
             for tile_k in (64, 128):
@@ -69,6 +68,7 @@ def _bf16_gemm_configs():
                                 cluster_m=cluster_m,
                                 epilogue_block_n=epilogue_block_n,
                                 split_k=split_k,
+                                output_fp32=output_fp32,
                             )
                             try:
                                 config.validate()
@@ -80,10 +80,10 @@ def _bf16_gemm_configs():
 BF16_GEMM_CONFIGS = tuple(_bf16_gemm_configs())
 
 
-def compatible_candidates(m, n, k):
+def compatible_candidates(m, n, k, output_fp32=False):
     return tuple(
         (config, swap_ab)
-        for config in BF16_GEMM_CONFIGS
+        for config in (_bf16_gemm_configs(True) if output_fp32 else BF16_GEMM_CONFIGS)
         for swap_ab in ((False, True) if config.split_k == 1 else (False,))
         if k % (config.tile_k * config.split_k) == 0
         and (
@@ -112,6 +112,7 @@ def format_candidate(candidate):
         f"/e{config.epilogue_block_n}"
         f"/sk{config.split_k}"
         f"/{'swap' if swap_ab else 'noswap'}"
+        f"/{'fp32' if config.output_fp32 else 'bf16'}"
     )
 
 
@@ -123,7 +124,7 @@ def gemm_sol_bounds(m, n, k, config, swap_ab=False):
     tile_count = math.ceil(m / cluster_tile_m) * math.ceil(n / config.tile_n)
     flops = 2 * m * n * k
     a_and_b_bytes = 2 * (m * k + n * k)
-    compulsory_bytes = a_and_b_bytes + 2 * m * n
+    compulsory_bytes = a_and_b_bytes + (4 if config.output_fp32 else 2) * m * n
     tile_read_bytes = 2 * tile_count * (cluster_tile_m + config.tile_n) * k
     return sol_bounds(flops, compulsory_bytes, a_and_b_bytes, tile_read_bytes)
 
@@ -192,6 +193,11 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
 
     def add_arguments(self, parser):
         parser.add_argument(
+            "--output-fp32",
+            action="store_true",
+            help="store FP32 accumulators directly (currently requires --baseline torch)",
+        )
+        parser.add_argument(
             "--max-active-clusters",
             type=int,
             default=0,
@@ -227,6 +233,8 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
         return super().validate_args(args)
 
     def validate_extra_args(self, args):
+        if args.output_fp32 and args.baseline != "torch":
+            raise SystemExit("--output-fp32 currently requires --baseline torch")
         if args.max_active_clusters < 0:
             raise SystemExit("--max-active-clusters must be non-negative")
         return args
@@ -255,6 +263,9 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
             run_accuracy_check(args)
 
     def emit_runtime_banner(self, args, actual_blas):
+        print(
+            f"[output] {'FP32' if args.output_fp32 else 'BF16'} (independent autotune cache)"
+        )
         if args.baseline == "cutedsl":
             print("[baseline] CuTE DSL persistent BF16 GEMM (autotuned)")
             return "CuTE DSL"
@@ -297,14 +308,20 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
         # measurements; the benchmark operation remains a(M,K) @ b(K,N).
         b_kernel = b.transpose(0, 1).contiguous()
 
-        out_kernel = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
-        out_baseline = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+        output_dtype = torch.float32 if args.output_fp32 else torch.bfloat16
+        out_kernel = torch.empty((m, n), device="cuda", dtype=output_dtype)
+        out_baseline = torch.empty((m, n), device="cuda", dtype=output_dtype)
         workspace = None
         cute_dsl_runner = None
 
         if args.baseline == "torch":
             baseline_name = "Torch"
-            baseline_fn = lambda: torch.mm(a, b, out=out_baseline)
+            if args.output_fp32:
+                baseline_fn = lambda: torch.mm(
+                    a, b, out_dtype=torch.float32, out=out_baseline
+                )
+            else:
+                baseline_fn = lambda: torch.mm(a, b, out=out_baseline)
             baseline_stats = benchmark_with_stats(
                 baseline_fn,
                 args.warmup,
@@ -328,6 +345,8 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
                 cold_l2_flush=getattr(args, "_cold_l2_flush", None),
             )
         elif args.baseline == "cutedsl":
+            from sm110a_kernel import CuteDslBf16GemmRunner
+
             cute_dsl_runner = CuteDslBf16GemmRunner(a, b, out_baseline)
             cute_dsl_runner.autotune(
                 self.make_tune_options(
@@ -379,6 +398,10 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
             max_abs_diff = (
                 (out_kernel.float() - out_baseline.float()).abs().max().item()
             )
+            if args.output_fp32:
+                torch.testing.assert_close(
+                    out_kernel, out_baseline, rtol=1e-4, atol=1e-3
+                )
 
         return (
             kernel_stats,
@@ -389,7 +412,7 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
         )
 
     def resolve_kernel(self, a, b_kernel, out, m, n, k, args):
-        candidates = compatible_candidates(m, n, k)
+        candidates = compatible_candidates(m, n, k, output_fp32=args.output_fp32)
         if not candidates:
             raise RuntimeError(f"no JIT config supports M={m}, N={n}, K={k}")
 
@@ -414,10 +437,9 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
         )
         return AutotuneRunner(options).resolve(
             candidates,
-            # B is now prepacked as (N, K), so prior selections measured the
-            # incorrect B interpretation and must not be reused.
-            namespace="bf16_gemm_nt_v5",
-            key=(m, n, k, args.max_active_clusters),
+            # Output dtype changes epilogue resources and must tune independently.
+            namespace="bf16_gemm_nt_v6",
+            key=(m, n, k, args.max_active_clusters, str(out.dtype)),
             prepare=prepare,
             benchmark=lambda prepared: benchmark_with_stats(
                 prepared.run,

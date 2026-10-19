@@ -181,3 +181,36 @@ the autotuner considers both tile sizes where the workload is compatible.
 - `../../sm110a_kernel/jit.py`: configuration-specialized grouped M JIT loader
 - `include/common.h`: shared CUDA/cuBLAS helpers
 - `include/bf16_gemm.h`: reusable BF16 GEMM declarations
+
+## FP32 output
+
+Set `Bf16GemmConfig(output_fp32=True)` to store the FP32 accumulator directly,
+without rounding through BF16. Inputs remain BF16; the default output is BF16.
+This option specializes the epilogue and is included in the JIT cache key.
+It supports both B layouts, `swap_ab`, and split-K (whose existing restriction
+against `swap_ab` still applies). Preallocated outputs must match the option.
+FP32 doubles the epilogue buffers, so some large epilogues need a smaller
+`tile_k` or `tile_m` to retain the required two mainloop stages; validation
+rejects configurations that exceed shared memory.
+
+```python
+import torch
+from sm110a_kernel import Bf16GemmConfig, bf16_gemm_nt_out
+
+config = Bf16GemmConfig(cluster_m=1, output_fp32=True)
+out = torch.empty((a.size(0), b_nt.size(0)), device=a.device, dtype=torch.float32)
+bf16_gemm_nt_out(a, b_nt, out, config=config)
+```
+
+FP32 output preserves accumulator precision; it does not change the BF16 MMA
+arithmetic or guarantee bitwise equality with an FP32-input cuBLAS operation.
+
+Benchmark and autotune FP32 output with the PyTorch BF16-to-FP32 baseline:
+
+```bash
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_bf16_gemm.py --output-fp32 --baseline torch --m 1 --n 4096 --k 4096
+```
+
+Autotune keys include output dtype, so BF16 and FP32 selections are independent.
+FP32 candidates are validated with their larger epilogue buffers before tuning.
+The benchmark reports the output dtype and uses it in the SOL memory estimate.

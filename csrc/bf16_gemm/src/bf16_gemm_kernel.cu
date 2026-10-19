@@ -10,7 +10,7 @@
 //
 // Problem
 // -------
-//   C[M,N] = A[M,K] @ B[K,N]   with A, B, C stored as nv_bfloat16.
+//   C[M,N] = A[M,K] @ B[K,N], BF16 inputs and BF16 or FP32 output.
 //   M, N, K must be multiples of (kTileM, kTileN, kTileK) respectively.
 //   A "SWAP_AB" template variant reuses the kernel for the transposed
 //   product B[N,K] @ A[K,M] by treating (B,A) as the operands on the host
@@ -218,6 +218,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <type_traits>
 #include <cudaTypedefs.h> // required for CUtensorMap
 
 #include <cuda_bf16.h>
@@ -247,6 +248,35 @@
 #endif
 
 namespace {
+
+#ifndef SM110A_BF16_OUTPUT_FP32
+#define SM110A_BF16_OUTPUT_FP32 0
+#endif
+using OutputType = std::conditional_t<SM110A_BF16_OUTPUT_FP32, float, nv_bfloat16>;
+constexpr int kOutputSwizzleElements = 64 / sizeof(OutputType);
+constexpr auto kOutputDataType = SM110A_BF16_OUTPUT_FP32
+    ? CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT32
+    : CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
+
+// The 64-byte TMA swizzle permutes 16-byte chunks identically for both dtypes.
+__device__ inline void store_output_vector(OutputType* dst, int vector, const float* values) {
+#if SM110A_BF16_OUTPUT_FP32
+    #pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int chunk = vector * 2 + j;
+        const int swizzled = (chunk & ~7) + ((chunk & 7) ^ ((chunk >> 3) & 3));
+        reinterpret_cast<float4*>(dst)[swizzled] =
+            make_float4(values[j * 4], values[j * 4 + 1], values[j * 4 + 2], values[j * 4 + 3]);
+    }
+#else
+    nv_bfloat162 out[4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+        out[i] = __float22bfloat162_rn({values[i * 2], values[i * 2 + 1]});
+    const int swizzled = (vector & ~7) + ((vector & 7) ^ ((vector >> 3) & 3));
+    reinterpret_cast<int4*>(dst)[swizzled] = reinterpret_cast<int4*>(out)[0];
+#endif
+}
 
 constexpr int kMmaK = 16;
 constexpr int kWarpSize = 32;
@@ -279,7 +309,7 @@ struct KernelConfig {
         (kTileN / kClusterM) * kTileK * static_cast<int>(sizeof(nv_bfloat16));
     static constexpr int kPerStageSmemBytes = kASmemBytes + kBSmemBytes;
     static constexpr int kEpilogueStageBytes =
-        kTileM * kEpilogueBlockN * static_cast<int>(sizeof(nv_bfloat16));
+        kTileM * kEpilogueBlockN * static_cast<int>(sizeof(OutputType));
     static constexpr int kEpilogueSmemBytes = kEpilogueStageCount * kEpilogueStageBytes;
     static constexpr int kReductionSmemBytes = kSplitK == 1 ? 0 : kTileM * kEpilogueBlockN * sizeof(float);
     static constexpr int kMaxSmemBytes = 227 * 1024;
@@ -505,24 +535,24 @@ inline void init_3D_tmap(
 
 inline void init_3D_output_tmap(
     CUtensorMap *tmap,
-    nv_bfloat16 *ptr,
+    OutputType *ptr,
     uint64_t global_height,
     uint64_t global_width,
     uint32_t shared_height,
     uint32_t shared_width) {
 
     constexpr uint32_t rank = 3;
-    constexpr uint32_t kSwizzleElements = 32;
+    constexpr uint32_t kSwizzleElements = kOutputSwizzleElements;
     assert(global_width % kSwizzleElements == 0);
     assert(shared_width % kSwizzleElements == 0);
     uint64_t global_dim[rank] = {kSwizzleElements, global_width / kSwizzleElements, global_height};
-    uint64_t global_strides[rank - 1] = {kSwizzleElements * sizeof(nv_bfloat16),
-        global_width * sizeof(nv_bfloat16)};
+    uint64_t global_strides[rank - 1] = {kSwizzleElements * sizeof(OutputType),
+        global_width * sizeof(OutputType)};
     uint32_t box_dim[rank] = {kSwizzleElements, shared_width / kSwizzleElements, shared_height};
     uint32_t element_strides[rank] = {1, 1, 1};
 
     cuTensorMapEncodeTiled(tmap,
-        CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        kOutputDataType,
         rank,
         ptr,
         global_dim,
@@ -537,7 +567,7 @@ inline void init_3D_output_tmap(
 
 inline void init_2D_output_tmap(
     CUtensorMap *tmap,
-    nv_bfloat16 *ptr,
+    OutputType *ptr,
     uint64_t global_height,
     uint64_t global_width,
     uint32_t shared_height,
@@ -545,12 +575,12 @@ inline void init_2D_output_tmap(
 
     constexpr uint32_t rank = 2;
     uint64_t global_dim[rank] = {global_width, global_height};
-    uint64_t global_strides[rank - 1] = {global_width * sizeof(nv_bfloat16)};
+    uint64_t global_strides[rank - 1] = {global_width * sizeof(OutputType)};
     uint32_t box_dim[rank] = {shared_width, shared_height};
     uint32_t element_strides[rank] = {1, 1};
 
     cuTensorMapEncodeTiled(tmap,
-        CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        kOutputDataType,
         rank,
         ptr,
         global_dim,
@@ -613,7 +643,7 @@ void bf16_gemm_kernel(
     // set up smem
     extern __shared__ __align__(1024) char _smem_ptr[];
     const int smem = static_cast<int>(__cvta_generic_to_shared(_smem_ptr));
-    nv_bfloat16 *epilogue_smem = reinterpret_cast<nv_bfloat16 *>(_smem_ptr + kMainloopSmemBytes);
+    OutputType *epilogue_smem = reinterpret_cast<OutputType *>(_smem_ptr + kMainloopSmemBytes);
     float *reduction_smem = reinterpret_cast<float *>(
         _smem_ptr + kMainloopSmemBytes + Config::kEpilogueSmemBytes);
 
@@ -759,7 +789,7 @@ void bf16_gemm_kernel(
             };
 
     auto tmem_to_smem = [&](int mainloop_stage, int n_block, int smem_stage) {
-        nv_bfloat16 *smem_out = epilogue_smem + smem_stage * kTileM * kEpilogueBlockN;
+        OutputType *smem_out = epilogue_smem + smem_stage * kTileM * kEpilogueBlockN;
 
         for (int n = 0; n < kEpilogueBlockN / 8; n++) {
             float tmp[8];
@@ -786,23 +816,22 @@ void bf16_gemm_kernel(
 
             if ((tid & 31) < kRowsPerTmemEpilogueWarp) {
               if constexpr (!SWAP_AB) {
-                nv_bfloat162 out[4];
-                for (int i = 0; i < 4; i++) {
-                    out[i] = __float22bfloat162_rn({tmp[i * 2], tmp[i * 2 + 1]});
-                }
-                const int chunk = logical_row * (kEpilogueBlockN / 8) + n;
-                const int swizzled_chunk = (chunk & ~7) + ((chunk & 7) ^ ((chunk >> 3) & 3));
-                reinterpret_cast<int4 *>(smem_out + swizzled_chunk * 8)[0] =
-                    reinterpret_cast<int4 *>(out)[0];
+                const int vector = logical_row * (kEpilogueBlockN / 8) + n;
+                store_output_vector(smem_out, vector, tmp);
               } else {
                 // Form one kEpilogueBlockN x kTileM tile from the TMEM panels.
                 const int dst_row = n * 8;
                 const int dst_col = logical_row;
                 for (int i = 0; i < 8; ++i) {
                     const int elem = (dst_row + i) * kTileM + dst_col;
-                    const int chunk = elem / 8;
+                    constexpr int kChunkElements = 16 / sizeof(OutputType);
+                    const int chunk = elem / kChunkElements;
                     const int swizzled_chunk = (chunk & ~7) + ((chunk & 7) ^ ((chunk >> 3) & 3));
-                    smem_out[swizzled_chunk * 8 + elem % 8] = __float2bfloat16_rn(tmp[i]);
+                    #if SM110A_BF16_OUTPUT_FP32
+                    smem_out[swizzled_chunk * kChunkElements + elem % kChunkElements] = tmp[i];
+#else
+                    smem_out[swizzled_chunk * kChunkElements + elem % kChunkElements] = __float2bfloat16_rn(tmp[i]);
+#endif
                 }
               }
             }
@@ -839,12 +868,12 @@ void bf16_gemm_kernel(
             const int smem_stage = n_block % kEpilogueStageCount;
             const int stage_smem =
                 smem + kMainloopSmemBytes +
-                smem_stage * kTileM * kEpilogueBlockN * static_cast<int>(sizeof(nv_bfloat16));
+                smem_stage * kTileM * kEpilogueBlockN * static_cast<int>(sizeof(OutputType));
 
             // TMA consumes the current stage while the epilogue warps fill the
             // other stage from tensor memory.
             if (tid == 0) {
-                if constexpr (!SWAP_AB && kEpilogueBlockN == 32) {
+                if constexpr (!SWAP_AB && kEpilogueBlockN == 32 && !SM110A_BF16_OUTPUT_FP32) {
                     tma_2d_smem2gmem(cache_policy,
                         stage_smem,
                         &C_tmap,
@@ -855,14 +884,14 @@ void bf16_gemm_kernel(
                         stage_smem,
                         &C_tmap,
                         0,
-                        (off_n + n_block * kEpilogueBlockN) / 32,
+                        (off_n + n_block * kEpilogueBlockN) / kOutputSwizzleElements,
                         off_m);
                 } else {
                     tma_3d_smem2gmem(cache_policy,
                         stage_smem,
                         &C_tmap,
                         0,
-                        off_m / 32,
+                        off_m / kOutputSwizzleElements,
                         off_n + n_block * kEpilogueBlockN);
                 }
             }
@@ -1056,7 +1085,7 @@ void bf16_gemm_kernel(
             asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
             asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
-            nv_bfloat16 *out_smem =
+            OutputType *out_smem =
                 epilogue_smem + smem_stage * kTileM * kEpilogueBlockN;
             // Every thread owns one contiguous BF16x8 vector at a time.  A
             // source-rank mapping is therefore amortized over eight FP32
@@ -1088,26 +1117,18 @@ void bf16_gemm_kernel(
                         sum[i] += value[i];
                     }
                 }
-                const int swizzled_vector =
-                    (vector & ~7) + ((vector & 7) ^ ((vector >> 3) & 3));
-                nv_bfloat162 out[4];
-                #pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    out[i] = __float22bfloat162_rn({sum[2 * i], sum[2 * i + 1]});
-                }
-                reinterpret_cast<int4 *>(out_smem + swizzled_vector * kElementsPerVector)[0] =
-                    reinterpret_cast<int4 *>(out)[0];
+                store_output_vector(out_smem, vector, sum);
             }
             __syncthreads();
             if (tid == 0) {
                 const int stage_smem = static_cast<int>(__cvta_generic_to_shared(out_smem));
-                if constexpr (kEpilogueBlockN == 32) {
+                if constexpr (kEpilogueBlockN == 32 && !SM110A_BF16_OUTPUT_FP32) {
                     tma_2d_smem2gmem(cache_policy, stage_smem, &C_tmap,
                         off_n + n_block * kEpilogueBlockN,
                         off_m + split_rank * kRowsPerSplit);
                 } else {
                     tma_3d_smem2gmem(cache_policy, stage_smem, &C_tmap, 0,
-                        (off_n + n_block * kEpilogueBlockN) / 32,
+                        (off_n + n_block * kEpilogueBlockN) / kOutputSwizzleElements,
                         off_m + split_rank * kRowsPerSplit);
                 }
             }
@@ -1164,7 +1185,7 @@ template <int kTileM,
 void launch_bf16_gemm_impl(
     const __nv_bfloat16 *A_ptr,
     const __nv_bfloat16 *B_ptr,
-    __nv_bfloat16 *C_ptr,
+    OutputType *C_ptr,
     int M,
     int N,
     int K,
@@ -1213,7 +1234,7 @@ void launch_bf16_gemm_impl(
     if constexpr (SWAP_AB) {
         init_3D_output_tmap(&C_tmap, C_ptr, logic_M, logic_N,
                             kEpilogueBlockN, kTileM / kSplitK);
-    } else if constexpr (kEpilogueBlockN == 32) {
+    } else if constexpr (kEpilogueBlockN == 32 && !SM110A_BF16_OUTPUT_FP32) {
         init_2D_output_tmap(&C_tmap, C_ptr, logic_M, logic_N,
                             kTileM / kSplitK, kEpilogueBlockN);
     } else {
@@ -1250,13 +1271,14 @@ void launch_bf16_gemm_impl(
 void launch_bf16_gemm(
     const __nv_bfloat16 *A_ptr,
     const __nv_bfloat16 *B_ptr,
-    __nv_bfloat16 *C_ptr,
+    void *output_ptr,
     int M,
     int N,
     int K,
     bool swap_ab,
     cudaStream_t stream,
     int max_active_clusters) {
+    auto *C_ptr = static_cast<OutputType *>(output_ptr);
     if (max_active_clusters <= 0) {
         int device = 0;
         int sm_count = 0;
@@ -1291,7 +1313,7 @@ void launch_bf16_gemm(
 
 extern "C" void sm110a_bf16_gemm_launch(
     const __nv_bfloat16* d_a, const __nv_bfloat16* d_b,
-    __nv_bfloat16* d_c, int m, int n, int k, bool swap_ab,
+    void* d_c, int m, int n, int k, bool swap_ab,
     int max_active_clusters, cudaStream_t stream) {
   launch_bf16_gemm(d_a, d_b, d_c, m, n, k, swap_ab, stream,
                    max_active_clusters);

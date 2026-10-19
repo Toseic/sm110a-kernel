@@ -10,7 +10,7 @@
 namespace {
 
 using Bf16GemmLauncher = void (*)(const __nv_bfloat16*, const __nv_bfloat16*,
-                                   __nv_bfloat16*, int, int, int, bool,
+                                   void*, int, int, int, bool,
                                    int, cudaStream_t);
 
 void check_tensor(const torch::Tensor& tensor, const char* name) {
@@ -67,8 +67,10 @@ void check_inputs_nt(const torch::Tensor& a, const torch::Tensor& b_nt,
 }
 
 void check_output(const torch::Tensor& out, int64_t m, int64_t n,
-                  const c10::Device& device) {
-  check_tensor(out, "Output");
+                  const c10::Device& device, bool output_fp32) {
+  TORCH_CHECK(out.is_cuda() && out.is_contiguous(), "Output must be contiguous CUDA tensor");
+  TORCH_CHECK(out.scalar_type() == (output_fp32 ? torch::kFloat32 : torch::kBFloat16),
+              "Output dtype must match config.output_fp32");
   TORCH_CHECK(out.dim() == 2 && out.device() == device, "invalid output tensor");
   TORCH_CHECK(out.size(0) == m && out.size(1) == n, "invalid output shape");
 }
@@ -76,25 +78,25 @@ void check_output(const torch::Tensor& out, int64_t m, int64_t n,
 torch::Tensor run_out(torch::Tensor a, torch::Tensor b, torch::Tensor out,
                       uint64_t launcher_address, int64_t tile_m,
                       int64_t tile_n, int64_t tile_k, int64_t cluster_m, int64_t split_k,
-                      int64_t max_active_clusters, bool swap_ab, bool b_is_nt) {
+                      int64_t max_active_clusters, bool swap_ab, bool b_is_nt, bool output_fp32) {
   TORCH_CHECK(launcher_address != 0, "BF16 GEMM launcher is null");
   TORCH_CHECK(split_k == 1 || !swap_ab,
               "split_k > 1 does not support swap_ab=True");
   if (b_is_nt) {
     check_inputs_nt(a, b, tile_m, tile_n, tile_k, cluster_m, split_k,
                     max_active_clusters, swap_ab);
-    check_output(out, a.size(0), b.size(0), a.device());
+    check_output(out, a.size(0), b.size(0), a.device(), output_fp32);
   } else {
     check_inputs(a, b, tile_m, tile_n, tile_k, cluster_m, split_k,
                  max_active_clusters, swap_ab);
-    check_output(out, a.size(0), b.size(1), a.device());
+    check_output(out, a.size(0), b.size(1), a.device(), output_fp32);
   }
   c10::cuda::CUDAGuard device_guard(a.device());
   const auto launcher = reinterpret_cast<Bf16GemmLauncher>(
       static_cast<uintptr_t>(launcher_address));
   launcher(reinterpret_cast<const __nv_bfloat16*>(a.data_ptr<at::BFloat16>()),
            reinterpret_cast<const __nv_bfloat16*>(b.data_ptr<at::BFloat16>()),
-           reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
+           out.data_ptr(),
            static_cast<int>(a.size(0)), static_cast<int>(b_is_nt ? b.size(0) : b.size(1)),
            static_cast<int>(a.size(1)), swap_ab,
            static_cast<int>(max_active_clusters),
@@ -105,27 +107,27 @@ torch::Tensor run_out(torch::Tensor a, torch::Tensor b, torch::Tensor out,
 
 torch::Tensor bf16_gemm(torch::Tensor a, torch::Tensor b, uint64_t launcher,
                         int64_t tm, int64_t tn, int64_t tk, int64_t cm, int64_t sk,
-                        int64_t max_active_clusters, bool swap) {
-  auto out = torch::empty({a.size(0), b.size(1)}, a.options());
-  return run_out(a, b, out, launcher, tm, tn, tk, cm, sk, max_active_clusters, swap, false);
+                        int64_t max_active_clusters, bool swap, bool output_fp32) {
+  auto out = torch::empty({a.size(0), b.size(1)}, a.options().dtype(output_fp32 ? torch::kFloat32 : torch::kBFloat16));
+  return run_out(a, b, out, launcher, tm, tn, tk, cm, sk, max_active_clusters, swap, false, output_fp32);
 }
 torch::Tensor bf16_gemm_out(torch::Tensor a, torch::Tensor b, torch::Tensor out,
                             uint64_t launcher, int64_t tm, int64_t tn,
                             int64_t tk, int64_t cm, int64_t sk, int64_t max_active_clusters,
-                            bool swap) {
-  return run_out(a, b, out, launcher, tm, tn, tk, cm, sk, max_active_clusters, swap, false);
+                            bool swap, bool output_fp32) {
+  return run_out(a, b, out, launcher, tm, tn, tk, cm, sk, max_active_clusters, swap, false, output_fp32);
 }
 torch::Tensor bf16_gemm_nt(torch::Tensor a, torch::Tensor b, uint64_t launcher,
                            int64_t tm, int64_t tn, int64_t tk, int64_t cm, int64_t sk,
-                           int64_t max_active_clusters, bool swap) {
-  auto out = torch::empty({a.size(0), b.size(0)}, a.options());
-  return run_out(a, b, out, launcher, tm, tn, tk, cm, sk, max_active_clusters, swap, true);
+                           int64_t max_active_clusters, bool swap, bool output_fp32) {
+  auto out = torch::empty({a.size(0), b.size(0)}, a.options().dtype(output_fp32 ? torch::kFloat32 : torch::kBFloat16));
+  return run_out(a, b, out, launcher, tm, tn, tk, cm, sk, max_active_clusters, swap, true, output_fp32);
 }
 torch::Tensor bf16_gemm_nt_out(torch::Tensor a, torch::Tensor b, torch::Tensor out,
                                uint64_t launcher, int64_t tm, int64_t tn,
                                int64_t tk, int64_t cm, int64_t sk, int64_t max_active_clusters,
-                               bool swap) {
-  return run_out(a, b, out, launcher, tm, tn, tk, cm, sk, max_active_clusters, swap, true);
+                               bool swap, bool output_fp32) {
+  return run_out(a, b, out, launcher, tm, tn, tk, cm, sk, max_active_clusters, swap, true, output_fp32);
 }
 
 }  // namespace
