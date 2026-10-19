@@ -41,13 +41,14 @@ def parse_args() -> argparse.Namespace:
         help="Directory containing model0-mp1.safetensors; omit for random weights",
     )
     parser.add_argument(
-        "--batch-size", "--bs", type=int, default=1, help="Batch size (default: 1)"
+        "--batch-size", "--bs", type=int, default=128, help="Batch size (default: 128)"
     )
     parser.add_argument(
         "--seq-len",
         "--seq",
         type=int,
-        help="Model context capacity; defaults to prefill + decode",
+        default=8192,
+        help="Model context capacity (default: 8192)",
     )
     parser.add_argument(
         "--prefill-len",
@@ -62,13 +63,17 @@ def parse_args() -> argparse.Namespace:
         "--decode",
         "--d",
         type=int,
-        default=128,
-        help="Generated tokens per request",
+        default=1,
+        help="Generated tokens per request (default: 1)",
     )
     parser.add_argument(
         "--decode-only",
-        action="store_true",
-        help="skip prefill and benchmark decode against zero-initialized KV cache at --seq-len",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "benchmark decode against zero-initialized KV cache (default: on); "
+            "use --no-decode-only to include prefill"
+        ),
     )
     parser.add_argument(
         "--layers", type=int, help="Override the default two transformer layers"
@@ -164,6 +169,9 @@ def benchmark_config(args: argparse.Namespace) -> dict:
 
 def budget_check(config: dict, args: argparse.Namespace) -> tuple[int, int]:
     parameter_bytes, buffer_bytes = model_storage_bytes(config)
+    # The official estimator widens checkpoint BF16 LM-head weights to FP32;
+    # our runtime retains BF16, including the single head shared with MTP.
+    parameter_bytes -= config["vocab_size"] * config["dim"] * 2
     resident_bytes = parameter_bytes + buffer_bytes
     # Fused FC1/FC2 use the same packed FP4 payload but a padded 4-byte
     # hardware scale layout.  The official state stores one byte per logical
@@ -192,7 +200,7 @@ def budget_check(config: dict, args: argparse.Namespace) -> tuple[int, int]:
     )
     print(
         f"SM110A resident: {gib(sm110a_resident_bytes):.2f} GiB "
-        f"(checkpoint tensors {gib(resident_bytes):.2f}, "
+        f"(model tensors {gib(resident_bytes):.2f}, "
         f"blocked expert-scale overhead {gib(sm110a_extra_bytes):.2f} GiB)"
     )
     print(
@@ -595,6 +603,10 @@ def main() -> None:
     args = parse_args()
     config = benchmark_config(args)
     sm110a_parameter_bytes, _ = budget_check(config, args)
+    print(
+        f"workload: batch={args.batch_size}, context capacity={config['max_seq_len']}, "
+        f"decode steps={args.decode_len}, decode-only={args.decode_only}"
+    )
     decode_start_pos = (
         config["max_seq_len"] - args.decode_len
         if args.decode_only

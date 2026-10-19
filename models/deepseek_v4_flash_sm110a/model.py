@@ -5,15 +5,35 @@ swapping the operator backend for one forward call, so converted official
 checkpoints load without another conversion step.
 """
 
+# Remaining native-kernel support (including inherited reference operators):
+# TODO(sm110a): fuse HC pre/projection, split-Sinkhorn, post mixing, and HC head.
+# TODO(sm110a): implement FP32 compressor projections and fused ratio-4 overlap /
+# ratio-128 pooling, incremental state updates, and compressed KV cache writes.
+# TODO(sm110a): add RMSNorm, Q normalization, RoPE/inverse RoPE, and Hadamard
+# rotation (currently an external extension or a PyTorch fallback).
+# TODO(sm110a): fuse FP8 QAT quantize-dequantize and its inplace store.
+# TODO(sm110a): connect existing MXFP4 indexer score prefill/decode kernels with
+# packed Q/K scales and KV cache updates; adapt compressed causal masking and
+# validate rounding against the current BF16/QAT score producer.
+# TODO(sm110a): fuse FP32 MoE gate projection, scoring, hash/score selection,
+# weight normalization, and metadata construction directly from expert IDs.
+# TODO(sm110a): fuse shared-expert clamp/SwiGLU and shared/routed output addition.
+# TODO(sm110a): fuse index generation, cache writes, padding, and layout
+# conversions where useful; extend the LM-head GEMM to unaligned dimensions.
+# TODO(sm110a): specialize small-M dense/MoE decode instead of padding tokens
+# to 128 rows; cache wo_a's fixed grouped-layout scheduling metadata.
+# TODO(sm110a): extend non-aligned GEMMs, non-E8M0 scales, other FP4 quantizer
+# modes, sparse MLA head counts/dimensions, and multi-GPU fused MoE support.
+
 from __future__ import annotations
 
-from collections import Counter, OrderedDict
-from dataclasses import replace
-from contextlib import contextmanager
-from importlib import import_module
 import math
-from pathlib import Path
 import sys
+from collections import Counter, OrderedDict
+from contextlib import contextmanager
+from dataclasses import replace
+from importlib import import_module
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -30,11 +50,15 @@ from sm110a_kernel import (
     Bf16GemmConfig,
     Fp8GemmConfig,
     Fp8Mxfp4GemmConfig,
+    GroupedMConfig,
+    Mxfp4Fc1Config,
+    Mxfp4Fc2Config,
     bf16_fa4_sparse_mla,
     bf16_fa4_sparse_mla_prefill,
     bf16_gemm_nt_out,
     bf16tofp4_quant_dequant,
     bf16tofp8_quant,
+    compile_bf16_grouped_m_gemm,
     compile_bf16tofp8_quant,
     compile_fp8_act_quant,
     compile_fp8_gemm,
@@ -44,13 +68,10 @@ from sm110a_kernel import (
     fp8_act_quant,
     fp8_gemm,
     fp8mxfp4_gemm_scaled,
-    Mxfp4Fc1Config,
-    Mxfp4Fc2Config,
     to_blocked_fp8_scales,
     to_blocked_fp8mxfp4_scales,
     to_blocked_mxfp4_sfa,
 )
-
 
 # Scoped to one model forward, like the official backend patches below.
 _DECODE_ENABLED = False
@@ -134,14 +155,10 @@ def _blocked_activation_scales(scales: torch.Tensor) -> torch.Tensor:
     if scales.dtype != torch.float8_e8m0fnu:
         raise TypeError("SM110A block-scaled GEMMs require E8M0 activation scales")
     expanded = scales.view(torch.uint8).repeat_interleave(4, dim=1)
-    return to_blocked_fp8mxfp4_scales(
-        expanded.view(torch.float8_e8m0fnu).contiguous()
-    )
+    return to_blocked_fp8mxfp4_scales(expanded.view(torch.float8_e8m0fnu).contiguous())
 
 
-def _blocked_fp8_weight_scales(
-    scales: torch.Tensor, rows: int, k: int
-) -> torch.Tensor:
+def _blocked_fp8_weight_scales(scales: torch.Tensor, rows: int, k: int) -> torch.Tensor:
     if scales.dtype != torch.float8_e8m0fnu:
         raise TypeError("SM110A FP8 GEMM requires E8M0 weight scales")
 
@@ -153,9 +170,7 @@ def _blocked_fp8_weight_scales(
             )
         logical = scales.view(torch.uint8).repeat_interleave(128, 0)
         logical = logical[:rows].repeat_interleave(4, 1)[:, : k // 32]
-        return to_blocked_fp8_scales(
-            logical.view(torch.float8_e8m0fnu).contiguous()
-        )
+        return to_blocked_fp8_scales(logical.view(torch.float8_e8m0fnu).contiguous())
 
     return _cache_scale(_tensor_key(scales, "fp8-weight"), make)
 
@@ -445,9 +460,7 @@ def hc_split_sinkhorn(
         mixes, (hc_mult, hc_mult, hc_mult * hc_mult), dim=-1
     )
     pre = torch.sigmoid(pre_logits * hc_scale[0] + hc_base[:hc_mult]) + eps
-    post = 2 * torch.sigmoid(
-        post_logits * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult]
-    )
+    post = 2 * torch.sigmoid(post_logits * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult])
     comb = comb_logits * hc_scale[2] + hc_base[2 * hc_mult :]
     comb = comb.unflatten(-1, (hc_mult, hc_mult)).softmax(-1) + eps
     comb = comb / (comb.sum(-2, keepdim=True) + eps)
@@ -455,6 +468,82 @@ def hc_split_sinkhorn(
         comb = comb / (comb.sum(-1, keepdim=True) + eps)
         comb = comb / (comb.sum(-2, keepdim=True) + eps)
     return pre, post, comb
+
+
+class Sm110aAttention(_official.Attention):
+    """Reference attention flow with one layout-driven grouped wo_a GEMM."""
+
+    def forward(self, x: torch.Tensor, start_pos: int):
+        bsz, seqlen, _ = x.size()
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        win, ratio, rd = self.window_size, self.compress_ratio, self.rope_head_dim
+        if ratio and self.compressor.kv_cache is None:
+            self.compressor.kv_cache = self.kv_cache[:, win:]
+            self.compressor.freqs_cis = self.freqs_cis
+            if self.indexer is not None:
+                self.indexer.freqs_cis = self.freqs_cis
+
+        qr = self.q_norm(self.wq_a(x))
+        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
+        q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
+        _official.apply_rotary_emb(q[..., -rd:], freqs_cis)
+        kv = self.kv_norm(self.wkv(x))
+        _official.apply_rotary_emb(kv[..., -rd:], freqs_cis)
+        act_quant(kv[..., :-rd], 64, _official.scale_fmt, _official.scale_dtype, True)
+        topk_idxs = _official.get_window_topk_idxs(win, bsz, seqlen, start_pos)
+        if ratio:
+            offset = seqlen if start_pos == 0 else win
+            if self.indexer is not None:
+                compress_topk_idxs = self.indexer(x, qr, start_pos, offset)
+            else:
+                compress_topk_idxs = _official.get_compress_topk_idxs(
+                    ratio, bsz, seqlen, start_pos, offset
+                )
+            topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
+        topk_idxs = topk_idxs.int()
+
+        if start_pos == 0:
+            if seqlen <= win:
+                self.kv_cache[:bsz, :seqlen] = kv
+            else:
+                cutoff = seqlen % win
+                self.kv_cache[:bsz, cutoff:win], self.kv_cache[:bsz, :cutoff] = kv[
+                    :, -win:
+                ].split([win - cutoff, cutoff], dim=1)
+            if ratio:
+                kv_compress = self.compressor(x, start_pos)
+                if kv_compress is not None:
+                    kv = torch.cat([kv, kv_compress], dim=1)
+            o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+        else:
+            self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
+            if ratio:
+                self.compressor(x, start_pos)
+            o = sparse_attn(
+                q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale
+            )
+        _official.apply_rotary_emb(o[..., -rd:], freqs_cis, True)
+        return self.wo_b(self.project_output(o).flatten(2))
+
+    def project_output(self, o: torch.Tensor) -> torch.Tensor:
+        bsz, seqlen = o.shape[:2]
+        groups, rows = self.n_local_groups, bsz * seqlen
+        # Group-major A: each contiguous segment of `rows` tokens selects one
+        # weight matrix. The layout schedules all groups in a single GEMM.
+        grouped = o.reshape(rows, groups, -1).transpose(0, 1).contiguous()
+        a = grouped.view(groups * rows, -1)
+        weights = self.wo_a.weight.view(groups, self.o_lora_rank, -1).contiguous()
+        layout = torch.arange(groups, device=o.device, dtype=torch.int32)
+        layout = layout.repeat_interleave(rows)
+        gemm = compile_bf16_grouped_m_gemm(GroupedMConfig(cluster_m=1, mode=0))
+        metadata = gemm.prepare_metadata(layout, groups, self.o_lora_rank)
+        out = gemm.bf16_grouped_m_gemm(a, weights, metadata)
+        _STATS["sm110a.wo_a_grouped_m_gemm"] += 1
+        return (
+            out.view(groups, rows, self.o_lora_rank)
+            .transpose(0, 1)
+            .reshape(bsz, seqlen, groups, self.o_lora_rank)
+        )
 
 
 class Sm110aIndexer(_official.Indexer):
@@ -472,9 +561,7 @@ class Sm110aIndexer(_official.Indexer):
         q = _official.rotate_activation(q)
         fp4_act_quant(q, _official.fp4_block_size, True)
         self.compressor(x, start_pos)
-        weights = self.weights_proj(x) * (
-            self.softmax_scale * self.n_heads ** -0.5
-        )
+        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
         # TODO(sm110a): replace the reference QAT/BF16 score producer with
         # the native MXFP4 indexer score kernel and its packed KV cache.
         scores = torch.einsum(
@@ -484,7 +571,9 @@ class Sm110aIndexer(_official.Indexer):
         if _official.world_size > 1:
             torch.distributed.all_reduce(scores)
         if start_pos == 0:
-            valid_groups = torch.arange(1, seqlen + 1, device=x.device)[:, None] // ratio
+            valid_groups = (
+                torch.arange(1, seqlen + 1, device=x.device)[:, None] // ratio
+            )
             mask = torch.arange(seqlen // ratio, device=x.device) >= valid_groups
             scores = scores.masked_fill(mask, -torch.inf)
 
@@ -772,6 +861,44 @@ def _use_sm110a_backend():
             setattr(_official, name, original)
 
 
+class Sm110aParallelHead(_official.ParallelHead):
+    """Keep checkpoint BF16 weights and write FP32 logits from the accumulator."""
+
+    def get_logits(self, x: torch.Tensor) -> torch.Tensor:
+        # The reference projects only the last position, including during prefill.
+        a = x[:, -1].contiguous()
+        weight = self.weight
+        rows, k = a.shape
+        n = weight.size(0)
+        if (
+            a.dtype != torch.bfloat16
+            or weight.dtype != torch.bfloat16
+            or not a.is_cuda
+            or rows == 0
+            or n % 32
+            or k % 64
+        ):
+            _STATS["torch.lm_head_todo"] += 1
+            return F.linear(a.float(), weight.float())
+
+        tile_m = 64 if rows <= 64 else 128
+        padded_rows = rows if rows <= tile_m else math.ceil(rows / tile_m) * tile_m
+        if padded_rows != rows:
+            a = torch.cat((a, a.new_zeros((padded_rows - rows, k))), dim=0)
+        tile_n = next(tile for tile in (256, 128, 64, 32) if n % tile == 0)
+        config = Bf16GemmConfig(
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=128 if k % 128 == 0 else 64,
+            cluster_m=1,
+            output_fp32=True,
+        )
+        out = torch.empty((padded_rows, n), device=a.device, dtype=torch.float32)
+        bf16_gemm_nt_out(a, weight.contiguous(), out, config=config)
+        _STATS["sm110a.lm_head_bf16_gemm_fp32"] += 1
+        return out[:rows]
+
+
 class Transformer(_official.Transformer):
     """Checkpoint-compatible official model with SM110A operator dispatch."""
 
@@ -786,6 +913,14 @@ class Transformer(_official.Transformer):
         if routing_weight_position not in ("fc1", "fc2"):
             raise ValueError("routing_weight_position must be 'fc1' or 'fc2'")
         super().__init__(args)
+        # Official checkpoints store this parameter in BF16. Allocate in that
+        # dtype before loading, retaining the original state-dict key and the
+        # head object shared by MTP blocks. No per-token weight conversion.
+        self.head.__class__ = Sm110aParallelHead
+        self.head.weight = torch.nn.Parameter(
+            torch.empty_like(self.head.weight, dtype=torch.bfloat16),
+            requires_grad=self.head.weight.requires_grad,
+        )
         self.pdl = pdl
         self.routing_weight_position = routing_weight_position
         self.deterministic_fc2 = deterministic_fc2
@@ -794,6 +929,7 @@ class Transformer(_official.Transformer):
         for layer in self.mtp:
             layer.ffn.__class__ = Sm110aMoE
         for layer in (*self.layers, *self.mtp):
+            layer.attn.__class__ = Sm110aAttention
             layer.ffn._sm110a_pdl = pdl
             layer.ffn._sm110a_weight_position = routing_weight_position
             layer.ffn._sm110a_deterministic_fc2 = deterministic_fc2

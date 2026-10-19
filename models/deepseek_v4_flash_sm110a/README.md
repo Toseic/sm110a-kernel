@@ -19,18 +19,35 @@ expert outputs. `--routing-weight-position fc2 --fc2-reduction atomic`
 selects the previous output-weighted path for comparison.
 
 The default path is bitwise reproducible between eager and CUDA Graph in the
-tested 128-step run, but full-model agreement with the official model is not
+tested decode runs, but full-model agreement with the official model is not
 yet validated. See [precision re-evaluation](../../docs/dsv4_flash_accuracy.md)
 for measured residual differences and controlled experiments.
+
+The LM head keeps the checkpoint's BF16 weights and uses the native BF16
+GEMM with FP32 output. It projects only the last sequence position, so GEMM M
+is the batch size. The epilogue writes the FP32 accumulator directly without
+an intermediate BF16 rounding or per-step weight conversion. Unsupported
+shapes/dtypes use a PyTorch FP32 fallback. Loading FP32 head weights rounds
+them to BF16; checkpoint key names and the head shared with MTP stay unchanged.
 
 The CSA indexer uses the native SM110A row top-k kernel for both prefill and
 decode. Its score producer currently retains the reference BF16/QAT path.
 
 Decode is always captured as one fixed CUDA Graph and benchmarked through
-graph replay. Run the SM110A model with:
+graph replay. By default the benchmark runs decode only with batch 128,
+context capacity 8192, and one step per replay (position 8191). KV caches are
+zero-initialized; no prefill is run. Warmup and measurement replay counts remain
+2 and 5. Run the default workload with:
 
 ```bash
 /home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_dsv4_flash.py
+```
+
+To include prefill and reproduce the previous batch-1, 1024-token prompt,
+128-step workload:
+
+```bash
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_dsv4_flash.py --no-decode-only --batch-size 1 --prefill-len 1024 --decode-len 128 --seq-len 1152
 ```
 
 Decode PDL is opt-in with `Transformer(args, pdl=True)` or the benchmark's
