@@ -11,11 +11,15 @@ import torch
 EARLY_STOP_RATIO = 1.3  # skip config if probe > best_probe * this
 MMA_PEAK_TFLOPS = 250.0
 # ``B300Sim`` changes this for the duration of one benchmark process.  Keep
-# the bandwidth constants unchanged: its purpose is to vary compute/GMEM
-# balance while EMC is explicitly pinned at maximum frequency.
+# the bandwidth constants unchanged: these are maximum-clock roofline peaks.
+# Low-clock runs therefore use a conservative L2 bound, not a per-clock peak.
 MMA_PEAK_SCALE = 1.0
 GMEM_BW_GBPS = 273.0
-L2_BW_GBPS = 1.281 * 1000.0
+# Thor NCU: lts__t_bytes.sum.peak_sustained / LTS clock = 1024 B/cycle.
+# Reference maximum LTS clock is 1575 MHz. Do not infer an unprofiled LTS
+# peak from the GPC devfreq setting: NCU changes the profiling conditions.
+L2_PEAK_BYTES_PER_CYCLE = 1024.0
+L2_BW_GBPS = 1.575 * L2_PEAK_BYTES_PER_CYCLE
 BF16_BYTES = 2
 _DECIMAL_MB = 1000**2
 _DECIMAL_GFLOP = 1000**3
