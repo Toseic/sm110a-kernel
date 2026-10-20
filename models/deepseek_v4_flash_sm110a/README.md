@@ -21,8 +21,8 @@ and state-dict keys/dtypes are unchanged. CPU and unsupported input formats
 retain the reference implementation. Backend statistics count native calls
 under `sm110a.rmsnorm` and fallbacks under `torch.rmsnorm_fallback`.
 
-Single-token decode at `start_pos > 0` uses `HcPreRunner` for HC pre, in both
-attention and FFN (including MTP blocks). Aligned BF16 inputs with even D >= 256
+Prefill and decode use `HcPreRunner` for HC pre in attention and FFN, including
+MTP blocks. Aligned BF16 inputs with even D >= 256
 use a split-K `tcgen05.mma` projection with instruction N=24. Its fixed tile is
 M=128, N=24, K=128; each CTA handles 512 K elements with two shared-memory
 buffers, 512 producer threads and one consumer warp. Producers load and convert
@@ -40,8 +40,9 @@ HC=4, D up to 4096, contiguous CUDA BF16/FP16/FP32 inputs, and FP32 HC parameter
 (16-byte aligned projection weights). Only the collapsed output is cast back
 to input dtype; post/comb stay FP32. FP32 reduction
 order differs from PyTorch, so agreement is numerical
-rather than bitwise. Prefill and unsupported formats use the reference path;
-a tensor-core prefill implementation remains future work. Dispatch counts are
+rather than bitwise. Unsupported formats use the reference path. The fixed
+configuration is tuned for decode; large-M prefill tuning remains future work.
+Dispatch counts are
 `sm110a.hc_pre` and `torch.hc_pre_fallback`. Attention/FFN RMSNorm remains a
 separate operator after HC pre, and checkpoint keys/dtypes are unchanged.
 
@@ -53,9 +54,28 @@ using cold-L2 CUDA Graph replay:
 ```
 
 `--dtype`, `--d`, `--sinkhorn-iters`, `--input-case`, and `--logit-scale`
-control numerical cases.
+control numerical cases. Pass `--batch-size B` to use `[B, tokens/B, 4, D]`
+prefill inputs (token counts must be divisible by B):
+
+```bash
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_hc_pre.py --batch-size 1 --tokens 128 512 1024 4096 --sol
+```
+
 Accuracy checks cover all three outputs and eager/graph reproducibility,
 including input updates between replays.
+
+On Thor at GPC 1575 MHz / EMC 4266 MHz, BF16 D=4096, B=1, Sinkhorn=20,
+5 warmups, 20 iterations and 5 samples, dirty cold-L2 CUDA Graph replay measured:
+
+| Prefill S | Native (us) | PyTorch (us) | Speedup | GMEM SOL |
+| --- | ---: | ---: | ---: | ---: |
+| 128 | 77.00 | 481.41 | 6.25x | 32.47% |
+| 512 | 210.17 | 1569.33 | 7.47x | 39.36% |
+| 1024 | 384.93 | 3085.19 | 8.02x | 41.49% |
+| 4096 | 1447.97 | 11809.64 | 8.16x | 42.92% |
+
+All three outputs passed comparison with the FP32 PyTorch reference at the
+existing tolerances, including graph replay after changing the input.
 
 `--sol` reports a memory-bandwidth lower bound: input bytes plus FP32 HC
 parameter bytes plus the three output tensors, each counted once per invocation.

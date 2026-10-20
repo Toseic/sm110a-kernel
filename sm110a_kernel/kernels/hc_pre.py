@@ -1,4 +1,4 @@
-"""Decode HC pre with pipelined tcgen05 projection and fused gates/collapse."""
+"""HC pre with pipelined tcgen05 projection and fused gates/collapse."""
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -94,7 +94,7 @@ _JIT = SplitCudaJit(
 
 
 def compile_hc_pre(d, *, sinkhorn_iters=20):
-    """Fixed decode configuration; HC=4, contiguous BF16/FP16/FP32, FP32 weights."""
+    """Fixed decode/prefill configuration; HC=4, contiguous BF16/FP16/FP32, FP32 weights."""
     if type(d) is not int or not 1 <= d <= 4096:
         raise ValueError("d must be an integer in [1, 4096]")
     if type(sinkhorn_iters) is not int or not 1 <= sinkhorn_iters <= 100:

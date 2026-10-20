@@ -6,7 +6,7 @@ checkpoints load without another conversion step.
 """
 
 # Remaining native-kernel support (including inherited reference operators):
-# TODO(sm110a): add tensor-core HC pre for prefill; fuse HC head.
+# TODO(sm110a): tune HC pre for large-M prefill; fuse HC head.
 # TODO(sm110a): implement FP32 compressor projections and fused ratio-4 overlap /
 # ratio-128 pooling, incremental state updates, and compressed KV cache writes.
 # TODO(sm110a): add Q normalization, RoPE/inverse RoPE, and Hadamard
@@ -831,10 +831,9 @@ class Sm110aParallelHead(_official.ParallelHead):
         return out[:rows]
 
 
-def _hc_pre_decode(self, x, hc_fn, hc_scale, hc_base):
+def _hc_pre(self, x, hc_fn, hc_scale, hc_base):
     if not (
-        _DECODE_ENABLED
-        and x.is_cuda
+        x.is_cuda
         and x.is_contiguous()
         and x.dtype in (torch.bfloat16, torch.float16, torch.float32)
         and self.hc_mult == 4
@@ -853,8 +852,16 @@ def _hc_pre_decode(self, x, hc_fn, hc_scale, hc_base):
     post = torch.empty((*prefix, 4), dtype=torch.float32, device=x.device)
     comb = torch.empty((*prefix, 4, 4), dtype=torch.float32, device=x.device)
     HcPreRunner(
-        x, hc_fn, hc_scale, hc_base, y, post, comb,
-        self.norm_eps, self.hc_eps, sinkhorn_iters=self.hc_sinkhorn_iters,
+        x,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        y,
+        post,
+        comb,
+        self.norm_eps,
+        self.hc_eps,
+        sinkhorn_iters=self.hc_sinkhorn_iters,
     ).run()
     _STATS["sm110a.hc_pre"] += 1
     return y, post, comb
@@ -879,12 +886,12 @@ def _hc_post(self, x, residual, post, comb):
 
 
 class Sm110aBlock(_official.Block):
-    hc_pre = _hc_pre_decode
+    hc_pre = _hc_pre
     hc_post = _hc_post
 
 
 class Sm110aMTPBlock(_official.MTPBlock):
-    hc_pre = _hc_pre_decode
+    hc_pre = _hc_pre
     hc_post = _hc_post
 
 

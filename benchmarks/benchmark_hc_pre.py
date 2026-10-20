@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Decode HC pre, fixed tcgen05/SIMT configurations, cold-L2 Graph timings."""
+"""HC pre for decode/prefill, fixed kernels, cold-L2 CUDA Graph timings."""
 
 import argparse
 import math
@@ -52,6 +52,11 @@ class HcPreBenchmark(BenchmarkBase):
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("--d", type=int, default=4096)
         parser.add_argument("--tokens", type=int, nargs="+", default=[1, 16, 128])
+        parser.add_argument(
+            "--batch-size",
+            type=int,
+            help="Use prefill shape [B, tokens/B, 4, D]; omit for decode [tokens, 1, 4, D]",
+        )
         parser.add_argument("--sinkhorn-iters", type=int, default=20)
         parser.add_argument(
             "--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16"
@@ -71,6 +76,12 @@ class HcPreBenchmark(BenchmarkBase):
         self.validate_timing_args(args, allow_zero_warmup=True)
         if not 1 <= args.d <= 4096 or any(t < 1 for t in args.tokens):
             raise SystemExit("D must be in [1, 4096]; tokens must be positive")
+        if args.batch_size is not None and (
+            args.batch_size < 1 or any(t % args.batch_size for t in args.tokens)
+        ):
+            raise SystemExit(
+                "--batch-size must be positive and divide every token count"
+            )
         if not 1 <= args.sinkhorn_iters <= 100:
             raise SystemExit("--sinkhorn-iters must be in [1, 100]")
         if not math.isfinite(args.logit_scale) or args.logit_scale <= 0:
@@ -102,8 +113,12 @@ class HcPreBenchmark(BenchmarkBase):
                 "on-chip cache traffic and launch overhead."
             )
         for tokens in args.tokens:
+            batch = tokens if args.batch_size is None else args.batch_size
+            seq = tokens // batch
+            if args.batch_size is not None:
+                print(f"[prefill] B={batch} S={seq} total_tokens={tokens}")
             x = torch.randn(
-                tokens, 1, 4, args.d, device="cuda", dtype=getattr(torch, args.dtype)
+                batch, seq, 4, args.d, device="cuda", dtype=getattr(torch, args.dtype)
             )
             if args.input_case == "zero":
                 x.zero_()
@@ -114,9 +129,9 @@ class HcPreBenchmark(BenchmarkBase):
             )
             scale = torch.tensor([0.7, 1.1, 0.9], device="cuda")
             base = torch.randn(24, device="cuda") * 0.2
-            y = torch.empty(tokens, 1, args.d, device="cuda", dtype=x.dtype)
-            post = torch.empty(tokens, 1, 4, device="cuda")
-            comb = torch.empty(tokens, 1, 4, 4, device="cuda")
+            y = torch.empty(batch, seq, args.d, device="cuda", dtype=x.dtype)
+            post = torch.empty(batch, seq, 4, device="cuda")
+            comb = torch.empty(batch, seq, 4, 4, device="cuda")
             runner = HcPreRunner(
                 x,
                 weight,
