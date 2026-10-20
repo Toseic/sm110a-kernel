@@ -6,7 +6,7 @@ checkpoints load without another conversion step.
 """
 
 # Remaining native-kernel support (including inherited reference operators):
-# TODO(sm110a): add tensor-core HC pre for prefill; fuse HC post mixing and HC head.
+# TODO(sm110a): add tensor-core HC pre for prefill; fuse HC head.
 # TODO(sm110a): implement FP32 compressor projections and fused ratio-4 overlap /
 # ratio-128 pooling, incremental state updates, and compressed KV cache writes.
 # TODO(sm110a): add Q normalization, RoPE/inverse RoPE, and Hadamard
@@ -56,6 +56,7 @@ from sm110a_kernel import (
     Fp8GemmRunner,
     Fp8Mxfp4GemmRunner,
     HcPreRunner,
+    HcPostRunner,
     Mxfp4Fc1Fc2Runner,
     Mxfp4MoeRunner,
     RmsNormRunner,
@@ -859,12 +860,32 @@ def _hc_pre_decode(self, x, hc_fn, hc_scale, hc_base):
     return y, post, comb
 
 
+def _hc_post(self, x, residual, post, comb):
+    if not (
+        self.hc_mult == 4
+        and x.is_cuda
+        and x.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        and 1 <= x.size(-1) <= 32768
+        and residual.dtype == x.dtype
+        and post.dtype == comb.dtype == torch.float32
+        and all(t.is_contiguous() and t.device == x.device for t in (x, residual, post, comb))
+    ):
+        _STATS["torch.hc_post_fallback"] += 1
+        return _official.Block.hc_post(self, x, residual, post, comb)
+    output = torch.empty_like(residual)
+    HcPostRunner(x, residual, post, comb, output).run()
+    _STATS["sm110a.hc_post"] += 1
+    return output
+
+
 class Sm110aBlock(_official.Block):
     hc_pre = _hc_pre_decode
+    hc_post = _hc_post
 
 
 class Sm110aMTPBlock(_official.MTPBlock):
     hc_pre = _hc_pre_decode
+    hc_post = _hc_post
 
 
 class Transformer(_official.Transformer):

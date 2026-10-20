@@ -57,6 +57,43 @@ can reuse them. The default peak is the repository's 273 GB/s, overridable with
 This is a compulsory-memory SOL only; it excludes compute, repeated L1/L2
 traffic, synchronization, and launch costs, and does not use tensor-core peaks.
 
+HC post uses `HcPostRunner` in attention and FFN, for prefill and decode
+(including MTP). It fuses the FP32 post-gated expansion, 4x4 residual mixing,
+addition and final cast into one kernel, reusing each loaded residual vector
+across all four output streams. FP32 multiplies and adds remain separate to
+preserve reference rounding. Contiguous CUDA BF16/FP16/FP32 inputs with HC=4
+and D in [1, 32768] are supported; unsupported inputs use the reference path.
+Aligned rows use streaming vector loads/stores; other layouts use a scalar
+kernel. Output must not overlap inputs. Dispatch statistics are
+`sm110a.hc_post` and `torch.hc_post_fallback`.
+
+```bash
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_hc_post.py --tokens 1 4 16 128 8192
+```
+
+The benchmark checks reference agreement, eager/graph agreement, and graph
+replay after updating all four inputs. `--dtype`, `--d`, `--unaligned` and
+`--input-case` select numerical/layout cases; `--threads` and `--vector-bytes`
+allow fixed-configuration comparisons. Bandwidth is effective compulsory
+traffic `(x + residual + post + comb + output) / time`, relative to 273 GB/s.
+This is not a hardware DRAM-counter measurement. The default dirty cold-L2
+flush also causes unrelated dirty cache lines to be written back; these bytes
+are excluded from compulsory traffic. Conversely, output may remain in L2,
+so clean-cold-L2 effective bandwidth can exceed DRAM peak for small tensors.
+Small-token bandwidth percentages include launch/latency costs and should not
+be interpreted as saturation throughput. No warm-L2 measurements are used.
+
+On Thor with GPC 1575 MHz and EMC 4266 MHz, BF16 D=4096, 5 warmups,
+20 iterations and 5 samples, a cold dirty-L2 sweep of 32/64/128/256 threads
+measured 6.1–6.8 us for 1 token and 12.9–14.0 us for 16 tokens. Smaller
+blocks did not provide a consistent improvement, so the default stays at
+128 threads and 16-byte vectors. A comparison against the reference measured
+6.19 vs 21.62 us at 1 token, 13.45 vs 91.53 us at 16 tokens, and 65.00 vs
+613.34 us at 128 tokens. The 128-token effective bandwidth was 145 GB/s
+(53% of peak); the 90% target is not reached for small-token decode. At 8192
+tokens, repeated measurements were around 243–246 GB/s (89–90%); this does
+not establish stable 90% bandwidth attainment.
+
 Dense BF16/FP8/FP8xMXFP4 GEMMs, grouped wo_a projection, routed MoE,
 quantizers, RMSNorm, sparse MLA, and indexer top-k execute through public runner
 classes in `sm110a_kernel/kernels/*.py`; `model.py` does not call `compile_*`.
