@@ -227,6 +227,13 @@ from .nvfp4_grouped_m_gemm import (
     nvfp4_grouped_m_gemm_out,
     prepare_nvfp4_grouped_m_metadata,
 )
+from .rmsnorm import (
+    RmsNormConfig,
+    RmsNormRunner,
+    compile_rmsnorm,
+    rmsnorm,
+    rmsnorm_out,
+)
 from .topk import TopKRunner
 
 __all__ = [name for name in globals() if not name.startswith("_")]

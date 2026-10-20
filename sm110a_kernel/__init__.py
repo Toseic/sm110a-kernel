@@ -294,6 +294,13 @@ from .kernels.nvfp4_grouped_m_gemm import (
     nvfp4_grouped_m_gemm_out,
     prepare_nvfp4_grouped_m_metadata,
 )
+from .kernels.rmsnorm import (
+    RmsNormConfig,
+    RmsNormRunner,
+    compile_rmsnorm,
+    rmsnorm,
+    rmsnorm_out,
+)
 from .kernels.topk import (
     TopKRunner,
     compile_topk,

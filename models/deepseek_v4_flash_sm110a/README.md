@@ -13,8 +13,16 @@ sparse MLA use the corresponding SM110A kernels. Missing fused model-level
 operators currently use explicit PyTorch fallbacks marked with
 `TODO(sm110a)` in `model.py`.
 
+All RMSNorm modules, including attention/FFN, compressor, final and MTP norms,
+use `RmsNormRunner` by default. Weights stay FP32 as in the reference model;
+BF16/FP16 inputs are normalized and multiplied by the FP32 weight in FP32,
+with one final cast to input dtype. No weight conversion is needed per call,
+and state-dict keys/dtypes are unchanged. CPU and unsupported input formats
+retain the reference implementation. Backend statistics count native calls
+under `sm110a.rmsnorm` and fallbacks under `torch.rmsnorm_fallback`.
+
 Dense BF16/FP8/FP8xMXFP4 GEMMs, grouped wo_a projection, routed MoE,
-quantizers, sparse MLA, and indexer top-k execute through public runner
+quantizers, RMSNorm, sparse MLA, and indexer top-k execute through public runner
 classes in `sm110a_kernel/kernels/*.py`; `model.py` does not call `compile_*`.
 These inherit `BaseKernelRunner` in `sm110a_kernel/runner.py`, which uses
 `AutotuneRunner` for selection and persistent caching. Benchmarks share the
@@ -26,7 +34,7 @@ current tensors; the shared selection cache retains only configurations.
 MoE tuning measures the complete quantization/routing/FC1/FC2 chain, rebuilding
 configuration-specific metadata on every invocation. Routing weights, BF16
 rounding, compact scales, and deterministic reduction remain fixed during tuning.
-Top-k uses `TopKRunner` for configuration selection. Quantizers and sparse MLA
+Top-k uses `TopKRunner` for configuration selection. Quantizers, RMSNorm and sparse MLA
 use fixed runners, which prepare their single implementation without a timing
 sweep. See the [runner guide](../../docs/kernel_runners.md) for the full API.
 

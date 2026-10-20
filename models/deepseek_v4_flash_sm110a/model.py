@@ -9,7 +9,7 @@ checkpoints load without another conversion step.
 # TODO(sm110a): fuse HC pre/projection, split-Sinkhorn, post mixing, and HC head.
 # TODO(sm110a): implement FP32 compressor projections and fused ratio-4 overlap /
 # ratio-128 pooling, incremental state updates, and compressed KV cache writes.
-# TODO(sm110a): add RMSNorm, Q normalization, RoPE/inverse RoPE, and Hadamard
+# TODO(sm110a): add Q normalization, RoPE/inverse RoPE, and Hadamard
 # rotation (currently an external extension or a PyTorch fallback).
 # TODO(sm110a): fuse FP8 QAT quantize-dequantize and its inplace store.
 # TODO(sm110a): connect existing MXFP4 indexer score prefill/decode kernels with
@@ -57,6 +57,7 @@ from sm110a_kernel import (
     Fp8Mxfp4GemmRunner,
     Mxfp4Fc1Fc2Runner,
     Mxfp4MoeRunner,
+    RmsNormRunner,
     TopKRunner,
     clear_kernel_runner_cache,
     compact_mxfp4_weight_scales,
@@ -174,6 +175,32 @@ def _blocked_mxfp4_weight_scales(scales: torch.Tensor) -> torch.Tensor:
         _tensor_key(scales, "mxfp4-weight"),
         lambda: to_blocked_fp8mxfp4_scales(scales.contiguous()),
     )
+
+
+class Sm110aRMSNorm(_official.RMSNorm):
+    """Native RMSNorm preserving the reference FP32 parameter and state dict."""
+
+    def forward(self, x: torch.Tensor):
+        if (
+            not x.is_cuda
+            or x.dtype not in (torch.bfloat16, torch.float16, torch.float32)
+            or not 1 <= self.dim <= 32768
+        ):
+            _STATS["torch.rmsnorm_fallback"] += 1
+            return super().forward(x)
+
+        input = x.contiguous()
+        weight = self.weight.contiguous()
+        # Contiguous slices can still have unaligned storage offsets. Keep the
+        # native kernel's vector alignment contract for these callers too.
+        if input.data_ptr() % 16:
+            input = input.clone()
+        if weight.data_ptr() % 16:
+            weight = weight.clone()
+        output = torch.empty_like(input)
+        RmsNormRunner(input, weight, output, self.eps).run()
+        _STATS["sm110a.rmsnorm"] += 1
+        return output
 
 
 def act_quant(
@@ -828,6 +855,9 @@ class Transformer(_official.Transformer):
         if moe_backend == "fused" and pdl:
             raise ValueError("fused MoE does not support PDL")
         super().__init__(args)
+        for module in self.modules():
+            if isinstance(module, _official.RMSNorm):
+                module.__class__ = Sm110aRMSNorm
         # Official checkpoints store this parameter in BF16. Allocate in that
         # dtype before loading, retaining the original state-dict key and the
         # head object shared by MTP blocks. No per-token weight conversion.
