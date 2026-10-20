@@ -46,6 +46,39 @@ Dispatch counts are
 `sm110a.hc_pre` and `torch.hc_pre_fallback`. Attention/FFN RMSNorm remains a
 separate operator after HC pre, and checkpoint keys/dtypes are unchanged.
 
+HC head also uses `HcPreRunner(..., head=True)` before the final RMSNorm and
+LM head, including the head shared by MTP blocks. This compile-time mode uses
+FP32 projection weights `[4, 4*D]`, scale `[1]` and base `[4]`. It computes only
+the four pre gates and weighted collapse, with no post/comb outputs, Sinkhorn,
+or scratch allocation. It uses the single-CTA FP32 SIMT projection for all
+supported dtypes. The input constraints match HC pre; dispatch statistics are
+`sm110a.hc_head` and `torch.hc_head_fallback`. Reduction order can differ from
+the PyTorch implementation. The existing benchmark selects this mode with
+`--mode head` (the default remains `--mode pre`):
+
+```bash
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_hc_pre.py --mode head --tokens 1 16 128 512 1024 --warmup 5 --iters 20 --samples 5 --sol
+```
+
+On Thor at GPC 1575 MHz / EMC 4266 MHz, BF16 D=4096, dirty cold-L2
+CUDA Graph replay with a 64 MiB eviction buffer, 5 warmups, 20 iterations
+and 5 samples measured the following medians. Inputs were `[tokens, 1, 4, D]`
+and parameters were random FP32 tensors. Both implementations include RMS
+normalization, projection, sigmoid gates and weighted collapse.
+
+| Tokens | Native (us) | PyTorch (us) | Speedup |
+| --- | ---: | ---: | ---: |
+| 1 | 17.342 | 35.778 | 2.06x |
+| 16 | 20.861 | 98.442 | 4.72x |
+| 128 | 59.208 | 278.302 | 4.70x |
+| 512 | 167.994 | 1324.010 | 7.88x |
+| 1024 | 294.298 | 2866.018 | 9.74x |
+
+All cases passed the existing BF16 tolerance (`rtol=0.008`, `atol=2e-5`),
+bitwise eager/graph agreement, and replay checks after changing the input.
+Maximum absolute output differences ranged from `1.19e-7` to `0.015625`.
+These are isolated HC head timings, excluding the final RMSNorm and LM head.
+
 Compare the complete fused operation with the current PyTorch implementation
 using cold-L2 CUDA Graph replay:
 

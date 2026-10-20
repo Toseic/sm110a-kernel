@@ -6,7 +6,7 @@ checkpoints load without another conversion step.
 """
 
 # Remaining native-kernel support (including inherited reference operators):
-# TODO(sm110a): tune HC pre for large-M prefill; fuse HC head.
+# TODO(sm110a): tune HC pre/head for large-M prefill.
 # TODO(sm110a): implement FP32 compressor projections and fused ratio-4 overlap /
 # ratio-128 pooling, incremental state updates, and compressed KV cache writes.
 # TODO(sm110a): add Q normalization, RoPE/inverse RoPE, and Hadamard
@@ -885,6 +885,35 @@ def _use_sm110a_backend():
 
 class Sm110aParallelHead(_official.ParallelHead):
     """Keep checkpoint BF16 weights and write FP32 logits from the accumulator."""
+
+    def hc_head(self, x, hc_fn, hc_scale, hc_base):
+        if not (
+            x.is_cuda
+            and x.is_contiguous()
+            and x.dtype in (torch.bfloat16, torch.float16, torch.float32)
+            and x.size(-2) == 4
+            and 1 <= x.size(-1) <= 4096
+            and hc_fn.data_ptr() % 16 == 0
+            and all(
+                t.device == x.device and t.dtype == torch.float32 and t.is_contiguous()
+                for t in (hc_fn, hc_scale, hc_base)
+            )
+        ):
+            _STATS["torch.hc_head_fallback"] += 1
+            return super().hc_head(x, hc_fn, hc_scale, hc_base)
+        output = torch.empty((*x.shape[:-2], x.size(-1)), device=x.device, dtype=x.dtype)
+        HcPreRunner(
+            x,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            output,
+            norm_eps=self.norm_eps,
+            hc_eps=self.hc_eps,
+            head=True,
+        ).run()
+        _STATS["sm110a.hc_head"] += 1
+        return output
 
     def get_logits(self, x: torch.Tensor) -> torch.Tensor:
         # The reference projects only the last position, including during prefill.

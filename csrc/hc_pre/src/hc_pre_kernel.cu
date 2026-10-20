@@ -10,7 +10,13 @@
 #define SM110A_HC_PRE_ITERS 20
 #endif
 
+#ifndef SM110A_HC_PRE_HEAD
+#define SM110A_HC_PRE_HEAD 0
+#endif
+
 namespace {
+constexpr bool Head = SM110A_HC_PRE_HEAD;
+constexpr int Projections = Head ? 4 : 24;
 constexpr int D = SM110A_HC_PRE_D;
 constexpr int K = 4 * D;
 constexpr int Threads = 256;
@@ -63,13 +69,13 @@ void hc_pre_kernel(const T* __restrict__ input, const float* __restrict__ weight
                    float* __restrict__ comb, float norm_eps, float hc_eps) {
     extern __shared__ __align__(16) unsigned char storage[];
     T *retained = reinterpret_cast<T *>(storage);
-    __shared__ float partial[25][Warps];
+    __shared__ float partial[Projections + 1][Warps];
     __shared__ float pre[4];
     const int tid = threadIdx.x;
     const int lane = tid % 32;
     const int warp = tid / 32;
     const int64_t row = blockIdx.x;
-    float dots[24] = {};
+    float dots[Projections] = {};
     float square_sum = 0.f;
     // Keep K loop rolled: unrolling the whole projection bloats the binary.
 #pragma unroll 1
@@ -83,7 +89,7 @@ void hc_pre_kernel(const T* __restrict__ input, const float* __restrict__ weight
             square_sum = fmaf(x[i], x[i], square_sum);
         }
 #pragma unroll
-        for (int j = 0; j < 24; ++j) {
+        for (int j = 0; j < Projections; ++j) {
             float4 w = *reinterpret_cast<const float4 *>(weight + j * K + k);
             dots[j] = fmaf(x[0], w.x, dots[j]);
             dots[j] = fmaf(x[1], w.y, dots[j]);
@@ -92,53 +98,55 @@ void hc_pre_kernel(const T* __restrict__ input, const float* __restrict__ weight
         }
     }
 #pragma unroll
-    for (int j = 0; j < 24; ++j) {
+    for (int j = 0; j < Projections; ++j) {
         float value = warp_sum(dots[j]);
         if (lane == 0)
             partial[j][warp] = value;
     }
     square_sum = warp_sum(square_sum);
     if (lane == 0)
-        partial[24][warp] = square_sum;
+        partial[Projections][warp] = square_sum;
     __syncthreads();
 
     if (warp == 0) {
-        // Each lane owns one projection (lane 24 owns the square sum).
+        // Each lane owns one projection; the next lane owns the square sum.
         float sum = 0.f;
 #pragma unroll
         for (int w = 0; w < Warps; ++w)
-            sum += partial[lane < 25 ? lane : 24][w];
-        float inv = rsqrtf(__shfl_sync(0xffffffff, sum, 24) / float(K) + norm_eps);
+            sum += partial[lane < Projections + 1 ? lane : Projections][w];
+        float inv = rsqrtf(__shfl_sync(0xffffffff, sum, Projections) / float(K) + norm_eps);
         float mix = sum * inv;
         if (lane < 4)
             pre[lane] = 1.f / (1.f + expf(-(__fmul_rn(mix, scale[0]) + base[lane]))) + hc_eps;
-        if (lane >= 4 && lane < 8)
-            post[row * 4 + lane - 4] = 2.f / (1.f + expf(-(__fmul_rn(mix, scale[1]) + base[lane])));
+        if constexpr (!Head) {
+            if (lane >= 4 && lane < 8)
+                post[row * 4 + lane - 4] = 2.f / (1.f + expf(-(__fmul_rn(mix, scale[1]) + base[lane])));
 
-        // Sixteen lanes hold a 4x4 matrix, row-major. Every lane executes
-        // every shuffle, including inactive lanes, with a full warp mask.
-        float c = __shfl_sync(0xffffffff, mix, lane < 16 ? lane + 8 : 8);
-        c = __fmul_rn(c, scale[2]) + base[8 + (lane % 16)];
-        float max_row = fmaxf(c, __shfl_xor_sync(0xffffffff, c, 1));
-        max_row = fmaxf(max_row, __shfl_xor_sync(0xffffffff, max_row, 2));
-        c = expf(c - max_row);
-        float denom = c + __shfl_xor_sync(0xffffffff, c, 1);
-        denom += __shfl_xor_sync(0xffffffff, denom, 2);
-        c = c / denom + hc_eps;
-        denom = c + __shfl_xor_sync(0xffffffff, c, 4);
-        denom += __shfl_xor_sync(0xffffffff, denom, 8);
-        c /= denom + hc_eps;
-#pragma unroll 1
-        for (int i = 1; i < SM110A_HC_PRE_ITERS; ++i) {
-            denom = c + __shfl_xor_sync(0xffffffff, c, 1);
+            // Sixteen lanes hold a 4x4 matrix, row-major. Every lane executes
+            // every shuffle, including inactive lanes, with a full warp mask.
+            float c = __shfl_sync(0xffffffff, mix, lane < 16 ? lane + 8 : 8);
+            c = __fmul_rn(c, scale[2]) + base[8 + (lane % 16)];
+            float max_row = fmaxf(c, __shfl_xor_sync(0xffffffff, c, 1));
+            max_row = fmaxf(max_row, __shfl_xor_sync(0xffffffff, max_row, 2));
+            c = expf(c - max_row);
+            float denom = c + __shfl_xor_sync(0xffffffff, c, 1);
             denom += __shfl_xor_sync(0xffffffff, denom, 2);
-            c /= denom + hc_eps;
+            c = c / denom + hc_eps;
             denom = c + __shfl_xor_sync(0xffffffff, c, 4);
             denom += __shfl_xor_sync(0xffffffff, denom, 8);
             c /= denom + hc_eps;
+#pragma unroll 1
+            for (int i = 1; i < SM110A_HC_PRE_ITERS; ++i) {
+                denom = c + __shfl_xor_sync(0xffffffff, c, 1);
+                denom += __shfl_xor_sync(0xffffffff, denom, 2);
+                c /= denom + hc_eps;
+                denom = c + __shfl_xor_sync(0xffffffff, c, 4);
+                denom += __shfl_xor_sync(0xffffffff, denom, 8);
+                c /= denom + hc_eps;
+            }
+            if (lane < 16)
+                comb[row * 16 + lane] = c;
         }
-        if (lane < 16)
-            comb[row * 16 + lane] = c;
     }
     __syncthreads();
     for (int d = tid; d < D; d += Threads) {
@@ -507,7 +515,7 @@ extern "C" cudaError_t sm110a_hc_pre_launch(
     cudaStream_t stream) {
     if (!rows)
         return cudaSuccess;
-    if (dtype == 0 && D >= 256 && D % 2 == 0 && (reinterpret_cast<uintptr_t>(input) % 16 == 0) &&
+    if (!Head && dtype == 0 && D >= 256 && D % 2 == 0 && (reinterpret_cast<uintptr_t>(input) % 16 == 0) &&
         (reinterpret_cast<uintptr_t>(output) % 16 == 0)) {
         constexpr int bytes_tc = 2 * (TileM + 3 * 24) * TileK * 2;
         if constexpr (bytes_tc > 48 * 1024) {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HC pre for decode/prefill, fixed kernels, cold-L2 CUDA Graph timings."""
+"""HC pre/head for decode/prefill, cold-L2 CUDA Graph timings."""
 
 import argparse
 import math
@@ -16,11 +16,16 @@ from common import GMEM_BW_GBPS, BenchmarkBase, benchmark_with_stats
 from sm110a_kernel import HcPreRunner
 
 
-def reference(x, weight, scale, base, norm_eps=1e-6, hc_eps=1e-6, sinkhorn_iters=20):
+def reference(
+    x, weight, scale, base, norm_eps=1e-6, hc_eps=1e-6, sinkhorn_iters=20, head=False
+):
     shape, dtype = x.shape, x.dtype
     x = x.flatten(-2).float()
     inv = torch.rsqrt(x.square().mean(-1, keepdim=True) + norm_eps)
     mixes = F.linear(x, weight) * inv
+    if head:
+        pre = torch.sigmoid(mixes * scale + base) + hc_eps
+        return ((pre.unsqueeze(-1) * x.view(shape)).sum(-2).to(dtype),)
     a, b, c = mixes.split((4, 4, 16), dim=-1)
     pre = torch.sigmoid(a * scale[0] + base[:4]) + hc_eps
     post = 2 * torch.sigmoid(b * scale[1] + base[4:8])
@@ -50,6 +55,7 @@ def capture(fn):
 class HcPreBenchmark(BenchmarkBase):
     def build_parser(self):
         parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("--mode", choices=["pre", "head"], default="pre")
         parser.add_argument("--d", type=int, default=4096)
         parser.add_argument("--tokens", type=int, nargs="+", default=[1, 16, 128])
         parser.add_argument(
@@ -89,7 +95,7 @@ class HcPreBenchmark(BenchmarkBase):
         if not math.isfinite(args.peak_gbps) or args.peak_gbps <= 0:
             raise SystemExit("--peak-gbps must be finite and positive")
         if not args.cold_l2:
-            raise SystemExit("HC pre comparisons require cold L2")
+            raise SystemExit("HC pre/head comparisons require cold L2")
 
     def initialize(self):
         if not torch.cuda.is_available():
@@ -99,16 +105,26 @@ class HcPreBenchmark(BenchmarkBase):
 
     @torch.inference_mode()
     def run_with_args(self, args):
-        print(
-            f"HC=4 D={args.d} dtype={args.dtype} "
-            "tcgen05 tile=128x24x128 split-K=512 buffers=2; SIMT threads=256; "
-            f"Sinkhorn={args.sinkhorn_iters}; cold-L2 CUDA Graph replay"
+        head = args.mode == "head"
+        kernel = (
+            "SIMT threads=256; projections=4"
+            if head
+            else f"tcgen05 tile=128x24x128 split-K=512 buffers=2; "
+            f"SIMT fallback threads=256; Sinkhorn={args.sinkhorn_iters}"
         )
-        print("tokens ours(us) torch(us) speedup max_abs(y/post/comb)")
+        print(
+            f"HC {args.mode}: HC=4 D={args.d} dtype={args.dtype}; {kernel}; "
+            "cold-L2 CUDA Graph replay"
+        )
+        print(
+            "tokens ours(us) torch(us) speedup max_abs("
+            + ("y" if head else "y/post/comb")
+            + ")"
+        )
         if args.sol:
             print(
                 f"[SOL memory] peak={args.peak_gbps:g} GB/s; compulsory traffic: "
-                "input once + FP32 HC parameters once + all three outputs once. "
+                "input once + FP32 HC parameters once + outputs once. "
                 "This is a memory-bandwidth lower bound, excluding compute, "
                 "on-chip cache traffic and launch overhead."
             )
@@ -124,14 +140,17 @@ class HcPreBenchmark(BenchmarkBase):
                 x.zero_()
             elif args.input_case == "constant":
                 x.fill_(0.5)
-            weight = torch.randn(24, 4 * args.d, device="cuda") * (
+            weight = torch.randn(4 if head else 24, 4 * args.d, device="cuda") * (
                 args.logit_scale / math.sqrt(4 * args.d)
             )
-            scale = torch.tensor([0.7, 1.1, 0.9], device="cuda")
-            base = torch.randn(24, device="cuda") * 0.2
+            scale = torch.tensor([0.7] if head else [0.7, 1.1, 0.9], device="cuda")
+            base = torch.randn(4 if head else 24, device="cuda") * 0.2
             y = torch.empty(batch, seq, args.d, device="cuda", dtype=x.dtype)
-            post = torch.empty(batch, seq, 4, device="cuda")
-            comb = torch.empty(batch, seq, 4, 4, device="cuda")
+            post = comb = None
+            if not head:
+                post = torch.empty(batch, seq, 4, device="cuda")
+                comb = torch.empty(batch, seq, 4, 4, device="cuda")
+            outputs = (y,) if head else (y, post, comb)
             runner = HcPreRunner(
                 x,
                 weight,
@@ -141,10 +160,11 @@ class HcPreBenchmark(BenchmarkBase):
                 post,
                 comb,
                 sinkhorn_iters=args.sinkhorn_iters,
+                head=head,
             )
             run = runner.run
             ref_fn = lambda: reference(
-                x, weight, scale, base, sinkhorn_iters=args.sinkhorn_iters
+                x, weight, scale, base, sinkhorn_iters=args.sinkhorn_iters, head=head
             )
             run()
             error = "-"
@@ -156,29 +176,29 @@ class HcPreBenchmark(BenchmarkBase):
                     torch.float32: 2e-5,
                 }[x.dtype]
                 torch.testing.assert_close(y, expected[0], rtol=rtol, atol=2e-5)
-                for actual, ref in zip((post, comb), expected[1:]):
+                for actual, ref in zip(outputs[1:], expected[1:]):
                     torch.testing.assert_close(actual, ref, rtol=2e-5, atol=2e-6)
                 error = "/".join(
                     f"{(a.float() - b.float()).abs().max().item():.3g}"
-                    for a, b in zip((y, post, comb), expected)
+                    for a, b in zip(outputs, expected)
                 )
-                eager = tuple(t.clone() for t in (y, post, comb))
+                eager = tuple(t.clone() for t in outputs)
             graph, _ = capture(run)
             graph.replay()
             if not args.no_accuracy:
-                for actual, ref in zip((y, post, comb), eager):
+                for actual, ref in zip(outputs, eager):
                     torch.testing.assert_close(actual, ref, rtol=0, atol=0)
                 # Verify captured work consumes new input, rather than stale intermediates.
                 original = x.clone()
                 x.copy_(original.roll(1, dims=-1) * 0.5)
                 graph.replay()
-                changed = tuple(t.clone() for t in (y, post, comb))
+                changed = tuple(t.clone() for t in outputs)
                 run()
-                for actual, ref in zip((y, post, comb), changed):
+                for actual, ref in zip(outputs, changed):
                     torch.testing.assert_close(actual, ref, rtol=0, atol=0)
                 updated_expected = ref_fn()
                 torch.testing.assert_close(y, updated_expected[0], rtol=rtol, atol=2e-5)
-                for actual, ref in zip((post, comb), updated_expected[1:]):
+                for actual, ref in zip(outputs[1:], updated_expected[1:]):
                     torch.testing.assert_close(actual, ref, rtol=2e-5, atol=2e-6)
                 x.copy_(original)
             stats = benchmark_with_stats(
@@ -211,7 +231,7 @@ class HcPreBenchmark(BenchmarkBase):
                 # them through L1/L2 even though every CTA issues global loads.
                 input_bytes = x.nbytes
                 parameter_bytes = weight.nbytes + scale.nbytes + base.nbytes
-                output_bytes = y.nbytes + post.nbytes + comb.nbytes
+                output_bytes = sum(t.nbytes for t in outputs)
                 traffic_bytes = input_bytes + parameter_bytes + output_bytes
                 sol_us = traffic_bytes / (args.peak_gbps * 1e3)
                 effective_gbps = traffic_bytes / (ours * 1e3)
