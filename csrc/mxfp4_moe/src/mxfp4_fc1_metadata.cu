@@ -1,7 +1,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace {
+namespace sm110a::mxfp4_fc1_metadata {
 constexpr int kThreads = 256;
 #ifndef SM110A_MXFP4_FC1_MACRO_SWIZZLE_N_MAJOR
 #define SM110A_MXFP4_FC1_MACRO_SWIZZLE_N_MAJOR 1
@@ -66,7 +66,9 @@ __global__ void build_expert_tile_tasks(
             tasks[next++] = {start, rows, tile_row, expert, tile_n};
 #endif
 }
-} // namespace
+} // namespace sm110a::mxfp4_fc1_metadata
+
+using namespace sm110a::mxfp4_fc1_metadata;
 
 extern "C" void sm110a_mxfp4_fc1_tasks_prepare(
     const int32_t *layout,

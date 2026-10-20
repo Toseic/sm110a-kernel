@@ -19,7 +19,7 @@
 #define SM110A_FA4_MHA_PACK_GQA 0
 #endif
 
-namespace {
+namespace sm110a::bf16_fa4_gqa {
 
 constexpr int kFaMhaTactic16Warp = 0;
 constexpr int kFaMhaTactic12Warp = 1;
@@ -3662,7 +3662,9 @@ __launch_bounds__(384, 1) void fa_mha_kernel_wg12(
     }
 }
 
-} // namespace
+} // namespace sm110a::bf16_fa4_gqa
+
+using namespace sm110a::bf16_fa4_gqa;
 
 // One launcher instantiation emits exactly one CTA schedule; the discarded
 // if-constexpr branch never instantiates its kernel.

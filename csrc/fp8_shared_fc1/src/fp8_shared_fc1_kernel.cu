@@ -45,7 +45,7 @@
 #define SM110A_FP8_SHARED_FC1_USE_TMA_PREFETCH 0
 #endif
 
-namespace {
+namespace sm110a::fp8_shared_fc1 {
 
 constexpr int kMmaK = 32;
 constexpr int kWarpSize = 32;
@@ -1081,7 +1081,9 @@ void fp8_shared_fc1_kernel(
     }
 }
 
-} // namespace
+} // namespace sm110a::fp8_shared_fc1
+
+using namespace sm110a::fp8_shared_fc1;
 
 template <int kTileM,
     int kTileN,

@@ -7,7 +7,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
-namespace {
+namespace sm110a::mxfp4_fc2_torch_binding {
 
 using Launcher = void (*)(
     const uint8_t*, const uint8_t*, const uint8_t*, const uint8_t*,
@@ -180,7 +180,9 @@ void prepare_pdl_out(torch::Tensor out, torch::Tensor state, bool clear_output) 
                                sizeof(int32_t), stream));
 }
 
-}  // namespace
+} // namespace sm110a::mxfp4_fc2_torch_binding
+
+using namespace sm110a::mxfp4_fc2_torch_binding;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("prepare_pdl_out", &prepare_pdl_out);

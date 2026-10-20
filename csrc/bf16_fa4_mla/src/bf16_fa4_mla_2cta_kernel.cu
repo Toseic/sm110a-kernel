@@ -10,7 +10,7 @@
 // heads and all 512 output columns.
 #define SM110A_FA4_MLA_PACK_SIZE 64
 
-namespace {
+namespace sm110a::bf16_fa4_mla_2cta {
 
 constexpr int kMlaPackSize = SM110A_FA4_MLA_PACK_SIZE;
 static_assert(kMlaPackSize == 64, "MLA decode packs 64 heads per CTA");
@@ -1144,7 +1144,9 @@ cudaError_t bf16_fa4_mla_decode_cuda(
 }
 
 
-} // namespace
+} // namespace sm110a::bf16_fa4_mla_2cta
+
+using namespace sm110a::bf16_fa4_mla_2cta;
 
 
 extern "C" cudaError_t sm110a_bf16_fa4_mla_2cta_launch(

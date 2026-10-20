@@ -385,7 +385,7 @@
 #define SM110A_BF16_EPILOGUE_BLOCK_N 32
 #endif
 
-namespace {
+namespace sm110a::bf16_gemm_serving {
 
 constexpr int kMmaK = 16;
 constexpr int kWarpSize = 32;
@@ -1754,7 +1754,9 @@ void bf16_gemm_serving_kernel(
     }
     }
 
-} // namespace
+} // namespace sm110a::bf16_gemm_serving
+
+using namespace sm110a::bf16_gemm_serving;
 
 cudaError_t initialize_bf16_gemm_serving_queue(
     sm110a::bf16_gemm_serving::ServingQueueControl *control,

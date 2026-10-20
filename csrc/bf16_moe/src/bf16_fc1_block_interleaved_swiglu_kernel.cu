@@ -41,7 +41,7 @@
 #define SM110A_FC1_DIRECT_GMEM 0
 #endif
 
-namespace {
+namespace sm110a::bf16_fc1_block_interleaved_swiglu {
 
 constexpr int kMmaK = 16;
 constexpr int kWarpSize = 32;
@@ -1613,7 +1613,9 @@ void launch_fc1_metadata_impl(const __nv_bfloat16* router, int tokens, int exper
     cudaFreeAsync(selected, stream);
 }
 
-} // namespace
+} // namespace sm110a::bf16_fc1_block_interleaved_swiglu
+
+using namespace sm110a::bf16_fc1_block_interleaved_swiglu;
 
 extern "C" void sm110a_fc1_metadata_prepare(const __nv_bfloat16* router, int tokens,
     int experts, int topk, int32_t* routing, int32_t* source_rows, int32_t* task_words,

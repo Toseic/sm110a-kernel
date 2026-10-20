@@ -8,7 +8,7 @@
 
 namespace py = pybind11;
 
-namespace {
+namespace sm110a::green_context_torch_binding {
 
 std::string driver_error(CUresult result) {
   const char* name = nullptr;
@@ -165,7 +165,9 @@ std::vector<std::shared_ptr<GreenContext>> create_green_contexts(
   return contexts;
 }
 
-}  // namespace
+} // namespace sm110a::green_context_torch_binding
+
+using namespace sm110a::green_context_torch_binding;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<GreenContext, std::shared_ptr<GreenContext>>(m, "GreenContext")

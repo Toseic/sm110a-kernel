@@ -9,7 +9,7 @@
 // CTAs.  Each CTA computes 64 heads and all 512 output columns.
 #define SM110A_FA4_MLA_PACK_SIZE 64
 
-namespace {
+namespace sm110a::bf16_fa4_mla {
 
 constexpr int kPvTileN = 128;
 constexpr int kPvGroupCount = 512 / kPvTileN;
@@ -1178,7 +1178,9 @@ cudaError_t bf16_fa4_mla_decode_cuda(
 }
 
 
-} // namespace
+} // namespace sm110a::bf16_fa4_mla
+
+using namespace sm110a::bf16_fa4_mla;
 
 
 extern "C" cudaError_t sm110a_bf16_fa4_mla_launch(

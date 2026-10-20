@@ -5,7 +5,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-namespace {
+namespace sm110a::indexer_score_decode {
 
 constexpr int kHeads = 64;
 constexpr int kDim = 128;
@@ -446,7 +446,9 @@ __global__ void indexer_score_decode_kernel(
     }
 }
 
-}  // namespace
+} // namespace sm110a::indexer_score_decode
+
+using namespace sm110a::indexer_score_decode;
 
 // Measured KV prefetch depths are 8 for dense and 4 for paged; result slots
 // remain independently double-buffered in both paths.

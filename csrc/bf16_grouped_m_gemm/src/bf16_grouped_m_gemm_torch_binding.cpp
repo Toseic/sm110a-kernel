@@ -6,7 +6,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
-namespace {
+namespace sm110a::bf16_grouped_m_gemm_torch_binding {
 
 using GroupedGemmLauncher = void (*)(
     const __nv_bfloat16*, const __nv_bfloat16*, const int32_t*, int32_t*,
@@ -129,7 +129,9 @@ torch::Tensor grouped_gemm(torch::Tensor a, torch::Tensor b,
       cluster_m, swap_ab);
 }
 
-}  // namespace
+} // namespace sm110a::bf16_grouped_m_gemm_torch_binding
+
+using namespace sm110a::bf16_grouped_m_gemm_torch_binding;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("prepare_grouped_m_metadata", &prepare_metadata,

@@ -55,7 +55,7 @@
 #ifndef SM110A_NVFP4_FC1_NUM_C_STAGE
 #define SM110A_NVFP4_FC1_NUM_C_STAGE 0
 #endif
-namespace {
+namespace sm110a::nvfp4_fc1 {
 
 constexpr int kMmaK = 64;
 constexpr int kWarpSize = 32;
@@ -1964,7 +1964,9 @@ void launch_nvfp4_fc1_entry(
             n, k, max_tasks, max_active_clusters, stream);
 }
 
-} // namespace
+} // namespace sm110a::nvfp4_fc1
+
+using namespace sm110a::nvfp4_fc1;
 
 void launch_nvfp4_fc1_main(
     const uint8_t *a, const uint8_t *b, const uint8_t *sfa, const uint8_t *sfb,

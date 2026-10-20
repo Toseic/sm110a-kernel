@@ -212,7 +212,7 @@
 #define SM110A_GROUPED_DIRECT_GMEM 0
 #endif
 
-namespace {
+namespace sm110a::bf16_grouped_m_gemm {
 
 constexpr int kMmaK = 16;
 constexpr int kWarpSize = 32;
@@ -1380,7 +1380,9 @@ void launch_bf16_grouped_m_gemm_entry(
     }
 }
 
-} // namespace
+} // namespace sm110a::bf16_grouped_m_gemm
+
+using namespace sm110a::bf16_grouped_m_gemm;
 
 void launch_bf16_grouped_m_gemm_main(
     const __nv_bfloat16 *d_a,

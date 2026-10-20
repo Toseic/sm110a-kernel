@@ -366,7 +366,7 @@
 #define SM110A_MXFP4_USE_TMA_PREFETCH 0
 #endif
 
-namespace {
+namespace sm110a::fp8mxfp4_gemm {
 
 constexpr int kMmaK = 32;
 constexpr int kWarpSize = 32;
@@ -1742,7 +1742,9 @@ void fp8mxfp4_gemm_kernel(
     }
 }
 
-} // namespace
+} // namespace sm110a::fp8mxfp4_gemm
+
+using namespace sm110a::fp8mxfp4_gemm;
 
 template <int kTileM,
     int kTileN,

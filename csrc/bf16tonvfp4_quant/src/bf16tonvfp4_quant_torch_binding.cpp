@@ -7,7 +7,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
-namespace {
+namespace sm110a::bf16tonvfp4_quant_torch_binding {
 
 constexpr int kRowMultiple = 128;
 constexpr int kColMultiple = 64;
@@ -77,7 +77,9 @@ std::tuple<torch::Tensor, torch::Tensor> bf16tonvfp4_quant(
   return bf16tonvfp4_quant_out(input, packed, scales, launcher_address);
 }
 
-}  // namespace
+} // namespace sm110a::bf16tonvfp4_quant_torch_binding
+
+using namespace sm110a::bf16tonvfp4_quant_torch_binding;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("bf16tonvfp4_quant", &bf16tonvfp4_quant);

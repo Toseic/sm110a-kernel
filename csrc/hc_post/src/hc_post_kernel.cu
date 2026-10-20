@@ -15,7 +15,7 @@
 #define SM110A_HC_POST_VECTOR_BYTES 16
 #endif
 
-namespace {
+namespace sm110a::hc_post {
 constexpr int kBytes = SM110A_HC_POST_VECTOR_BYTES;
 using Packed = std::conditional_t<kBytes == 16, uint4, uint2>;
 constexpr int kD = SM110A_HC_POST_D;
@@ -136,7 +136,9 @@ void hc_post_kernel(const T* __restrict__ x, const T* __restrict__ residual,
             output[(row * 4 + j) * kD + col] = yv[j].values[0];
     }
 }
-} // namespace
+} // namespace sm110a::hc_post
+
+using namespace sm110a::hc_post;
 
 extern "C" void sm110a_hc_post_launch(
     const void *x,

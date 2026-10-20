@@ -8,7 +8,7 @@
 
 namespace py = pybind11;
 
-namespace {
+namespace sm110a::nccl_lsa_torch_binding {
 
 class NcclLsaAllReduce {
  public:
@@ -90,7 +90,9 @@ py::bytes nccl_unique_id() {
   return py::bytes(id);
 }
 
-}  // namespace
+} // namespace sm110a::nccl_lsa_torch_binding
+
+using namespace sm110a::nccl_lsa_torch_binding;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("nccl_unique_id", &nccl_unique_id,

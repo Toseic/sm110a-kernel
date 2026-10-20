@@ -7,7 +7,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
-namespace {
+namespace sm110a::fp8mxfp4_gemm_split_torch_binding {
 using Fp8Mxfp4GemmLauncher = void (*)(const uint8_t*, const uint8_t*, const uint8_t*, const uint8_t*, __nv_bfloat16*, int, int, int, cudaStream_t);
 
 void check_fp8(const torch::Tensor& x, const char* name) {
@@ -40,5 +40,7 @@ torch::Tensor run_out(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch
 }
 torch::Tensor fp8mxfp4_gemm_out(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb, torch::Tensor out, uint64_t launcher, int64_t tm, int64_t tn, int64_t tk, int64_t cm, int64_t sk, int64_t compact_b_gmem) { return run_out(a,b,sfa,sfb,out,launcher,tm,tn,tk,cm,sk,compact_b_gmem); }
 torch::Tensor fp8mxfp4_gemm(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb, uint64_t launcher, int64_t tm, int64_t tn, int64_t tk, int64_t cm, int64_t sk, int64_t compact_b_gmem) { auto out=torch::empty({a.size(0),b.size(0)},a.options().dtype(torch::kBFloat16)); return run_out(a,b,sfa,sfb,out,launcher,tm,tn,tk,cm,sk,compact_b_gmem); }
-}  // namespace
+} // namespace sm110a::fp8mxfp4_gemm_split_torch_binding
+
+using namespace sm110a::fp8mxfp4_gemm_split_torch_binding;
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("fp8mxfp4_gemm", &fp8mxfp4_gemm); m.def("fp8mxfp4_gemm_out", &fp8mxfp4_gemm_out); }

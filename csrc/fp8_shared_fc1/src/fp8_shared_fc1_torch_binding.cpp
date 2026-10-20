@@ -7,7 +7,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
-namespace {
+namespace sm110a::fp8_shared_fc1_torch_binding {
 using Fp8GemmLauncher = void (*)(const uint8_t *,
     const uint8_t *,
     const uint8_t *,
@@ -126,7 +126,9 @@ torch::Tensor fp8_shared_fc1(
     auto out = torch::empty({a.size(0), b.size(0) / 2}, a.options().dtype(torch::kBFloat16));
     return run_out(a, b, sfa, sfb, out, launcher, tm, tn, tk, cm, sk);
 }
-} // namespace
+} // namespace sm110a::fp8_shared_fc1_torch_binding
+
+using namespace sm110a::fp8_shared_fc1_torch_binding;
 PYBIND11_MODULE(
     TORCH_EXTENSION_NAME,
     m) {

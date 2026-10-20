@@ -9,7 +9,7 @@
 // gathers 64 indexed KV rows per tile with four dedicated cp.async warps.
 #define SM110A_FA4_MLA_PACK_SIZE 64
 
-namespace {
+namespace sm110a::bf16_fa4_sparse_mla {
 
 constexpr int kPvTileN = 128;
 constexpr int kPvGroupCount = 512 / kPvTileN;
@@ -1219,7 +1219,9 @@ cudaError_t bf16_fa4_sparse_mla_decode_cuda(
 }
 
 
-} // namespace
+} // namespace sm110a::bf16_fa4_sparse_mla
+
+using namespace sm110a::bf16_fa4_sparse_mla;
 
 
 extern "C" cudaError_t sm110a_bf16_fa4_sparse_mla_launch(

@@ -7,7 +7,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
-namespace {
+namespace sm110a::bf16tofp4_quant_torch_binding {
 
 constexpr int kQuantBlock = 32;
 using QuantLauncher = void (*)(const __nv_bfloat16*, uint8_t*, uint8_t*, int,
@@ -108,7 +108,9 @@ torch::Tensor bf16tofp4_quant_dequant(torch::Tensor input,
   return bf16tofp4_quant_dequant_out(input, output, scales, launcher_address);
 }
 
-}  // namespace
+} // namespace sm110a::bf16tofp4_quant_torch_binding
+
+using namespace sm110a::bf16tofp4_quant_torch_binding;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("bf16tofp4_quant", &bf16tofp4_quant);

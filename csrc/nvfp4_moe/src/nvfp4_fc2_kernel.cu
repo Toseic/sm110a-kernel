@@ -52,7 +52,7 @@
 #define SM110A_NVFP4_FC2_REDUCE_TILE_N 64
 #endif
 
-namespace {
+namespace sm110a::nvfp4_fc2 {
 
 constexpr int kMmaK = 64;
 constexpr int kWarpSize = 32;
@@ -473,7 +473,7 @@ template <
     int kTaskPacketSize = 1>
 __global__ __cluster_dims__(kClusterM, 1, 1)
 __launch_bounds__(kWarpSize * kBaseWarpCount)
-void nvfp4_fc2_fused_kernel(
+void nvfp4_fc2_kernel(
     const uint8_t *sfa,
     const __grid_constant__ CUtensorMap a_tensor_map,
     const __grid_constant__ CUtensorMap b_tensor_map,
@@ -1423,14 +1423,14 @@ void launch_nvfp4_fc2_impl(
 
     const int persistent_clusters =
         (max_tasks + kPersistentTileCount - 1) / kPersistentTileCount;
-    auto single_tile_kernel = nvfp4_fc2_fused_kernel<kTileM,
+    auto single_tile_kernel = nvfp4_fc2_kernel<kTileM,
         kTileN,
         kTileK,
         kClusterM,
         true,
         false,
         1>;
-    auto packet_kernel = nvfp4_fc2_fused_kernel<kTileM,
+    auto packet_kernel = nvfp4_fc2_kernel<kTileM,
         kTileN,
         kTileK,
         kClusterM,
@@ -1495,7 +1495,9 @@ void launch_nvfp4_fc2_entry(
         m, experts, n, k, topk, max_tasks, max_active_clusters, stream);
 }
 
-}  // namespace
+} // namespace sm110a::nvfp4_fc2
+
+using namespace sm110a::nvfp4_fc2;
 
 void launch_nvfp4_fc2_main(
     const uint8_t* a, const uint8_t* b, const uint8_t* sfa,

@@ -8,7 +8,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
-namespace {
+namespace sm110a::nvfp4_fc1fc2_torch_binding {
 
 using Launcher = void (*)(
     const uint8_t*, const uint8_t*, const uint8_t*, const uint8_t*,
@@ -173,7 +173,9 @@ torch::Tensor run(
     return run_out(a, w1, sfa, sfw1, w2, sfw2, output, workspace, address);
 }
 
-}  // namespace
+} // namespace sm110a::nvfp4_fc1fc2_torch_binding
+
+using namespace sm110a::nvfp4_fc1fc2_torch_binding;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     module.def("nvfp4_fc1fc2", &run);

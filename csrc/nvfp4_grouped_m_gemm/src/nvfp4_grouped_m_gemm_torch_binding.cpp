@@ -5,7 +5,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
-namespace {
+namespace sm110a::nvfp4_grouped_m_gemm_torch_binding {
 using Launcher = void (*)(const uint8_t*, const uint8_t*, const uint8_t*, const uint8_t*,
     const int32_t*, int32_t*, __nv_bfloat16*, int, int, int, int, int, cudaStream_t);
 using MetadataLauncher = void (*)(const int32_t*, int32_t*, int32_t*, int32_t*, int32_t*,
@@ -67,7 +67,9 @@ torch::Tensor run(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Te
   auto out = torch::empty({a.size(0), b.size(1)}, a.options().dtype(torch::kBFloat16));
   return run_out(a,b,sfa,sfb,tasks,state,out,address);
 }
-}
+} // namespace sm110a::nvfp4_grouped_m_gemm_torch_binding
+
+using namespace sm110a::nvfp4_grouped_m_gemm_torch_binding;
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("prepare_grouped_m_metadata", &prepare);
   m.def("nvfp4_grouped_m_gemm", &run);

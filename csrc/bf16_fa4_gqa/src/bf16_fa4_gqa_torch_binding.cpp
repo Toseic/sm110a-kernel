@@ -8,7 +8,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
-namespace {
+namespace sm110a::bf16_fa4_gqa_torch_binding {
 
 using FaGqaLauncher = cudaError_t (*)(const __nv_bfloat16*, const __nv_bfloat16*,
                                       const __nv_bfloat16*, __nv_bfloat16*, int,
@@ -84,7 +84,9 @@ torch::Tensor fa_gqa_out(torch::Tensor q, torch::Tensor k, torch::Tensor v,
   return run_out(q, k, v, out, launcher, causal, scale);
 }
 
-}  // namespace
+} // namespace sm110a::bf16_fa4_gqa_torch_binding
+
+using namespace sm110a::bf16_fa4_gqa_torch_binding;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fa_gqa", &fa_gqa);

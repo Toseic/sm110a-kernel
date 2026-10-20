@@ -8,7 +8,7 @@
 
 #include "bf16_gemm.h"
 
-namespace {
+namespace sm110a::bf16_gemm_torch_binding {
 
 constexpr int kBlockN = 256;
 constexpr int kBlockK = 64;
@@ -205,7 +205,9 @@ torch::Tensor cublaslt_gemm_out_batched(torch::Tensor a, torch::Tensor b,
   return out;
 }
 
-}  // namespace
+} // namespace sm110a::bf16_gemm_torch_binding
+
+using namespace sm110a::bf16_gemm_torch_binding;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("cublaslt_gemm", &cublaslt_gemm, "cuBLASLt BF16 GEMM");

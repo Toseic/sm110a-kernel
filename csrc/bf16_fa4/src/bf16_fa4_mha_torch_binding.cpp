@@ -9,7 +9,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
-namespace {
+namespace sm110a::bf16_fa4_mha_torch_binding {
 
 using FaMhaLauncher = cudaError_t (*)(const __nv_bfloat16*, const __nv_bfloat16*,
     const __nv_bfloat16*, __nv_bfloat16*, int, int, int, int, int, float, bool,
@@ -120,7 +120,9 @@ torch::Tensor fa_mha_out(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                  block_table, cu_seqlens_q, kv_seqlens, max_q_len, max_kv_len);
 }
 
-}  // namespace
+} // namespace sm110a::bf16_fa4_mha_torch_binding
+
+using namespace sm110a::bf16_fa4_mha_torch_binding;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fa_mha", &fa_mha);

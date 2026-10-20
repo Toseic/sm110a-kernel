@@ -1,7 +1,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace {
+namespace sm110a::bf16_grouped_m_gemm_metadata {
 constexpr int kThreads = 256;
 #ifndef SM110A_NVFP4_GROUPED_MACRO_SWIZZLE_N_MAJOR
 #define SM110A_NVFP4_GROUPED_MACRO_SWIZZLE_N_MAJOR 1
@@ -105,7 +105,9 @@ __global__ void build_expert_tile_tasks(
     state[0] = next;
     state[1] = 0;
 }
-} // namespace
+} // namespace sm110a::bf16_grouped_m_gemm_metadata
+
+using namespace sm110a::bf16_grouped_m_gemm_metadata;
 
 extern "C" void sm110a_bf16_grouped_m_metadata_prepare(
     const int32_t *layout,

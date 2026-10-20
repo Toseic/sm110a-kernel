@@ -45,7 +45,7 @@ void launch_fc2_grouped_gemm_fused(
     __nv_bfloat16* final_output, int m, int experts, int n, int k, int topk,
     int max_tasks, cudaStream_t stream);
 
-namespace {
+namespace sm110a::bf16_fc2_finalize {
 
 constexpr int kRoutingThreads = 256;
 
@@ -209,7 +209,9 @@ __global__ void invert_grouped_assignments_kernel(
         assignment_to_grouped[grouped_assignments[grouped_row]] = grouped_row;
 }
 
-} // namespace
+} // namespace sm110a::bf16_fc2_finalize
+
+using namespace sm110a::bf16_fc2_finalize;
 
 void launch_fc2_finalize(
     const __nv_bfloat16 *d_fc1,
@@ -260,7 +262,7 @@ extern "C" void sm110a_fc2_finalize_launch(
         d_routing_metadata, d_tasks, d_task_state, max_tasks, stream);
 }
 
-namespace {
+namespace sm110a::bf16_fc2_finalize {
 
 constexpr int kMmaK = 16;
 constexpr int kWarpSize = 32;
@@ -908,7 +910,9 @@ __launch_bounds__(kBlockThreads) void fc2_grouped_gemm_kernel(
     }
 }
 
-} // namespace
+} // namespace sm110a::bf16_fc2_finalize
+
+using namespace sm110a::bf16_fc2_finalize;
 
 void launch_fc2_grouped_gemm_fused(
     const __nv_bfloat16 *d_a,

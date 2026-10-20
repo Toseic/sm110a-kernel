@@ -7,7 +7,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
-namespace {
+namespace sm110a::nvfp4_gemm_split_torch_binding {
 
 using Nvfp4GemmLauncher = void (*)(const uint8_t*, const uint8_t*,
                                     const uint8_t*, const uint8_t*,
@@ -112,7 +112,9 @@ torch::Tensor nvfp4_gemm(torch::Tensor a, torch::Tensor b,
                  cluster_m, split_k);
 }
 
-}  // namespace
+} // namespace sm110a::nvfp4_gemm_split_torch_binding
+
+using namespace sm110a::nvfp4_gemm_split_torch_binding;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("nvfp4_gemm", &nvfp4_gemm);

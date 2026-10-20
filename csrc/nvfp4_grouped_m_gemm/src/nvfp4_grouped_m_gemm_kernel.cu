@@ -42,7 +42,7 @@
 #define SM110A_NVFP4_GROUPED_DIRECT_GMEM 0
 #endif
 
-namespace {
+namespace sm110a::nvfp4_grouped_m_gemm {
 
 constexpr int kMmaK = 64;
 constexpr int kWarpSize = 32;
@@ -1219,7 +1219,9 @@ void launch_nvfp4_grouped_m_gemm_entry(
         false>(a, b, sfa, sfb, tasks, state, c, m, experts, n, k, max_tasks, stream);
 }
 
-} // namespace
+} // namespace sm110a::nvfp4_grouped_m_gemm
+
+using namespace sm110a::nvfp4_grouped_m_gemm;
 
 void launch_nvfp4_grouped_m_gemm_main(
     const uint8_t *a, const uint8_t *b, const uint8_t *sfa, const uint8_t *sfb,

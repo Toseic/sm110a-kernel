@@ -9,7 +9,7 @@
 #include "bf16tofp8_quant.h"
 #include "blocked_quant.h"
 
-namespace {
+namespace sm110a::bf16tofp8_quant {
 
 constexpr int kRows = 32;
 constexpr int kBlock = 128;
@@ -247,7 +247,9 @@ void bf16tofp8_quant_kernel(const __grid_constant__ CUtensorMap input_map,
     }
 }
 
-}  // namespace
+} // namespace sm110a::bf16tofp8_quant
+
+using namespace sm110a::bf16tofp8_quant;
 
 void launch_bf16tofp8_quant(const __nv_bfloat16* input, uint8_t* output,
                             uint8_t* scales, int tokens, int d,

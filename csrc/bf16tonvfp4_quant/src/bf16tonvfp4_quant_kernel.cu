@@ -10,7 +10,7 @@
 
 #include "bf16tonvfp4_quant.h"
 
-namespace {
+namespace sm110a::bf16tonvfp4_quant {
 
 constexpr int kRows = 32;
 constexpr int kBlock = 128;
@@ -303,7 +303,9 @@ void bf16tonvfp4_quant_kernel(const __grid_constant__ CUtensorMap input_map,
     }
 }
 
-}  // namespace
+} // namespace sm110a::bf16tonvfp4_quant
+
+using namespace sm110a::bf16tonvfp4_quant;
 
 void launch_bf16tonvfp4_quant(const __nv_bfloat16* input, uint8_t* packed,
                               uint8_t* scales, int tokens, int d,

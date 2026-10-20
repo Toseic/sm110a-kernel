@@ -21,7 +21,7 @@
 #include "nvfp4_fc1fc2_pipeline_delay.cuh"
 #include "pipeline_delay.h"
 
-namespace {
+namespace sm110a::nvfp4_fc1fc2 {
 
 constexpr int kH = 6144;
 constexpr int kI = 2048;
@@ -1469,7 +1469,9 @@ bool init_scale_map(
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
 
-}  // namespace
+} // namespace sm110a::nvfp4_fc1fc2
+
+using namespace sm110a::nvfp4_fc1fc2;
 
 void launch_nvfp4_fc1fc2(
     const uint8_t* a, const uint8_t* w1, const uint8_t* sfa,

@@ -14,7 +14,7 @@
 #define SM110A_RMSNORM_ROWS 1
 #endif
 
-namespace {
+namespace sm110a::rmsnorm {
 __device__ __forceinline__ float to_float(
     float x) {
     return x;
@@ -165,7 +165,9 @@ void rmsnorm_kernel(const T* input, const W* weight, T* output,
         }
     }
 }
-} // namespace
+} // namespace sm110a::rmsnorm
+
+using namespace sm110a::rmsnorm;
 
 extern "C" void sm110a_rmsnorm_launch(
     const void *input,

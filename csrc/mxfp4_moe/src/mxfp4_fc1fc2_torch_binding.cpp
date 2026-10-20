@@ -8,7 +8,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
-namespace {
+namespace sm110a::mxfp4_fc1fc2_torch_binding {
 
 using Launcher = cudaError_t (*)(const uint8_t *,
     const uint8_t *,
@@ -232,7 +232,9 @@ torch::Tensor run_routed_out(
     return output;
 }
 
-} // namespace
+} // namespace sm110a::mxfp4_fc1fc2_torch_binding
+
+using namespace sm110a::mxfp4_fc1fc2_torch_binding;
 
 PYBIND11_MODULE(
     TORCH_EXTENSION_NAME,

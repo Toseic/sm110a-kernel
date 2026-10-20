@@ -6,7 +6,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
-namespace {
+namespace sm110a::bf16_moe_torch_binding {
 
 using Fc1Launcher = void (*)(
     const __nv_bfloat16*,
@@ -187,7 +187,9 @@ torch::Tensor fc1_main_out(torch::Tensor a, torch::Tensor b, torch::Tensor sourc
   C10_CUDA_KERNEL_LAUNCH_CHECK(); return out;
 }
 
-}  // namespace
+} // namespace sm110a::bf16_moe_torch_binding
+
+using namespace sm110a::bf16_moe_torch_binding;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("prepare_fc1_metadata", &prepare_fc1_metadata);

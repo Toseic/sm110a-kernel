@@ -7,7 +7,7 @@
 #include <cuda_bf16.h>
 #include <torch/extension.h>
 
-namespace {
+namespace sm110a::indexer_score_prefill_torch_binding {
 
 using Launcher = void (*)(const uint8_t*, const uint8_t*, const uint8_t*,
                           const uint8_t*, const __nv_bfloat16*, __nv_bfloat16*, int, int,
@@ -189,7 +189,9 @@ torch::Tensor indexer_score_prefill(
                launcher_address);
 }
 
-}  // namespace
+} // namespace sm110a::indexer_score_prefill_torch_binding
+
+using namespace sm110a::indexer_score_prefill_torch_binding;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     module.def("indexer_score_prefill", &indexer_score_prefill);

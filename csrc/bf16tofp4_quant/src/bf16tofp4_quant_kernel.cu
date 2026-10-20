@@ -9,7 +9,7 @@
 
 #include "bf16tofp4_quant.h"
 
-namespace {
+namespace sm110a::bf16tofp4_quant {
 
 constexpr int kRows = 32;
 constexpr int kBlock = 128;
@@ -484,7 +484,9 @@ void launch_bf16tofp4_quant_impl(const __nv_bfloat16* input, uint8_t* output,
     }
 }
 
-}  // namespace
+} // namespace sm110a::bf16tofp4_quant
+
+using namespace sm110a::bf16tofp4_quant;
 
 void launch_bf16tofp4_quant(const __nv_bfloat16* input, uint8_t* output,
                             uint8_t* scales, int tokens, int d,

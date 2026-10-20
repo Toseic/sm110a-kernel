@@ -10,7 +10,7 @@
 // head. The kernel has one schedule: the 16-warp FA4 tactic.
 #define SM110A_FA4_MQA_PACK_SIZE 32
 
-namespace {
+namespace sm110a::bf16_fa4_mqa {
 
 constexpr int kMqaPackSize = SM110A_FA4_MQA_PACK_SIZE;
 constexpr bool kPackMqa = true;
@@ -1632,7 +1632,9 @@ cudaError_t bf16_fa4_mqa_decode_cuda(
 }
 
 
-} // namespace
+} // namespace sm110a::bf16_fa4_mqa
+
+using namespace sm110a::bf16_fa4_mqa;
 
 // Dispatch between the 12-warp decode and 16-warp prefill schedules.
 cudaError_t bf16_fa4_mqa_cuda(

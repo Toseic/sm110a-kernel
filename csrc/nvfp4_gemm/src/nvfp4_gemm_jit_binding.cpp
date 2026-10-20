@@ -18,7 +18,7 @@
 #error "SM110A_NVFP4_CLUSTER_M must be defined by the JIT compiler"
 #endif
 
-namespace {
+namespace sm110a::nvfp4_gemm_jit_binding {
 
 void check_fp4(const torch::Tensor& tensor, const char* name) {
   TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
@@ -100,7 +100,9 @@ torch::Tensor nvfp4_gemm(torch::Tensor a, torch::Tensor b,
   return nvfp4_gemm_out(a, b, sfa, sfb, out);
 }
 
-}  // namespace
+} // namespace sm110a::nvfp4_gemm_jit_binding
+
+using namespace sm110a::nvfp4_gemm_jit_binding;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("nvfp4_gemm", &nvfp4_gemm, py::arg("a"), py::arg("b"),

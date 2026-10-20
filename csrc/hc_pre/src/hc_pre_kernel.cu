@@ -14,7 +14,7 @@
 #define SM110A_HC_PRE_HEAD 0
 #endif
 
-namespace {
+namespace sm110a::hc_pre {
 constexpr bool Head = SM110A_HC_PRE_HEAD;
 constexpr int Projections = Head ? 4 : 24;
 constexpr int D = SM110A_HC_PRE_D;
@@ -497,7 +497,9 @@ cudaError_t launch(
             hc_eps);
     return cudaGetLastError();
 }
-} // namespace
+} // namespace sm110a::hc_pre
+
+using namespace sm110a::hc_pre;
 
 extern "C" cudaError_t sm110a_hc_pre_launch(
     const void *input,

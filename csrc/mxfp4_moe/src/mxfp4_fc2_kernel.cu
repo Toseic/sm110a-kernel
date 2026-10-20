@@ -76,7 +76,7 @@
 #define SM110A_MXFP4_FC2_COMPACT_WEIGHT_SCALES 0
 #endif
 
-namespace {
+namespace sm110a::mxfp4_fc2 {
 constexpr bool kCompactWeightScales = SM110A_MXFP4_FC2_COMPACT_WEIGHT_SCALES;
 
 
@@ -521,7 +521,7 @@ template <
     bool kDeterministic = false>
 __global__ __cluster_dims__(kClusterM, 1, 1)
 __launch_bounds__(kWarpSize * kBaseWarpCount)
-void mxfp4_fc2_fused_kernel(
+void mxfp4_fc2_kernel(
     const uint8_t *sfa,
     const __grid_constant__ CUtensorMap a_tensor_map,
     const __grid_constant__ CUtensorMap b_tensor_map,
@@ -1506,14 +1506,14 @@ void launch_mxfp4_fc2_impl(
 
     const int persistent_clusters =
         (max_tasks + kPersistentTileCount - 1) / kPersistentTileCount;
-    auto single_tile_kernel = mxfp4_fc2_fused_kernel<kTileM,
+    auto single_tile_kernel = mxfp4_fc2_kernel<kTileM,
         kTileN,
         kTileK,
         kClusterM,
         true,
         false,
         1, kWeightInFc1, kDeterministic>;
-    auto packet_kernel = mxfp4_fc2_fused_kernel<kTileM,
+    auto packet_kernel = mxfp4_fc2_kernel<kTileM,
         kTileN,
         kTileK,
         kClusterM,
@@ -1595,7 +1595,9 @@ __global__ void mxfp4_fc2_finalize_deterministic(
     output[index] = __float2bfloat16_rn(sum);
 }
 
-}  // namespace
+} // namespace sm110a::mxfp4_fc2
+
+using namespace sm110a::mxfp4_fc2;
 
 void launch_mxfp4_fc2_main(
     const uint8_t* a, const uint8_t* b, const uint8_t* sfa,

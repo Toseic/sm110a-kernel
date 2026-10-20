@@ -8,7 +8,7 @@
 // One KV stage holds three 128-row MMA tiles. The three epilogue groups drain
 // independent TMEM results while the producer walks an eight-stage KV ring.
 
-namespace {
+namespace sm110a::indexer_score_prefill {
 
 constexpr int kHeads = 64;
 constexpr int kDim = 128;
@@ -605,7 +605,9 @@ void indexer_score_prefill_kernel(
     }
 }
 
-}  // namespace
+} // namespace sm110a::indexer_score_prefill
+
+using namespace sm110a::indexer_score_prefill;
 
 extern "C" void sm110a_indexer_score_prefill_launch(
     const uint8_t* q, const uint8_t* k,

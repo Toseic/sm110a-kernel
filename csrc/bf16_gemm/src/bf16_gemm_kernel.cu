@@ -247,7 +247,7 @@
 #define SM110A_BF16_SPLIT_K 1
 #endif
 
-namespace {
+namespace sm110a::bf16_gemm {
 
 #ifndef SM110A_BF16_OUTPUT_FP32
 #define SM110A_BF16_OUTPUT_FP32 0
@@ -1173,7 +1173,9 @@ void bf16_gemm_kernel(
     }
     }
 
-} // namespace
+} // namespace sm110a::bf16_gemm
+
+using namespace sm110a::bf16_gemm;
 
 template <int kTileM,
     int kTileN,

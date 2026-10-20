@@ -7,7 +7,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
-namespace {
+namespace sm110a::bf16_gemm_serving_split_torch_binding {
 
 using Bf16GemmServingLauncher = void (*)(const __nv_bfloat16*, const __nv_bfloat16*,
                                    __nv_bfloat16*, int, int, int, bool,
@@ -282,7 +282,9 @@ void serving_test_consume(torch::Tensor c_ring, torch::Tensor rows,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-}  // namespace
+} // namespace sm110a::bf16_gemm_serving_split_torch_binding
+
+using namespace sm110a::bf16_gemm_serving_split_torch_binding;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("bf16_gemm_serving", &bf16_gemm_serving);

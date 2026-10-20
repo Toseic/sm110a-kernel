@@ -6,7 +6,7 @@
 #include <limits>
 #include <torch/extension.h>
 
-namespace {
+namespace sm110a::rmsnorm_torch_binding {
 using Launcher =
     void (*)(const void *, const void *, void *, int64_t, int, int, float, cudaStream_t);
 
@@ -63,7 +63,9 @@ torch::Tensor rmsnorm_out(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
-} // namespace
+} // namespace sm110a::rmsnorm_torch_binding
+
+using namespace sm110a::rmsnorm_torch_binding;
 
 PYBIND11_MODULE(
     TORCH_EXTENSION_NAME,

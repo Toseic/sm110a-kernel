@@ -9,7 +9,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
-namespace {
+namespace sm110a::fp8_act_quant_torch_binding {
 
 constexpr int kScaleModeUe8m0 = 0;
 constexpr int kScaleModeFp32 = 1;
@@ -101,7 +101,9 @@ std::tuple<torch::Tensor, torch::Tensor> fp8_act_quant(
                            launcher_address, blocked);
 }
 
-}  // namespace
+} // namespace sm110a::fp8_act_quant_torch_binding
+
+using namespace sm110a::fp8_act_quant_torch_binding;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fp8_act_quant", &fp8_act_quant);

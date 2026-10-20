@@ -7,7 +7,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
-namespace {
+namespace sm110a::bf16_gemm_split_torch_binding {
 
 using Bf16GemmLauncher = void (*)(const __nv_bfloat16*, const __nv_bfloat16*,
                                    void*, int, int, int, bool,
@@ -130,7 +130,9 @@ torch::Tensor bf16_gemm_nt_out(torch::Tensor a, torch::Tensor b, torch::Tensor o
   return run_out(a, b, out, launcher, tm, tn, tk, cm, sk, max_active_clusters, swap, true, output_fp32);
 }
 
-}  // namespace
+} // namespace sm110a::bf16_gemm_split_torch_binding
+
+using namespace sm110a::bf16_gemm_split_torch_binding;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("bf16_gemm", &bf16_gemm);

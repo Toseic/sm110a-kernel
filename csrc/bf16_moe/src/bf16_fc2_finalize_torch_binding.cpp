@@ -7,7 +7,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
-namespace {
+namespace sm110a::bf16_fc2_finalize_torch_binding {
 
 using Fc2Launcher = void (*)(
     const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*,
@@ -113,7 +113,9 @@ torch::Tensor fc2_finalize(
   return fc2_finalize_out(fc1, b, router_scores, topk, out, launcher_address, tile_n, tile_k);
 }
 
-}  // namespace
+} // namespace sm110a::bf16_fc2_finalize_torch_binding
+
+using namespace sm110a::bf16_fc2_finalize_torch_binding;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fc2_finalize", &fc2_finalize, "Routed FC2 grouped GEMM and token finalize");

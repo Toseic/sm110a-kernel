@@ -8,7 +8,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
-namespace {
+namespace sm110a::bf16_fa4_sparse_mla_torch_binding {
 
 using SparseMlaLauncher = cudaError_t (*)(
     const __nv_bfloat16*, const __nv_bfloat16*, const int32_t*,
@@ -77,7 +77,9 @@ torch::Tensor sparse_mla(torch::Tensor q, torch::Tensor kv,
                         launcher_address, scale);
 }
 
-}  // namespace
+} // namespace sm110a::bf16_fa4_sparse_mla_torch_binding
+
+using namespace sm110a::bf16_fa4_sparse_mla_torch_binding;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("sparse_mla", &sparse_mla);

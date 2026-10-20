@@ -9,7 +9,7 @@
 
 #include "nccl_lsa.h"
 
-namespace {
+namespace sm110a::nccl_lsa {
 
 void check_cuda(
     cudaError_t status,
@@ -60,7 +60,9 @@ __global__ void nccl_lsa_all_reduce_kernel(
     barrier.sync(ncclCoopCta(), cuda::memory_order_release);
 }
 
-} // namespace
+} // namespace sm110a::nccl_lsa
+
+using namespace sm110a::nccl_lsa;
 
 struct Sm110aNcclLsaState {
     int device = 0;

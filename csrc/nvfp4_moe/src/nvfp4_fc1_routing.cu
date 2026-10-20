@@ -10,7 +10,7 @@ extern "C" void sm110a_nvfp4_fc1_tasks_from_ranges(
     const int32_t *, const int32_t *, int32_t *, int32_t *, int, int,
     int, int, int, cudaStream_t);
 
-namespace {
+namespace sm110a::nvfp4_fc1_routing {
 constexpr int kThreads = 256;
 constexpr int kWarpSize = 32;
 #ifndef SM110A_NVFP4_FC1_CLUSTER_N
@@ -135,7 +135,9 @@ __global__ void invert_assignments(
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row < m) assignment_to_grouped[grouped_assignments[row]] = row;
 }
-}  // namespace
+} // namespace sm110a::nvfp4_fc1_routing
+
+using namespace sm110a::nvfp4_fc1_routing;
 
 extern "C" void sm110a_nvfp4_fc1_routing_prepare(
     const __nv_bfloat16 *router, int tokens, int experts, int topk,

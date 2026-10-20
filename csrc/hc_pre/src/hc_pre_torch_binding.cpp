@@ -7,7 +7,7 @@
 #include <vector>
 #include <torch/extension.h>
 
-namespace {
+namespace sm110a::hc_pre_torch_binding {
 using Launcher = cudaError_t (*)(const void *,
     const float *,
     const float *,
@@ -119,7 +119,9 @@ void hc_pre_out(
         float(hc_eps),
         c10::cuda::getCurrentCUDAStream(input.get_device())));
 }
-} // namespace
+} // namespace sm110a::hc_pre_torch_binding
+
+using namespace sm110a::hc_pre_torch_binding;
 
 PYBIND11_MODULE(
     TORCH_EXTENSION_NAME,

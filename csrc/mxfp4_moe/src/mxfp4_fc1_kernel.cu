@@ -82,7 +82,7 @@
 #define SM110A_MXFP4_FC1_COMPACT_WEIGHT_SCALES 0
 #endif
 
-namespace {
+namespace sm110a::mxfp4_fc1 {
 constexpr bool kCompactWeightScales = SM110A_MXFP4_FC1_COMPACT_WEIGHT_SCALES;
 
 
@@ -1961,7 +1961,9 @@ void launch_mxfp4_fc1_entry(
             grouped_assignments, routing_weights);
 }
 
-} // namespace
+} // namespace sm110a::mxfp4_fc1
+
+using namespace sm110a::mxfp4_fc1;
 
 void launch_mxfp4_fc1_main(
     const uint8_t *a, const uint8_t *b, const uint8_t *sfa, const uint8_t *sfb,

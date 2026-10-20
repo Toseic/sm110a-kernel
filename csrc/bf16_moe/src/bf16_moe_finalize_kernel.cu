@@ -3,7 +3,7 @@
 
 #include "bf16_moe_finalize.h"
 
-namespace {
+namespace sm110a::bf16_moe_finalize {
 
 constexpr int kFinalizeThreads = 256;
 
@@ -30,7 +30,9 @@ __global__ void finalize_kernel(
     }
 }
 
-}  // namespace
+} // namespace sm110a::bf16_moe_finalize
+
+using namespace sm110a::bf16_moe_finalize;
 
 void launch_moe_finalize(const __nv_bfloat16* grouped_fc2,
                          const int32_t* assignment_to_grouped,

@@ -5,7 +5,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
-namespace {
+namespace sm110a::nvfp4_fc1_torch_binding {
 using Launcher = void (*)(const uint8_t*, const uint8_t*, const uint8_t*, const uint8_t*,
     const int32_t*, const int32_t*, int32_t*, uint8_t*, uint8_t*, int, int, int, int,
     int, int, int, cudaStream_t);
@@ -123,7 +123,9 @@ std::vector<torch::Tensor> run(torch::Tensor a, torch::Tensor b, torch::Tensor s
   run_out(a,b,sfa,sfb,source_rows,tasks,state,out,out_scale,address,max_active_clusters);
   return {out, out_scale};
 }
-}
+} // namespace sm110a::nvfp4_fc1_torch_binding
+
+using namespace sm110a::nvfp4_fc1_torch_binding;
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("prepare_nvfp4_fc1_tasks", &prepare);
   m.def("prepare_nvfp4_fc1_routing", &prepare_routing);

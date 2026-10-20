@@ -10,7 +10,7 @@
 #define SM110A_TOPK_TMA 0
 #endif
 
-namespace {
+namespace sm110a::topk {
 constexpr int Stages = SM110A_TOPK_STAGES;
 constexpr bool UseTma = SM110A_TOPK_TMA;
 static_assert(Stages >= 2 && Stages <= 8, "TopK supports 2 through 8 stages");
@@ -636,7 +636,9 @@ void launch(const T *scores, int32_t *out, int rows, int n, int split,
     case 8: launch_split<T, 8>(scores, out, rows, n, stream); break;
     }
 }
-} // namespace
+} // namespace sm110a::topk
+
+using namespace sm110a::topk;
 
 extern "C" void sm110a_topk_launch(
     const void *scores, int32_t *out, int rows, int n, int dtype,

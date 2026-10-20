@@ -5,7 +5,7 @@
 #include <limits>
 #include <torch/extension.h>
 
-namespace {
+namespace sm110a::hc_post_torch_binding {
 using Launcher = void (*)(const void *,
     const void *,
     const float *,
@@ -68,7 +68,9 @@ torch::Tensor hc_post_out(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
-} // namespace
+} // namespace sm110a::hc_post_torch_binding
+
+using namespace sm110a::hc_post_torch_binding;
 PYBIND11_MODULE(
     TORCH_EXTENSION_NAME,
     m) {

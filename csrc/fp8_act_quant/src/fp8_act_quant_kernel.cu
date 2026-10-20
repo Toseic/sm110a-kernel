@@ -9,7 +9,7 @@
 #include "fp8_act_quant.h"
 #include "blocked_quant.h"
 
-namespace {
+namespace sm110a::fp8_act_quant {
 
 constexpr int kComputeWarps = 4;
 constexpr int kLoadWarp = 4;
@@ -309,7 +309,9 @@ void fp8_act_quant_kernel(const __grid_constant__ CUtensorMap input_map,
     }
 }
 
-}  // namespace
+} // namespace sm110a::fp8_act_quant
+
+using namespace sm110a::fp8_act_quant;
 
 template <int kBlockSize, int kScaleMode>
 // Keep the function-local configuration state private to each JIT library.

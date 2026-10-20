@@ -19,7 +19,7 @@
 #include "mxfp4_fc1fc2.h"
 #include "mxfp4_fc1fc2_scale.cuh"
 
-namespace {
+namespace sm110a::mxfp4_fc1fc2 {
 
 #ifndef SM110A_MXFP4_FC1FC2_HIDDEN_DIM
 #define SM110A_MXFP4_FC1FC2_HIDDEN_DIM 6144
@@ -1459,7 +1459,9 @@ bool init_compact_scale_map(
                CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
 
-} // namespace
+} // namespace sm110a::mxfp4_fc1fc2
+
+using namespace sm110a::mxfp4_fc1fc2;
 
 cudaError_t launch_mxfp4_fc1fc2(
     const uint8_t *a,
