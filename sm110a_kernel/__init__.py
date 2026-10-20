@@ -148,6 +148,14 @@ from .kernels.fp8_gemm import (
     quantize_fp8_rows,
     to_blocked_fp8_scales,
 )
+from .kernels.fp8_shared_fc1 import (
+    Fp8SharedFc1Config,
+    Fp8SharedFc1Runner,
+    compile_fp8_shared_fc1,
+    fp8_shared_fc1,
+    fp8_shared_fc1_out,
+    pack_fp8_shared_fc1_weights,
+)
 from .kernels.fp8mxfp4_gemm import (
     Fp8Mxfp4GemmConfig,
     Fp8Mxfp4GemmRunner,

@@ -17,7 +17,7 @@ checkpoints load without another conversion step.
 # TODO(sm110a): fuse FP32 MoE gate projection, scoring, hash/score selection,
 # weight normalization, and metadata construction directly from expert IDs.
 # TODO(sm110a): add deterministic reduction and PDL to the FC1/FC2 fused backend.
-# TODO(sm110a): fuse shared-expert clamp/SwiGLU and shared/routed output addition.
+# TODO(sm110a): fuse shared/routed output addition into the shared-expert FC2.
 # TODO(sm110a): fuse index generation, cache writes, padding, and layout
 # conversions where useful; extend the LM-head GEMM to unaligned dimensions.
 # TODO(sm110a): specialize small-M dense/MoE decode instead of padding tokens
@@ -54,6 +54,7 @@ from sm110a_kernel import (
     Fp8ActQuantRunner,
     Fp8GemmRunner,
     Fp8Mxfp4GemmRunner,
+    Fp8SharedFc1Runner,
     HcPreRunner,
     HcPostRunner,
     IndexerScoreDecodeRunner,
@@ -64,6 +65,7 @@ from sm110a_kernel import (
     TopKRunner,
     clear_kernel_runner_cache,
     compact_mxfp4_weight_scales,
+    pack_fp8_shared_fc1_weights,
     to_blocked_fp8_scales,
     to_blocked_fp8mxfp4_scales,
     to_blocked_mxfp4_scales,
@@ -682,10 +684,100 @@ class Sm110aIndexer(_official.Indexer):
         return indices
 
 
+class Sm110aSharedExpert(_official.Expert):
+    """Checkpoint-compatible FP8 shared expert with a fused gate/up FC1."""
+
+    def prepare_fused_weights(self) -> None:
+        if getattr(self, "_sm110a_shared_prepared", False):
+            return
+        gate, up = self.w1.weight, self.w3.weight
+        inter_dim, dim = gate.shape
+        if (
+            not gate.is_cuda
+            or gate.dtype != torch.float8_e4m3fn
+            or up.dtype != gate.dtype
+            or up.device != gate.device
+            or up.shape != gate.shape
+            or dim % 128
+            or inter_dim % 128
+            or _official.block_size != 128
+            or _official.scale_dtype != torch.float8_e8m0fnu
+            or self.w1.scale is None
+            or self.w3.scale is None
+            or self.w1.scale.dtype != torch.float8_e8m0fnu
+            or self.w3.scale.dtype != torch.float8_e8m0fnu
+        ):
+            return
+
+        def expand(scales):
+            expected = (inter_dim // 128, dim // 128)
+            if tuple(scales.shape) != expected:
+                raise ValueError(f"shared FP8 weight scales must have shape {expected}")
+            return (
+                scales.view(torch.uint8)
+                .repeat_interleave(128, dim=0)
+                .repeat_interleave(4, dim=1)
+                .view(torch.float8_e8m0fnu)
+            )
+
+        weight, scales = pack_fp8_shared_fc1_weights(
+            gate, up, expand(self.w1.scale), expand(self.w3.scale)
+        )
+        # Keep w1/w3 and their checkpoint keys. Packed execution buffers are
+        # derived once after checkpoint loading, and are not saved in state_dict.
+        self.register_buffer("sm110a_shared_fc1_weight", weight, persistent=False)
+        self.register_buffer("sm110a_shared_fc1_scale", scales, persistent=False)
+        self._sm110a_shared_prepared = True
+
+    def forward(self, x: torch.Tensor, weights: torch.Tensor | None = None):
+        if (
+            weights is not None
+            or not x.is_cuda
+            or x.dtype != torch.bfloat16
+            or x.size(-1) != self.w1.in_features
+        ):
+            _STATS["torch.shared_expert_fallback"] += 1
+            return super().forward(x, weights)
+        self.prepare_fused_weights()
+        if not getattr(self, "_sm110a_shared_prepared", False):
+            _STATS["torch.shared_expert_fallback"] += 1
+            return super().forward(x, weights)
+
+        shape = x.shape
+        dim, inter_dim = self.w1.in_features, self.w1.out_features
+        flat = x.reshape(-1, dim).contiguous()
+        tokens = flat.size(0)
+        padded_tokens = math.ceil(tokens / 128) * 128
+        if padded_tokens != tokens:
+            flat = torch.cat((flat, flat.new_zeros((padded_tokens - tokens, dim))))
+        aq = torch.empty(flat.shape, device=x.device, dtype=torch.float8_e4m3fn)
+        sfa = torch.empty(
+            padded_tokens * dim // 8, device=x.device, dtype=torch.float8_e8m0fnu
+        )
+        hidden = torch.empty(
+            (padded_tokens, inter_dim), device=x.device, dtype=torch.bfloat16
+        )
+        Fp8SharedFc1Runner(
+            aq,
+            self.sm110a_shared_fc1_weight,
+            sfa,
+            self.sm110a_shared_fc1_scale,
+            hidden,
+            input=flat,
+            swiglu_limit=self.swiglu_limit,
+            pdl=_DECODE_PDL,
+        ).run()
+        _STATS["sm110a.fp8_shared_fc1"] += 1
+        _STATS["sm110a.fp8_act_quant_blocked"] += 1
+        # Leave the padded hidden rows in place so FC2 need not pad again.
+        return self.w2(hidden)[:tokens].reshape(*shape[:-1], self.w2.out_features)
+
+
 class Sm110aMoE(_official.MoE):
     """Official MoE state layout with separate or fused SM110A FC1/FC2."""
 
     def prepare_fused_weights(self) -> None:
+        self.shared_experts.prepare_fused_weights()
         if getattr(self, "_sm110a_prepared", False):
             return
         if _official.world_size != 1:
@@ -854,8 +946,8 @@ class Sm110aMoE(_official.MoE):
             _STATS["sm110a.mxfp4_fc1"] += 1
             _STATS["sm110a.mxfp4_fc2"] += 1
 
-        # The shared expert is dense FP8 in the official checkpoint and goes
-        # through the SM110A dense backend installed by the forward context.
+        # Shared FC1 fuses FP8 gate/up projection and the activation epilogue;
+        # shared FC2 uses the native dense backend installed by this context.
         out = out[:tokens] + self.shared_experts(x)
         return out.to(x.dtype).view(shape)
 
@@ -1055,6 +1147,7 @@ class Transformer(_official.Transformer):
             layer.__class__ = Sm110aMTPBlock
             layer.ffn.__class__ = Sm110aMoE
         for layer in (*self.layers, *self.mtp):
+            layer.ffn.shared_experts.__class__ = Sm110aSharedExpert
             layer.attn.__class__ = Sm110aAttention
             layer.ffn._sm110a_compact_weight_scales = compact_moe_scales
             layer.ffn._sm110a_moe_backend = moe_backend

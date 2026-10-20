@@ -13,6 +13,27 @@ sparse MLA use the corresponding SM110A kernels. Missing fused model-level
 operators currently use explicit PyTorch fallbacks marked with
 `TODO(sm110a)` in `model.py`.
 
+Shared experts use `Fp8SharedFc1Runner` by default for CUDA BF16 inputs
+with supported E4M3 weights, E8M0 scales and 128-aligned dimensions. This
+applies to both decoder and MTP blocks. `prepare_for_inference()` packs
+static gate/up weights once into 64-row interleaved pairs and expands the
+checkpoint's 128x128 scales into the blocked MMA layout. Original w1/w3
+parameters and state-dict keys are retained; derived packed buffers are
+non-persistent. As with routed expert preparation, load the checkpoint before
+preparing the model.
+
+The shared FC1 quantizes its BF16 input once, then fuses both FP8 projections,
+intermediate BF16 rounding, FP32 clamp/SiLU/multiply, and final BF16 conversion.
+Decode supports the existing optional PDL setting. Small token workloads pad
+to 128 rows, and the padded activation feeds the existing native dense FC2
+before trimming the result. Shared/routed output addition remains PyTorch.
+Backend statistics are `sm110a.fp8_shared_fc1` and
+`torch.shared_expert_fallback`; unsupported formats or explicit per-expert
+routing weights use the inherited reference path. See the
+[shared FC1 kernel guide](../../csrc/fp8_shared_fc1/README.md) for benchmark
+results and the corrected L2 SOL model; isolated FC1 gains do not establish
+an end-to-end model speedup.
+
 All RMSNorm modules, including attention/FFN, compressor, final and MTP norms,
 use `RmsNormRunner` by default. Weights stay FP32 as in the reference model;
 BF16/FP16 inputs are normalized and multiplied by the FP32 weight in FP32,
