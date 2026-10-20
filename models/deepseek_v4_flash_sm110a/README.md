@@ -22,15 +22,23 @@ retain the reference implementation. Backend statistics count native calls
 under `sm110a.rmsnorm` and fallbacks under `torch.rmsnorm_fallback`.
 
 Single-token decode at `start_pos > 0` uses `HcPreRunner` for HC pre, in both
-attention and FFN (including MTP blocks). One CTA per token shares each input
-load between the FP32 RMS sum and all 24 FP32 projection accumulators, then
-computes pre/post gates, 4x4 Sinkhorn and the weighted HC collapse in one kernel.
-The input stays in shared memory in its original dtype for the final collapse.
-Only the collapsed output is cast back to input dtype; post/comb stay FP32.
-The current implementation supports HC=4, D up to 4096, contiguous CUDA
-BF16/FP16/FP32 inputs, and FP32 HC parameters (16-byte aligned projection
-weights). The kernel uses a fixed 256 threads per token, selected for the
-default batch-128 decode workload. FP32 reduction
+attention and FFN (including MTP blocks). Aligned BF16 inputs with even D >= 256
+use a split-K `tcgen05.mma` projection with instruction N=24. Its fixed tile is
+M=128, N=24, K=128; each CTA handles 512 K elements with two shared-memory
+buffers, 512 producer threads and one consumer warp. Producers load and convert
+the next tile while MMA processes the current tile. Each input load supplies
+both the FP32 RMS sum and projection. FP32 weights are decomposed into three
+BF16 components on device, with separate FP32 high/residual accumulators.
+A second kernel reduces partials, computes pre/post gates and 4x4 Sinkhorn,
+and collapses the HC streams. It overlaps asynchronous input prefetch with
+Sinkhorn. The runner retains its scratch allocation across graph replays
+(512 KiB for batch=128, D=4096).
+
+FP16/FP32 inputs, odd/small D, and unaligned input/output buffers retain the
+single-CTA SIMT kernel with 256 threads per token. The implementation supports
+HC=4, D up to 4096, contiguous CUDA BF16/FP16/FP32 inputs, and FP32 HC parameters
+(16-byte aligned projection weights). Only the collapsed output is cast back
+to input dtype; post/comb stay FP32. FP32 reduction
 order differs from PyTorch, so agreement is numerical
 rather than bitwise. Prefill and unsupported formats use the reference path;
 a tensor-core prefill implementation remains future work. Dispatch counts are
@@ -55,7 +63,8 @@ Shared projection weights are counted once across tokens because on-chip caches
 can reuse them. The default peak is the repository's 273 GB/s, overridable with
 `--peak-gbps`. Attainment is `(traffic / peak_bandwidth) / measured_time`.
 This is a compulsory-memory SOL only; it excludes compute, repeated L1/L2
-traffic, synchronization, and launch costs, and does not use tensor-core peaks.
+traffic, temporary buffers, synchronization, and launch costs, and does not
+use tensor-core peaks.
 
 HC post uses `HcPostRunner` in attention and FFN, for prefill and decode
 (including MTP). It fuses the FP32 post-gated expansion, 4x4 residual mixing,

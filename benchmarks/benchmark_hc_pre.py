@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Decode HC pre, fixed CTA configuration, cold-L2 CUDA Graph timings."""
+"""Decode HC pre, fixed tcgen05/SIMT configurations, cold-L2 Graph timings."""
 
 import argparse
 import math
@@ -89,7 +89,8 @@ class HcPreBenchmark(BenchmarkBase):
     @torch.inference_mode()
     def run_with_args(self, args):
         print(
-            f"HC=4 D={args.d} dtype={args.dtype} threads=256 "
+            f"HC=4 D={args.d} dtype={args.dtype} "
+            "tcgen05 tile=128x24x128 split-K=512 buffers=2; SIMT threads=256; "
             f"Sinkhorn={args.sinkhorn_iters}; cold-L2 CUDA Graph replay"
         )
         print("tokens ours(us) torch(us) speedup max_abs(y/post/comb)")

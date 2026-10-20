@@ -13,6 +13,7 @@ using Launcher = cudaError_t (*)(const void *,
     void *,
     float *,
     float *,
+    float *,
     int64_t,
     int,
     float,
@@ -27,6 +28,7 @@ void hc_pre_out(
     torch::Tensor output,
     torch::Tensor post,
     torch::Tensor comb,
+    torch::Tensor scratch,
     double norm_eps,
     double hc_eps,
     int64_t d,
@@ -78,6 +80,12 @@ void hc_pre_out(
         "HC pre outputs must not overlap one another");
     int64_t rows = input.numel() / (4 * d);
     TORCH_CHECK(rows <= std::numeric_limits<int>::max(), "too many token rows");
+    TORCH_CHECK(fp32(scratch) && scratch.numel() == rows * ((4 * d + 511) / 512) * 32,
+        "invalid HC pre scratch");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(scratch.data_ptr()) % 16 == 0,
+        "HC pre scratch must be 16-byte aligned");
+    for (const auto &t : {input, weight, scale, base, output, post, comb})
+        TORCH_CHECK(!overlaps(scratch, t), "HC pre scratch must not overlap tensors");
     c10::cuda::CUDAGuard guard(input.device());
     C10_CUDA_CHECK(reinterpret_cast<Launcher>(address)(input.data_ptr(),
         weight.data_ptr<float>(),
@@ -86,6 +94,7 @@ void hc_pre_out(
         output.data_ptr(),
         post.data_ptr<float>(),
         comb.data_ptr<float>(),
+        scratch.data_ptr<float>(),
         rows,
         type == at::kBFloat16 ? 0
         : type == at::kHalf   ? 1

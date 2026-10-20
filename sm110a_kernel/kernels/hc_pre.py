@@ -1,4 +1,4 @@
-"""Decode HC pre: fused FP32 projection/RMS, split-Sinkhorn and HC collapse."""
+"""Decode HC pre with pipelined tcgen05 projection and fused gates/collapse."""
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +10,15 @@ from ..runner import FixedKernelRunner
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE = _ROOT / "csrc/hc_pre/src"
+_SPLIT_K = 512
+
+
+def _allocate_scratch(input, d):
+    return torch.empty(
+        (input.numel() // (4 * d), (4 * d + _SPLIT_K - 1) // _SPLIT_K, 32),
+        device=input.device,
+        dtype=torch.float32,
+    )
 
 
 @dataclass(frozen=True)
@@ -25,8 +34,21 @@ class HcPreModule:
         self.config = config
 
     def hc_pre_out(
-        self, input, weight, scale, base, output, post, comb, norm_eps=1e-6, hc_eps=1e-6
+        self,
+        input,
+        weight,
+        scale,
+        base,
+        output,
+        post,
+        comb,
+        norm_eps=1e-6,
+        hc_eps=1e-6,
+        *,
+        scratch=None,
     ):
+        if scratch is None:
+            scratch = _allocate_scratch(input, self.config.d)
         self._binding.hc_pre_out(
             input,
             weight,
@@ -35,6 +57,7 @@ class HcPreModule:
             output,
             post,
             comb,
+            scratch,
             norm_eps,
             hc_eps,
             self.config.d,
@@ -129,6 +152,7 @@ class HcPreRunner(FixedKernelRunner):
         *,
         sinkhorn_iters=20,
     ):
+        scratch = _allocate_scratch(input, input.size(-1))
         super().__init__(
             input.device,
             "hc_pre",
@@ -142,7 +166,16 @@ class HcPreRunner(FixedKernelRunner):
             lambda: compile_hc_pre(input.size(-1), sinkhorn_iters=sinkhorn_iters),
             lambda module: (
                 lambda: module.hc_pre_out(
-                    input, weight, scale, base, output, post, comb, norm_eps, hc_eps
+                    input,
+                    weight,
+                    scale,
+                    base,
+                    output,
+                    post,
+                    comb,
+                    norm_eps,
+                    hc_eps,
+                    scratch=scratch,
                 )
             ),
         )
