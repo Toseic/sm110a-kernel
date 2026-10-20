@@ -21,6 +21,42 @@ and state-dict keys/dtypes are unchanged. CPU and unsupported input formats
 retain the reference implementation. Backend statistics count native calls
 under `sm110a.rmsnorm` and fallbacks under `torch.rmsnorm_fallback`.
 
+Single-token decode at `start_pos > 0` uses `HcPreRunner` for HC pre, in both
+attention and FFN (including MTP blocks). One CTA per token shares each input
+load between the FP32 RMS sum and all 24 FP32 projection accumulators, then
+computes pre/post gates, 4x4 Sinkhorn and the weighted HC collapse in one kernel.
+The input stays in shared memory in its original dtype for the final collapse.
+Only the collapsed output is cast back to input dtype; post/comb stay FP32.
+The current implementation supports HC=4, D up to 4096, contiguous CUDA
+BF16/FP16/FP32 inputs, and FP32 HC parameters (16-byte aligned projection
+weights). The kernel uses a fixed 256 threads per token, selected for the
+default batch-128 decode workload. FP32 reduction
+order differs from PyTorch, so agreement is numerical
+rather than bitwise. Prefill and unsupported formats use the reference path;
+a tensor-core prefill implementation remains future work. Dispatch counts are
+`sm110a.hc_pre` and `torch.hc_pre_fallback`. Attention/FFN RMSNorm remains a
+separate operator after HC pre, and checkpoint keys/dtypes are unchanged.
+
+Compare the complete fused operation with the current PyTorch implementation
+using cold-L2 CUDA Graph replay:
+
+```bash
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_hc_pre.py --tokens 1 16 128 --sol
+```
+
+`--dtype`, `--d`, `--sinkhorn-iters`, `--input-case`, and `--logit-scale`
+control numerical cases.
+Accuracy checks cover all three outputs and eager/graph reproducibility,
+including input updates between replays.
+
+`--sol` reports a memory-bandwidth lower bound: input bytes plus FP32 HC
+parameter bytes plus the three output tensors, each counted once per invocation.
+Shared projection weights are counted once across tokens because on-chip caches
+can reuse them. The default peak is the repository's 273 GB/s, overridable with
+`--peak-gbps`. Attainment is `(traffic / peak_bandwidth) / measured_time`.
+This is a compulsory-memory SOL only; it excludes compute, repeated L1/L2
+traffic, synchronization, and launch costs, and does not use tensor-core peaks.
+
 Dense BF16/FP8/FP8xMXFP4 GEMMs, grouped wo_a projection, routed MoE,
 quantizers, RMSNorm, sparse MLA, and indexer top-k execute through public runner
 classes in `sm110a_kernel/kernels/*.py`; `model.py` does not call `compile_*`.

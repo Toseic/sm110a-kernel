@@ -6,7 +6,7 @@ checkpoints load without another conversion step.
 """
 
 # Remaining native-kernel support (including inherited reference operators):
-# TODO(sm110a): fuse HC pre/projection, split-Sinkhorn, post mixing, and HC head.
+# TODO(sm110a): add tensor-core HC pre for prefill; fuse HC post mixing and HC head.
 # TODO(sm110a): implement FP32 compressor projections and fused ratio-4 overlap /
 # ratio-128 pooling, incremental state updates, and compressed KV cache writes.
 # TODO(sm110a): add Q normalization, RoPE/inverse RoPE, and Hadamard
@@ -55,6 +55,7 @@ from sm110a_kernel import (
     Fp8ActQuantRunner,
     Fp8GemmRunner,
     Fp8Mxfp4GemmRunner,
+    HcPreRunner,
     Mxfp4Fc1Fc2Runner,
     Mxfp4MoeRunner,
     RmsNormRunner,
@@ -829,6 +830,43 @@ class Sm110aParallelHead(_official.ParallelHead):
         return out[:rows]
 
 
+def _hc_pre_decode(self, x, hc_fn, hc_scale, hc_base):
+    if not (
+        _DECODE_ENABLED
+        and x.is_cuda
+        and x.is_contiguous()
+        and x.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        and self.hc_mult == 4
+        and 1 <= x.size(-1) <= 4096
+        and 1 <= self.hc_sinkhorn_iters <= 100
+        and hc_fn.data_ptr() % 16 == 0
+        and all(
+            t.dtype == torch.float32 and t.is_contiguous()
+            for t in (hc_fn, hc_scale, hc_base)
+        )
+    ):
+        _STATS["torch.hc_pre_fallback"] += 1
+        return _official.Block.hc_pre(self, x, hc_fn, hc_scale, hc_base)
+    prefix = x.shape[:-2]
+    y = torch.empty((*prefix, x.size(-1)), dtype=x.dtype, device=x.device)
+    post = torch.empty((*prefix, 4), dtype=torch.float32, device=x.device)
+    comb = torch.empty((*prefix, 4, 4), dtype=torch.float32, device=x.device)
+    HcPreRunner(
+        x, hc_fn, hc_scale, hc_base, y, post, comb,
+        self.norm_eps, self.hc_eps, sinkhorn_iters=self.hc_sinkhorn_iters,
+    ).run()
+    _STATS["sm110a.hc_pre"] += 1
+    return y, post, comb
+
+
+class Sm110aBlock(_official.Block):
+    hc_pre = _hc_pre_decode
+
+
+class Sm110aMTPBlock(_official.MTPBlock):
+    hc_pre = _hc_pre_decode
+
+
 class Transformer(_official.Transformer):
     """Checkpoint-compatible official model with SM110A operator dispatch."""
 
@@ -872,8 +910,10 @@ class Transformer(_official.Transformer):
         self.routing_weight_position = routing_weight_position
         self.deterministic_fc2 = deterministic_fc2
         for layer in self.layers:
+            layer.__class__ = Sm110aBlock
             layer.ffn.__class__ = Sm110aMoE
         for layer in self.mtp:
+            layer.__class__ = Sm110aMTPBlock
             layer.ffn.__class__ = Sm110aMoE
         for layer in (*self.layers, *self.mtp):
             layer.attn.__class__ = Sm110aAttention

@@ -146,6 +146,7 @@ from .grouped_m_gemm import (
     compile_bf16_grouped_m_gemm_configs,
     get_bf16_grouped_m_gemm_module,
 )
+from .hc_pre import HcPreConfig, HcPreRunner, compile_hc_pre, hc_pre, hc_pre_out
 from .moe_routing import pack_routing_metadata
 from .mxfp4_fc1 import (
     Mxfp4Fc1Config,

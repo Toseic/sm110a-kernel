@@ -174,6 +174,7 @@ from .kernels.grouped_m_gemm import (
     get_bf16_grouped_m_gemm_module,
     prepare_grouped_m_metadata,
 )
+from .kernels.hc_pre import HcPreConfig, HcPreRunner, compile_hc_pre, hc_pre, hc_pre_out
 from .kernels.moe_routing import pack_routing_metadata
 from .kernels.mxfp4_fc1 import (
     Mxfp4Fc1Config,
