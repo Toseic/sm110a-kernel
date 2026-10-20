@@ -189,8 +189,60 @@ an intermediate BF16 rounding or per-step weight conversion. Unsupported
 shapes/dtypes use a PyTorch FP32 fallback. Loading FP32 head weights rounds
 them to BF16; checkpoint key names and the head shared with MTP stay unchanged.
 
-The CSA indexer uses the native SM110A row top-k kernel for both prefill and
-decode. Its score producer currently retains the reference BF16/QAT path.
+The CSA indexer uses native MXFP4 score runners and row top-k for both prefill
+and decode on single-GPU CUDA BF16 inputs with 64 index heads of dimension 128.
+Rotated Q is quantized directly to block-32 E2M1/E8M0; the valid prefix of the
+BF16/QAT KV cache is repacked on every invocation. Scale tiles are padded
+independently per batch, including odd query and KV lengths. Repacking keeps
+cache resets and CUDA Graph replay consistent without a second persistent KV
+state; fusing packing into compressor cache writes remains future work.
+Prefill computes scores with the kernel's ordinary causal mask disabled and
+applies compressed visibility `kv_index < floor((query_position + 1) / ratio)`
+before top-k. Empty compressed prefixes return empty indices. Other index
+head configurations and distributed execution retain the reference score path.
+Dispatch counts are `sm110a.indexer_score_prefill`,
+`sm110a.indexer_score_decode`, and `torch.indexer_score_fallback`.
+
+The native score epilogue uses the existing DeepGEMM-style BF16 FMA/reduction
+order, which differs from the reference PyTorch multiply and sum. Scores are
+numerically rather than bitwise equivalent; near-tied candidates may select
+different top-k indices. Full-model/checkpoint quality agreement still needs
+validation.
+
+Supported configurations always use the native indexer score kernels. The
+full-model benchmark uses the shared GPC/EMC clock-lock helper by default;
+`--no-lock-clocks` keeps existing clock settings.
+
+On Thor at GPC 1575 MHz / EMC 4266 MHz, cold-L2 CUDA Graph measurements gave:
+
+| Workload | Previous PyTorch | Native MXFP4 | Previous/native |
+| --- | ---: | ---: | ---: |
+| Indexer decode B=1, KV=2048 | 31.47 us | 38.18 us | 0.824x |
+| Indexer decode B=16, KV=2048 | 155.08 us | 159.43 us | 0.973x |
+| Indexer decode B=128, KV=2048 | 1245.98 us | 828.65 us | 1.504x |
+| Indexer prefill B=1, S=1024, KV=256 | 1207.61 us | 315.67 us | 3.826x |
+| Complete two-layer model decode B=128, context=8192 | 40.30 ms | 39.83 ms | 1.012x |
+
+Indexer timings include Q QAT or Q/K packing, score, compressed causal masking
+and top-k, excluding projections, RoPE/Hadamard and compressor. Inputs are fixed
+random BF16/QAT values; timings are medians of five samples of 20 replays after
+five warmups, with a dirty cold-L2 flush before each measured replay. Relative
+score RMSE was about 0.49% for B=128 decode and prefill; decode top-k overlap
+was 99.72%. Prefill selects all available keys in this case, so its 100% overlap
+does not establish agreement for a truncated candidate selection.
+
+Full-model timings are means of 20 replays after five warmups, with the existing
+default random weights and zero-initialized history, unfused deterministic MoE,
+and PDL disabled. Full model traffic exceeds L2 capacity. Both score backends
+passed the benchmark's eager/graph checks; these are not checkpoint-quality
+comparisons. Small-batch decode currently regresses; repacking KV and dispatch
+overhead remain optimization work.
+
+Run the current native full-model workload with:
+
+```bash
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_dsv4_flash.py --batch-size 128 --seq-len 8192 --decode-len 1 --warmup 5 --iters 20
+```
 
 Decode is always captured as one fixed CUDA Graph and benchmarked through
 graph replay. By default the benchmark runs decode only with batch 128,

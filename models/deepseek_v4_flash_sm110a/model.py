@@ -12,9 +12,8 @@ checkpoints load without another conversion step.
 # TODO(sm110a): add Q normalization, RoPE/inverse RoPE, and Hadamard
 # rotation (currently an external extension or a PyTorch fallback).
 # TODO(sm110a): fuse FP8 QAT quantize-dequantize and its inplace store.
-# TODO(sm110a): connect existing MXFP4 indexer score prefill/decode kernels with
-# packed Q/K scales and KV cache updates; adapt compressed causal masking and
-# validate rounding against the current BF16/QAT score producer.
+# TODO(sm110a): fuse indexer KV packing with compressor cache writes instead
+# of repacking the valid BF16/QAT cache on every invocation.
 # TODO(sm110a): fuse FP32 MoE gate projection, scoring, hash/score selection,
 # weight normalization, and metadata construction directly from expert IDs.
 # TODO(sm110a): add deterministic reduction and PDL to the FC1/FC2 fused backend.
@@ -57,6 +56,8 @@ from sm110a_kernel import (
     Fp8Mxfp4GemmRunner,
     HcPreRunner,
     HcPostRunner,
+    IndexerScoreDecodeRunner,
+    IndexerScorePrefillRunner,
     Mxfp4Fc1Fc2Runner,
     Mxfp4MoeRunner,
     RmsNormRunner,
@@ -65,6 +66,7 @@ from sm110a_kernel import (
     compact_mxfp4_weight_scales,
     to_blocked_fp8_scales,
     to_blocked_fp8mxfp4_scales,
+    to_blocked_mxfp4_scales,
 )
 
 # Scoped to one model forward, like the official backend patches below.
@@ -554,8 +556,91 @@ class Sm110aAttention(_official.Attention):
         )
 
 
+def _pack_indexer_fp4(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack [B, rows, 128], padding scale tiles independently per batch.
+
+    Q uses 64 rows per query; K uses one row per compressed token. The score
+    kernels address scales in independent 128-row tiles for each sequence.
+    Values keep their logical row count, including odd query/KV lengths.
+    """
+    batch, rows, width = x.shape
+    flat = x.contiguous().view(batch * rows, width)
+    packed = torch.empty(
+        (batch * rows, width // 2), device=x.device, dtype=torch.float4_e2m1fn_x2
+    )
+    scales = torch.empty(
+        (batch * rows, width // 32), device=x.device, dtype=torch.float8_e8m0fnu
+    )
+    Bf16ToFp4QuantRunner(flat, packed, scales).run()
+    padded_rows = math.ceil(rows / 128) * 128
+    if padded_rows != rows:
+        # E8M0 byte 127 represents 1.0. Padding is never a valid Q/K row.
+        padded = torch.full(
+            (batch, padded_rows, width // 32),
+            127,
+            device=x.device,
+            dtype=torch.uint8,
+        )
+        padded[:, :rows].copy_(scales.view(torch.uint8).view(batch, rows, -1))
+        scales = padded.view(torch.float8_e8m0fnu)
+    blocked = to_blocked_mxfp4_scales(scales.reshape(batch * padded_rows, -1))
+    return packed.view(batch, rows, width // 2), blocked
+
+
 class Sm110aIndexer(_official.Indexer):
-    """CSA indexer with SM110A row top-k after the reference score producer."""
+    """CSA indexer with native MXFP4 scoring and row top-k."""
+
+    def _score(self, q: torch.Tensor, weights: torch.Tensor, width: int):
+        bsz, seqlen, heads, dim = q.shape
+        kv = self.kv_cache[:bsz, :width]
+        if (
+            q.is_cuda
+            and q.dtype == kv.dtype == weights.dtype == torch.bfloat16
+            and heads == 64
+            and dim == 128
+            and _official.world_size == 1
+        ):
+            # Q is packed directly from the rotated BF16 activation. The BF16
+            # KV cache already contains block-32 FP4 QAT values; repacking it
+            # also keeps external cache restores visible on every graph replay.
+            pq, sq = _pack_indexer_fp4(q.reshape(bsz, seqlen * heads, dim))
+            pk, sk = _pack_indexer_fp4(kv)
+            scores = torch.empty(
+                (bsz, seqlen, width), device=q.device, dtype=torch.bfloat16
+            )
+            if seqlen == 1:
+                IndexerScoreDecodeRunner(
+                    pq.view(bsz, heads, dim // 2),
+                    pk,
+                    sq,
+                    sk,
+                    weights.reshape(bsz, heads).contiguous(),
+                    scores.view(bsz, width),
+                ).run()
+                _STATS["sm110a.indexer_score_decode"] += 1
+            else:
+                # The kernel's ordinary token causal mask does not express
+                # compressed visibility floor((query_position + 1) / ratio).
+                # Compute the full matrix and apply that mask before top-k.
+                IndexerScorePrefillRunner(
+                    pq.view(bsz, seqlen, heads, dim // 2),
+                    pk,
+                    sq,
+                    sk,
+                    weights.contiguous(),
+                    scores,
+                    causal=False,
+                ).run()
+                _STATS["sm110a.indexer_score_prefill"] += 1
+            return scores
+
+        fp4_act_quant(q, _official.fp4_block_size, True)
+        scores = torch.einsum("bshd,btd->bsht", q, kv)
+        scores = (scores.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+        if _official.world_size > 1:
+            torch.distributed.all_reduce(scores)
+        _STATS["torch.indexer_score_fallback"] += 1
+        return scores
 
     def forward(self, x, qr, start_pos: int, offset: int):
         bsz, seqlen, _ = x.shape
@@ -567,17 +652,14 @@ class Sm110aIndexer(_official.Indexer):
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
         _official.apply_rotary_emb(q[..., -rd:], self.freqs_cis[start_pos:end_pos])
         q = _official.rotate_activation(q)
-        fp4_act_quant(q, _official.fp4_block_size, True)
         self.compressor(x, start_pos)
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
-        # TODO(sm110a): replace the reference QAT/BF16 score producer with
-        # the native MXFP4 indexer score kernel and its packed KV cache.
-        scores = torch.einsum(
-            "bshd,btd->bsht", q, self.kv_cache[:bsz, : end_pos // ratio]
-        )
-        scores = (scores.relu_() * weights.unsqueeze(-1)).sum(dim=2)
-        if _official.world_size > 1:
-            torch.distributed.all_reduce(scores)
+        width = end_pos // ratio
+        if width == 0:
+            # A short prefill/decode still updates compressor state, but has
+            # no completed compressed group to score or select.
+            return torch.empty((bsz, seqlen, 0), device=x.device, dtype=torch.int32)
+        scores = self._score(q, weights, width)
         if start_pos == 0:
             valid_groups = (
                 torch.arange(1, seqlen + 1, device=x.device)[:, None] // ratio

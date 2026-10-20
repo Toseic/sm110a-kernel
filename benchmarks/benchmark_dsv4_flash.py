@@ -22,7 +22,7 @@ sys.path.insert(0, str(OFFICIAL_MODEL_ROOT))
 sys.path.insert(0, str(OFFICIAL_MODEL_ROOT / "inference"))
 
 from benchmark_utils import gib, model_storage_bytes
-from common import GMEM_BW_GBPS
+from common import GMEM_BW_GBPS, B300Sim, BenchmarkBase
 from models.deepseek_v4_flash_sm110a.model import (
     ModelArgs as Sm110aModelArgs,
     Transformer as Sm110aTransformer,
@@ -34,6 +34,7 @@ from models.deepseek_v4_flash_sm110a.model import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    BenchmarkBase.add_b300_sim_args(parser)
     parser.add_argument(
         "--checkpoint",
         "--ckpt-path",
@@ -625,8 +626,7 @@ def _print_results(results, args):
             print(f"  {name}: {count}")
 
 
-def main() -> None:
-    args = parse_args()
+def run_benchmark(args: argparse.Namespace) -> None:
     config = benchmark_config(args)
     sm110a_parameter_bytes, _ = budget_check(config, args)
     print(
@@ -708,6 +708,12 @@ def main() -> None:
                 prefill_seconds=result["prefill_seconds"],
                 decode_seconds=result["decode_seconds"],
             )
+
+
+def main() -> None:
+    args = parse_args()
+    with B300Sim(args):
+        run_benchmark(args)
 
 
 if __name__ == "__main__":
