@@ -8,10 +8,38 @@ SM110A kernels from `sm110a_kernel`.
 The 32-GiB benchmark configuration contains one ratio-4 CSA layer and one
 ratio-128 HCA layer. Routed experts default to separate W4A8 `mxfp4_fc1` and
 `mxfp4_fc2` kernels. An optional `fused` backend executes both in one
-`mxfp4_fc1fc2` kernel. Dense projections, activation quantization and
-sparse MLA use the corresponding SM110A kernels. Missing fused model-level
-operators currently use explicit PyTorch fallbacks marked with
-`TODO(sm110a)` in `model.py`.
+`mxfp4_fc1fc2` kernel. Dense projections and activation quantization use
+SM110A kernels. Main attention uses native FP8-cache sparse MLA as described
+below. Missing fused model-level operators use explicit PyTorch fallbacks
+marked with `TODO(sm110a)` in `model.py`.
+
+Main-attention KV caches now store E4M3 FP8 non-RoPE values, one scale per
+64 values, and separate BF16 RoPE values. This covers the sliding window and
+both CSA/HCA compressed caches, including MTP. With the default 512-dimensional
+KV and E8M0 scales, each entry uses 448 + 7 + 128 = 583 bytes instead of
+1024 bytes (43.1% less persistent main KV storage). FP32 scales are also
+supported. The separate indexer retains its existing MXFP4/QAT cache path.
+All cache buffers are non-persistent, preserving checkpoint keys.
+
+`sparse_attn_fp8` consumes these packed tensors in both prefill and decode.
+For CUDA BF16 Q with H=64/D=512 it uses the separate native
+[FP8 KV sparse MLA kernel](../../csrc/fp8_kv_fa4_sparse_mla/README.md).
+Warp 4–7 gather selected FP8 values/scales, dequantize in registers and write
+BF16 shared tiles; warp 2 issues BF16 MMA. RoPE loads remain BF16, while
+accumulation, sink and online softmax remain FP32. This preserves the former
+QAT KV operands without a BF16 global-cache mirror or Torch dequantization.
+It does not introduce FP8 Q quantization or FP8 MMA. The existing BF16 sparse
+MLA kernel is unchanged. Unsupported layouts retain the chunked Torch fallback.
+
+Native dispatch counters are `sm110a.sparse_mla_fp8_kv_prefill` and
+`sm110a.sparse_mla_fp8_kv_decode`; the fallback is
+`torch.sparse_mla_fp8_cache_todo`. Quantization uses `sm110a.fp8_act_quant`,
+and cache writes still use `torch.fp8_kv_cache_store_todo`. Fused FP8 cache
+writes and additional head/layout support remain in `TODO(sm110a)`.
+Benchmark CUDA Graph snapshots restore FP8 bytes, scales, RoPE and
+compressor/indexer state together. Memory budgets use the packed layout.
+HBM SOL counts logical selected-cache bytes, excluding repeated loads and
+fallback temporary traffic, so it remains a lower bound.
 
 Compressor KV/gate and MoE router projections use native BF16 GEMM in both
 prefill and decode, including MTP. Compressor `wkv`/`wgate` parameters retain
@@ -192,8 +220,8 @@ tokens, repeated measurements were around 243–246 GB/s (89–90%); this does
 not establish stable 90% bandwidth attainment.
 
 Dense BF16/FP8/FP8xMXFP4 GEMMs, grouped wo_a projection, routed MoE,
-quantizers, RMSNorm, sparse MLA, and indexer top-k execute through public runner
-classes in `sm110a_kernel/kernels/*.py`; `model.py` does not call `compile_*`.
+quantizers, RMSNorm, FP8 KV sparse MLA, and indexer top-k execute through public
+runner classes in `sm110a_kernel/kernels/*.py`; `model.py` does not call `compile_*`.
 These inherit `BaseKernelRunner` in `sm110a_kernel/runner.py`, which uses
 `AutotuneRunner` for selection and persistent caching. Benchmarks share the
 same candidate policies and execution bindings.
@@ -204,9 +232,10 @@ current tensors; the shared selection cache retains only configurations.
 MoE tuning measures the complete quantization/routing/FC1/FC2 chain, rebuilding
 configuration-specific metadata on every invocation. Routing weights, BF16
 rounding, compact scales, and deterministic reduction remain fixed during tuning.
-Top-k uses `TopKRunner` for configuration selection. Quantizers, RMSNorm and sparse MLA
-use fixed runners, which prepare their single implementation without a timing
-sweep. See the [runner guide](../../docs/kernel_runners.md) for the full API.
+Top-k uses `TopKRunner` for configuration selection. Quantizers, RMSNorm and
+FP8 KV sparse MLA use fixed runners, preparing their single implementation
+without a timing sweep. See the [runner guide](../../docs/kernel_runners.md)
+for the full API.
 
 Warm up each intended shape and mode eagerly before capturing a CUDA Graph.
 `prepare_for_inference()` packs static weights; input-dependent tuning happens

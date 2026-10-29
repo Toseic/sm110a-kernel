@@ -124,6 +124,12 @@ from .fp8_act_quant import (
 from .fp8_gemm import (
     Fp8GemmRunner,
 )
+from .fp8_kv_fa4_sparse_mla import (
+    Fp8KvFa4SparseMlaRunner,
+    compile_fp8_kv_fa4_sparse_mla,
+    fp8_kv_fa4_sparse_mla,
+    fp8_kv_fa4_sparse_mla_out,
+)
 from .fp8_shared_fc1 import (
     Fp8SharedFc1Config,
     Fp8SharedFc1Runner,

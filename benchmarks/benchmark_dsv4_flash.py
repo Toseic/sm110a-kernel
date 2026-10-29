@@ -201,6 +201,22 @@ def budget_check(config: dict, args: argparse.Namespace) -> tuple[int, int]:
     # The official estimator widens checkpoint BF16 LM-head weights to FP32;
     # our runtime retains BF16, including the single head shared with MTP.
     parameter_bytes -= config["vocab_size"] * config["dim"] * 2
+    # Main attention retains E4M3 non-RoPE + block-64 scales + BF16 RoPE.
+    # The separate MXFP4/QAT indexer cache is unchanged.
+    scale_bytes = 1 if config.get("scale_dtype", "fp8") == "fp8" else 4
+    nope_dim = config["head_dim"] - config["rope_head_dim"]
+    cache_entry_bytes = (
+        nope_dim + nope_dim // 64 * scale_bytes + config["rope_head_dim"] * 2
+    )
+    for ratio in config["compress_ratios"]:
+        entries = config["window_size"] + (
+            config["max_seq_len"] // ratio if ratio else 0
+        )
+        buffer_bytes -= (
+            config["max_batch_size"]
+            * entries
+            * (config["head_dim"] * 2 - cache_entry_bytes)
+        )
     resident_bytes = parameter_bytes + buffer_bytes
     # Both backends can retain padded 4-byte scales or pack static scales
     # once into the original one-byte-per-K32 scale footprint.
@@ -245,11 +261,12 @@ def budget_check(config: dict, args: argparse.Namespace) -> tuple[int, int]:
 def decode_kv_cache_load_bytes(config: dict, prompt_len: int, decode_len: int) -> int:
     """Return persistent KV-cache bytes read by the SM110A decode path.
 
-    ``sparse_attn`` gathers only valid indices in ``topk_idxs`` rather than
+    The FP8-cache path gathers indices in ``topk_idxs`` rather than
     reading the entire cache. Ratio-4 layers also read their indexer's
     compressed KV cache to choose those sparse indices. Cache writes and the
     temporary prefill KV tensor are deliberately excluded: this is a read-only
-    persistent-KV-cache model.
+    persistent-KV-cache model. Invalid/padded gathers, repeated accesses and
+    temporary dequantization traffic are excluded; this is a logical lower bound.
     """
     batch_size = config["max_batch_size"]
     window_size = config["window_size"]
@@ -257,6 +274,9 @@ def decode_kv_cache_load_bytes(config: dict, prompt_len: int, decode_len: int) -
     index_head_dim = config["index_head_dim"]
     index_topk = config["index_topk"]
     bf16_bytes = 2
+    nope_dim = head_dim - config["rope_head_dim"]
+    scale_bytes = 1 if config.get("scale_dtype", "fp8") == "fp8" else 4
+    entry_bytes = nope_dim + nope_dim // 64 * scale_bytes + config["rope_head_dim"] * 2
     total_bytes = 0
 
     for position in range(prompt_len, prompt_len + decode_len):
@@ -272,10 +292,7 @@ def decode_kv_cache_load_bytes(config: dict, prompt_len: int, decode_len: int) -
                     else completed_groups
                 )
             total_bytes += (
-                batch_size
-                * (window_entries + compressed_entries)
-                * head_dim
-                * bf16_bytes
+                batch_size * (window_entries + compressed_entries) * entry_bytes
             )
             if ratio == 4:
                 # Indexer.forward scores every completed compressed entry.
@@ -409,7 +426,14 @@ class DecodeCudaGraph:
         self.cache_state = [
             (buffer, buffer.clone())
             for name, buffer in model.named_buffers()
-            if name.rsplit(".", 1)[-1] in ("kv_cache", "kv_state", "score_state")
+            if name.rsplit(".", 1)[-1]
+            in (
+                "kv_cache",
+                "kv_cache_scale",
+                "kv_cache_rope",
+                "kv_state",
+                "score_state",
+            )
         ]
 
         def restore_cache():

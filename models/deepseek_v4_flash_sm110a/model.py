@@ -11,7 +11,11 @@ checkpoints load without another conversion step.
 # ratio-128 pooling, incremental state updates, and compressed KV cache writes.
 # TODO(sm110a): add Q normalization, RoPE/inverse RoPE, and Hadamard
 # rotation (currently an external extension or a PyTorch fallback).
-# TODO(sm110a): fuse FP8 QAT quantize-dequantize and its inplace store.
+# TODO(sm110a): tune FP8 KV sparse MLA long-prefill/full-selection append
+# performance; current cold-L2 wins are workload dependent.
+# TODO(sm110a): extend native FP8 KV sparse MLA beyond H=64/D=512,
+# block-64 E4M3 non-RoPE + BF16 RoPE layouts (Torch handles other shapes).
+# TODO(sm110a): fuse FP8 cache quantization, scale/RoPE stores and ring writes.
 # TODO(sm110a): fuse indexer KV packing with compressor cache writes instead
 # of repacking the valid BF16/QAT cache on every invocation.
 # TODO(sm110a): fuse MoE gate projection, scoring, hash/score selection,
@@ -53,6 +57,7 @@ from sm110a_kernel import (
     Bf16ToFp4QuantRunner,
     Fp8ActQuantRunner,
     Fp8GemmRunner,
+    Fp8KvFa4SparseMlaRunner,
     Fp8Mxfp4GemmRunner,
     Fp8SharedFc1Runner,
     HcPreRunner,
@@ -360,6 +365,137 @@ def _bf16_projection(x: torch.Tensor, weight: torch.Tensor, *, output_fp32=False
     return out[:rows].view(*x.shape[:-1], n)
 
 
+def _pack_fp8_kv(kv: torch.Tensor, rope_dim: int):
+    values, scales = act_quant(
+        kv[..., :-rope_dim], 64, _official.scale_fmt, _official.scale_dtype
+    )
+    return values, scales, kv[..., -rope_dim:]
+
+
+class Fp8KvCache(torch.nn.Module):
+    """Persistent mixed KV storage: E4M3 non-RoPE, block-64 scales, BF16 RoPE."""
+
+    def __init__(self, shape, rope_dim, device, scale_dtype):
+        super().__init__()
+        self.rope_dim = rope_dim
+        prefix, nope_dim = shape[:-1], shape[-1] - rope_dim
+        if nope_dim <= 0 or nope_dim % 64:
+            raise ValueError("FP8 KV cache requires a positive block-64 non-RoPE width")
+        self.register_buffer(
+            "kv_cache",
+            torch.zeros(*prefix, nope_dim, device=device, dtype=torch.float8_e4m3fn),
+            persistent=False,
+        )
+        scales = torch.empty(*prefix, nope_dim // 64, device=device, dtype=scale_dtype)
+        # E8M0 has no zero. Unwritten entries must reconstruct as zero, so
+        # initialize their scales to one (encoding 127), rather than NaN.
+        if scale_dtype == torch.float8_e8m0fnu:
+            scales.view(torch.uint8).fill_(127)
+        else:
+            scales.fill_(1)
+        self.register_buffer("kv_cache_scale", scales, persistent=False)
+        self.register_buffer(
+            "kv_cache_rope",
+            torch.zeros(*prefix, rope_dim, device=device, dtype=torch.bfloat16),
+            persistent=False,
+        )
+
+    def tensors(self, batch_size):
+        return (
+            self.kv_cache[:batch_size],
+            self.kv_cache_scale[:batch_size],
+            self.kv_cache_rope[:batch_size],
+        )
+
+    def write(self, packed, position):
+        batch_size, count = packed[0].shape[:2]
+        for destination, source in zip(self.tensors(batch_size), packed):
+            destination[:, position : position + count].copy_(source)
+        _STATS["torch.fp8_kv_cache_store_todo"] += 1
+
+
+class _Fp8KvCacheView:
+    """Non-owning compressed-cache view; its owner stays registered on attention."""
+
+    def __init__(self, cache, offset):
+        self.cache, self.offset = cache, offset
+
+    def write(self, kv, position):
+        packed = _pack_fp8_kv(kv, self.cache.rope_dim)
+        self.cache.write(packed, self.offset + position)
+        return packed
+
+
+def sparse_attn_fp8(q, packed, sink, indices, scale):
+    values, scales, rope = packed
+    if (
+        q.is_cuda
+        and q.dtype == torch.bfloat16
+        and q.shape[2:] == (64, 512)
+        and values.dtype == torch.float8_e4m3fn
+        and values.size(-1) == 448
+        and rope.dtype == torch.bfloat16
+        and rope.size(-1) == 64
+        and scales.dtype in (torch.float8_e8m0fnu, torch.float32)
+        and scales.size(-1) == 7
+    ):
+        query = q.transpose(1, 2).contiguous()
+        out = torch.empty_like(query)
+        Fp8KvFa4SparseMlaRunner(
+            query,
+            values.contiguous(),
+            scales.contiguous(),
+            rope.contiguous(),
+            indices.contiguous(),
+            sink.contiguous(),
+            out,
+            scale=scale,
+        ).run()
+        phase = "decode" if q.size(1) == 1 else "prefill"
+        _STATS[f"sm110a.sparse_mla_fp8_kv_{phase}"] += 1
+        return out.transpose(1, 2).contiguous()
+    return _torch_sparse_attn_fp8(q, packed, sink, indices, scale)
+
+
+def _torch_sparse_attn_fp8(q, packed, sink, indices, scale):
+    """Torch FP8-cache fallback for unsupported native sparse MLA layouts.
+
+    Only selected entries are decoded, in bounded query chunks. Q stays BF16;
+    quantized non-RoPE values round to BF16 as in the previous QAT path, then
+    scores, sink softmax and value accumulation use FP32.
+    """
+    values, scales, rope = packed
+    batch = torch.arange(q.size(0), device=q.device)[:, None, None]
+    out = torch.empty_like(q)
+    chunk_size = max(1, 32 // q.size(0))
+    for start in range(0, q.size(1), chunk_size):
+        end = min(start + chunk_size, q.size(1))
+        selected_indices = indices[:, start:end]
+        safe = selected_indices.clamp_min(0).long()
+        # Byte gathers also support FP8 formats without Torch index kernels.
+        selected_values = values.view(torch.uint8)[batch, safe].view(values.dtype)
+        if scales.dtype == torch.float8_e8m0fnu:
+            selected_scales = scales.view(torch.uint8)[batch, safe].view(scales.dtype)
+        else:
+            selected_scales = scales[batch, safe]
+        nope = (
+            selected_values.float()
+            * selected_scales.float().repeat_interleave(64, dim=-1)
+        ).to(q.dtype)
+        selected = torch.cat((nope, rope[batch, safe]), dim=-1).float()
+        scores = (
+            torch.einsum("bshd,bskd->bshk", q[:, start:end].float(), selected) * scale
+        )
+        scores.masked_fill_(selected_indices[:, :, None, :] < 0, -torch.inf)
+        sink_scores = sink.view(1, 1, -1, 1).expand(*scores.shape[:-1], 1)
+        probabilities = torch.cat((scores, sink_scores), dim=-1).softmax(-1)[..., :-1]
+        out[:, start:end] = torch.einsum("bshk,bskd->bshd", probabilities, selected).to(
+            q.dtype
+        )
+    _STATS["torch.sparse_mla_fp8_cache_todo"] += 1
+    return out
+
+
 class Sm110aCompressor(_official.Compressor):
     """Joint BF16 KV/score projection, retaining FP32 compression state."""
 
@@ -439,7 +575,8 @@ class Sm110aCompressor(_official.Compressor):
             kv = _official.rotate_activation(kv)
             fp4_act_quant(kv, _official.fp4_block_size, True)
         else:
-            act_quant(kv[..., :-rd], 64, _official.scale_fmt, _official.scale_dtype, True)
+            # Main-attention compressors write quantized bytes/scales directly.
+            return self.kv_cache.write(kv, 0 if start_pos == 0 else start_pos // ratio)
         if start_pos == 0:
             self.kv_cache[:bsz, : seqlen // ratio] = kv
         else:
@@ -618,14 +755,21 @@ def hc_split_sinkhorn(
 
 
 class Sm110aAttention(_official.Attention):
-    """Reference attention flow with one layout-driven grouped wo_a GEMM."""
+    """FP8 KV-cache attention with a layout-driven grouped wo_a GEMM."""
+
+    def prepare_kv_cache(self):
+        old_cache = self.kv_cache
+        del self.kv_cache
+        self.fp8_cache = Fp8KvCache(
+            old_cache.shape, self.rope_head_dim, old_cache.device, _official.scale_dtype
+        )
 
     def forward(self, x: torch.Tensor, start_pos: int):
         bsz, seqlen, _ = x.size()
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
         win, ratio, rd = self.window_size, self.compress_ratio, self.rope_head_dim
         if ratio and self.compressor.kv_cache is None:
-            self.compressor.kv_cache = self.kv_cache[:, win:]
+            self.compressor.kv_cache = _Fp8KvCacheView(self.fp8_cache, win)
             self.compressor.freqs_cis = self.freqs_cis
             if self.indexer is not None:
                 self.indexer.freqs_cis = self.freqs_cis
@@ -636,7 +780,7 @@ class Sm110aAttention(_official.Attention):
         _official.apply_rotary_emb(q[..., -rd:], freqs_cis)
         kv = self.kv_norm(self.wkv(x))
         _official.apply_rotary_emb(kv[..., -rd:], freqs_cis)
-        act_quant(kv[..., :-rd], 64, _official.scale_fmt, _official.scale_dtype, True)
+        packed = _pack_fp8_kv(kv, rd)
         topk_idxs = _official.get_window_topk_idxs(win, bsz, seqlen, start_pos)
         if ratio:
             offset = seqlen if start_pos == 0 else win
@@ -651,24 +795,24 @@ class Sm110aAttention(_official.Attention):
 
         if start_pos == 0:
             if seqlen <= win:
-                self.kv_cache[:bsz, :seqlen] = kv
+                self.fp8_cache.write(packed, 0)
             else:
                 cutoff = seqlen % win
-                self.kv_cache[:bsz, cutoff:win], self.kv_cache[:bsz, :cutoff] = kv[
-                    :, -win:
-                ].split([win - cutoff, cutoff], dim=1)
+                tail = tuple(t[:, -win:] for t in packed)
+                self.fp8_cache.write(tuple(t[:, : win - cutoff] for t in tail), cutoff)
+                self.fp8_cache.write(tuple(t[:, win - cutoff :] for t in tail), 0)
             if ratio:
-                kv_compress = self.compressor(x, start_pos)
-                if kv_compress is not None:
-                    kv = torch.cat([kv, kv_compress], dim=1)
-            o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+                compressed = self.compressor(x, start_pos)
+                if compressed is not None:
+                    packed = tuple(
+                        torch.cat((a, b), dim=1) for a, b in zip(packed, compressed)
+                    )
         else:
-            self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
+            self.fp8_cache.write(packed, start_pos % win)
             if ratio:
                 self.compressor(x, start_pos)
-            o = sparse_attn(
-                q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale
-            )
+            packed = self.fp8_cache.tensors(bsz)
+        o = sparse_attn_fp8(q, packed, self.attn_sink, topk_idxs, self.softmax_scale)
         _official.apply_rotary_emb(o[..., -rd:], freqs_cis, True)
         return self.wo_b(self.project_output(o).flatten(2))
 
@@ -1297,6 +1441,7 @@ class Transformer(_official.Transformer):
         for layer in (*self.layers, *self.mtp):
             layer.ffn.shared_experts.__class__ = Sm110aSharedExpert
             layer.attn.__class__ = Sm110aAttention
+            layer.attn.prepare_kv_cache()
             layer.ffn._sm110a_compact_weight_scales = compact_moe_scales
             layer.ffn._sm110a_moe_backend = moe_backend
             layer.ffn._sm110a_pdl = pdl
