@@ -76,51 +76,67 @@ routing weights use the inherited reference path. See the
 results and the corrected L2 SOL model; isolated FC1 gains do not establish
 an end-to-end model speedup.
 
-All RMSNorm modules, including attention/FFN, compressor, final and MTP norms,
-use `RmsNormRunner` by default. Weights stay FP32 as in the reference model;
+Standalone RMSNorm modules, including compressor and MTP input norms,
+use `RmsNormRunner` by default. Attention/FFN and final norms are fused into
+HC pre/head when the input and parameters support `HcPreNormRunner`. Weights stay FP32 as in the reference model;
 BF16/FP16 inputs are normalized and multiplied by the FP32 weight in FP32,
 with one final cast to input dtype. No weight conversion is needed per call,
 and state-dict keys/dtypes are unchanged. CPU and unsupported input formats
 retain the reference implementation. Backend statistics count native calls
 under `sm110a.rmsnorm` and fallbacks under `torch.rmsnorm_fallback`.
 
-Prefill and decode use `HcPreRunner` for HC pre in attention and FFN, including
-MTP blocks. Aligned BF16 inputs with even D >= 256
-use a split-K `tcgen05.mma` projection with instruction N=24. Its fixed tile is
-M=128, N=24, K=128; each CTA handles 512 K elements with two shared-memory
-buffers, 512 producer threads and one consumer warp. Producers load and convert
-the next tile while MMA processes the current tile. Each input load supplies
-both the FP32 RMS sum and projection. FP32 weights are decomposed into three
+Prefill and decode use `HcPreNormRunner` for HC pre + attention/FFN RMSNorm,
+including MTP blocks. BF16 inputs with even D >= 256 use a split-K
+`tcgen05.mma` projection with instruction N=24. Its tile is M=128, N=24,
+K=128 with two shared-memory buffers, 512 producer threads and one consumer
+warp. Each CTA handles 1024 K elements for D=4096 and at least 256 tokens;
+other shapes retain 512. FP32 projection weights are decomposed into three
 BF16 components on device, with separate FP32 high/residual accumulators.
-A second kernel reduces partials, computes pre/post gates and 4x4 Sinkhorn,
-and collapses the HC streams. It overlaps asynchronous input prefetch with
-Sinkhorn. The runner retains its scratch allocation across graph replays
-(512 KiB for batch=128, D=4096).
+A second kernel reduces partials, computes gates and Sinkhorn, collapses the HC
+streams, and applies weighted RMSNorm without a global collapse intermediate.
+The collapse is rounded to input dtype before RMSNorm to preserve the separate
+operators' semantics. HC projection epsilon and the target norm's epsilon are
+passed independently. Post/comb stay FP32. Scratch is sized for split-K=512
+and reused during graph replay (512 KiB for batch=128, D=4096).
 
-FP16/FP32 inputs, odd/small D, and unaligned input/output buffers retain the
-single-CTA SIMT kernel with 256 threads per token. The implementation supports
-HC=4, D up to 4096, contiguous CUDA BF16/FP16/FP32 inputs, and FP32 HC parameters
-(16-byte aligned projection weights). Only the collapsed output is cast back
-to input dtype; post/comb stay FP32. FP32 reduction
-order differs from PyTorch, so agreement is numerical
-rather than bitwise. Unsupported formats use the reference path. The fixed
-configuration is tuned for decode; large-M prefill tuning remains future work.
-Dispatch counts are
-`sm110a.hc_pre` and `torch.hc_pre_fallback`. Attention/FFN RMSNorm remains a
-separate operator after HC pre, and checkpoint keys/dtypes are unchanged.
+FP16/FP32 inputs and odd/small D use the single-CTA SIMT projection and fused
+collapse/norm. Fusion supports HC=4, D up to 4096, contiguous CUDA
+BF16/FP16/FP32 inputs, contiguous FP32 HC and norm parameters, and 16-byte
+aligned projection weights. Custom norm implementations and unsupported formats
+retain separate HC pre and norm calls. Checkpoint keys and parameter dtypes
+are unchanged. Native fusion counts are `sm110a.hc_pre_norm`; separate-path
+fallbacks count `unfused.hc_pre_norm` and their individual operator counters.
+Explicit `hc_pre` calls still expose the original standalone operator.
 
-HC head also uses `HcPreRunner(..., head=True)` before the final RMSNorm and
-LM head, including the head shared by MTP blocks. This compile-time mode uses
-FP32 projection weights `[4, 4*D]`, scale `[1]` and base `[4]`. It computes only
-the four pre gates and weighted collapse, with no post/comb outputs, Sinkhorn,
-or scratch allocation. It uses the single-CTA FP32 SIMT projection for all
-supported dtypes. The input constraints match HC pre; dispatch statistics are
-`sm110a.hc_head` and `torch.hc_head_fallback`. Reduction order can differ from
-the PyTorch implementation. The existing benchmark selects this mode with
-`--mode head` (the default remains `--mode pre`):
+The shared final/MTP head fuses HC head collapse and its passed RMSNorm using
+`HcPreNormRunner(..., head=True)`, followed by the existing logits projection
+and distributed gather. This mode uses FP32 `[4, 4*D]` projection weights,
+`[1]` scale, and `[4]` base, with no post/comb outputs, Sinkhorn, or scratch.
+Dispatch statistics are `sm110a.hc_head_norm` and `unfused.hc_head_norm`.
+Explicit `hc_head` calls retain their standalone behavior.
 
 ```bash
-/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_hc_pre.py --mode head --tokens 1 16 128 512 1024 --warmup 5 --iters 20 --samples 5 --sol
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_hc_pre_norm.py --tokens 1 16 128 256 512 1024 2048 4096 --baseline none --warmup 5 --iters 50 --samples 5
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_hc_pre_norm.py --mode head --tokens 1 16 128 --baseline none
+```
+
+See [HC pre + RMSNorm measurements](../../csrc/hc_pre_norm/README.md) for the
+current fused-kernel comparison. The standalone HC measurements below predate
+model integration of RMSNorm fusion.
+
+Integration validation ran one-layer prefill (4 tokens) and decode with the
+standard benchmark config at batch=1, context=16. CUDA Graph/eager logits had
+cosine 1.0 and identical final tokens; backend counts included fused HC pre/norm
+and head/norm. A same-weight fused/unfused comparison with D=4096, one regular
+layer plus one MTP layer, vocab=128, eight experts and expert width=128 produced
+identical logits for prefill, decode and MTP in that random-weight case. This
+is an integration check, not a checkpoint accuracy or end-to-end speedup claim.
+CPU head fallback also matched the existing forward exactly.
+
+```bash
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_dsv4_flash.py \
+  --batch-size 1 --seq-len 16 --prefill-len 4 --decode-len 1 \
+  --layers 1 --no-decode-only --warmup 1 --iters 1
 ```
 
 On Thor at GPC 1575 MHz / EMC 4266 MHz, BF16 D=4096, dirty cold-L2

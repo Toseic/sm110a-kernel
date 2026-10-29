@@ -60,8 +60,9 @@ from sm110a_kernel import (
     Fp8KvFa4SparseMlaRunner,
     Fp8Mxfp4GemmRunner,
     Fp8SharedFc1Runner,
-    HcPreRunner,
     HcPostRunner,
+    HcPreNormRunner,
+    HcPreRunner,
     IndexerScoreDecodeRunner,
     IndexerScorePrefillRunner,
     Mxfp4Fc1Fc2Runner,
@@ -528,7 +529,9 @@ class Sm110aCompressor(_official.Compressor):
             offset = ratio if self.overlap else 0
             if self.overlap and cutoff >= ratio:
                 self.kv_state[:bsz, :ratio] = kv[:, cutoff - ratio : cutoff]
-                self.score_state[:bsz, :ratio] = score[:, cutoff - ratio : cutoff] + self.ape
+                self.score_state[:bsz, :ratio] = (
+                    score[:, cutoff - ratio : cutoff] + self.ape
+                )
             if remainder > 0:
                 self.kv_state[:bsz, offset : offset + remainder] = kv[:, cutoff:]
                 self.score_state[:bsz, offset : offset + remainder] = (
@@ -550,11 +553,17 @@ class Sm110aCompressor(_official.Compressor):
             if should_compress:
                 if self.overlap:
                     kv_state = torch.cat(
-                        (self.kv_state[:bsz, :ratio, :d], self.kv_state[:bsz, ratio:, d:]),
+                        (
+                            self.kv_state[:bsz, :ratio, :d],
+                            self.kv_state[:bsz, ratio:, d:],
+                        ),
                         dim=1,
                     )
                     score_state = torch.cat(
-                        (self.score_state[:bsz, :ratio, :d], self.score_state[:bsz, ratio:, d:]),
+                        (
+                            self.score_state[:bsz, :ratio, :d],
+                            self.score_state[:bsz, ratio:, d:],
+                        ),
                         dim=1,
                     )
                 else:
@@ -1253,8 +1262,59 @@ def _use_sm110a_backend():
             setattr(_official, name, original)
 
 
+def _can_fuse_hc_norm(x, hc_fn, hc_scale, hc_base, norm, *, head=False):
+    # Preserve custom norm forward implementations and unsupported formats.
+    return (
+        type(norm) in (_official.RMSNorm, Sm110aRMSNorm)
+        and x.is_cuda
+        and x.is_contiguous()
+        and x.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        and x.dim() == 4
+        and x.size(-2) == 4
+        and 1 <= x.size(-1) <= 4096
+        and hc_fn.data_ptr() % 16 == 0
+        and tuple(hc_fn.shape) == (4 if head else 24, 4 * x.size(-1))
+        and tuple(hc_scale.shape) == (1 if head else 3,)
+        and tuple(hc_base.shape) == (4 if head else 24,)
+        and norm.dim == x.size(-1)
+        and tuple(norm.weight.shape) == (x.size(-1),)
+        and all(
+            t.device == x.device and t.dtype == torch.float32 and t.is_contiguous()
+            for t in (hc_fn, hc_scale, hc_base, norm.weight)
+        )
+    )
+
+
 class Sm110aParallelHead(_official.ParallelHead):
     """Keep checkpoint BF16 weights and write FP32 logits from the accumulator."""
+
+    def forward(self, x, hc_fn, hc_scale, hc_base, norm):
+        if _can_fuse_hc_norm(x, hc_fn, hc_scale, hc_base, norm, head=True):
+            output = torch.empty(
+                (*x.shape[:-2], x.size(-1)), device=x.device, dtype=x.dtype
+            )
+            HcPreNormRunner(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                norm.weight,
+                output,
+                norm_eps=self.norm_eps,
+                hc_eps=self.hc_eps,
+                rms_eps=norm.eps,
+                head=True,
+            ).run()
+            _STATS["sm110a.hc_head_norm"] += 1
+        else:
+            _STATS["unfused.hc_head_norm"] += 1
+            output = norm(self.hc_head(x, hc_fn, hc_scale, hc_base))
+        logits = self.get_logits(output)
+        if _official.world_size > 1:
+            all_logits = [torch.empty_like(logits) for _ in range(_official.world_size)]
+            torch.distributed.all_gather(all_logits, logits)
+            logits = torch.cat(all_logits, dim=-1)
+        return logits
 
     def hc_head(self, x, hc_fn, hc_scale, hc_base):
         if not (
@@ -1271,7 +1331,9 @@ class Sm110aParallelHead(_official.ParallelHead):
         ):
             _STATS["torch.hc_head_fallback"] += 1
             return super().hc_head(x, hc_fn, hc_scale, hc_base)
-        output = torch.empty((*x.shape[:-2], x.size(-1)), device=x.device, dtype=x.dtype)
+        output = torch.empty(
+            (*x.shape[:-2], x.size(-1)), device=x.device, dtype=x.dtype
+        )
         HcPreRunner(
             x,
             hc_fn,
@@ -1348,6 +1410,53 @@ def _hc_pre(self, x, hc_fn, hc_scale, hc_base):
     return y, post, comb
 
 
+def _hc_pre_norm(self, x, hc_fn, hc_scale, hc_base, norm):
+    if not (
+        self.hc_mult == 4
+        and 1 <= self.hc_sinkhorn_iters <= 100
+        and _can_fuse_hc_norm(x, hc_fn, hc_scale, hc_base, norm)
+    ):
+        _STATS["unfused.hc_pre_norm"] += 1
+        y, post, comb = self.hc_pre(x, hc_fn, hc_scale, hc_base)
+        return norm(y), post, comb
+    prefix = x.shape[:-2]
+    y = torch.empty((*prefix, x.size(-1)), dtype=x.dtype, device=x.device)
+    post = torch.empty((*prefix, 4), dtype=torch.float32, device=x.device)
+    comb = torch.empty((*prefix, 4, 4), dtype=torch.float32, device=x.device)
+    HcPreNormRunner(
+        x,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        norm.weight,
+        y,
+        post,
+        comb,
+        norm_eps=self.norm_eps,
+        hc_eps=self.hc_eps,
+        rms_eps=norm.eps,
+        sinkhorn_iters=self.hc_sinkhorn_iters,
+    ).run()
+    _STATS["sm110a.hc_pre_norm"] += 1
+    return y, post, comb
+
+
+def _hc_block_forward(self, x, start_pos, input_ids):
+    residual = x
+    x, post, comb = self.hc_pre_norm(
+        x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base, self.attn_norm
+    )
+    x = self.attn(x, start_pos)
+    x = self.hc_post(x, residual, post, comb)
+
+    residual = x
+    x, post, comb = self.hc_pre_norm(
+        x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base, self.ffn_norm
+    )
+    x = self.ffn(x, input_ids)
+    return self.hc_post(x, residual, post, comb)
+
+
 def _hc_post(self, x, residual, post, comb):
     if not (
         self.hc_mult == 4
@@ -1356,7 +1465,10 @@ def _hc_post(self, x, residual, post, comb):
         and 1 <= x.size(-1) <= 32768
         and residual.dtype == x.dtype
         and post.dtype == comb.dtype == torch.float32
-        and all(t.is_contiguous() and t.device == x.device for t in (x, residual, post, comb))
+        and all(
+            t.is_contiguous() and t.device == x.device
+            for t in (x, residual, post, comb)
+        )
     ):
         _STATS["torch.hc_post_fallback"] += 1
         return _official.Block.hc_post(self, x, residual, post, comb)
@@ -1368,12 +1480,26 @@ def _hc_post(self, x, residual, post, comb):
 
 class Sm110aBlock(_official.Block):
     hc_pre = _hc_pre
+    hc_pre_norm = _hc_pre_norm
     hc_post = _hc_post
+    forward = _hc_block_forward
 
 
 class Sm110aMTPBlock(_official.MTPBlock):
     hc_pre = _hc_pre
+    hc_pre_norm = _hc_pre_norm
     hc_post = _hc_post
+
+    @torch.inference_mode()
+    def forward(self, x, start_pos, input_ids):
+        assert self.embed is not None and self.head is not None
+        e = self.enorm(self.embed(input_ids))
+        x = self.hnorm(x)
+        x = self.e_proj(e).unsqueeze(2) + self.h_proj(x)
+        x = _hc_block_forward(self, x, start_pos, input_ids)
+        return self.head(
+            x, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm
+        )
 
 
 class Transformer(_official.Transformer):
