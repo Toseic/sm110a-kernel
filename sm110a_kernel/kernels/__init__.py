@@ -162,6 +162,13 @@ from .grouped_m_gemm import (
 )
 from .hc_post import HcPostConfig, HcPostRunner, compile_hc_post, hc_post, hc_post_out
 from .hc_pre import HcPreConfig, HcPreRunner, compile_hc_pre, hc_pre, hc_pre_out
+from .hc_pre_norm import (
+    HcPreNormConfig,
+    HcPreNormRunner,
+    compile_hc_pre_norm,
+    hc_pre_norm,
+    hc_pre_norm_out,
+)
 from .moe_routing import pack_routing_metadata
 from .mxfp4_fc1 import (
     Mxfp4Fc1Config,

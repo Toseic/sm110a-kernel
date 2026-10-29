@@ -370,6 +370,14 @@ def __getattr__(name):
     raise AttributeError(name)
 
 
+from .kernels.hc_pre_norm import (
+    HcPreNormConfig,
+    HcPreNormRunner,
+    compile_hc_pre_norm,
+    hc_pre_norm,
+    hc_pre_norm_out,
+)
+
 __all__ = [name for name in globals() if not name.startswith("_")] + sorted(
     _RUNNER_EXPORTS | _CUTEDSL_EXPORTS
 )
