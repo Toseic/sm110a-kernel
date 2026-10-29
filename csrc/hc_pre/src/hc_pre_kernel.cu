@@ -1,3 +1,6 @@
+#ifndef SM110A_HC_PRE_SINGLE
+#define SM110A_HC_PRE_SINGLE 0
+#endif
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -159,13 +162,15 @@ void hc_pre_kernel(const T* __restrict__ input, const float* __restrict__ weight
     }
 }
 
+#include "hc_pre_split_simt.cuh"
+
 // One fixed decode configuration. Instruction N is exactly 24; the two
 // 32-column TMEM regions hold high and residual accumulators separately.
 constexpr int TileK = 128;
 constexpr int ChunkK = 512;
 constexpr int StageCount = ChunkK / TileK;
 constexpr int ProducerThreads = 512;
-constexpr int TileM = 128;
+constexpr int TileM = SM110A_HC_PRE_SINGLE ? 64 : 128;
 constexpr int Splits = (K + ChunkK - 1) / ChunkK;
 // K-major SW128: each 64-element slab contains all M/N rows.
 __device__ __forceinline__ int swizzle_index(
@@ -185,7 +190,7 @@ __device__ __forceinline__ void mma_tcgen(
     uint64_t a,
     uint64_t b,
     int accumulate) {
-    constexpr unsigned desc = (1U << 4) | (1U << 7) | (1U << 10) | (3U << 17) | (8U << 24);
+    constexpr unsigned desc = (1U << 4) | (1U << 7) | (1U << 10) | (3U << 17) | (unsigned(TileM / 16) << 24);
     asm volatile("{ .reg .pred p; setp.ne.b32 p, %4, 0; "
                  "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p; }" ::"r"(dst),
         "l"(a),
@@ -464,6 +469,8 @@ void hc_pre_finish_tc(const __nv_bfloat16* input, const float* scale, const floa
     }
 }
 
+#include "hc_pre_single.cuh"
+
 template <typename T>
 cudaError_t launch(
     const void *input,
@@ -517,7 +524,25 @@ extern "C" cudaError_t sm110a_hc_pre_launch(
     cudaStream_t stream) {
     if (!rows)
         return cudaSuccess;
-    if (!Head && dtype == 0 && D >= 256 && D % 2 == 0 && (reinterpret_cast<uintptr_t>(input) % 16 == 0) &&
+    if (SM110A_HC_PRE_SINGLE && !Head && dtype == 0 && D % 8 == 0 &&
+        reinterpret_cast<uintptr_t>(input) % 16 == 0 && rows <= 1) {
+        hc_pre_split_simt<__nv_bfloat16><<<dim3(rows, (K + 1023)/1024), Threads, K*2, stream>>>(
+            static_cast<const __nv_bfloat16*>(input), weight, scale, base,
+            static_cast<__nv_bfloat16*>(output), post, comb, scratch, norm_eps, hc_eps);
+        return cudaGetLastError();
+    }
+    if (SM110A_HC_PRE_SINGLE && !Head && dtype == 0 && D >= 256 && D % 2 == 0 &&
+        reinterpret_cast<uintptr_t>(input) % 16 == 0) {
+        constexpr int bytes = 2 * (TileM + 3 * 24) * TileK * 2;
+        auto err = cudaFuncSetAttribute(hc_pre_single_tc,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+        if (err != cudaSuccess) return err;
+        hc_pre_single_tc<<<dim3((rows + 31) / 32, Splits), 544, bytes, stream>>>(
+            static_cast<const __nv_bfloat16*>(input), weight, scratch, scale, base,
+            static_cast<__nv_bfloat16*>(output), post, comb, rows, norm_eps, hc_eps);
+        return cudaGetLastError();
+    }
+    if (!SM110A_HC_PRE_SINGLE && !Head && dtype == 0 && D >= 256 && D % 2 == 0 && (reinterpret_cast<uintptr_t>(input) % 16 == 0) &&
         (reinterpret_cast<uintptr_t>(output) % 16 == 0)) {
         constexpr int bytes_tc = 2 * (TileM + 3 * 24) * TileK * 2;
         if constexpr (bytes_tc > 48 * 1024) {

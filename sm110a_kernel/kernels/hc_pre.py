@@ -13,8 +13,10 @@ _SOURCE = _ROOT / "csrc/hc_pre/src"
 _SPLIT_K = 512
 
 
-def _allocate_scratch(input, d):
-    return torch.empty(
+def _allocate_scratch(input, d, single_kernel=False):
+    allocate = torch.zeros if single_kernel else torch.empty
+    # Slot 31 of each tile's first row is an arrival counter, reset by the kernel.
+    return allocate(
         (input.numel() // (4 * d), (4 * d + _SPLIT_K - 1) // _SPLIT_K, 32),
         device=input.device,
         dtype=torch.float32,
@@ -26,6 +28,7 @@ class HcPreConfig:
     d: int
     sinkhorn_iters: int = 20
     head: bool = False
+    single_kernel: bool = False
 
 
 class HcPreModule:
@@ -48,8 +51,10 @@ class HcPreModule:
         *,
         scratch=None,
     ):
+        # A supplied scratch must initially be zeroed for single_kernel=True.
+        # It is reset by the last CTA and may be reused serially, including graphs.
         if scratch is None and not self.config.head:
-            scratch = _allocate_scratch(input, self.config.d)
+            scratch = _allocate_scratch(input, self.config.d, self.config.single_kernel)
         self._binding.hc_pre_out(
             input,
             weight,
@@ -88,10 +93,15 @@ _JIT = SplitCudaJit(
     root=_ROOT,
     binding_sources=(_SOURCE / "hc_pre_torch_binding.cpp",),
     kernel_sources=(_SOURCE / "hc_pre_kernel.cu",),
-    kernel_dependencies=(),
+    kernel_dependencies=(
+        _SOURCE / "hc_pre_single.cuh",
+        _SOURCE / "hc_pre_cooperative.cuh",
+        _SOURCE / "hc_pre_split_simt.cuh",
+    ),
     kernel_symbol="sm110a_hc_pre_launch",
-    config_key=lambda c: (c.d, c.sinkhorn_iters, c.head),
+    config_key=lambda c: (c.d, c.sinkhorn_iters, c.head, c.single_kernel),
     kernel_cflags=lambda c, _variant: (
+        f"-DSM110A_HC_PRE_SINGLE={int(c.single_kernel)}",
         f"-DSM110A_HC_PRE_D={c.d}",
         f"-DSM110A_HC_PRE_ITERS={c.sinkhorn_iters}",
         f"-DSM110A_HC_PRE_HEAD={int(c.head)}",
@@ -100,15 +110,19 @@ _JIT = SplitCudaJit(
 )
 
 
-def compile_hc_pre(d, *, sinkhorn_iters=20, head=False):
+def compile_hc_pre(d, *, sinkhorn_iters=20, head=False, single_kernel=False):
     """Compile HC=4 pre or head; head uses FP32 [4, 4*D]/[1]/[4] parameters."""
     if type(d) is not int or not 1 <= d <= 4096:
         raise ValueError("d must be an integer in [1, 4096]")
     if type(sinkhorn_iters) is not int or not 1 <= sinkhorn_iters <= 100:
         raise ValueError("sinkhorn_iters must be an integer in [1, 100]")
+    if type(single_kernel) is not bool:
+        raise TypeError("single_kernel must be bool")
     if type(head) is not bool:
         raise TypeError("head must be bool")
-    return _JIT.compile(HcPreConfig(d, 1 if head else sinkhorn_iters, head))
+    return _JIT.compile(
+        HcPreConfig(d, 1 if head else sinkhorn_iters, head, single_kernel)
+    )
 
 
 def hc_pre(
@@ -121,11 +135,13 @@ def hc_pre(
     *,
     sinkhorn_iters=20,
     head=False,
+    single_kernel=False,
 ):
     return compile_hc_pre(
         input.size(-1),
         sinkhorn_iters=sinkhorn_iters,
         head=head,
+        single_kernel=single_kernel,
     ).hc_pre(input, weight, scale, base, norm_eps, hc_eps)
 
 
@@ -142,11 +158,13 @@ def hc_pre_out(
     *,
     sinkhorn_iters=20,
     head=False,
+    single_kernel=False,
 ):
     return compile_hc_pre(
         input.size(-1),
         sinkhorn_iters=sinkhorn_iters,
         head=head,
+        single_kernel=single_kernel,
     ).hc_pre_out(input, weight, scale, base, output, post, comb, norm_eps, hc_eps)
 
 
@@ -165,8 +183,11 @@ class HcPreRunner(FixedKernelRunner):
         *,
         sinkhorn_iters=20,
         head=False,
+        single_kernel=False,
     ):
-        scratch = None if head else _allocate_scratch(input, input.size(-1))
+        scratch = (
+            None if head else _allocate_scratch(input, input.size(-1), single_kernel)
+        )
         super().__init__(
             input.device,
             "hc_pre",
@@ -177,9 +198,13 @@ class HcPreRunner(FixedKernelRunner):
                 hc_eps,
                 1 if head else sinkhorn_iters,
                 head,
+                single_kernel,
             ),
             lambda: compile_hc_pre(
-                input.size(-1), sinkhorn_iters=sinkhorn_iters, head=head
+                input.size(-1),
+                sinkhorn_iters=sinkhorn_iters,
+                head=head,
+                single_kernel=single_kernel,
             ),
             lambda module: (
                 lambda: module.hc_pre_out(

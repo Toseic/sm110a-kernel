@@ -1,0 +1,266 @@
+// Single-launch HC pre: split-K projection and last-CTA completion.
+// Included inside namespace sm110a::hc_pre after the tensor-core helpers.
+__global__ __launch_bounds__(544)
+void hc_pre_single_tc(const __nv_bfloat16* input, const float* weight,
+                          float* scratch, const float* scale, const float* base, __nv_bfloat16* output,
+                       float* post, float* comb, int64_t rows, float norm_eps, float hc_eps) {
+    extern __shared__ __align__(1024) __nv_bfloat16 storage_tc[];
+    constexpr int StageElements = (TileM + 3 * 24) * TileK;
+    // A completion barrier per shared buffer prevents producers from
+    // overwriting operands still in use by asynchronous MMA.
+    __shared__ __align__(8) uint64_t barriers[2];
+    __shared__ float norms[TileM];
+    __shared__ unsigned tmem;
+    int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+    constexpr int ActiveM = 32;
+    int r0 = blockIdx.x * ActiveM;
+    if (tid < TileM)
+        norms[tid] = 0.f;
+    if (tid < 2) {
+        unsigned ba = __cvta_generic_to_shared(barriers + tid);
+        asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(ba));
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    }
+    if (warp == 0) {
+        unsigned ta = __cvta_generic_to_shared(&tmem);
+        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 64;" ::"r"(ta)
+            : "memory");
+        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
+    }
+    __syncthreads();
+#pragma unroll 1
+    for (int stage = 0; stage < StageCount; ++stage) {
+        int buf = stage % 2;
+        unsigned ba = __cvta_generic_to_shared(barriers + buf);
+        auto *x = storage_tc + buf * StageElements;
+        auto *w = reinterpret_cast<__nv_bfloat16(*)[24 * TileK]>(x + TileM * TileK);
+        int k0 = blockIdx.y * ChunkK + stage * TileK;
+        if (stage >= 2) {
+            int phase = ((stage / 2) - 1) % 2;
+            asm volatile(
+                "{ .reg .pred p; WAIT: mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 p, "
+                "[%0], %1; @!p bra WAIT; }" ::"r"(ba),
+                "r"(phase)
+                : "memory");
+        }
+        // Producer warps advance to the next buffer while the dedicated
+        // consumer warp issues MMA for the current buffer.
+        if (tid < ProducerThreads) {
+#pragma unroll 4
+            for (int v = tid; v < TileM * TileK / 8; v += ProducerThreads) {
+                int r = v / (TileK / 8), k = (v % (TileK / 8)) * 8;
+                uint4 packed = {};
+                if (r < ActiveM && r0 + r < rows && k0 + k + 7 < K)
+                    packed =
+                        *reinterpret_cast<const uint4 *>(input + (int64_t(r0) + r) * K + k0 + k);
+                else if (r < ActiveM && r0 + r < rows) {
+                    auto *vals = reinterpret_cast<__nv_bfloat16 *>(&packed);
+#pragma unroll
+                    for (int e = 0; e < 8; ++e)
+                        if (k0 + k + e < K)
+                            vals[e] = input[(int64_t(r0) + r) * K + k0 + k + e];
+                }
+                *reinterpret_cast<uint4 *>(x + swizzle_index(r, k, TileM)) = packed;
+                float sq = 0.f;
+                const auto *vals = reinterpret_cast<const __nv_bfloat16 *>(&packed);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    float value = as_float(vals[e]);
+                    sq = fmaf(value, value, sq);
+                }
+#pragma unroll
+                for (int offset = TileK / 8 / 2; offset; offset /= 2)
+                    sq += __shfl_xor_sync(0xffffffff, sq, offset);
+                if (v % (TileK / 8) == 0 && r < ActiveM && r0 + r < rows)
+                    norms[r] += sq;
+            }
+#pragma unroll
+            for (int v = tid; v < 24 * TileK / 4; v += ProducerThreads) {
+                int n = v / (TileK / 4), k = (v % (TileK / 4)) * 4;
+                float4 packed = k0 + k < K
+                                    ? *reinterpret_cast<const float4 *>(weight + n * K + k0 + k)
+                                    : make_float4(0, 0, 0, 0);
+                float vals[4] = {packed.x, packed.y, packed.z, packed.w};
+                int idx = swizzle_index(n, k, 24);
+#pragma unroll
+                // Successive residuals preserve the FP32 weight interface;
+                // no persistent weight packing or stale-parameter cache.
+                for (int c = 0; c < 3; ++c) {
+                    uint2 bits;
+                    auto *part = reinterpret_cast<__nv_bfloat16 *>(&bits);
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        part[e] = __float2bfloat16_rn(vals[e]);
+                        vals[e] -= as_float(part[e]);
+                    }
+                    *reinterpret_cast<uint2 *>(w[c] + idx) = bits;
+                }
+            }
+        }
+        __syncthreads();
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+        if (tid == ProducerThreads) {
+#pragma unroll
+            for (int k = 0; k < TileK; k += 16) {
+                int ao = ((k / 64) * TileM * 64 + k % 64) * 2;
+                int bo = ((k / 64) * 24 * 64 + k % 64) * 2;
+#pragma unroll
+                for (int c = 0; c < 3; ++c)
+                    mma_tcgen(tmem + (c == 0 ? 0 : 32),
+                        matrix_desc(reinterpret_cast<char *>(x) + ao),
+                        matrix_desc(reinterpret_cast<char *>(w[c]) + bo),
+                        stage != 0 || k != 0 || c == 2);
+            }
+            asm volatile(
+                "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];" ::"r"(
+                    ba)
+                : "memory");
+        }
+    }
+    unsigned ba = __cvta_generic_to_shared(barriers + (StageCount - 1) % 2);
+    int phase = ((StageCount - 1) / 2) % 2;
+    asm volatile("{ .reg .pred p; WAIT: mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 p, "
+                 "[%0], %1; @!p bra WAIT; }" ::"r"(ba),
+        "r"(phase)
+        : "memory");
+    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+    __syncthreads();
+    if (tid < TileM && tid < ActiveM && r0 + tid < rows)
+        scratch[((int64_t(r0) + tid) * Splits + blockIdx.y) * 32 + 24] = norms[tid];
+    if (warp < 4)
+        for (int n = 0; n < 24; n += 8) {
+            float v[8];
+            unsigned addr = tmem + (warp * 32 << 16) + n;
+            asm volatile("tcgen05.ld.sync.aligned.32x32b.x8.b32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
+                : "=f"(v[0]),
+                "=f"(v[1]),
+                "=f"(v[2]),
+                "=f"(v[3]),
+                "=f"(v[4]),
+                "=f"(v[5]),
+                "=f"(v[6]),
+                "=f"(v[7])
+                : "r"(addr));
+            asm volatile("tcgen05.wait::ld.sync.aligned;");
+            float lo[8];
+            addr += 32;
+            asm volatile("tcgen05.ld.sync.aligned.32x32b.x8.b32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
+                : "=f"(lo[0]),
+                "=f"(lo[1]),
+                "=f"(lo[2]),
+                "=f"(lo[3]),
+                "=f"(lo[4]),
+                "=f"(lo[5]),
+                "=f"(lo[6]),
+                "=f"(lo[7])
+                : "r"(addr));
+            asm volatile("tcgen05.wait::ld.sync.aligned;");
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                v[j] += lo[j];
+            int r = r0 + warp * 16 + lane;
+            if (lane < 16 && r - r0 < ActiveM && r < rows) {
+                float *dst = scratch + (int64_t(r) * Splits + blockIdx.y) * 32 + n;
+                *reinterpret_cast<float4 *>(dst) = make_float4(v[0], v[1], v[2], v[3]);
+                *reinterpret_cast<float4 *>(dst + 4) = make_float4(v[4], v[5], v[6], v[7]);
+            }
+        }
+    __syncthreads();
+    if (warp == 0)
+        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 64;" ::"r"(tmem)
+            : "memory");
+
+    // Every scratch writer publishes before the tile completion counter. The
+    // last CTA alone consumes all splits; other CTAs leave without spinning.
+    __threadfence();
+    __syncthreads();
+    __shared__ int last;
+    auto* counter = reinterpret_cast<unsigned*>(scratch + int64_t(r0) * Splits * 32 + 31);
+    if (tid == 0) last = atomicAdd(counter, 1u) == Splits - 1;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    for (int local_row = warp; local_row < ActiveM; local_row += 17) {
+        int64_t row = int64_t(r0) + local_row;
+        if (row >= rows) continue;
+        float sum = 0.f;
+        for (int split = 0; split < Splits; ++split)
+            sum += scratch[(row * Splits + split) * 32 + (lane < 25 ? lane : 24)];
+        float gate = 0.f;
+        float inv = rsqrtf(__shfl_sync(0xffffffff, sum, 24) / float(K) + norm_eps);
+        float mix = sum * inv;
+        if (lane < 4)
+            gate = 1.f / (1.f + __expf(-(__fmul_rn(mix, scale[0]) + base[lane]))) + hc_eps;
+        if (lane >= 4 && lane < 8)
+            post[row * 4 + lane - 4] =
+                2.f / (1.f + __expf(-(__fmul_rn(mix, scale[1]) + base[lane])));
+
+        // Sixteen lanes hold a 4x4 matrix, row-major. Every lane executes
+        // every shuffle, including inactive lanes, with a full warp mask.
+        float c = __shfl_sync(0xffffffff, mix, lane < 16 ? lane + 8 : 8);
+        c = __fmul_rn(c, scale[2]) + base[8 + (lane % 16)];
+        float max_row = fmaxf(c, __shfl_xor_sync(0xffffffff, c, 1));
+        max_row = fmaxf(max_row, __shfl_xor_sync(0xffffffff, max_row, 2));
+        c = __expf(c - max_row);
+        float denom = c + __shfl_xor_sync(0xffffffff, c, 1);
+        denom += __shfl_xor_sync(0xffffffff, denom, 2);
+        c = __fdividef(c, denom) + hc_eps;
+        denom = c + __shfl_xor_sync(0xffffffff, c, 4);
+        denom += __shfl_xor_sync(0xffffffff, denom, 8);
+        c = __fdividef(c, denom + hc_eps);
+#pragma unroll 1
+        for (int i = 1; i < SM110A_HC_PRE_ITERS; ++i) {
+            denom = c + __shfl_xor_sync(0xffffffff, c, 1);
+            denom += __shfl_xor_sync(0xffffffff, denom, 2);
+            c = __fdividef(c, denom + hc_eps);
+            denom = c + __shfl_xor_sync(0xffffffff, c, 4);
+            denom += __shfl_xor_sync(0xffffffff, denom, 8);
+            c = __fdividef(c, denom + hc_eps);
+        }
+        if (lane < 16)
+            comb[row * 16 + lane] = c;
+
+        const float gates[4] = {__shfl_sync(0xffffffff, gate, 0),
+                                __shfl_sync(0xffffffff, gate, 1),
+                                __shfl_sync(0xffffffff, gate, 2),
+                                __shfl_sync(0xffffffff, gate, 3)};
+        if constexpr (D % 8 == 0) {
+            for (int d = lane * 8; d < D; d += 32 * 8) {
+                float y[8] = {};
+#pragma unroll
+                for (int h = 0; h < 4; ++h) {
+                    uint4 bits = *reinterpret_cast<const uint4*>(input + row * K + h * D + d);
+                    const auto* v = reinterpret_cast<const __nv_bfloat16*>(&bits);
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        float product = __fmul_rn(gates[h], as_float(v[e]));
+                        y[e] = h == 0 ? product : y[e] + product;
+                    }
+                }
+                uint4 bits;
+                auto* v = reinterpret_cast<__nv_bfloat16*>(&bits);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) v[e] = from_float<__nv_bfloat16>(y[e]);
+                if (reinterpret_cast<uintptr_t>(output) % 16 == 0)
+                    *reinterpret_cast<uint4*>(output + row * D + d) = bits;
+                else {
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) output[row * D + d + e] = v[e];
+                }
+            }
+        } else {
+            for (int d = lane; d < D; d += 32) {
+                float y = __fmul_rn(gates[0], as_float(input[row * K + d]));
+#pragma unroll
+                for (int h = 1; h < 4; ++h)
+                    y += __fmul_rn(gates[h], as_float(input[row * K + h * D + d]));
+                output[row * D + d] = from_float<__nv_bfloat16>(y);
+            }
+        }
+    }
+    __syncthreads();
+    if (tid == 0) atomicExch(counter, 0u);
+
+}
+

@@ -109,7 +109,7 @@ class HcPreBenchmark(BenchmarkBase):
         kernel = (
             "SIMT threads=256; projections=4"
             if head
-            else f"tcgen05 tile=128x24x128 split-K=512 buffers=2; "
+            else f"default two-stage tcgen05; optional single-launch comparison; "
             f"SIMT fallback threads=256; Sinkhorn={args.sinkhorn_iters}"
         )
         print(
@@ -117,7 +117,7 @@ class HcPreBenchmark(BenchmarkBase):
             "cold-L2 CUDA Graph replay"
         )
         print(
-            "tokens ours(us) torch(us) speedup max_abs("
+            "tokens two_stage(us) single(us) fusion_speedup torch(us) speedup max_abs("
             + ("y" if head else "y/post/comb")
             + ")"
         )
@@ -209,6 +209,31 @@ class HcPreBenchmark(BenchmarkBase):
                 cold_l2_flush=args._cold_l2_flush,
             )
             ours = stats["median_ms"] * 1000
+            single_runner = HcPreRunner(
+                x,
+                weight,
+                scale,
+                base,
+                y,
+                post,
+                comb,
+                sinkhorn_iters=args.sinkhorn_iters,
+                head=head,
+                single_kernel=True,
+            )
+            single_graph, _ = capture(single_runner.run)
+            if not args.no_accuracy:
+                torch.testing.assert_close(y, expected[0], rtol=rtol, atol=2e-5)
+                for actual, ref in zip(outputs[1:], expected[1:]):
+                    torch.testing.assert_close(actual, ref, rtol=2e-5, atol=2e-6)
+            single_stats = benchmark_with_stats(
+                single_graph.replay,
+                args.warmup,
+                args.iters,
+                args.samples,
+                cold_l2_flush=args._cold_l2_flush,
+            )
+            single_us = single_stats["median_ms"] * 1000
             baseline = speedup = "-"
             if args.baseline == "torch":
                 ref_graph, ref_outputs = capture(ref_fn)
@@ -222,7 +247,7 @@ class HcPreBenchmark(BenchmarkBase):
                 baseline = f"{stats['median_ms'] * 1000:.3f}"
                 speedup = f"{stats['median_ms'] * 1000 / ours:.2f}x"
             print(
-                f"{tokens} {ours:.3f} {baseline} {speedup} {error}",
+                f"{tokens} {ours:.3f} {single_us:.3f} {ours / single_us:.2f}x {baseline} {speedup} {error}",
                 flush=True,
             )
             if args.sol:
