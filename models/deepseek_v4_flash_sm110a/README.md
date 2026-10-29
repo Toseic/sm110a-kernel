@@ -13,6 +13,20 @@ sparse MLA use the corresponding SM110A kernels. Missing fused model-level
 operators currently use explicit PyTorch fallbacks marked with
 `TODO(sm110a)` in `model.py`.
 
+Compressor KV/gate and MoE router projections use native BF16 GEMM in both
+prefill and decode, including MTP. Compressor `wkv`/`wgate` parameters retain
+their checkpoint keys but are stored in BF16. `prepare_for_inference()` joins
+them into a non-persistent weight buffer for one GEMM with BF16 output.
+Compression state, positional scores and pooling accumulation remain FP32.
+Router weights are also stored in BF16; its GEMM writes FP32 logits directly,
+and scoring, selection and routing-weight normalization retain the reference
+FP32 computation. Dispatch counts are `sm110a.compressor_bf16_gemm` and
+`sm110a.router_bf16_gemm_fp32`. Unsupported shapes/devices use PyTorch with
+the same BF16 operands. Load checkpoints before preparing packed weights.
+These projections change the previous FP32 computation: compressor output
+now rounds to BF16, and FP32 checkpoint projection weights round to BF16 on
+load. Prior full-model precision measurements do not validate this path.
+
 Shared experts use `Fp8SharedFc1Runner` by default for CUDA BF16 inputs
 with supported E4M3 weights, E8M0 scales and 128-aligned dimensions. This
 applies to both decoder and MTP blocks. `prepare_for_inference()` packs
@@ -212,10 +226,10 @@ uses a fixed-order FP32 reduction and rounds to BF16 once after summing the
 expert outputs. `--routing-weight-position fc2 --fc2-reduction atomic`
 selects the previous output-weighted path for comparison.
 
-Select the fused backend with `Transformer(args, moe_backend="fused")` or:
+Select the fused backend with `Transformer(args, moe_backend="fused", pdl=False)` or:
 
 ```bash
-/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_dsv4_flash.py --moe-backend fused
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_dsv4_flash.py --moe-backend fused --no-pdl
 ```
 
 `--moe-backend unfused` remains the default. The fused backend keeps the same
@@ -315,8 +329,10 @@ To include prefill and reproduce the previous batch-1, 1024-token prompt,
 /home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_dsv4_flash.py --no-decode-only --batch-size 1 --prefill-len 1024 --decode-len 128 --seq-len 1152
 ```
 
-Decode PDL is opt-in with `Transformer(args, pdl=True)` or the benchmark's
-`--pdl` flag (`--no-pdl`, the default, is the serial control):
+Decode PDL is enabled by default in `Transformer(args)` and the benchmark.
+Use `Transformer(args, pdl=False)` or `--no-pdl` for the serial control.
+The fused MoE backend requires explicitly disabling PDL. Compare serial and
+PDL decode with the default unfused backend:
 
 ```bash
 /home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_dsv4_flash.py --decode-only --seq-len 2184 --decode-len 16 --warmup 1 --iters 3 --no-pdl

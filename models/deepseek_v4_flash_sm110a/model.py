@@ -7,14 +7,14 @@ checkpoints load without another conversion step.
 
 # Remaining native-kernel support (including inherited reference operators):
 # TODO(sm110a): tune HC pre/head for large-M prefill.
-# TODO(sm110a): implement FP32 compressor projections and fused ratio-4 overlap /
+# TODO(sm110a): implement fused ratio-4 overlap /
 # ratio-128 pooling, incremental state updates, and compressed KV cache writes.
 # TODO(sm110a): add Q normalization, RoPE/inverse RoPE, and Hadamard
 # rotation (currently an external extension or a PyTorch fallback).
 # TODO(sm110a): fuse FP8 QAT quantize-dequantize and its inplace store.
 # TODO(sm110a): fuse indexer KV packing with compressor cache writes instead
 # of repacking the valid BF16/QAT cache on every invocation.
-# TODO(sm110a): fuse FP32 MoE gate projection, scoring, hash/score selection,
+# TODO(sm110a): fuse MoE gate projection, scoring, hash/score selection,
 # weight normalization, and metadata construction directly from expert IDs.
 # TODO(sm110a): add deterministic reduction and PDL to the FC1/FC2 fused backend.
 # TODO(sm110a): fuse shared/routed output addition into the shared-expert FC2.
@@ -338,6 +338,141 @@ def _torch_fp4_linear(a, a_s, b, b_s):
     return (lhs @ weight.t()).to(torch.bfloat16)
 
 
+def _bf16_projection(x: torch.Tensor, weight: torch.Tensor, *, output_fp32=False):
+    """BF16 operands with an optional direct FP32 accumulator output."""
+    a = x.to(torch.bfloat16).reshape(-1, x.size(-1)).contiguous()
+    n, k = weight.shape
+    output_dtype = torch.float32 if output_fp32 else torch.bfloat16
+    if not a.is_cuda or n % 32 or k % 64:
+        _STATS["torch.bf16_projection_fallback"] += 1
+        if output_fp32:
+            result = F.linear(a.float(), weight.float())
+        else:
+            result = F.linear(a, weight)
+        return result.view(*x.shape[:-1], n)
+    rows = a.size(0)
+    tile_m = 64 if rows <= 64 else 128
+    padded_rows = rows if rows <= tile_m else math.ceil(rows / tile_m) * tile_m
+    if padded_rows != rows:
+        a = torch.cat((a, a.new_zeros((padded_rows - rows, k))), dim=0)
+    out = torch.empty((padded_rows, n), device=a.device, dtype=output_dtype)
+    Bf16GemmRunner(a, weight.contiguous(), out).run()
+    return out[:rows].view(*x.shape[:-1], n)
+
+
+class Sm110aCompressor(_official.Compressor):
+    """Joint BF16 KV/score projection, retaining FP32 compression state."""
+
+    def prepare_projection(self):
+        self.register_buffer(
+            "sm110a_kv_gate_weight",
+            torch.cat((self.wkv.weight, self.wgate.weight), dim=0).contiguous(),
+            persistent=False,
+        )
+
+    def project_kv_score(self, x: torch.Tensor):
+        if not hasattr(self, "sm110a_kv_gate_weight"):
+            self.prepare_projection()
+        projected = _bf16_projection(x, self.sm110a_kv_gate_weight)
+        _STATS["sm110a.compressor_bf16_gemm"] += 1
+        return projected.chunk(2, dim=-1)
+
+    def forward(self, x: torch.Tensor, start_pos: int):
+        assert self.kv_cache is not None
+        bsz, seqlen, _ = x.shape
+        ratio, d, rd = self.compress_ratio, self.head_dim, self.rope_head_dim
+        dtype = x.dtype
+        kv, score = self.project_kv_score(x)
+        # Projection rounds to BF16; positional scoring and pooling use FP32.
+        kv, score = kv.float(), score.float()
+        if start_pos == 0:
+            should_compress = seqlen >= ratio
+            remainder = seqlen % ratio
+            cutoff = seqlen - remainder
+            offset = ratio if self.overlap else 0
+            if self.overlap and cutoff >= ratio:
+                self.kv_state[:bsz, :ratio] = kv[:, cutoff - ratio : cutoff]
+                self.score_state[:bsz, :ratio] = score[:, cutoff - ratio : cutoff] + self.ape
+            if remainder > 0:
+                self.kv_state[:bsz, offset : offset + remainder] = kv[:, cutoff:]
+                self.score_state[:bsz, offset : offset + remainder] = (
+                    score[:, cutoff:] + self.ape[:remainder]
+                )
+                kv, score = kv[:, :cutoff], score[:, :cutoff]
+            kv = kv.unflatten(1, (-1, ratio))
+            score = score.unflatten(1, (-1, ratio)) + self.ape
+            if self.overlap:
+                kv = self.overlap_transform(kv, 0)
+                score = self.overlap_transform(score, float("-inf"))
+            kv = (kv * score.softmax(dim=2)).sum(dim=2)
+        else:
+            should_compress = (start_pos + 1) % ratio == 0
+            score = score + self.ape[start_pos % ratio]
+            offset = ratio if self.overlap else 0
+            self.kv_state[:bsz, offset + start_pos % ratio] = kv.squeeze(1)
+            self.score_state[:bsz, offset + start_pos % ratio] = score.squeeze(1)
+            if should_compress:
+                if self.overlap:
+                    kv_state = torch.cat(
+                        (self.kv_state[:bsz, :ratio, :d], self.kv_state[:bsz, ratio:, d:]),
+                        dim=1,
+                    )
+                    score_state = torch.cat(
+                        (self.score_state[:bsz, :ratio, :d], self.score_state[:bsz, ratio:, d:]),
+                        dim=1,
+                    )
+                else:
+                    kv_state, score_state = self.kv_state[:bsz], self.score_state[:bsz]
+                kv = (kv_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
+                if self.overlap:
+                    self.kv_state[:bsz, :ratio] = self.kv_state[:bsz, ratio:]
+                    self.score_state[:bsz, :ratio] = self.score_state[:bsz, ratio:]
+        if not should_compress:
+            return
+        kv = self.norm(kv.to(dtype))
+        if start_pos == 0:
+            freqs_cis = self.freqs_cis[:cutoff:ratio]
+        else:
+            freqs_cis = self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0)
+        _official.apply_rotary_emb(kv[..., -rd:], freqs_cis)
+        if self.rotate:
+            kv = _official.rotate_activation(kv)
+            fp4_act_quant(kv, _official.fp4_block_size, True)
+        else:
+            act_quant(kv[..., :-rd], 64, _official.scale_fmt, _official.scale_dtype, True)
+        if start_pos == 0:
+            self.kv_cache[:bsz, : seqlen // ratio] = kv
+        else:
+            self.kv_cache[:bsz, start_pos // ratio] = kv.squeeze(1)
+        return kv
+
+
+class Sm110aGate(_official.Gate):
+    """BF16 router operands with FP32 logits and reference routing semantics."""
+
+    def forward(self, x: torch.Tensor, input_ids: torch.Tensor | None = None):
+        scores = _bf16_projection(x, self.weight, output_fp32=True)
+        _STATS["sm110a.router_bf16_gemm_fp32"] += 1
+        if self.score_func == "softmax":
+            scores = scores.softmax(dim=-1)
+        elif self.score_func == "sigmoid":
+            scores = scores.sigmoid()
+        else:
+            scores = F.softplus(scores).sqrt()
+        original_scores = scores
+        if self.bias is not None:
+            scores = scores + self.bias
+        if self.hash:
+            indices = self.tid2eid[input_ids]
+        else:
+            indices = scores.topk(self.topk, dim=-1)[1]
+        weights = original_scores.gather(1, indices)
+        if self.score_func != "softmax":
+            weights /= weights.sum(dim=-1, keepdim=True)
+        weights *= self.route_scale
+        return weights, indices
+
+
 def _decode_fp8_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     k, n = x.size(-1), weight.size(0)
     rows = x.numel() // k
@@ -402,9 +537,8 @@ def linear(
         _STATS["sm110a.bf16_gemm"] += 1
         return out[:rows].view(*x.shape[:-1], n)
 
-    # TODO(sm110a): RMS/HC/router projections are FP32 in the reference
-    # checkpoint.  Replace these F.linear calls when an FP32-capable SM110A
-    # kernel (or a fused surrounding operator) is available.
+    # Other FP32 projections outside the specialized native modules retain
+    # the reference computation.
     _STATS["torch.fp32_linear_todo"] += 1
     return F.linear(x, weight)
 
@@ -1109,7 +1243,7 @@ class Transformer(_official.Transformer):
         deterministic_fc2: bool | None = None,
         moe_backend: str = "unfused",
         compact_moe_scales: bool = True,
-        pdl: bool = False,
+        pdl: bool = True,
     ):
         if routing_weight_position not in ("fc1", "fc2"):
             raise ValueError("routing_weight_position must be 'fc1' or 'fc2'")
@@ -1122,8 +1256,22 @@ class Transformer(_official.Transformer):
         if moe_backend == "fused" and deterministic_fc2:
             raise ValueError("fused MoE currently supports atomic reduction only")
         if moe_backend == "fused" and pdl:
-            raise ValueError("fused MoE does not support PDL")
+            raise ValueError("fused MoE does not support PDL; pass pdl=False")
         super().__init__(args)
+        for module in self.modules():
+            if isinstance(module, _official.Compressor):
+                module.__class__ = Sm110aCompressor
+                for projection in (module.wkv, module.wgate):
+                    projection.weight = torch.nn.Parameter(
+                        projection.weight.to(torch.bfloat16),
+                        requires_grad=projection.weight.requires_grad,
+                    )
+            elif isinstance(module, _official.Gate):
+                module.__class__ = Sm110aGate
+                module.weight = torch.nn.Parameter(
+                    module.weight.to(torch.bfloat16),
+                    requires_grad=module.weight.requires_grad,
+                )
         for module in self.modules():
             if isinstance(module, _official.RMSNorm):
                 module.__class__ = Sm110aRMSNorm
@@ -1162,6 +1310,9 @@ class Transformer(_official.Transformer):
     def prepare_for_inference(self) -> None:
         if self._sm110a_prepared:
             return
+        for module in self.modules():
+            if isinstance(module, Sm110aCompressor):
+                module.prepare_projection()
         for layer in (*self.layers, *self.mtp):
             layer.ffn.prepare_fused_weights()
         self._sm110a_prepared = True

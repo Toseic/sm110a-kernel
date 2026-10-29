@@ -112,10 +112,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pdl",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="enable quant->GEMM and quant->FC1->FC2 PDL in graphed decode (default: off)",
+        default=True,
+        help="enable quant->GEMM and quant->FC1->FC2 PDL in graphed decode (default: on)",
     )
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument(
+        "--profile-phase",
+        choices=("prefill", "decode"),
+        help="collect warmed cold-L2 passes using CUDA profiler start/stop",
+    )
     parser.add_argument("--memory-limit-gib", type=float, default=32.0)
     parser.add_argument(
         "--runtime-reserve-gib",
@@ -141,7 +146,9 @@ def parse_args() -> argparse.Namespace:
     if args.moe_backend == "fused" and args.fc2_reduction != "atomic":
         parser.error("--moe-backend fused requires --fc2-reduction atomic")
     if args.moe_backend == "fused" and args.pdl:
-        parser.error("--moe-backend fused does not support --pdl")
+        parser.error("--moe-backend fused requires --no-pdl")
+    if args.profile_phase == "prefill" and args.decode_only:
+        parser.error("--profile-phase prefill requires --no-decode-only")
     return args
 
 
@@ -580,6 +587,27 @@ def _measure_sm110a(config, checkpoint, args, prompt, tokens, decode_start_pos):
         ]
         prefill_seconds = sum(item[0] for item in results) / len(results)
         decode_seconds = sum(item[1] for item in results) / len(results)
+
+    if args.profile_phase is not None:
+        # Each profiler range contains only one model phase. Cache restoration
+        # and dirty L2 eviction run before collection starts.
+        eviction = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+        torch.cuda.synchronize()
+        for iteration in range(args.iters):
+            decode_graph.reset_cache()
+            decode_graph.static_tokens.copy_(graph_seed)
+            eviction.fill_(iteration % 255 + 1)
+            torch.cuda.synchronize()
+            torch.cuda.profiler.start()
+            try:
+                if args.profile_phase == "prefill":
+                    model(prompt, 0)
+                else:
+                    decode_graph.graph.replay()
+                torch.cuda.synchronize()
+            finally:
+                torch.cuda.profiler.stop()
+        print(f"[profile] collected {args.iters} cold-L2 {args.profile_phase} passes")
 
     result = {
         "label": "sm110a",
