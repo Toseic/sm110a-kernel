@@ -37,6 +37,35 @@ void check_scale(const torch::Tensor& x, int64_t size, const char* name,
               name, " has invalid blocked scale storage");
 }
 
+using RangesLauncher = void (*)(const int32_t*, const int32_t*, int32_t*, int32_t*,
+    int, int, int, int, int, cudaStream_t);
+
+std::vector<torch::Tensor> prepare_metadata_from_ranges(
+    torch::Tensor offsets, torch::Tensor counts, int64_t rows, int64_t n,
+    uint64_t address, int64_t tile_m, int64_t tile_n, int64_t cluster_m) {
+  TORCH_CHECK(offsets.is_cuda() && offsets.scalar_type() == torch::kInt32 &&
+      offsets.dim() == 1 && offsets.is_contiguous() && counts.is_cuda() &&
+      counts.scalar_type() == torch::kInt32 && counts.dim() == 1 &&
+      counts.is_contiguous() && counts.sizes() == offsets.sizes() &&
+      counts.device() == offsets.device(), "ranges must be matching CUDA int32 vectors");
+  const int64_t experts = counts.numel();
+  TORCH_CHECK(rows > 0 && rows % 128 == 0 && experts > 0 && n > 0 &&
+      tile_m == 128 && tile_n == 256 && n % tile_n == 0 && address != 0 &&
+      (cluster_m == 1 || cluster_m == 2), "invalid MXFP4 FC2 ranges/config");
+  const int64_t max_tasks =
+      ((rows + cluster_m * tile_m - 1) / (cluster_m * tile_m) + experts) *
+      (n / tile_n);
+  auto tasks = torch::empty({max_tasks, 5}, counts.options());
+  auto state = torch::empty({2}, counts.options());
+  c10::cuda::CUDAGuard guard(counts.device());
+  auto stream = c10::cuda::getCurrentCUDAStream(counts.device().index());
+  reinterpret_cast<RangesLauncher>(address)(offsets.data_ptr<int32_t>(),
+      counts.data_ptr<int32_t>(), tasks.data_ptr<int32_t>(), state.data_ptr<int32_t>(),
+      experts, n, tile_m, tile_n, cluster_m, stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {offsets, counts, tasks, state};
+}
+
 std::vector<torch::Tensor> prepare_metadata(
     torch::Tensor layout, int64_t experts, int64_t n, uint64_t address,
     int64_t tile_m, int64_t tile_n, int64_t cluster_m) {
@@ -187,6 +216,7 @@ using namespace sm110a::mxfp4_fc2_torch_binding;
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("prepare_pdl_out", &prepare_pdl_out);
   m.def("prepare_mxfp4_fc2_metadata", &prepare_metadata);
+  m.def("prepare_mxfp4_fc2_metadata_from_ranges", &prepare_metadata_from_ranges);
   m.def("mxfp4_fc2", &run);
   m.def("mxfp4_fc2_out", &run_out);
 }

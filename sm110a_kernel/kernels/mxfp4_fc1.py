@@ -148,6 +148,28 @@ class Mxfp4Fc1Module:
         self._metadata_address = ctypes.cast(symbol, ctypes.c_void_p).value
         routing_symbol = getattr(library.handle, "sm110a_mxfp4_fc1_routing_prepare")
         self._routing_address = ctypes.cast(routing_symbol, ctypes.c_void_p).value
+        self._ids_address = ctypes.cast(
+            getattr(library.handle, "sm110a_mxfp4_fc1_routing_from_ids"),
+            ctypes.c_void_p,
+        ).value
+
+    def prepare_metadata_from_ids(self, expert_ids, experts: int, n: int):
+        """Build routing from valid expert IDs, retaining token/rank order.
+
+        IDs must be distinct per token and in [0, experts); no host
+        synchronization validates values.
+        The small-token path supports E <= 1024 and K <= 32.
+        """
+        values = self._binding.prepare_mxfp4_fc1_routing_from_ids(
+            expert_ids,
+            experts,
+            n,
+            self.config.tile_m,
+            self.config.tile_n,
+            self.config.cluster_m,
+            self._ids_address,
+        )
+        return Mxfp4Fc1Metadata(*values)
 
     def prepare_metadata(self, router_scores, topk: int, n: int) -> Mxfp4Fc1Metadata:
 

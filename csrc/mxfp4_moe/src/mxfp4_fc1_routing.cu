@@ -80,9 +80,11 @@ __global__ void topk_router_kernel(
     grid.sync();
 }
 
+template <bool FuseMaps>
 __global__ void build_grouped_rows(
     const int *selected, const int *offsets, int *source_rows,
-    int *grouped_assignments, int m, int topk) {
+    int *grouped_assignments, int m, int topk,
+    int *layout, int *assignment_to_grouped) {
     constexpr int kWarps = kThreads / kWarpSize;
     const int expert = blockIdx.x;
     const int lane = threadIdx.x & (kWarpSize - 1);
@@ -114,10 +116,45 @@ __global__ void build_grouped_rows(
             const int grouped = rows_written + warp_offsets[warp] + prefix;
             source_rows[grouped] = assignment / topk;
             grouped_assignments[grouped] = assignment;
+            if constexpr (FuseMaps) {
+                layout[grouped] = expert;
+                assignment_to_grouped[assignment] = grouped;
+            }
         }
         __syncthreads();
         if (threadIdx.x == 0) rows_written += block_matches;
         __syncthreads();
+    }
+}
+
+// Decode has few (padded) tokens. One CTA replaces the cooperative top-k
+// launch with integer-only ID copies, histogram and prefix sum.
+// Inputs must contain valid, distinct expert IDs per token. Rank order is
+// already known, so only the integer histogram and prefix sum are needed.
+template <typename Index>
+__global__ void routing_from_ids(
+    const Index *ids, int tokens, int experts, int topk,
+    int *selected, int *counts, int *offsets) {
+    extern __shared__ int histogram[];
+    for (int e = threadIdx.x; e < experts; e += blockDim.x)
+        histogram[e] = 0;
+    __syncthreads();
+    for (int token = threadIdx.x; token < tokens; token += blockDim.x) {
+        for (int rank = 0; rank < topk; ++rank) {
+            const auto assignment = static_cast<size_t>(token) * topk + rank;
+            const int expert = static_cast<int>(ids[assignment]);
+            selected[assignment] = expert;
+            atomicAdd(histogram + expert, 1);
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int offset = 0;
+        for (int e = 0; e < experts; ++e) {
+            counts[e] = histogram[e];
+            offsets[e] = offset;
+            offset += histogram[e];
+        }
     }
 }
 
@@ -167,11 +204,38 @@ extern "C" void sm110a_mxfp4_fc1_routing_prepare(
     if (blocks > 0)
         cudaLaunchCooperativeKernel(reinterpret_cast<const void *>(topk_router_kernel),
             dim3(blocks), dim3(kThreads), args, smem_bytes, stream);
-    build_grouped_rows<<<experts, kThreads, 0, stream>>>(
-        selected, offsets, source_rows, grouped_assignments, m, topk);
+    build_grouped_rows<false><<<experts, kThreads, 0, stream>>>(
+        selected, offsets, source_rows, grouped_assignments, m, topk, nullptr, nullptr);
     materialize_layout<<<experts, kThreads, 0, stream>>>(offsets, counts, experts, layout);
     invert_assignments<<<(m + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
         grouped_assignments, m, assignment_to_grouped);
+    sm110a_mxfp4_fc1_tasks_from_ranges(
+        offsets, counts, tasks, state, experts, n, tile_m,
+        tile_n * SM110A_MXFP4_FC1_CLUSTER_N, cluster_m, stream);
+}
+
+extern "C" void sm110a_mxfp4_fc1_routing_from_ids(
+    const void *ids, bool ids64, int tokens, int experts, int topk,
+    int32_t *routing, int32_t *source_rows, int32_t *selected,
+    int32_t *tasks, int32_t *state, int n, int tile_m, int tile_n,
+    int cluster_m, cudaStream_t stream) {
+    const int m = tokens * topk;
+    auto *counts = routing;
+    auto *offsets = counts + experts;
+    auto *layout = offsets + experts;
+    auto *grouped_assignments = layout + m;
+    auto *assignment_to_grouped = grouped_assignments + m;
+    if (ids64)
+        routing_from_ids<int64_t><<<1, kThreads, experts * sizeof(int), stream>>>(
+            static_cast<const int64_t *>(ids), tokens, experts, topk,
+            selected, counts, offsets);
+    else
+        routing_from_ids<int32_t><<<1, kThreads, experts * sizeof(int), stream>>>(
+            static_cast<const int32_t *>(ids), tokens, experts, topk,
+            selected, counts, offsets);
+    build_grouped_rows<true><<<experts, kThreads, 0, stream>>>(
+        selected, offsets, source_rows, grouped_assignments, m, topk,
+        layout, assignment_to_grouped);
     sm110a_mxfp4_fc1_tasks_from_ranges(
         offsets, counts, tasks, state, experts, n, tile_m,
         tile_n * SM110A_MXFP4_FC1_CLUSTER_N, cluster_m, stream);

@@ -13,6 +13,8 @@ using MetadataLauncher = void (*)(const int32_t*, int32_t*, int32_t*, int32_t*, 
     int, int, int, int, int, int, bool, cudaStream_t);
 using RoutingLauncher = void (*)(const __nv_bfloat16*, int, int, int, int32_t*, int32_t*,
     int32_t*, int32_t*, int32_t*, int, int, int, int, cudaStream_t);
+using IdsLauncher = void (*)(const void*, bool, int, int, int, int32_t*, int32_t*,
+    int32_t*, int32_t*, int32_t*, int, int, int, int, cudaStream_t);
 
 void check_fp4(const torch::Tensor& x, const char* name, int dim) {
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kFloat4_e2m1fn_x2 &&
@@ -71,6 +73,36 @@ std::vector<torch::Tensor> prepare_routing(
   auto stream = c10::cuda::getCurrentCUDAStream(router.device().index());
   reinterpret_cast<RoutingLauncher>(address)(
       reinterpret_cast<const __nv_bfloat16*>(router.data_ptr<at::BFloat16>()),
+      tokens, experts, topk, routing.data_ptr<int32_t>(), source_rows.data_ptr<int32_t>(),
+      selected.data_ptr<int32_t>(), tasks.data_ptr<int32_t>(), state.data_ptr<int32_t>(),
+      n, tile_m, tile_n, cluster_m, stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {routing, source_rows, tasks, state};
+}
+
+std::vector<torch::Tensor> prepare_routing_from_ids(
+    torch::Tensor ids, int64_t experts, int64_t n, int64_t tile_m,
+    int64_t tile_n, int64_t cluster_m, uint64_t address) {
+  TORCH_CHECK(ids.is_cuda() && ids.dim() == 2 && ids.is_contiguous() &&
+      (ids.scalar_type() == torch::kInt32 || ids.scalar_type() == torch::kInt64),
+      "expert_ids must be contiguous CUDA int32/int64 [tokens,topk]");
+  const int64_t tokens = ids.size(0), topk = ids.size(1), rows = tokens * topk;
+  TORCH_CHECK(tokens > 0 && tokens % 128 == 0 && experts > 0 && experts <= 1024 &&
+      topk > 0 && topk <= experts && topk <= 32 && address != 0 &&
+      tile_m == 128 && tile_n == 256 && n > 0 && n % tile_n == 0 &&
+      (cluster_m == 1 || cluster_m == 2), "invalid direct-ID routing shape/config");
+  auto options = ids.options().dtype(torch::kInt32);
+  auto routing = torch::empty({2 * experts + 3 * rows}, options);
+  auto source_rows = torch::empty({rows}, options);
+  auto selected = torch::empty({rows}, options);
+  const int64_t max_tasks =
+      ((rows + cluster_m * tile_m - 1) / (cluster_m * tile_m) + experts) *
+      (n / tile_n);
+  auto tasks = torch::empty({max_tasks, 5}, options);
+  auto state = torch::empty({2}, options);
+  c10::cuda::CUDAGuard guard(ids.device());
+  auto stream = c10::cuda::getCurrentCUDAStream(ids.device().index());
+  reinterpret_cast<IdsLauncher>(address)(ids.data_ptr(), ids.scalar_type() == torch::kInt64,
       tokens, experts, topk, routing.data_ptr<int32_t>(), source_rows.data_ptr<int32_t>(),
       selected.data_ptr<int32_t>(), tasks.data_ptr<int32_t>(), state.data_ptr<int32_t>(),
       n, tile_m, tile_n, cluster_m, stream);
@@ -154,6 +186,7 @@ using namespace sm110a::mxfp4_fc1_torch_binding;
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("prepare_mxfp4_fc1_tasks", &prepare);
   m.def("prepare_mxfp4_fc1_routing", &prepare_routing);
+  m.def("prepare_mxfp4_fc1_routing_from_ids", &prepare_routing_from_ids);
   m.def("mxfp4_fc1", &run);
   m.def("mxfp4_fc1_out", &run_out);
 }

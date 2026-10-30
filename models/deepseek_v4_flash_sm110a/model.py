@@ -18,14 +18,14 @@ checkpoints load without another conversion step.
 # TODO(sm110a): fuse FP8 cache quantization, scale/RoPE stores and ring writes.
 # TODO(sm110a): fuse indexer KV packing with compressor cache writes instead
 # of repacking the valid BF16/QAT cache on every invocation.
-# TODO(sm110a): fuse MoE gate projection and metadata construction directly
-# from expert IDs (sqrtsoftplus scoring/selection/normalization is fused).
+# TODO(sm110a): fuse MoE gate projection and metadata construction
+# (decode metadata accepts expert IDs directly).
 # TODO(sm110a): add deterministic reduction and PDL to the FC1/FC2 fused backend.
 # TODO(sm110a): fuse shared/routed output addition into the shared-expert FC2.
 # TODO(sm110a): fuse index generation, cache writes, padding, and layout
 # conversions where useful; extend the LM-head GEMM to unaligned dimensions.
 # TODO(sm110a): specialize small-M dense/MoE decode instead of padding tokens
-# to 128 rows; cache wo_a's fixed grouped-layout scheduling metadata.
+# to 128 rows.
 # TODO(sm110a): extend non-aligned GEMMs, non-E8M0 scales, other FP4 quantizer
 # modes, sparse MLA head counts/dimensions, and multi-GPU fused MoE support.
 
@@ -81,6 +81,7 @@ from sm110a_kernel import (
 # Scoped to one model forward, like the official backend patches below.
 _DECODE_ENABLED = False
 _DECODE_PDL = False
+_DECODE_ZERO_PADDING = None
 
 ModelArgs = _official.ModelArgs
 _OFFICIAL_FP4_ACT_QUANT = _official.fp4_act_quant
@@ -232,7 +233,9 @@ def act_quant(
         device=flat.device,
         dtype=torch.float8_e8m0fnu if scale_mode == "ue8m0" else torch.float32,
     )
-    Fp8ActQuantRunner(flat, values, scales, block_size, scale_mode, pdl=_DECODE_PDL).run()
+    Fp8ActQuantRunner(
+        flat, values, scales, block_size, scale_mode, pdl=_DECODE_PDL
+    ).run()
     values = values.view_as(x)
     scales = scales.view(*x.shape[:-1], width // block_size)
     _STATS["sm110a.fp8_act_quant"] += 1
@@ -601,11 +604,19 @@ class Sm110aGate(_official.Gate):
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor | None = None):
         scores = _bf16_projection(x, self.weight, output_fp32=True)
         _STATS["sm110a.router_bf16_gemm_fp32"] += 1
-        if self.score_func not in ("softmax", "sigmoid") and scores.size(-1) <= 1024 and self.topk <= 32:
+        if (
+            self.score_func not in ("softmax", "sigmoid")
+            and scores.size(-1) <= 1024
+            and self.topk <= 32
+        ):
             hash_indices = self.tid2eid[input_ids].contiguous() if self.hash else None
             result = fused_gate(
-                scores, self.topk, self.route_scale, bias=self.bias,
-                hash_indices=hash_indices, pdl=_DECODE_PDL,
+                scores,
+                self.topk,
+                self.route_scale,
+                bias=self.bias,
+                hash_indices=hash_indices,
+                pdl=_DECODE_PDL,
             )
             _STATS["sm110a.fused_gate"] += 1
             return result
@@ -629,13 +640,28 @@ class Sm110aGate(_official.Gate):
         return weights, indices
 
 
+def _zero_padding(x: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
+    """Reuse immutable padding owned by the current decoding model.
+
+    Callers only read this tensor (normally as a cat input). Keep it separate
+    from writable GEMM inputs and retain it across CUDA Graph captures.
+    """
+    cache = _DECODE_ZERO_PADDING if _DECODE_ENABLED else None
+    if cache is None:
+        return x.new_zeros(shape)
+    key = (x.device, x.dtype, tuple(shape))
+    if key not in cache:
+        cache[key] = x.new_zeros(shape)
+    return cache[key]
+
+
 def _decode_fp8_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     k, n = x.size(-1), weight.size(0)
     rows = x.numel() // k
     padded_rows = math.ceil(rows / 128) * 128
     a = x.reshape(rows, k).contiguous()
     if padded_rows != rows:
-        a = torch.cat((a, a.new_zeros((padded_rows - rows, k))), dim=0)
+        a = torch.cat((a, _zero_padding(a, (padded_rows - rows, k))), dim=0)
     sfb = _blocked_fp8_weight_scales(weight.scale, n, k)
     b = weight.contiguous()
     aq = torch.empty(a.shape, device=x.device, dtype=torch.float8_e4m3fn)
@@ -682,7 +708,7 @@ def linear(
         padded_rows = math.ceil(rows / 128) * 128
         a = x.reshape(rows, k).contiguous()
         if padded_rows != rows:
-            a = torch.cat((a, a.new_zeros((padded_rows - rows, k))), dim=0)
+            a = torch.cat((a, _zero_padding(a, (padded_rows - rows, k))), dim=0)
         if n % 32:
             # TODO(sm110a): add an epilogue for BF16 projection widths that
             # are not a multiple of the current 32-column store atom.
@@ -778,10 +804,38 @@ class Sm110aAttention(_official.Attention):
 
     def prepare_kv_cache(self):
         old_cache = self.kv_cache
+        self._wo_a_metadata_cache = {}
         del self.kv_cache
         self.fp8_cache = Fp8KvCache(
             old_cache.shape, self.rope_head_dim, old_cache.device, _official.scale_dtype
         )
+        # Immutable index data belongs to the module so CUDA Graph replays
+        # retain its storage, including after backend runner caches are cleared.
+        self.register_buffer(
+            "sm110a_group_ids",
+            torch.arange(
+                self.n_local_groups, device=old_cache.device, dtype=torch.int32
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "sm110a_window_ring",
+            torch.arange(
+                self.window_size, device=old_cache.device, dtype=torch.int32
+            ).repeat(2),
+            persistent=False,
+        )
+        if self.compress_ratio and self.indexer is None:
+            self.register_buffer(
+                "sm110a_compress_ids",
+                torch.arange(
+                    self.window_size,
+                    old_cache.size(1),
+                    device=old_cache.device,
+                    dtype=torch.int32,
+                ),
+                persistent=False,
+            )
 
     def forward(self, x: torch.Tensor, start_pos: int):
         bsz, seqlen, _ = x.size()
@@ -800,11 +854,26 @@ class Sm110aAttention(_official.Attention):
         kv = self.kv_norm(self.wkv(x))
         _official.apply_rotary_emb(kv[..., -rd:], freqs_cis)
         packed = _pack_fp8_kv(kv, rd)
-        topk_idxs = _official.get_window_topk_idxs(win, bsz, seqlen, start_pos)
+        if seqlen == 1 and start_pos >= win - 1:
+            begin = start_pos % win + 1
+            topk_idxs = (
+                self.sm110a_window_ring[begin : begin + win]
+                .unsqueeze(0)
+                .expand(bsz, -1, -1)
+            )
+        else:
+            topk_idxs = _official.get_window_topk_idxs(win, bsz, seqlen, start_pos)
         if ratio:
             offset = seqlen if start_pos == 0 else win
             if self.indexer is not None:
                 compress_topk_idxs = self.indexer(x, qr, start_pos, offset)
+            elif start_pos > 0:
+                # Decode uses the fixed window-size cache offset. This is the
+                # same int64 arange + offset, materialized once during setup.
+                width = (start_pos + 1) // ratio
+                compress_topk_idxs = (
+                    self.sm110a_compress_ids[:width].unsqueeze(0).expand(bsz, -1, -1)
+                )
             else:
                 compress_topk_idxs = _official.get_compress_topk_idxs(
                     ratio, bsz, seqlen, start_pos, offset
@@ -843,10 +912,19 @@ class Sm110aAttention(_official.Attention):
         grouped = o.reshape(rows, groups, -1).transpose(0, 1).contiguous()
         a = grouped.view(groups * rows, -1)
         weights = self.wo_a.weight.view(groups, self.o_lora_rank, -1).contiguous()
-        layout = torch.arange(groups, device=o.device, dtype=torch.int32)
-        layout = layout.repeat_interleave(rows)
+        layout = self.sm110a_group_ids
+        if rows != 1:
+            layout = layout.repeat_interleave(rows)
         out = torch.empty((a.size(0), self.o_lora_rank), device=o.device, dtype=o.dtype)
-        Bf16GroupedMGemmRunner(a, weights, layout, out, dynamic_metadata=True, pdl=_DECODE_PDL).run()
+        Bf16GroupedMGemmRunner(
+            a,
+            weights,
+            layout,
+            out,
+            dynamic_metadata=True,
+            pdl=_DECODE_PDL,
+            static_metadata_cache=self._wo_a_metadata_cache if rows == 1 else None,
+        ).run()
         _STATS["sm110a.wo_a_grouped_m_gemm"] += 1
         return (
             out.view(groups, rows, self.o_lora_rank)
@@ -973,7 +1051,9 @@ class Sm110aIndexer(_official.Indexer):
         indices = torch.empty(
             (bsz * seqlen, k), device=scores.device, dtype=torch.int32
         )
-        TopKRunner(scores.contiguous().view(bsz * seqlen, width), indices, k, pdl=_DECODE_PDL).run()
+        TopKRunner(
+            scores.contiguous().view(bsz * seqlen, width), indices, k, pdl=_DECODE_PDL
+        ).run()
         indices = indices.view(bsz, seqlen, k)
         _STATS["sm110a.indexer_topk"] += 1
         if start_pos == 0:
@@ -1048,7 +1128,7 @@ class Sm110aSharedExpert(_official.Expert):
         tokens = flat.size(0)
         padded_tokens = math.ceil(tokens / 128) * 128
         if padded_tokens != tokens:
-            flat = torch.cat((flat, flat.new_zeros((padded_tokens - tokens, dim))))
+            flat = torch.cat((flat, _zero_padding(flat, (padded_tokens - tokens, dim))))
         aq = torch.empty(flat.shape, device=x.device, dtype=torch.float8_e4m3fn)
         sfa = torch.empty(
             padded_tokens * dim // 8, device=x.device, dtype=torch.float8_e8m0fnu
@@ -1137,6 +1217,33 @@ class Sm110aMoE(_official.MoE):
             self.sm110a_fc1_scale = compact_mxfp4_weight_scales(self.sm110a_fc1_scale)
             self.sm110a_fc2_scale = compact_mxfp4_weight_scales(self.sm110a_fc2_scale)
         self._sm110a_inter_dim = inter_dim
+        index_dtype = self.gate.tid2eid.dtype if self.gate.hash else torch.int64
+        self.register_buffer(
+            "sm110a_dummy_expert_ids",
+            torch.arange(self.n_activated_experts, device=device, dtype=index_dtype),
+            persistent=False,
+        )
+        self.register_buffer(
+            "sm110a_route_ranks",
+            torch.arange(
+                self.n_activated_experts, 0, -1, device=device, dtype=torch.bfloat16
+            ),
+            persistent=False,
+        )
+        self._sm110a_direct_ids = (
+            self._sm110a_moe_backend == "unfused"
+            and self.n_routed_experts <= 1024
+            and self.n_activated_experts <= 32
+        )
+        if self._sm110a_direct_ids and self.gate.hash:
+            # Validate the immutable table once outside graph capture. Duplicate
+            # IDs give scatter ambiguous overwrite semantics; retain the old
+            # router path for such tables instead of changing their behavior.
+            ids = self.gate.tid2eid
+            ordered = ids.sort(dim=-1).values
+            valid = ((ids >= 0) & (ids < self.n_routed_experts)).all()
+            unique = (ordered[:, 1:] != ordered[:, :-1]).all()
+            self._sm110a_direct_ids = bool((valid & unique).item())
 
         # The fused tensors now own the routed-expert weights.  Drop the
         # official per-expert modules instead of retaining a second 3+ GiB
@@ -1144,7 +1251,7 @@ class Sm110aMoE(_official.MoE):
         self.experts = torch.nn.ModuleList()
         self._sm110a_prepared = True
 
-    def _run_experts(self, x, weights, router, topk):
+    def _run_experts(self, x, weights, router, topk, *, expert_ids=None):
         out = torch.empty_like(x)
         semantics = dict(
             swiglu_limit=self._sm110a_swiglu_limit,
@@ -1190,6 +1297,7 @@ class Sm110aMoE(_official.MoE):
                 out,
                 deterministic=self._sm110a_deterministic_fc2,
                 pdl=_DECODE_ENABLED and self._sm110a_pdl,
+                expert_ids=expert_ids,
                 **semantics,
             )
         return runner.run()
@@ -1207,38 +1315,48 @@ class Sm110aMoE(_official.MoE):
 
         if padded_tokens != tokens:
             x_padded = torch.cat(
-                (x, x.new_zeros((padded_tokens - tokens, self.dim))), dim=0
+                (x, _zero_padding(x, (padded_tokens - tokens, self.dim))), dim=0
             )
             weights_padded = torch.cat(
                 (
                     weights,
-                    weights.new_zeros((padded_tokens - tokens, topk)),
+                    _zero_padding(weights, (padded_tokens - tokens, topk)),
                 ),
                 dim=0,
             )
-            dummy_indices = torch.arange(
-                topk, device=indices.device, dtype=indices.dtype
-            ).expand(padded_tokens - tokens, -1)
+            dummy_indices = self.sm110a_dummy_expert_ids.expand(
+                padded_tokens - tokens, -1
+            )
             indices_padded = torch.cat((indices, dummy_indices), dim=0)
         else:
             x_padded, weights_padded, indices_padded = x, weights, indices
 
-        # FC1 metadata performs its own top-k.  Synthetic descending values
-        # preserve the exact order returned by the official gate, including
-        # hash-routed layers. The selected compile-time weighting mode receives
-        # the real routing weights without multiplying them a second time.
-        router = torch.full(
-            (padded_tokens, self.n_routed_experts),
-            -torch.inf,
-            device=x.device,
-            dtype=torch.bfloat16,
+        direct_ids = (
+            _DECODE_ENABLED and self._sm110a_direct_ids and padded_tokens <= 1024
         )
-        rank_values = torch.arange(
-            topk, 0, -1, device=x.device, dtype=torch.bfloat16
-        ).expand(padded_tokens, -1)
-        router.scatter_(1, indices_padded.long(), rank_values)
+        router = None
+        if not direct_ids:
+            # Compatibility path for prefill, fused MoE and hash tables with
+            # repeated IDs. Synthetic scores retain the gate's rank order.
+            router = torch.full(
+                (padded_tokens, self.n_routed_experts),
+                -torch.inf,
+                device=x.device,
+                dtype=torch.bfloat16,
+            )
+            router.scatter_(
+                1,
+                indices_padded.long(),
+                self.sm110a_route_ranks.expand(padded_tokens, -1),
+            )
 
-        out = self._run_experts(x_padded.contiguous(), weights_padded, router, topk)
+        out = self._run_experts(
+            x_padded.contiguous(),
+            weights_padded,
+            router,
+            topk,
+            expert_ids=indices_padded.contiguous() if direct_ids else None,
+        )
         if self._sm110a_moe_backend == "fused":
             _STATS["sm110a.mxfp4_fc1fc2"] += 1
         else:
@@ -1591,6 +1709,7 @@ class Transformer(_official.Transformer):
             if indexer is not None:
                 indexer.__class__ = Sm110aIndexer
         self._sm110a_prepared = False
+        self._sm110a_zero_padding = {}
 
     def prepare_for_inference(self) -> None:
         if self._sm110a_prepared:
@@ -1606,12 +1725,13 @@ class Transformer(_official.Transformer):
     def forward(self, input_ids: torch.Tensor, start_pos: int = 0):
         if not self._sm110a_prepared:
             self.prepare_for_inference()
-        global _DECODE_ENABLED, _DECODE_PDL
-        previous = _DECODE_ENABLED, _DECODE_PDL
+        global _DECODE_ENABLED, _DECODE_PDL, _DECODE_ZERO_PADDING
+        previous = _DECODE_ENABLED, _DECODE_PDL, _DECODE_ZERO_PADDING
         _DECODE_ENABLED = input_ids.size(1) == 1 and start_pos > 0
         _DECODE_PDL = self.pdl and _DECODE_ENABLED
+        _DECODE_ZERO_PADDING = self._sm110a_zero_padding
         try:
             with _use_sm110a_backend():
                 return super().forward(input_ids, start_pos)
         finally:
-            _DECODE_ENABLED, _DECODE_PDL = previous
+            _DECODE_ENABLED, _DECODE_PDL, _DECODE_ZERO_PADDING = previous

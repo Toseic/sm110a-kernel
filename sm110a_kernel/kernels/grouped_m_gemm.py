@@ -247,12 +247,29 @@ def format_candidate(config, swap_ab):
 class Bf16GroupedMGemmRunner(BaseKernelRunner):
     namespace = "bf16_grouped_m_gemm"
 
-    def __init__(self, a, b, layout, out, *, dynamic_metadata=False, pdl=False):
+    def __init__(
+        self,
+        a,
+        b,
+        layout,
+        out,
+        *,
+        dynamic_metadata=False,
+        pdl=False,
+        static_metadata_cache=None,
+    ):
+        """Optionally reuse schedules for a caller-owned immutable layout.
+
+        The caller must keep the layout unchanged and own the cache for as
+        long as its CUDA graphs. Entries retain the layout storage as well.
+        Selection keys stay unchanged so existing GEMM tactics are preserved.
+        """
         validate_pdl(pdl)
         super().__init__(a.device)
         self.pdl = pdl
         self.a, self.b, self.layout, self.out = a, b, layout, out
         self.dynamic_metadata = dynamic_metadata
+        self.static_metadata_cache = static_metadata_cache
         if dynamic_metadata:
             self.namespace = "bf16_grouped_m_gemm_dynamic_v1"
             self.graph_timing = True
@@ -285,9 +302,23 @@ class Bf16GroupedMGemmRunner(BaseKernelRunner):
         module = self.pre_jit(candidate)
 
         def metadata():
-            return module.prepare_metadata(
+            cache = self.static_metadata_cache
+            key = (
+                candidate,
+                self.layout.device,
+                self.layout.data_ptr(),
+                self.layout.numel(),
+                self.b.size(0),
+                self.b.size(1),
+            )
+            if cache is not None and key in cache:
+                return cache[key][1]
+            result = module.prepare_metadata(
                 self.layout, self.b.size(0), self.b.size(1), candidate[1]
             )
+            if cache is not None:
+                cache[key] = (self.layout, result)
+            return result
 
         prepared_metadata = None if self.dynamic_metadata else metadata()
 

@@ -115,6 +115,25 @@ class Mxfp4Fc2Module:
             ctypes.c_void_p,
         ).value
 
+        self._ranges_metadata_address = ctypes.cast(
+            getattr(library.handle, "sm110a_bf16_grouped_m_metadata_from_ranges"),
+            ctypes.c_void_p,
+        ).value
+
+    def prepare_metadata_from_ranges(self, offsets, counts, rows: int, n: int):
+        """Reuse FC1 expert ranges; retain FC2's own task traversal order."""
+        values = self._binding.prepare_mxfp4_fc2_metadata_from_ranges(
+            offsets,
+            counts,
+            rows,
+            n,
+            self._ranges_metadata_address,
+            self.config.tile_m,
+            self.config.tile_n,
+            self.config.cluster_m,
+        )
+        return Mxfp4Fc2Metadata(*values)
+
     def prepare_metadata(self, grouped_layout, experts: int, n: int):
         values = self._binding.prepare_mxfp4_fc2_metadata(
             grouped_layout,

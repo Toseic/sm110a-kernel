@@ -112,6 +112,15 @@ __global__ void build_expert_tile_tasks(
 
 using namespace sm110a::bf16_grouped_m_gemm_metadata;
 
+extern "C" void sm110a_bf16_grouped_m_metadata_from_ranges(
+    const int32_t *offsets, const int32_t *counts, int32_t *tasks, int32_t *state,
+    int experts, int n, int tile_m, int tile_n, int cluster_m,
+    cudaStream_t stream) {
+    sm110a::launch_kernel(build_expert_tile_tasks, 1, 1, 0, stream, offsets,
+        counts, experts, n / tile_n, cluster_m * tile_m,
+        reinterpret_cast<ExpertTileTask *>(tasks), state);
+}
+
 extern "C" void sm110a_bf16_grouped_m_metadata_prepare(
     const int32_t *layout,
     int32_t *offsets,

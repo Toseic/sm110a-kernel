@@ -563,6 +563,13 @@ class Mxfp4MoeConfig:
 
 
 class Mxfp4MoeRunner(BaseKernelRunner):
+    """Unfused MoE with optional direct routing for small token counts.
+
+    With router=None, expert_ids supplies contiguous CUDA int32/int64
+    [tokens,topk] IDs, distinct per token and within [0,experts). The caller
+    guarantees these values; the direct path performs no host value checks.
+    """
+
     namespace = "mxfp4_moe_pipeline_v1"
     graph_timing = True
 
@@ -584,6 +591,7 @@ class Mxfp4MoeRunner(BaseKernelRunner):
         activation_bf16_rounding=False,
         deterministic=False,
         pdl=False,
+        expert_ids=None,
     ):
         super().__init__(x.device)
         self.x, self.w1, self.sfw1, self.w2, self.sfw2 = x, w1, sfw1, w2, sfw2
@@ -596,6 +604,16 @@ class Mxfp4MoeRunner(BaseKernelRunner):
         self.limit, self.compact = swiglu_limit, compact_weight_scales
         self.position, self.rounding = routing_weight_position, activation_bf16_rounding
         self.deterministic, self.pdl = deterministic, pdl
+        self.expert_ids = expert_ids
+        if expert_ids is not None:
+            if router is not None:
+                raise ValueError("provide expert_ids or router, not both")
+            if expert_ids.shape != (x.size(0), topk) or expert_ids.device != x.device:
+                raise ValueError(
+                    "expert_ids must match [tokens,topk] on the input device"
+                )
+        elif router is None:
+            raise ValueError("router or expert_ids is required")
         tokens, dim = x.shape
         inter = w1.size(1) // 2
         self.aq = torch.empty_like(x, dtype=torch.float8_e4m3fn)
@@ -611,7 +629,18 @@ class Mxfp4MoeRunner(BaseKernelRunner):
         self.weights1 = (
             routing_weights.float().contiguous() if self.position == "fc1" else None
         )
-        self.weights2 = routing_weights.to(torch.bfloat16).contiguous()
+        # FC1-weighted variants compile out every FC2 routing-weight read.
+        # The FC2 binding still requires a non-null BF16 [tokens, topk]
+        # tensor; reserve ABI-compatible storage without launching a cast.
+        self.weights2 = (
+            torch.empty_like(
+                routing_weights,
+                dtype=torch.bfloat16,
+                memory_format=torch.contiguous_format,
+            )
+            if self.position == "fc1"
+            else routing_weights.to(torch.bfloat16).contiguous()
+        )
 
     @property
     def workload_key(self):
@@ -666,11 +695,21 @@ class Mxfp4MoeRunner(BaseKernelRunner):
         quant, fc1, fc2 = self.pre_jit(candidate)
 
         def run():
-            md1 = fc1.prepare_metadata(self.router, self.topk, self.w1.size(1))
-            layout = md1.routing.narrow(
-                0, 2 * self.w1.size(0), self.x.size(0) * self.topk
-            )
-            md2 = fc2.prepare_metadata(layout, self.w1.size(0), self.x.size(1))
+            experts = self.w1.size(0)
+            if self.expert_ids is None:
+                md1 = fc1.prepare_metadata(self.router, self.topk, self.w1.size(1))
+                layout = md1.routing.narrow(0, 2 * experts, self.x.size(0) * self.topk)
+                md2 = fc2.prepare_metadata(layout, experts, self.x.size(1))
+            else:
+                md1 = fc1.prepare_metadata_from_ids(
+                    self.expert_ids, experts, self.w1.size(1)
+                )
+                md2 = fc2.prepare_metadata_from_ranges(
+                    md1.routing.narrow(0, experts, experts),
+                    md1.routing.narrow(0, 0, experts),
+                    self.x.size(0) * self.topk,
+                    self.x.size(1),
+                )
             if self.pdl:
                 fc2.prepare_pdl_out(self.out, md2)
             quant.quantize_out(self.x, self.aq, self.sfa)
