@@ -323,6 +323,7 @@ from .kernels.rmsnorm import (
     rmsnorm,
     rmsnorm_out,
 )
+from .kernels.rope import RopeConfig, RopeRunner, compile_rope, rope_
 from .kernels.topk import (
     TopKRunner,
     compile_topk,

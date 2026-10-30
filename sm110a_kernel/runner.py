@@ -529,6 +529,7 @@ def main():
         "indexer-score-prefill": "benchmark_mxfp4_indexer_score_prefill.py",
         "indexer-score-decode": "benchmark_mxfp4_indexer_score_decode.py",
         "topk": "benchmark_topk.py",
+        "rope": "benchmark_rope.py",
         "nccl-lsa": "benchmark_nccl_lsa.py",
     }
     parser.add_argument(

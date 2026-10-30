@@ -9,7 +9,7 @@ checkpoints load without another conversion step.
 # TODO(sm110a): tune HC pre/head for large-M prefill.
 # TODO(sm110a): implement fused ratio-4 overlap /
 # ratio-128 pooling, incremental state updates, and compressed KV cache writes.
-# TODO(sm110a): add Q normalization, RoPE/inverse RoPE, and Hadamard
+# TODO(sm110a): add Q normalization and Hadamard
 # rotation (currently an external extension or a PyTorch fallback).
 # TODO(sm110a): tune FP8 KV sparse MLA long-prefill/full-selection append
 # performance; current cold-L2 wins are workload dependent.
@@ -69,6 +69,7 @@ from sm110a_kernel import (
     Mxfp4Fc1Fc2Runner,
     Mxfp4MoeRunner,
     RmsNormRunner,
+    RopeRunner,
     TopKRunner,
     clear_kernel_runner_cache,
     fused_gate,
@@ -86,6 +87,7 @@ _DECODE_ZERO_PADDING = None
 
 ModelArgs = _official.ModelArgs
 _OFFICIAL_FP4_ACT_QUANT = _official.fp4_act_quant
+_OFFICIAL_APPLY_ROTARY_EMB = _official.apply_rotary_emb
 
 _STATS: Counter[str] = Counter()
 _SCALE_CACHE: OrderedDict[tuple, torch.Tensor] = OrderedDict()
@@ -190,6 +192,27 @@ def _blocked_mxfp4_weight_scales(scales: torch.Tensor) -> torch.Tensor:
         _tensor_key(scales, "mxfp4-weight"),
         lambda: to_blocked_fp8mxfp4_scales(scales.contiguous()),
     )
+
+
+def apply_rotary_emb(x, freqs_cis, inverse=False):
+    if (
+        x.is_cuda
+        and x.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        and x.ndim in (3, 4)
+        and 2 <= x.size(-1) <= 1024
+        and x.size(-1) % 2 == 0
+        and x.stride(-1) == 1
+        and freqs_cis.device == x.device
+        and freqs_cis.dtype == torch.complex64
+        and freqs_cis.ndim == 2
+        and tuple(freqs_cis.shape) == (x.size(1), x.size(-1) // 2)
+        and freqs_cis.stride(-1) == 1
+    ):
+        RopeRunner(x, freqs_cis, inverse, pdl=_DECODE_PDL).run()
+        _STATS["sm110a.rope_inverse" if inverse else "sm110a.rope"] += 1
+        return x
+    _STATS["torch.rope_fallback"] += 1
+    return _OFFICIAL_APPLY_ROTARY_EMB(x, freqs_cis, inverse)
 
 
 class Sm110aRMSNorm(_official.RMSNorm):
@@ -1371,6 +1394,7 @@ class Sm110aMoE(_official.MoE):
 
 
 _PATCHES = {
+    "apply_rotary_emb": apply_rotary_emb,
     "act_quant": act_quant,
     "fp4_act_quant": fp4_act_quant,
     "fp8_gemm": fp8_gemm_backend,

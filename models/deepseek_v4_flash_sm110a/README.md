@@ -13,6 +13,13 @@ SM110A kernels. Main attention uses native FP8-cache sparse MLA as described
 below. Missing fused model-level operators use explicit PyTorch fallbacks
 marked with `TODO(sm110a)` in `model.py`.
 
+Q, KV, compressed KV and indexer RoPE, plus attention output inverse RoPE,
+use the native [RoPE kernel](../../csrc/rope/README.md). It consumes strided
+head-tail views and precomputed complex64 frequency slices directly, with
+FP32 arithmetic, BF16/FP16/FP32 input and optional decode PDL. Native counters
+are `sm110a.rope` and `sm110a.rope_inverse`; unsupported formats use
+`torch.rope_fallback`.
+
 Main-attention KV caches now store E4M3 FP8 non-RoPE values, one scale per
 64 values, and separate BF16 RoPE values. This covers the sliding window and
 both CSA/HCA compressed caches, including MTP. With the default 512-dimensional
