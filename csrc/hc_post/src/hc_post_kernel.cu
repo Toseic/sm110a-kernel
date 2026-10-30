@@ -83,9 +83,10 @@ __device__ __forceinline__ void store_vector(
             : "memory");
 }
 
-// A thread owns a vector of D columns and all four output streams. Each
-// residual/input vector is loaded once and reused for every output stream.
-template <typename T, bool Aligned>
+// A thread owns a vector of D columns and Outputs output streams. Decode
+// splits the four streams across CTAs to expose more parallelism; larger
+// batches reuse each residual/input vector across all four streams.
+template <typename T, bool Aligned, int Outputs = 4>
 __global__ __launch_bounds__(kThreads)
 void hc_post_kernel(const T* __restrict__ x, const T* __restrict__ residual,
                     const float* __restrict__ post, const float* __restrict__ comb,
@@ -100,7 +101,7 @@ void hc_post_kernel(const T* __restrict__ x, const T* __restrict__ residual,
     union Vector {
         Packed packed;
         T values[V];
-    } xv, rv[4], yv[4];
+    } xv, rv[4], yv[Outputs];
     if constexpr (Aligned) {
         xv.packed = load_vector(x + row * kD + col);
 #pragma unroll
@@ -113,7 +114,10 @@ void hc_post_kernel(const T* __restrict__ x, const T* __restrict__ residual,
             rv[i].values[0] = residual[(row * 4 + i) * kD + col];
     }
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
+    for (int out = 0; out < Outputs; ++out) {
+        int j = out;
+        if constexpr (Outputs < 4)
+            j += blockIdx.y * Outputs;
         float p = post[row * 4 + j];
         float c0 = comb[row * 16 + j];
         float c1 = comb[row * 16 + 4 + j];
@@ -127,15 +131,18 @@ void hc_post_kernel(const T* __restrict__ x, const T* __restrict__ residual,
             s = __fadd_rn(s, __fmul_rn(c1, as_float(rv[1].values[v])));
             s = __fadd_rn(s, __fmul_rn(c2, as_float(rv[2].values[v])));
             s = __fadd_rn(s, __fmul_rn(c3, as_float(rv[3].values[v])));
-            yv[j].values[v] = cast<T>(__fadd_rn(__fmul_rn(p, as_float(xv.values[v])), s));
+            yv[out].values[v] = cast<T>(__fadd_rn(__fmul_rn(p, as_float(xv.values[v])), s));
         }
     }
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
+    for (int out = 0; out < Outputs; ++out) {
+        int j = out;
+        if constexpr (Outputs < 4)
+            j += blockIdx.y * Outputs;
         if constexpr (Aligned)
-            store_vector(output + (row * 4 + j) * kD + col, yv[j].packed);
+            store_vector(output + (row * 4 + j) * kD + col, yv[out].packed);
         else
-            output[(row * 4 + j) * kD + col] = yv[j].values[0];
+            output[(row * 4 + j) * kD + col] = yv[out].values[0];
     }
 }
 } // namespace sm110a::hc_post
@@ -159,7 +166,14 @@ extern "C" void sm110a_hc_post_launch(
 #define LAUNCH(T)                                                                                  \
     do {                                                                                           \
         constexpr int V = kBytes / sizeof(T);                                                      \
-        if (kD % V == 0 && aligned)                                                                \
+        if (kD == 4096 && kThreads == 128 && kBytes == 16 && aligned && rows == 1 &&                  \
+            std::is_same_v<T, __nv_bfloat16>)                                                       \
+            sm110a::launch_kernel(hc_post_kernel<T, true, 1>,                                      \
+                dim3((kD + kThreads * V - 1) / (kThreads * V), 4),                                 \
+                kThreads, 0, stream,                                                              \
+                static_cast<const T *>(x), static_cast<const T *>(residual),                        \
+                post, comb, static_cast<T *>(output));                                             \
+        else if (kD % V == 0 && aligned)                                                           \
             sm110a::launch_kernel(hc_post_kernel<T, true>,                                         \
                 rows * ((kD + kThreads * V - 1) / (kThreads * V)),                                 \
                 kThreads,                                                                          \

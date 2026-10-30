@@ -371,6 +371,13 @@ def __getattr__(name):
 
 
 from .kernels.fused_gate import FusedGateConfig, compile_fused_gate, fused_gate
+from .kernels.hc_post_pre_norm import (
+    HcPostPreNormConfig,
+    HcPostPreNormRunner,
+    compile_hc_post_pre_norm,
+    hc_post_pre_norm,
+    hc_post_pre_norm_out,
+)
 from .kernels.hc_pre_norm import (
     HcPreNormConfig,
     HcPreNormRunner,

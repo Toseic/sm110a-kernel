@@ -61,6 +61,7 @@ from sm110a_kernel import (
     Fp8Mxfp4GemmRunner,
     Fp8SharedFc1Runner,
     HcPostRunner,
+    HcPostPreNormRunner,
     HcPreNormRunner,
     HcPreRunner,
     IndexerScoreDecodeRunner,
@@ -1579,12 +1580,43 @@ def _hc_block_forward(self, x, start_pos, input_ids):
         x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base, self.attn_norm
     )
     x = self.attn(x, start_pos)
-    x = self.hc_post(x, residual, post, comb)
-
-    residual = x
-    x, post, comb = self.hc_pre_norm(
-        x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base, self.ffn_norm
-    )
+    # Fuse the measured decode shape and prefill regimes. The large-row kernel
+    # reuses post source vectors across all four streams inside each CTA.
+    if (
+        self.hc_mult == 4
+        and type(self).hc_post is _hc_post
+        and type(self).hc_pre_norm is _hc_pre_norm
+        and 1 <= self.hc_sinkhorn_iters <= 100
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and residual.dtype == x.dtype
+        and residual.device == x.device
+        and x.size(-1) == 4096
+        and (x.numel() == 4096 or x.numel() >= 512 * 4096)
+        and x.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and residual.data_ptr() % 16 == 0
+        and _can_fuse_hc_norm(
+            residual, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base, self.ffn_norm
+        )
+    ):
+        mixed, normalized = torch.empty_like(residual), torch.empty_like(x)
+        next_post, next_comb = torch.empty_like(post), torch.empty_like(comb)
+        HcPostPreNormRunner(
+            x, residual, post, comb, self.hc_ffn_fn, self.hc_ffn_scale,
+            self.hc_ffn_base, self.ffn_norm.weight, mixed, normalized,
+            next_post, next_comb, norm_eps=self.norm_eps, hc_eps=self.hc_eps,
+            rms_eps=self.ffn_norm.eps, sinkhorn_iters=self.hc_sinkhorn_iters,
+            pdl=_DECODE_PDL,
+        ).run()
+        _STATS["sm110a.hc_post_pre_norm"] += 1
+        residual, x, post, comb = mixed, normalized, next_post, next_comb
+    else:
+        x = self.hc_post(x, residual, post, comb)
+        residual = x
+        x, post, comb = self.hc_pre_norm(
+            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base, self.ffn_norm
+        )
     x = self.ffn(x, input_ids)
     return self.hc_post(x, residual, post, comb)
 

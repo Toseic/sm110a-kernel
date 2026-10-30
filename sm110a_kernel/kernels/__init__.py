@@ -162,6 +162,13 @@ from .grouped_m_gemm import (
     get_bf16_grouped_m_gemm_module,
 )
 from .hc_post import HcPostConfig, HcPostRunner, compile_hc_post, hc_post, hc_post_out
+from .hc_post_pre_norm import (
+    HcPostPreNormConfig,
+    HcPostPreNormRunner,
+    compile_hc_post_pre_norm,
+    hc_post_pre_norm,
+    hc_post_pre_norm_out,
+)
 from .hc_pre import HcPreConfig, HcPreRunner, compile_hc_pre, hc_pre, hc_pre_out
 from .hc_pre_norm import (
     HcPreNormConfig,
