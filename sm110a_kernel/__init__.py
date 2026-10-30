@@ -370,6 +370,7 @@ def __getattr__(name):
     raise AttributeError(name)
 
 
+from .kernels.fused_gate import FusedGateConfig, compile_fused_gate, fused_gate
 from .kernels.hc_pre_norm import (
     HcPreNormConfig,
     HcPreNormRunner,

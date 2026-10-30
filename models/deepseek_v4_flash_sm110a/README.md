@@ -41,6 +41,10 @@ compressor/indexer state together. Memory budgets use the packed layout.
 HBM SOL counts logical selected-cache bytes, excluding repeated loads and
 fallback temporary traffic, so it remains a lower bound.
 
+MoE sqrtsoftplus routing uses a [fused gate kernel](../../docs/fused_gate.md)
+for scoring, top-k/hash selection, normalization and scaling. Bias affects
+selection only. Decode passes the model PDL flag to the fused gate.
+
 Compressor KV/gate and MoE router projections use native BF16 GEMM in both
 prefill and decode, including MTP. Compressor `wkv`/`wgate` parameters retain
 their checkpoint keys but are stored in BF16. `prepare_for_inference()` joins

@@ -151,6 +151,7 @@ from .fp8mxfp4_gemm import (
     quantize_fp8mxfp4_weights,
     to_blocked_fp8mxfp4_scales,
 )
+from .fused_gate import FusedGateConfig, compile_fused_gate, fused_gate
 from .grouped_m_gemm import (
     Bf16GroupedMGemmRunner,
     GroupedMConfig,

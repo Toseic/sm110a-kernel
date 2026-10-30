@@ -18,8 +18,8 @@ checkpoints load without another conversion step.
 # TODO(sm110a): fuse FP8 cache quantization, scale/RoPE stores and ring writes.
 # TODO(sm110a): fuse indexer KV packing with compressor cache writes instead
 # of repacking the valid BF16/QAT cache on every invocation.
-# TODO(sm110a): fuse MoE gate projection, scoring, hash/score selection,
-# weight normalization, and metadata construction directly from expert IDs.
+# TODO(sm110a): fuse MoE gate projection and metadata construction directly
+# from expert IDs (sqrtsoftplus scoring/selection/normalization is fused).
 # TODO(sm110a): add deterministic reduction and PDL to the FC1/FC2 fused backend.
 # TODO(sm110a): fuse shared/routed output addition into the shared-expert FC2.
 # TODO(sm110a): fuse index generation, cache writes, padding, and layout
@@ -70,6 +70,7 @@ from sm110a_kernel import (
     RmsNormRunner,
     TopKRunner,
     clear_kernel_runner_cache,
+    fused_gate,
     compact_mxfp4_weight_scales,
     pack_fp8_shared_fc1_weights,
     to_blocked_fp8_scales,
@@ -600,6 +601,14 @@ class Sm110aGate(_official.Gate):
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor | None = None):
         scores = _bf16_projection(x, self.weight, output_fp32=True)
         _STATS["sm110a.router_bf16_gemm_fp32"] += 1
+        if self.score_func not in ("softmax", "sigmoid") and scores.size(-1) <= 1024 and self.topk <= 32:
+            hash_indices = self.tid2eid[input_ids].contiguous() if self.hash else None
+            result = fused_gate(
+                scores, self.topk, self.route_scale, bias=self.bias,
+                hash_indices=hash_indices, pdl=_DECODE_PDL,
+            )
+            _STATS["sm110a.fused_gate"] += 1
+            return result
         if self.score_func == "softmax":
             scores = scores.softmax(dim=-1)
         elif self.score_func == "sigmoid":
