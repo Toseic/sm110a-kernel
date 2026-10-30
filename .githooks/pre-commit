@@ -11,14 +11,25 @@ fi
 
 fail=0
 while IFS= read -r -d '' f; do
-    if ! out=$(git show ":$f" | ruff format --check --stdin-filename "$f" - 2>&1); then
+    # Buffer staged content before Ruff reads it. Ruff may skip an excluded
+    # stdin filename without consuming stdin; piping git show directly then
+    # makes pipefail report git's SIGPIPE as a formatter failure.
+    staged=$(mktemp)
+    if ! git show ":$f" > "$staged"; then
+        rm -f "$staged"
+        echo "pre-commit: could not read staged content: $f" >&2
+        fail=1
+        continue
+    fi
+    if ! out=$(ruff format --check --stdin-filename "$f" - < "$staged" 2>&1); then
         echo "ruff format would reformat (staged content): $f"
         fail=1
     fi
-    if ! out=$(git show ":$f" | ruff check --stdin-filename "$f" - 2>&1); then
+    if ! out=$(ruff check --stdin-filename "$f" - < "$staged" 2>&1); then
         echo "$out" | sed 's/^/  /'
         fail=1
     fi
+    rm -f "$staged"
 done < <(git diff --cached --name-only -z --diff-filter=ACMR -- '*.py')
 
 if [ "$fail" -ne 0 ]; then
