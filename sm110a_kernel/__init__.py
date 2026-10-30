@@ -316,6 +316,7 @@ from .kernels.nvfp4_grouped_m_gemm import (
     nvfp4_grouped_m_gemm_out,
     prepare_nvfp4_grouped_m_metadata,
 )
+from .kernels.qk_norm import QkNormRunner, compile_qk_norm, qk_norm, qk_norm_out
 from .kernels.rmsnorm import (
     RmsNormConfig,
     RmsNormRunner,

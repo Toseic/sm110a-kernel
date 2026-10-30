@@ -9,8 +9,8 @@ checkpoints load without another conversion step.
 # TODO(sm110a): tune HC pre/head for large-M prefill.
 # TODO(sm110a): implement fused ratio-4 overlap /
 # ratio-128 pooling, incremental state updates, and compressed KV cache writes.
-# TODO(sm110a): add Q normalization and Hadamard
-# rotation (currently an external extension or a PyTorch fallback).
+# TODO(sm110a): add Hadamard rotation
+# (currently an external extension or a PyTorch fallback).
 # TODO(sm110a): tune FP8 KV sparse MLA long-prefill/full-selection append
 # performance; current cold-L2 wins are workload dependent.
 # TODO(sm110a): extend native FP8 KV sparse MLA beyond H=64/D=512,
@@ -68,6 +68,7 @@ from sm110a_kernel import (
     IndexerScorePrefillRunner,
     Mxfp4Fc1Fc2Runner,
     Mxfp4MoeRunner,
+    QkNormRunner,
     RmsNormRunner,
     RopeRunner,
     TopKRunner,
@@ -873,7 +874,18 @@ class Sm110aAttention(_official.Attention):
 
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
-        q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
+        if (
+            q.is_cuda
+            and q.is_contiguous()
+            and q.dtype in (torch.bfloat16, torch.float16, torch.float32)
+            and 1 <= self.head_dim <= 32768
+            and q.data_ptr() % 16 == 0
+        ):
+            QkNormRunner(q, q, self.eps, pdl=_DECODE_PDL).run()
+            _STATS["sm110a.qk_norm"] += 1
+        else:
+            q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
+            _STATS["torch.qk_norm_fallback"] += 1
         _official.apply_rotary_emb(q[..., -rd:], freqs_cis)
         kv = self.kv_norm(self.wkv(x))
         _official.apply_rotary_emb(kv[..., -rd:], freqs_cis)

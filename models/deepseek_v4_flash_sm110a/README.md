@@ -96,6 +96,13 @@ and state-dict keys/dtypes are unchanged. CPU and unsupported input formats
 retain the reference implementation. Backend statistics count native calls
 under `sm110a.rmsnorm` and fallbacks under `torch.rmsnorm_fallback`.
 
+The separate weightless per-head Q normalization after `wq_b`, before RoPE,
+uses [QkNormRunner](../../csrc/qk_norm/README.md) in place. This preserves
+the original Torch expression's input-dtype rounding boundaries, including
+BF16 square/mean/epsilon/rsqrt intermediates. It does not use a learned weight.
+Decode forwards the PDL setting. Counters are `sm110a.qk_norm` and
+`torch.qk_norm_fallback`; the weighted low-rank `q_norm` remains RMSNorm.
+
 Prefill and decode use `HcPreNormRunner` for HC pre + attention/FFN RMSNorm,
 including MTP blocks. BF16 inputs with even D >= 256 use a split-K
 `tcgen05.mma` projection with instruction N=24. Its tile is M=128, N=24,

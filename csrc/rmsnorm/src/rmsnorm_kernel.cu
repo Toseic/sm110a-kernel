@@ -15,6 +15,15 @@
 #define SM110A_RMSNORM_ROWS 1
 #endif
 
+// QK mode preserves the unfused Torch expression's input-dtype rounding.
+#ifndef SM110A_QK_NORM
+#define SM110A_QK_NORM 0
+#endif
+#if SM110A_QK_NORM
+#define rmsnorm_kernel qk_norm_kernel
+#define sm110a_rmsnorm_launch sm110a_qk_norm_launch
+#endif
+
 namespace sm110a::rmsnorm {
 __device__ __forceinline__ float to_float(
     float x) {
@@ -45,6 +54,7 @@ __device__ __forceinline__ __nv_bfloat16 from_float<__nv_bfloat16>(
     return __float2bfloat16_rn(x);
 }
 
+constexpr bool kQkNorm = SM110A_QK_NORM;
 constexpr int kD = SM110A_RMSNORM_D;
 constexpr int kWarps = SM110A_RMSNORM_WARPS;
 constexpr int kRows = SM110A_RMSNORM_ROWS;
@@ -66,6 +76,18 @@ __device__ __forceinline__ float warp_sum(
     for (int delta = 16; delta; delta /= 2)
         value += __shfl_down_sync(0xffffffff, value, delta);
     return value;
+}
+
+template <typename T>
+__device__ __forceinline__ float inverse_rms(
+    float sum,
+    float eps) {
+    if constexpr (kQkNorm) {
+        float mean = to_float(from_float<T>(sum / float(kD)));
+        float shifted = to_float(from_float<T>(mean + eps));
+        return to_float(from_float<T>(rsqrtf(shifted)));
+    }
+    return rsqrtf(sum / float(kD) + eps);
 }
 
 template <typename T, typename W>
@@ -99,21 +121,27 @@ void rmsnorm_kernel(const T* input, const W* weight, T* output,
 #pragma unroll
             for (int j = 0; j < kVector; ++j) {
                 float x = active && col < kD ? to_float(values[i].elements[j]) : 0.f;
-                sum = fmaf(x, x, sum);
+                if constexpr (kQkNorm)
+                    sum += to_float(from_float<T>(__fmul_rn(x, x)));
+                else
+                    sum = fmaf(x, x, sum);
             }
         } else {
 #pragma unroll
             for (int j = 0; j < kVector; ++j) {
                 float x = active && col + j < kD ? to_float(input[row * kD + col + j]) : 0.f;
                 scalar_values[i][j] = x;
-                sum = fmaf(x, x, sum);
+                if constexpr (kQkNorm)
+                    sum += to_float(from_float<T>(__fmul_rn(x, x)));
+                else
+                    sum = fmaf(x, x, sum);
             }
         }
     }
     sum = warp_sum(sum);
     float inv;
     if constexpr (kWarps == 1) {
-        inv = rsqrtf(__shfl_sync(0xffffffff, sum, 0) / float(kD) + eps);
+        inv = inverse_rms<T>(__shfl_sync(0xffffffff, sum, 0), eps);
     } else {
         __shared__ float partials[kRows][kWarps];
         __shared__ float inverse[kRows];
@@ -124,7 +152,7 @@ void rmsnorm_kernel(const T* input, const W* weight, T* output,
             sum = lane < kWarps ? partials[row_in_cta][lane] : 0.f;
             sum = warp_sum(sum);
             if (lane == 0)
-                inverse[row_in_cta] = rsqrtf(sum / float(kD) + eps);
+                inverse[row_in_cta] = inverse_rms<T>(sum, eps);
         }
         __syncthreads();
         inv = inverse[row_in_cta];
@@ -142,7 +170,8 @@ void rmsnorm_kernel(const T* input, const W* weight, T* output,
                 Vector y;
 #pragma unroll
                 for (int v = 0; v < kWeightVectors; ++v)
-                    w.packed[v] = reinterpret_cast<const uint4 *>(weight + col)[v];
+                    if constexpr (!kQkNorm)
+                        w.packed[v] = reinterpret_cast<const uint4 *>(weight + col)[v];
                 Vector retained;
                 retained.packed = values[i].packed;
                 // An opaque register identity prevents the compiler from
@@ -153,17 +182,23 @@ void rmsnorm_kernel(const T* input, const W* weight, T* output,
                     "+r"(retained.packed.z),
                     "+r"(retained.packed.w));
 #pragma unroll
-                for (int j = 0; j < kVector; ++j)
-                    y.elements[j] = from_float<T>(
-                        (to_float(retained.elements[j]) * inv) * to_float(w.elements[j]));
+                for (int j = 0; j < kVector; ++j) {
+                    float value = to_float(retained.elements[j]) * inv;
+                    if constexpr (!kQkNorm)
+                        value *= to_float(w.elements[j]);
+                    y.elements[j] = from_float<T>(value);
+                }
                 *reinterpret_cast<uint4 *>(output + row * kD + col) = y.packed;
             }
         } else {
 #pragma unroll
             for (int j = 0; j < kVector; ++j)
-                if (active && col + j < kD)
-                    output[row * kD + col + j] =
-                        from_float<T>((scalar_values[i][j] * inv) * to_float(weight[col + j]));
+                if (active && col + j < kD) {
+                    float value = scalar_values[i][j] * inv;
+                    if constexpr (!kQkNorm)
+                        value *= to_float(weight[col + j]);
+                    output[row * kD + col + j] = from_float<T>(value);
+                }
         }
     }
 }

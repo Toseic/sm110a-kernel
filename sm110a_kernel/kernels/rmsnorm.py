@@ -28,6 +28,10 @@ class RmsNormModule:
         self.config = config
 
     def rmsnorm_out(self, input, weight, output, eps=1e-6):
+        if weight is None:
+            raise ValueError(
+                "RMSNorm requires weight; use qk_norm for weightless normalization"
+            )
         return self._binding.rmsnorm_out(
             input, weight, output, eps, self.config.d, self._launcher
         )
@@ -60,6 +64,10 @@ def compile_rmsnorm(d, *, warps_per_row=None, rows_per_cta=None, pdl=False):
     Supports D in [1, 32768], and at most 128 input values per thread.
     For vectorizable D, tensors must have 16-byte aligned base addresses.
     """
+    return _JIT.compile(_rmsnorm_config(d, warps_per_row, rows_per_cta, pdl))
+
+
+def _rmsnorm_config(d, warps_per_row=None, rows_per_cta=None, pdl=False):
     validate_pdl(pdl)
     if type(d) is not int or not 1 <= d <= 32768:
         raise ValueError("d must be an integer in [1, 32768]")
@@ -82,7 +90,7 @@ def compile_rmsnorm(d, *, warps_per_row=None, rows_per_cta=None, pdl=False):
     )
     if (values_per_thread + 32) * warps_per_row * 32 * rows_per_cta > 65536:
         raise ValueError("configuration exceeds the conservative register budget")
-    return _JIT.compile(RmsNormConfig(d, warps_per_row, rows_per_cta, pdl))
+    return RmsNormConfig(d, warps_per_row, rows_per_cta, pdl)
 
 
 def rmsnorm(

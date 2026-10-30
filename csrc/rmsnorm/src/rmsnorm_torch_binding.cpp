@@ -12,7 +12,7 @@ using Launcher =
 
 torch::Tensor rmsnorm_out(
     torch::Tensor input,
-    torch::Tensor weight,
+    c10::optional<torch::Tensor> weight,
     torch::Tensor output,
     double eps,
     int64_t d,
@@ -23,10 +23,12 @@ torch::Tensor rmsnorm_out(
     auto type = input.scalar_type();
     TORCH_CHECK(type == at::kBFloat16 || type == at::kHalf || type == at::kFloat,
         "input must be bfloat16, float16 or float32");
-    TORCH_CHECK(weight.device() == input.device() &&
-                    (weight.scalar_type() == type || weight.scalar_type() == at::kFloat) &&
-                    weight.is_contiguous() && weight.dim() == 1 && weight.numel() == d,
-        "weight must be contiguous [D] on input's device, with float32 or input dtype");
+    if (weight) {
+        TORCH_CHECK(weight->device() == input.device() &&
+                        (weight->scalar_type() == type || weight->scalar_type() == at::kFloat) &&
+                        weight->is_contiguous() && weight->dim() == 1 && weight->numel() == d,
+            "weight must be contiguous [D] on input's device, with float32 or input dtype");
+    }
     TORCH_CHECK(output.device() == input.device() && output.scalar_type() == type &&
                     output.is_contiguous() && output.sizes() == input.sizes(),
         "output must match input shape, device and dtype and be contiguous");
@@ -35,7 +37,7 @@ torch::Tensor rmsnorm_out(
     TORCH_CHECK(address, "RMSNorm launcher is null");
     if (d % (16 / input.element_size()) == 0) {
         TORCH_CHECK(reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0 &&
-                        reinterpret_cast<uintptr_t>(weight.data_ptr()) % 16 == 0 &&
+                        (!weight || reinterpret_cast<uintptr_t>(weight->data_ptr()) % 16 == 0) &&
                         reinterpret_cast<uintptr_t>(output.data_ptr()) % 16 == 0,
             "vectorized RMSNorm requires 16-byte aligned tensors");
     }
@@ -46,18 +48,18 @@ torch::Tensor rmsnorm_out(
         auto bp = reinterpret_cast<uintptr_t>(b.data_ptr());
         return ap < bp + b.nbytes() && bp < ap + a.nbytes();
     };
-    TORCH_CHECK(!overlaps(output, weight), "output must not overlap weight");
+    TORCH_CHECK((!weight || !overlaps(output, *weight)), "output must not overlap weight");
     TORCH_CHECK(output.data_ptr() == input.data_ptr() || !overlaps(output, input),
         "output may alias input exactly, but must not partially overlap it");
     c10::cuda::CUDAGuard guard(input.device());
     reinterpret_cast<Launcher>(address)(input.data_ptr(),
-        weight.data_ptr(),
+        weight ? weight->data_ptr() : nullptr,
         output.data_ptr(),
         input.numel() / d,
         type == at::kBFloat16 ? 0
         : type == at::kHalf   ? 1
                               : 2,
-        weight.scalar_type() == at::kFloat,
+        weight && weight->scalar_type() == at::kFloat,
         static_cast<float>(eps),
         c10::cuda::getCurrentCUDAStream(input.get_device()));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
