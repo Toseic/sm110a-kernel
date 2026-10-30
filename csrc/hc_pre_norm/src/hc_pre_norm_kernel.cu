@@ -1,3 +1,4 @@
+#include "../../../include/pdl.h"
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -150,6 +151,7 @@ void hc_pre_norm_kernel(const T* __restrict__ input, const float* __restrict__ w
                    const float* __restrict__ scale, const float* __restrict__ base,
                    T* __restrict__ output, float* __restrict__ post,
                    float* __restrict__ comb, const float* norm_weight, float rms_eps, float norm_eps, float hc_eps) {
+    sm110a::pdl_entry();
     extern __shared__ __align__(16) unsigned char storage[];
     T *retained = reinterpret_cast<T *>(storage);
     __shared__ float partial[Projections + 1][Warps];
@@ -271,6 +273,7 @@ template <int ChunkK>
 __global__ __launch_bounds__(544)
 void hc_pre_norm_projection_tc(const __nv_bfloat16* input, const float* weight,
                           float* scratch, int64_t rows) {
+    sm110a::pdl_entry();
     constexpr int StageCount = ChunkK / TileK;
     constexpr int Splits = (K + ChunkK - 1) / ChunkK;
     extern __shared__ __align__(1024) __nv_bfloat16 storage_tc[];
@@ -444,6 +447,7 @@ __global__ __launch_bounds__(Threads)
 void hc_pre_norm_finish_tc(const __nv_bfloat16* input, const float* scale, const float* base,
                       __nv_bfloat16* output, float* post, float* comb,
                       const float* scratch, const float* norm_weight, float rms_eps, float norm_eps, float hc_eps) {
+    sm110a::pdl_entry();
     constexpr int Splits = (K + ChunkK - 1) / ChunkK;
     extern __shared__ __align__(16) __nv_bfloat16 retained[];
     __shared__ float pre[4];
@@ -524,7 +528,7 @@ cudaError_t launch_tc(const void* input, const float* weight, const float* scale
         if (err != cudaSuccess)
             return err;
     }
-    hc_pre_norm_projection_tc<ChunkK><<<dim3((rows + TileM - 1) / TileM, Splits), 544, bytes_tc, stream>>>(
+    sm110a::launch_kernel(hc_pre_norm_projection_tc<ChunkK>, dim3((rows + TileM - 1) / TileM, Splits), 544, bytes_tc, stream,
         static_cast<const __nv_bfloat16 *>(input),
         weight,
         scratch,
@@ -532,7 +536,7 @@ cudaError_t launch_tc(const void* input, const float* weight, const float* scale
     auto err = cudaGetLastError();
     if (err != cudaSuccess)
         return err;
-    hc_pre_norm_finish_tc<ChunkK><<<rows, Threads, K * 2, stream>>>(
+    sm110a::launch_kernel(hc_pre_norm_finish_tc<ChunkK>, rows, Threads, K * 2, stream,
         static_cast<const __nv_bfloat16 *>(input),
         scale,
         base,
@@ -566,8 +570,7 @@ cudaError_t launch(
         if (error != cudaSuccess)
             return error;
     }
-    hc_pre_norm_kernel<T>
-        <<<static_cast<unsigned int>(rows), Threads, bytes, stream>>>(static_cast<const T *>(input),
+    sm110a::launch_kernel(hc_pre_norm_kernel<T>, static_cast<unsigned int>(rows), Threads, bytes, stream, static_cast<const T *>(input),
             weight,
             scale,
             base,

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from ..jit_runtime import SplitCudaJit
 from ..runner import FixedKernelRunner
+from .pdl import validate_pdl
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_DIR = _ROOT / "csrc/fp8_kv_fa4_sparse_mla/src"
@@ -36,13 +37,14 @@ _JIT = SplitCudaJit(
     kernel_dependencies=(),
     kernel_symbol="sm110a_fp8_kv_fa4_sparse_mla_launch",
     config_key=lambda config: config,
-    kernel_cflags=lambda _config, _variant: (),
+    kernel_cflags=lambda pdl, _variant: (f"-DSM110A_PDL={int(pdl)}",),
     make_facade=Fp8KvFa4SparseMlaModule,
 )
 
 
-def compile_fp8_kv_fa4_sparse_mla():
-    return _JIT.compile(None)
+def compile_fp8_kv_fa4_sparse_mla(*, pdl=False):
+    validate_pdl(pdl)
+    return _JIT.compile(pdl)
 
 
 def _resolve_scale(scale):
@@ -52,26 +54,31 @@ def _resolve_scale(scale):
     return scale
 
 
-def fp8_kv_fa4_sparse_mla(q, kv, scales, rope, indices, sink, *, scale=None):
+def fp8_kv_fa4_sparse_mla(q, kv, scales, rope, indices, sink, *, scale=None, pdl=False):
     """Return BF16 [B,64,Q,512] for E4M3 [B,N,448], scales [B,N,7], RoPE [B,N,64].
 
     Indices are int32 [B,Q,K], or [B,K] for Q=1 decode. Negative and
     out-of-range indices are masked. Scales are E8M0 or FP32, block size 64.
     """
-    return compile_fp8_kv_fa4_sparse_mla().sparse_mla(
+    return compile_fp8_kv_fa4_sparse_mla(pdl=pdl).sparse_mla(
         q, kv, scales, rope, indices, sink, _resolve_scale(scale)
     )
 
 
-def fp8_kv_fa4_sparse_mla_out(q, kv, scales, rope, indices, sink, out, *, scale=None):
+def fp8_kv_fa4_sparse_mla_out(
+    q, kv, scales, rope, indices, sink, out, *, scale=None, pdl=False
+):
     """Write packed-cache sparse MLA output to contiguous BHSD ``out``."""
-    return compile_fp8_kv_fa4_sparse_mla().sparse_mla_out(
+    return compile_fp8_kv_fa4_sparse_mla(pdl=pdl).sparse_mla_out(
         q, kv, scales, rope, indices, sink, out, _resolve_scale(scale)
     )
 
 
 class Fp8KvFa4SparseMlaRunner(FixedKernelRunner):
-    def __init__(self, q, kv, scales, rope, indices, sink, out, *, scale=None):
+    def __init__(
+        self, q, kv, scales, rope, indices, sink, out, *, scale=None, pdl=False
+    ):
+        validate_pdl(pdl)
         scale = _resolve_scale(scale)
         super().__init__(
             q.device,
@@ -82,8 +89,9 @@ class Fp8KvFa4SparseMlaRunner(FixedKernelRunner):
                 str(scales.dtype),
                 tuple(indices.shape),
                 scale,
+                pdl,
             ),
-            compile_fp8_kv_fa4_sparse_mla,
+            lambda: compile_fp8_kv_fa4_sparse_mla(pdl=pdl),
             lambda module: (
                 lambda: module.sparse_mla_out(
                     q, kv, scales, rope, indices, sink, out, scale

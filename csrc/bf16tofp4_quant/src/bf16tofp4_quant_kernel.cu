@@ -1,3 +1,4 @@
+#include "../../../include/pdl.h"
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -115,6 +116,7 @@ void bf16tofp4_tail_kernel(const __nv_bfloat16* __restrict__ input,
                            uint8_t* __restrict__ output,
                            uint8_t* __restrict__ scales,
                            int tokens_base, int tail_rows, int d) {
+    sm110a::pdl_entry();
     const int row = tokens_base + blockIdx.x * (128 / 32) + threadIdx.x / 32;
     if (row >= tokens_base + tail_rows) {
         return;
@@ -190,6 +192,7 @@ void bf16tofp4_quant_kernel(const __grid_constant__ CUtensorMap input_map,
                             const __grid_constant__ CUtensorMap output_map,
                             uint8_t* __restrict__ scales,
                             int tokens, int d, int tiles, int stages) {
+    sm110a::pdl_entry();
     constexpr int kStageBytes = kDequant ? kInputBytes + kDequantOutBytes
                                          : kInputBytes + kQuantOutBytes;
     // Stage barriers: input ready/free, output ready/free. Loader and storer
@@ -474,12 +477,12 @@ void launch_bf16tofp4_quant_impl(const __nv_bfloat16* input, uint8_t* output,
         const int stages = std::min({max_stages, 4, (tiles + ctas - 1) / ctas});
         const int shared_bytes = stages *
             (kStageBytes + kBarrierCount * sizeof(uint64_t));
-        bf16tofp4_quant_kernel<kDequant><<<ctas, kThreads, shared_bytes, stream>>>(
+        sm110a::launch_kernel(bf16tofp4_quant_kernel<kDequant>, ctas, kThreads, shared_bytes, stream,
             input_map, output_map, scales, tokens_full, d, tiles, stages);
     }
     const int tail_rows = tokens - tokens_full;
     if (tail_rows > 0) {
-        bf16tofp4_tail_kernel<kDequant><<<(tail_rows + 3) / 4, 128, 0, stream>>>(
+        sm110a::launch_kernel(bf16tofp4_tail_kernel<kDequant>, (tail_rows + 3) / 4, 128, 0, stream,
             input, output, scales, tokens_full, tail_rows, d);
     }
 }

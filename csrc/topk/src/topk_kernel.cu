@@ -1,3 +1,4 @@
+#include "../../../include/pdl.h"
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -474,6 +475,7 @@ __global__ void topk_buffered(
     const T *scores,
     int32_t *out,
     int n) {
+    sm110a::pdl_entry();
     constexpr int k = TopK;
     __shared__ RadixStorage scratch;
     __shared__ int retained;
@@ -596,6 +598,7 @@ __global__ void topk_buffered(
 // Every candidate survives for short rows; scores and selection scratch are
 // unnecessary. One CTA fills each output row in ascending index order.
 __global__ void all_candidate_indices(int32_t *out, int n) {
+    sm110a::pdl_entry();
     int32_t *row = out + int64_t(blockIdx.x) * n;
     for (int i = threadIdx.x; i < n; i += blockDim.x)
         row[i] = i;
@@ -610,7 +613,7 @@ void launch_split(
     if (smem + StaticBytes > 48 * 1024)
         cudaFuncSetAttribute(topk_buffered<T, Split>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     if constexpr (Split == 1) {
-        topk_buffered<T, Split><<<rows, Threads, smem, stream>>>(scores, out, n);
+        sm110a::launch_kernel(topk_buffered<T, Split>, rows, Threads, smem, stream, scores, out, n);
     } else {
         cudaLaunchConfig_t config{};
         config.gridDim = dim3(static_cast<unsigned>(rows) * Split);
@@ -622,7 +625,7 @@ void launch_split(
         attr.val.clusterDim = {Split, 1, 1};
         config.attrs = &attr;
         config.numAttrs = 1;
-        cudaLaunchKernelEx(&config, topk_buffered<T, Split>, scores, out, n);
+        sm110a::launch_pdl<SM110A_PDL>(&config, topk_buffered<T, Split>, scores, out, n);
     }
 }
 
@@ -646,7 +649,7 @@ extern "C" void sm110a_topk_launch(
     if (!rows || !n)
         return;
     if (n <= TopK) {
-        all_candidate_indices<<<rows, Threads, 0, stream>>>(out, n);
+        sm110a::launch_kernel(all_candidate_indices, rows, Threads, 0, stream, out, n);
         return;
     }
     if (dtype == 0)

@@ -1,3 +1,4 @@
+#include "pdl.h"
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -73,9 +74,7 @@ void bf16tofp8_quant_kernel(const __grid_constant__ CUtensorMap input_map,
                             const __grid_constant__ CUtensorMap output_map,
                             uint8_t* __restrict__ scales,
                             int tokens, int d, int tiles, int stages) {
-    if constexpr (SM110A_QUANT_PDL) {
-        if (threadIdx.x == 0) cudaTriggerProgrammaticLaunchCompletion();
-    }
+    sm110a::pdl_entry<SM110A_QUANT_PDL>();
 
     // Stage barriers: input ready/free, output ready/free. Loader and storer
     // each own a TMA warp; four other warps convert 32 rows per tile.
@@ -299,7 +298,7 @@ void launch_bf16tofp8_quant(const __nv_bfloat16* input, uint8_t* output,
     const int stages = std::min({max_stages, 4, (tiles + ctas - 1) / ctas});
     const int shared_bytes = stages *
         (kStageBytes + kBarrierCount * sizeof(uint64_t));
-    bf16tofp8_quant_kernel<<<ctas, kThreads, shared_bytes, stream>>>(
+    sm110a::launch_kernel<SM110A_QUANT_PDL>(bf16tofp8_quant_kernel, ctas, kThreads, shared_bytes, stream,
         input_map, output_map, scales, tokens, d, tiles, stages);
 }
 

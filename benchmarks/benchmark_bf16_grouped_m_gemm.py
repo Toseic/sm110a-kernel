@@ -243,6 +243,9 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
 
     def build_parser(self):
         parser = super().build_parser()
+        parser.add_argument(
+            "--pdl", action="store_true", help="enable programmatic dependent launch"
+        )
         self.add_timing_args(parser, warmup=2, iters=3, samples=3)
         parser.add_argument("--check", action="store_true")
         parser.add_argument(
@@ -352,7 +355,7 @@ class Bf16GroupedMGemmBenchmark(BenchmarkBase):
             sol_report.print()
 
     def resolve_grouped_kernel(self, a, b, layout, out, args):
-        kernel_runner = Bf16GroupedMGemmRunner(a, b, layout, out)
+        kernel_runner = Bf16GroupedMGemmRunner(a, b, layout, out, pdl=args.pdl)
         candidates = kernel_runner.compatible_candidates()
         n, k = (b.size(1), a.size(1))
         options = self.make_tune_options(

@@ -210,7 +210,7 @@ class Sm110aRMSNorm(_official.RMSNorm):
         if weight.data_ptr() % 16:
             weight = weight.clone()
         output = torch.empty_like(input)
-        RmsNormRunner(input, weight, output, self.eps).run()
+        RmsNormRunner(input, weight, output, self.eps, pdl=_DECODE_PDL).run()
         _STATS["sm110a.rmsnorm"] += 1
         return output
 
@@ -231,7 +231,7 @@ def act_quant(
         device=flat.device,
         dtype=torch.float8_e8m0fnu if scale_mode == "ue8m0" else torch.float32,
     )
-    Fp8ActQuantRunner(flat, values, scales, block_size, scale_mode).run()
+    Fp8ActQuantRunner(flat, values, scales, block_size, scale_mode, pdl=_DECODE_PDL).run()
     values = values.view_as(x)
     scales = scales.view(*x.shape[:-1], width // block_size)
     _STATS["sm110a.fp8_act_quant"] += 1
@@ -258,7 +258,7 @@ def fp4_act_quant(x: torch.Tensor, block_size: int = 32, inplace: bool = False):
     scales = torch.empty(
         (flat.size(0), width // 32), device=flat.device, dtype=torch.float8_e8m0fnu
     )
-    Bf16ToFp4QuantRunner(flat, restored, scales, dequant=True).run()
+    Bf16ToFp4QuantRunner(flat, restored, scales, dequant=True, pdl=_DECODE_PDL).run()
     restored = restored.view_as(x)
     x.copy_(restored)
     _STATS["sm110a.bf16tofp4_quant_dequant"] += 1
@@ -362,7 +362,7 @@ def _bf16_projection(x: torch.Tensor, weight: torch.Tensor, *, output_fp32=False
     if padded_rows != rows:
         a = torch.cat((a, a.new_zeros((padded_rows - rows, k))), dim=0)
     out = torch.empty((padded_rows, n), device=a.device, dtype=output_dtype)
-    Bf16GemmRunner(a, weight.contiguous(), out).run()
+    Bf16GemmRunner(a, weight.contiguous(), out, pdl=_DECODE_PDL).run()
     return out[:rows].view(*x.shape[:-1], n)
 
 
@@ -451,6 +451,7 @@ def sparse_attn_fp8(q, packed, sink, indices, scale):
             sink.contiguous(),
             out,
             scale=scale,
+            pdl=_DECODE_PDL,
         ).run()
         phase = "decode" if q.size(1) == 1 else "prefill"
         _STATS[f"sm110a.sparse_mla_fp8_kv_{phase}"] += 1
@@ -679,7 +680,7 @@ def linear(
             _STATS["torch.bf16_linear_todo"] += 1
             return F.linear(x, weight)
         out = torch.empty((padded_rows, n), device=x.device, dtype=torch.bfloat16)
-        Bf16GemmRunner(a, weight.contiguous(), out).run()
+        Bf16GemmRunner(a, weight.contiguous(), out, pdl=_DECODE_PDL).run()
         _STATS["sm110a.bf16_gemm"] += 1
         return out[:rows].view(*x.shape[:-1], n)
 
@@ -836,7 +837,7 @@ class Sm110aAttention(_official.Attention):
         layout = torch.arange(groups, device=o.device, dtype=torch.int32)
         layout = layout.repeat_interleave(rows)
         out = torch.empty((a.size(0), self.o_lora_rank), device=o.device, dtype=o.dtype)
-        Bf16GroupedMGemmRunner(a, weights, layout, out, dynamic_metadata=True).run()
+        Bf16GroupedMGemmRunner(a, weights, layout, out, dynamic_metadata=True, pdl=_DECODE_PDL).run()
         _STATS["sm110a.wo_a_grouped_m_gemm"] += 1
         return (
             out.view(groups, rows, self.o_lora_rank)
@@ -860,7 +861,7 @@ def _pack_indexer_fp4(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     scales = torch.empty(
         (batch * rows, width // 32), device=x.device, dtype=torch.float8_e8m0fnu
     )
-    Bf16ToFp4QuantRunner(flat, packed, scales).run()
+    Bf16ToFp4QuantRunner(flat, packed, scales, pdl=_DECODE_PDL).run()
     padded_rows = math.ceil(rows / 128) * 128
     if padded_rows != rows:
         # E8M0 byte 127 represents 1.0. Padding is never a valid Q/K row.
@@ -905,6 +906,7 @@ class Sm110aIndexer(_official.Indexer):
                     sk,
                     weights.reshape(bsz, heads).contiguous(),
                     scores.view(bsz, width),
+                    pdl=_DECODE_PDL,
                 ).run()
                 _STATS["sm110a.indexer_score_decode"] += 1
             else:
@@ -919,6 +921,7 @@ class Sm110aIndexer(_official.Indexer):
                     weights.contiguous(),
                     scores,
                     causal=False,
+                    pdl=_DECODE_PDL,
                 ).run()
                 _STATS["sm110a.indexer_score_prefill"] += 1
             return scores
@@ -961,7 +964,7 @@ class Sm110aIndexer(_official.Indexer):
         indices = torch.empty(
             (bsz * seqlen, k), device=scores.device, dtype=torch.int32
         )
-        TopKRunner(scores.contiguous().view(bsz * seqlen, width), indices, k).run()
+        TopKRunner(scores.contiguous().view(bsz * seqlen, width), indices, k, pdl=_DECODE_PDL).run()
         indices = indices.view(bsz, seqlen, k)
         _STATS["sm110a.indexer_topk"] += 1
         if start_pos == 0:
@@ -1304,6 +1307,7 @@ class Sm110aParallelHead(_official.ParallelHead):
                 hc_eps=self.hc_eps,
                 rms_eps=norm.eps,
                 head=True,
+                pdl=_DECODE_PDL,
             ).run()
             _STATS["sm110a.hc_head_norm"] += 1
         else:
@@ -1369,7 +1373,7 @@ class Sm110aParallelHead(_official.ParallelHead):
         if padded_rows != rows:
             a = torch.cat((a, a.new_zeros((padded_rows - rows, k))), dim=0)
         out = torch.empty((padded_rows, n), device=a.device, dtype=torch.float32)
-        Bf16GemmRunner(a, weight.contiguous(), out).run()
+        Bf16GemmRunner(a, weight.contiguous(), out, pdl=_DECODE_PDL).run()
         _STATS["sm110a.lm_head_bf16_gemm_fp32"] += 1
         return out[:rows]
 
@@ -1436,6 +1440,7 @@ def _hc_pre_norm(self, x, hc_fn, hc_scale, hc_base, norm):
         hc_eps=self.hc_eps,
         rms_eps=norm.eps,
         sinkhorn_iters=self.hc_sinkhorn_iters,
+        pdl=_DECODE_PDL,
     ).run()
     _STATS["sm110a.hc_pre_norm"] += 1
     return y, post, comb
@@ -1473,7 +1478,7 @@ def _hc_post(self, x, residual, post, comb):
         _STATS["torch.hc_post_fallback"] += 1
         return _official.Block.hc_post(self, x, residual, post, comb)
     output = torch.empty_like(residual)
-    HcPostRunner(x, residual, post, comb, output).run()
+    HcPostRunner(x, residual, post, comb, output, pdl=_DECODE_PDL).run()
     _STATS["sm110a.hc_post"] += 1
     return output
 

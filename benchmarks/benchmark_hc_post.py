@@ -27,6 +27,9 @@ def reference(x, residual, post, comb):
 class HcPostBenchmark(BenchmarkBase):
     def build_parser(self):
         parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument(
+            "--pdl", action="store_true", help="enable programmatic dependent launch"
+        )
         parser.add_argument("--vector-bytes", type=int, choices=[8, 16], default=16)
         parser.add_argument("--d", type=int, default=4096)
         parser.add_argument("--tokens", type=int, nargs="+", default=[1, 16, 128, 1024])
@@ -110,6 +113,7 @@ class HcPostBenchmark(BenchmarkBase):
                 output,
                 threads=args.threads,
                 vector_bytes=args.vector_bytes,
+                pdl=args.pdl,
             )
             run = runner.run
             ref_fn = lambda: reference(x, residual, post, comb)

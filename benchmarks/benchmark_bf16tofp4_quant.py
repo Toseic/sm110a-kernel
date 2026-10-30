@@ -101,6 +101,9 @@ def compile_tilelang_baseline(d, inplace):
 class QuantBenchmark(BenchmarkBase):
     def build_parser(self):
         parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument(
+            "--pdl", action="store_true", help="enable programmatic dependent launch"
+        )
         parser.add_argument("--d", type=int, default=4096)
         parser.add_argument("--tokens", type=int, nargs="*", default=TOKENS)
         parser.add_argument(
@@ -174,7 +177,11 @@ class QuantBenchmark(BenchmarkBase):
                     dtype=torch.float8_e8m0fnu,
                 )
                 kernel_runner = Bf16ToFp4QuantRunner(
-                    input, output, scales, dequant=dequant
+                    input,
+                    output,
+                    scales,
+                    dequant=dequant,
+                    pdl=args.pdl,
                 )
                 kernel_runner.run()
                 run_ours = kernel_runner.run

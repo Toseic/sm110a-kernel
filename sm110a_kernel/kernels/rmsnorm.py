@@ -7,6 +7,7 @@ import torch
 
 from ..jit_runtime import SplitCudaJit
 from ..runner import FixedKernelRunner
+from .pdl import validate_pdl
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE = _ROOT / "csrc/rmsnorm/src"
@@ -17,6 +18,7 @@ class RmsNormConfig:
     d: int
     warps_per_row: int
     rows_per_cta: int
+    pdl: bool = False
 
 
 class RmsNormModule:
@@ -41,8 +43,9 @@ _JIT = SplitCudaJit(
     kernel_sources=(_SOURCE / "rmsnorm_kernel.cu",),
     kernel_dependencies=(),
     kernel_symbol="sm110a_rmsnorm_launch",
-    config_key=lambda c: (c.d, c.warps_per_row, c.rows_per_cta),
+    config_key=lambda c: (c.d, c.warps_per_row, c.rows_per_cta, c.pdl),
     kernel_cflags=lambda c, _variant: (
+        f"-DSM110A_PDL={int(c.pdl)}",
         f"-DSM110A_RMSNORM_D={c.d}",
         f"-DSM110A_RMSNORM_WARPS={c.warps_per_row}",
         f"-DSM110A_RMSNORM_ROWS={c.rows_per_cta}",
@@ -51,12 +54,13 @@ _JIT = SplitCudaJit(
 )
 
 
-def compile_rmsnorm(d, *, warps_per_row=None, rows_per_cta=None):
+def compile_rmsnorm(d, *, warps_per_row=None, rows_per_cta=None, pdl=False):
     """Compile a fixed D/config; no autotuning or device work at selection time.
 
     Supports D in [1, 32768], and at most 128 input values per thread.
     For vectorizable D, tensors must have 16-byte aligned base addresses.
     """
+    validate_pdl(pdl)
     if type(d) is not int or not 1 <= d <= 32768:
         raise ValueError("d must be an integer in [1, 32768]")
     if warps_per_row is None:
@@ -78,10 +82,12 @@ def compile_rmsnorm(d, *, warps_per_row=None, rows_per_cta=None):
     )
     if (values_per_thread + 32) * warps_per_row * 32 * rows_per_cta > 65536:
         raise ValueError("configuration exceeds the conservative register budget")
-    return _JIT.compile(RmsNormConfig(d, warps_per_row, rows_per_cta))
+    return _JIT.compile(RmsNormConfig(d, warps_per_row, rows_per_cta, pdl))
 
 
-def rmsnorm(input, weight, eps=1e-6, *, warps_per_row=None, rows_per_cta=None):
+def rmsnorm(
+    input, weight, eps=1e-6, *, warps_per_row=None, rows_per_cta=None, pdl=False
+):
     """Compute x * rsqrt(mean(x**2) + eps) * weight along the last axis.
 
     Input is contiguous CUDA BF16/FP16/FP32. Weight is [D], normally FP32
@@ -89,23 +95,32 @@ def rmsnorm(input, weight, eps=1e-6, *, warps_per_row=None, rows_per_cta=None):
     Reduction and both multiplies use FP32; output is cast once at the end.
     """
     return compile_rmsnorm(
-        input.size(-1), warps_per_row=warps_per_row, rows_per_cta=rows_per_cta
+        input.size(-1), warps_per_row=warps_per_row, rows_per_cta=rows_per_cta, pdl=pdl
     ).rmsnorm(input, weight, eps)
 
 
 def rmsnorm_out(
-    input, weight, output, eps=1e-6, *, warps_per_row=None, rows_per_cta=None
+    input, weight, output, eps=1e-6, *, warps_per_row=None, rows_per_cta=None, pdl=False
 ):
     """Allocation-free RMSNorm; exact input/output aliasing is supported."""
     return compile_rmsnorm(
-        input.size(-1), warps_per_row=warps_per_row, rows_per_cta=rows_per_cta
+        input.size(-1), warps_per_row=warps_per_row, rows_per_cta=rows_per_cta, pdl=pdl
     ).rmsnorm_out(input, weight, output, eps)
 
 
 class RmsNormRunner(FixedKernelRunner):
     def __init__(
-        self, input, weight, output, eps=1e-6, *, warps_per_row=None, rows_per_cta=None
+        self,
+        input,
+        weight,
+        output,
+        eps=1e-6,
+        *,
+        warps_per_row=None,
+        rows_per_cta=None,
+        pdl=False,
     ):
+        validate_pdl(pdl)
         super().__init__(
             input.device,
             "rmsnorm",
@@ -116,9 +131,13 @@ class RmsNormRunner(FixedKernelRunner):
                 eps,
                 warps_per_row,
                 rows_per_cta,
+                pdl,
             ),
             lambda: compile_rmsnorm(
-                input.size(-1), warps_per_row=warps_per_row, rows_per_cta=rows_per_cta
+                input.size(-1),
+                warps_per_row=warps_per_row,
+                rows_per_cta=rows_per_cta,
+                pdl=pdl,
             ),
             lambda module: lambda: module.rmsnorm_out(input, weight, output, eps),
         )

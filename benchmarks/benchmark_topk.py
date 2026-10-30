@@ -247,12 +247,14 @@ def prepare_indexer(args, rows, n, scores):
         k = make_packed_rows(rows * n).view(rows, n, DIM // 2)
         qs = torch.cat([make_blocked_scales(HEADS) for _ in range(rows)])
         ks = torch.cat([make_blocked_scales(n) for _ in range(rows)])
-        runner = IndexerScoreDecodeRunner(q, k, qs, ks, weight, scores)
+        runner = IndexerScoreDecodeRunner(q, k, qs, ks, weight, scores, pdl=args.pdl)
         prepared = runner.prepare(IndexerScoreDecodeConfig(args.split_kv))
     else:
         k = make_packed_rows(n)
         qs, ks = make_blocked_scales(rows * HEADS), make_blocked_scales(n)
-        runner = IndexerScorePrefillRunner(q, k, qs, ks, weight, scores, causal=False)
+        runner = IndexerScorePrefillRunner(
+            q, k, qs, ks, weight, scores, causal=False, pdl=args.pdl
+        )
         prepared = runner.prepare(IndexerScorePrefillConfig(args.cluster_m))
     run = prepared.run
     run()
@@ -262,6 +264,9 @@ def prepare_indexer(args, rows, n, scores):
 class TopKBenchmark(BenchmarkBase):
     def build_parser(self):
         p = argparse.ArgumentParser(description=__doc__)
+        p.add_argument(
+            "--pdl", action="store_true", help="enable programmatic dependent launch"
+        )
         p.add_argument("--q-lens", type=int, nargs="+", default=(1, 8, 64, 256))
         p.add_argument(
             "--kv-lens", type=int, nargs="+", default=(4096, 16384, 65536, 131072)
@@ -349,7 +354,9 @@ class TopKBenchmark(BenchmarkBase):
 
     def run_with_args(self, args):
         torch.manual_seed(args.seed)
-        module = compile_topk(stages=args.stages, copy_engine=args.copy_engine)
+        module = compile_topk(
+            stages=args.stages, copy_engine=args.copy_engine, pdl=args.pdl
+        )
         if not args.no_accuracy:
             run_contract_checks(module, args.split_k)
         if args.check_only:
@@ -406,6 +413,7 @@ class TopKBenchmark(BenchmarkBase):
                 k,
                 stages=args.stages,
                 copy_engine=args.copy_engine,
+                pdl=args.pdl,
             )
             if args.split_k is None:
                 prepared = runner.tune(self.make_tune_options(args)).prepared

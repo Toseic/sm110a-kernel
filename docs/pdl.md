@@ -1,4 +1,4 @@
-# FC1 → FC2 programmatic dependent launch
+# Programmatic dependent launch
 
 The independent NVFP4 and MXFP4 FC1/FC2 kernels support opt-in PDL with
 `pdl=True` in both configurations. Defaults remain `False`. This applies to
@@ -42,7 +42,8 @@ fc2.nvfp4_fc2_out(
 For MXFP4 use `Mxfp4Fc1Config`, `Mxfp4Fc2Config`, `compile_mxfp4_fc1`,
 `compile_mxfp4_fc2` and the corresponding `mxfp4_*_out` methods. Match the
 routing weight position across FC1/FC2 as usual. MXFP4 deterministic FC2 is
-also supported; its final reduction remains after FC2.
+also supported; its final reduction waits on FC2 and can trigger a downstream
+PDL consumer.
 
 `prepare_pdl_out` resets FC2's scheduler counter and clears its atomic
 reduction output (the deterministic variant needs only the counter reset).
@@ -252,9 +253,9 @@ Python compilation and `git diff --check` passed.
 
 ## DeepSeek-V4-Flash decode chains
 
-`models/deepseek_v4_flash_sm110a` supports opt-in PDL for fixed CUDA Graph
+`models/deepseek_v4_flash_sm110a` enables PDL by default for fixed CUDA Graph
 single-token decode with `Transformer(args, pdl=True)`. The model benchmark
-accepts `--pdl` / `--no-pdl` (default off). Both modes use quantizers that
+accepts `--pdl` / `--no-pdl` (default on). Both modes use quantizers that
 write padded, blocked activation scales directly, so the switch compares
 PDL on the same decode computation/layout rather than introducing scale
 conversion kernels in the serial control. Prefill retains its serial path.
@@ -271,7 +272,7 @@ The enabled edges are:
   scheduler memset, and waits after initialization before consuming A/SFA.
 - `mxfp4_fc1 -> mxfp4_fc2`: the existing `pdl=True` switches apply, with
   FC2's `pdl_wait="before_a"`. Deterministic finalize remains a normal
-  completion dependency after FC2.
+  PDL consumer after FC2, with its own downstream launch trigger.
 
 Blocked quantization requires 128-aligned rows and K; the generalized
 quantizer additionally requires block size 128 and UE8M0 scales. It returns
@@ -286,3 +287,81 @@ output and routing-weight conversions before the quantizer as well, and
 call `fc2.prepare_pdl_out(output, metadata2)` there. Keep all three kernels
 adjacent on the same stream. Enabling FC1's incoming `pdl_input` is separate
 from its outgoing `pdl` trigger so either edge can be used independently.
+
+
+## Shared kernel interface
+
+`include/pdl.h` supplies the common device and host operations:
+
+- `pdl_trigger<Enabled>()`: thread 0 signals once per CTA. A warp-owned
+  trigger can call `pdl_trigger<Enabled>(is_issuer)` instead.
+- `pdl_wait<Enabled>()`: the calling thread waits for all direct grid
+  dependencies. Call before reading any predecessor output, including
+  metadata, scales, indices and inputs to asynchronous loads.
+- `pdl_entry<Enabled>()`: trigger followed by wait, called by every thread
+  before any dependent read or divergent early return. This is the
+  conservative bidirectional default for newly supported kernels.
+- `launch_kernel<Enabled>(kernel, grid, block, smem, stream, args...)`:
+  ordinary launch when disabled, extended dependent launch when enabled.
+- `launch_pdl<Enabled>(&config, kernel, args...)`: extended launch preserving
+  existing attributes (including cluster dimensions). It copies the config
+  and appends/updates the programmatic serialization attribute without
+  retaining stack pointers in the caller's config.
+
+The template defaults to the compile-time `SM110A_PDL` flag. Disabled device
+helpers compile away. Existing FP8 and MoE specializations retain their
+kernel-specific flag names and use explicit template arguments. Existing
+GEMM/FC1/FC2 delayed waits and FC1 trigger selection remain in place.
+A trigger permits scheduling only; it does not indicate that output is ready.
+Every consumer must wait before its first dependent access. No consumer may
+assume that another kernel will execute concurrently or read partially
+completed producer output.
+
+The following APIs accept `pdl=False` by default, with input waiting and
+output triggering enabled together by `pdl=True`:
+
+| Kernel | Python selection API | Physical launches covered |
+| --- | --- | --- |
+| RMSNorm | `compile_rmsnorm`, `RmsNormRunner` | All input/weight dtypes and row configurations |
+| HC post | `compile_hc_post`, `HcPostRunner` | Vector and scalar paths |
+| HC pre/head + norm | `compile_hc_pre_norm`, `HcPreNormRunner` | SIMT/head, TC projection and finish, both split sizes |
+| BF16 GEMM | `Bf16GemmConfig(pdl=True)`, `Bf16GemmRunner` | Normal/swapped operands, cluster and split-K, BF16/FP32 output |
+| Grouped BF16 GEMM | `GroupedMConfig(pdl=True)`, `Bf16GroupedMGemmRunner` | Metadata collection/task construction and all GEMM scheduling modes |
+| BF16→FP4 | `compile_bf16tofp4_quant`, `Bf16ToFp4QuantRunner` | Packed/dequantized output, main and tail kernels |
+| FP8 KV sparse MLA | `compile_fp8_kv_fa4_sparse_mla`, `Fp8KvFa4SparseMlaRunner` | Decode/prefill, E8M0/FP32 scales |
+| Indexer score | `compile_indexer_score_decode/prefill`, corresponding runners | Dense/paged/ragged layouts and cluster variants |
+| TopK | `compile_topk`, `TopKRunner` | Ordinary/cluster launches, LDGSTS/TMA, all-candidate fast path |
+
+The public convenience functions for these operators also accept `pdl`,
+except GEMMs, which select it through their config objects. PDL is included
+in JIT and runner/autotune cache keys. All split CUDA JITs hash `pdl.h`, so
+changing the shared implementation invalidates dependent binaries without
+manual cache deletion.
+
+The existing FP8 quantizers now also wait on incoming dependencies and launch
+with the PDL attribute. FP8 GEMM, shared FC1 and MXFP4 FC2 also signal their
+outputs. MXFP4 FC1 retains separate incoming `pdl_input` and outgoing `pdl`
+switches. Deterministic FC2's finalize participates in the same chain.
+
+The model forwards its decode switch to all the operators above. Its
+prefill remains serial; standalone prefill kernels can opt into PDL.
+PyTorch operations, compressor pooling/cache writes and layout conversions
+remain ordinary stream dependencies. This coverage does not establish a
+fully overlapping end-to-end model pipeline. Independent preparation should
+precede the intended chain, while input-dependent preparation must keep its
+own dependency. The fused MoE backend still requires `pdl=False`.
+
+Existing per-operator benchmarks accept `--pdl`; omitting it selects the
+serial control. For example:
+
+```bash
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_hc_pre_norm.py \
+  --tokens 1 16 256 --pdl --baseline none --warmup 1 --iters 2 --samples 1
+/home/bifrost/miniforge3/bin/python3 benchmarks/benchmark_topk.py \
+  --q-lens 1 8 --kv-lens 512 4096 --split-k 2 --pdl \
+  --baseline none --warmup 1 --iters 2 --samples 1
+```
+
+These are correctness smoke workloads with cold-L2 timing, not evidence of
+an application speedup. Measure fixed producer/consumer configurations before
+moving conservative waits later into each kernel's independent setup.

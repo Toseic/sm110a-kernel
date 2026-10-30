@@ -1,3 +1,4 @@
+#include "../../../include/pdl.h"
 // =============================================================================
 // SM110A BF16 GEMM — Overview
 // =============================================================================
@@ -611,6 +612,7 @@ void bf16_gemm_kernel(
     int M,
     int N,
     int K) {
+    sm110a::pdl_entry();
 
     using Config = KernelConfig<kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN, kSplitK>;
     constexpr int kStageCount = Config::kStageCount;
@@ -1261,7 +1263,7 @@ void launch_bf16_gemm_impl(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     }
 
-    kernel<<<grid, kBlockThreads, smem_size, stream>>>(A_tmap,
+    sm110a::launch_kernel(kernel, grid, kBlockThreads, smem_size, stream, A_tmap,
         B_tmap,
         C_tmap,
         M,

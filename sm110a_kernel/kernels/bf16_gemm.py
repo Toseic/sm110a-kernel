@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import torch
 
 from ..jit_runtime import SplitCudaJit
 from ..runner import BaseKernelRunner, PreparedKernel
+from .pdl import validate_pdl
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_DIR = _ROOT / "csrc/bf16_gemm/src"
@@ -26,7 +27,10 @@ class Bf16GemmConfig:
     split_k: int = 1
     output_fp32: bool = False
 
+    pdl: bool = False
+
     def validate(self) -> None:
+        validate_pdl(self.pdl)
         if not isinstance(self.output_fp32, bool):
             raise TypeError("output_fp32 must be a bool")
         if self.tile_m not in (64, 128):
@@ -138,7 +142,7 @@ class Bf16GemmModule:
 
 
 def _kernel_cflags(config, _variant):
-    return tuple(
+    return (f"-DSM110A_PDL={int(config.pdl)}",) + tuple(
         f"-DSM110A_BF16_{name}={value}"
         for name, value in (
             ("TILE_M", config.tile_m),
@@ -272,7 +276,7 @@ def format_bf16_candidate(candidate):
         f"/e{config.epilogue_block_n}"
         f"/sk{config.split_k}"
         f"/{'swap' if swap_ab else 'noswap'}"
-        f"/{'fp32' if config.output_fp32 else 'bf16'}"
+        f"/{'fp32' if config.output_fp32 else 'bf16'}/pdl{int(config.pdl)}"
     )
 
 
@@ -280,15 +284,24 @@ class Bf16GemmRunner(BaseKernelRunner):
     namespace = "bf16_gemm_nt_v6"
     format_candidate = staticmethod(format_bf16_candidate)
 
-    def __init__(self, a, b_nt, out, *, max_active_clusters=None):
+    def __init__(self, a, b_nt, out, *, max_active_clusters=None, pdl=False):
+        validate_pdl(pdl)
         super().__init__(a.device)
+        self.pdl = pdl
         self.a, self.b, self.out = a, b_nt, out
         self.m, self.k, self.n = a.size(0), a.size(1), b_nt.size(0)
         self.max_active_clusters = max_active_clusters
 
     @property
     def workload_key(self):
-        return (self.m, self.n, self.k, self.max_active_clusters, str(self.out.dtype))
+        return (
+            self.m,
+            self.n,
+            self.k,
+            self.max_active_clusters,
+            str(self.out.dtype),
+            self.pdl,
+        )
 
     def compatible_candidates(self):
         candidates = bf16_candidates(
@@ -314,7 +327,7 @@ class Bf16GemmRunner(BaseKernelRunner):
                 and self.k % tk == 0
                 and (self.m % tm == 0 or self.m < tm)
             )
-        return candidates
+        return tuple((replace(c, pdl=self.pdl), swap) for c, swap in candidates)
 
     def pre_jit(self, candidate):
         return compile_bf16_gemm(candidate[0])

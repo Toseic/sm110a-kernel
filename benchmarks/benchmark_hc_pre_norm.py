@@ -55,6 +55,9 @@ def capture(fn):
 class HcPreNormBenchmark(BenchmarkBase):
     def build_parser(self):
         parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument(
+            "--pdl", action="store_true", help="enable programmatic dependent launch"
+        )
         parser.add_argument("--mode", choices=["pre", "head"], default="pre")
         parser.add_argument("--d", type=int, default=4096)
         parser.add_argument("--tokens", type=int, nargs="+", default=[1, 16, 128])
@@ -165,7 +168,7 @@ class HcPreNormBenchmark(BenchmarkBase):
                 sinkhorn_iters=args.sinkhorn_iters,
                 head=head,
             )
-            norm_runner = RmsNormRunner(intermediate, norm_weight, y)
+            norm_runner = RmsNormRunner(intermediate, norm_weight, y, pdl=args.pdl)
 
             def separate():
                 pre_runner.run()
@@ -182,6 +185,7 @@ class HcPreNormBenchmark(BenchmarkBase):
                 comb,
                 sinkhorn_iters=args.sinkhorn_iters,
                 head=head,
+                pdl=args.pdl,
             )
             run = runner.run
             hc_ref_fn = lambda: reference(

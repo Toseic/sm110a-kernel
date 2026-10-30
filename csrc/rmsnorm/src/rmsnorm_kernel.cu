@@ -1,3 +1,4 @@
+#include "../../../include/pdl.h"
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -71,6 +72,7 @@ template <typename T, typename W>
 __global__ __launch_bounds__(kThreadsPerRow * kRows)
 void rmsnorm_kernel(const T* input, const W* weight, T* output,
                     int64_t rows, float eps) {
+    sm110a::pdl_entry();
     constexpr int kVector = 16 / sizeof(T);
     constexpr int kChunks = (kD + kThreadsPerRow * kVector - 1) / (kThreadsPerRow * kVector);
     const int row_in_cta = threadIdx.x / kThreadsPerRow;
@@ -182,12 +184,16 @@ extern "C" void sm110a_rmsnorm_launch(
         return;
     const int blocks = (rows + kRows - 1) / kRows;
 #define LAUNCH(T, W)                                                                               \
-    rmsnorm_kernel<T, W>                                                                           \
-        <<<blocks, kThreadsPerRow * kRows, 0, stream>>>(static_cast<const T *>(input),             \
-            static_cast<const W *>(weight),                                                        \
-            static_cast<T *>(output),                                                              \
-            rows,                                                                                  \
-            eps)
+    sm110a::launch_kernel(rmsnorm_kernel<T, W>,                                                    \
+        blocks,                                                                                    \
+        kThreadsPerRow *kRows,                                                                     \
+        0,                                                                                         \
+        stream,                                                                                    \
+        static_cast<const T *>(input),                                                             \
+        static_cast<const W *>(weight),                                                            \
+        static_cast<T *>(output),                                                                  \
+        rows,                                                                                      \
+        eps)
     if (dtype == 0) {
         if (fp32_weight) {
             LAUNCH(__nv_bfloat16, float);

@@ -848,7 +848,7 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void m
     const int32_t *grouped_assignments,
     const float *routing_weights) {
     if constexpr (SM110A_MXFP4_FC1_PDL && SM110A_MXFP4_FC1_PDL_TRIGGER == 0) {
-        if (threadIdx.x == 0) cudaTriggerProgrammaticLaunchCompletion();
+        if (threadIdx.x == 0) sm110a::pdl_trigger<true>(true);
     }
     using Config = KernelConfig<kTileM, kTileN, kTileK, kEpilogueTileN, kClusterM, kClusterN>;
     using Shape = ClusterShape<kClusterM, kClusterN>;
@@ -991,10 +991,10 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void m
     asm volatile("barrier.cluster.wait.acquire.aligned;");
 
     if constexpr (SM110A_MXFP4_FC1_PDL && SM110A_MXFP4_FC1_PDL_TRIGGER == 1) {
-        if (tid == 0) cudaTriggerProgrammaticLaunchCompletion();
+        if (tid == 0) sm110a::pdl_trigger<true>(true);
     }
 
-    if constexpr (SM110A_MXFP4_FC1_PDL_INPUT) cudaGridDependencySynchronize();
+    sm110a::pdl_wait<SM110A_MXFP4_FC1_PDL_INPUT>();
     const int tmem_addr = tmem_base[0];
     // kind::mxf8f6f4 instruction descriptor: atype = E4M3 (field 0) and
     // btype = E2M1 (field 5), input-D enabled. Identical encoding to
@@ -1379,7 +1379,7 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void m
                         if (tid == kTmaWarp * kWarpSize && !pdl_triggered &&
                             (tile_k + 1) * 4 >=
                                 k_tiles * (SM110A_MXFP4_FC1_PDL_TRIGGER - 1)) {
-                            cudaTriggerProgrammaticLaunchCompletion();
+                            sm110a::pdl_trigger<true>(true);
                             pdl_triggered = true;
                         }
                     }
@@ -1778,7 +1778,7 @@ __launch_bounds__(kWarpSize * (kBaseWarpCount + (kClusterM > 1 ? 1 : 0))) void m
     }
 
     if constexpr (SM110A_MXFP4_FC1_PDL && SM110A_MXFP4_FC1_PDL_TRIGGER == 6) {
-        if (tid == 0) cudaTriggerProgrammaticLaunchCompletion();
+        if (tid == 0) sm110a::pdl_trigger<true>(true);
     }
 
     // No later C-slot acquisition exists to retire the final bulk group(s).

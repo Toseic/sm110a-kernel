@@ -209,6 +209,10 @@ class SplitCudaJit(Generic[ConfigT, FacadeT]):
             and pipeline_delay_header not in kernel_dependencies
             else ()
         )
+        # Shared PDL helpers affect all users, including legacy kernel flags.
+        pdl_header = root / "include" / "pdl.h"
+        if pdl_header.exists() and pdl_header not in self._kernel_dependencies:
+            self._kernel_dependencies += (pdl_header,)
         self._kernel_symbol = kernel_symbol
         self._config_key = config_key
         self._kernel_cflags = kernel_cflags

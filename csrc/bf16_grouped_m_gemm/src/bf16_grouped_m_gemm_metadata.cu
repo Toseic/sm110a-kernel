@@ -1,3 +1,4 @@
+#include "../../../include/pdl.h"
 #include <cstdint>
 #include <cuda_runtime.h>
 
@@ -22,6 +23,7 @@ __global__ void collect_expert_metadata(
     int experts,
     int32_t *offsets,
     int32_t *counts) {
+    sm110a::pdl_entry();
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= m)
         return;
@@ -40,6 +42,7 @@ __global__ void build_expert_tile_tasks(
     int task_tile_rows,
     ExpertTileTask *tasks,
     int32_t *state) {
+    sm110a::pdl_entry();
     if (blockIdx.x || threadIdx.x)
         return;
     int next = 0;
@@ -131,12 +134,12 @@ extern "C" void sm110a_bf16_grouped_m_metadata_prepare(
         return;
     cudaMemsetAsync(offsets, 0x7f, experts * sizeof(int32_t), stream);
     cudaMemsetAsync(counts, 0, experts * sizeof(int32_t), stream);
-    collect_expert_metadata<<<(m + kThreads - 1) / kThreads, kThreads, 0, stream>>>(layout,
+    sm110a::launch_kernel(collect_expert_metadata, (m + kThreads - 1) / kThreads, kThreads, 0, stream, layout,
         m,
         experts,
         offsets,
         counts);
-    build_expert_tile_tasks<<<1, 1, 0, stream>>>(offsets,
+    sm110a::launch_kernel(build_expert_tile_tasks, 1, 1, 0, stream, offsets,
         counts,
         experts,
         n / logical_n_tile,

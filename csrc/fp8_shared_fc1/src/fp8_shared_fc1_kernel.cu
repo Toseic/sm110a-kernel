@@ -604,6 +604,7 @@ void fp8_shared_fc1_kernel(
     int N,
     int K,
     __nv_bfloat16 *fc1_out) {
+    sm110a::pdl_trigger<SM110A_FP8_SHARED_FC1_PDL>();
 
     using Config = KernelConfig<kTileM, kTileN, kTileK, kClusterM, kEpilogueBlockN, kSplitK>;
     constexpr int kStageCount = Config::kStageCount;
@@ -718,7 +719,7 @@ void fp8_shared_fc1_kernel(
         __syncthreads();
     }
 
-    if constexpr (SM110A_FP8_SHARED_FC1_PDL) cudaGridDependencySynchronize();
+    sm110a::pdl_wait<SM110A_FP8_SHARED_FC1_PDL>();
     const int taddr = tmem_addr[0];
 
     // Hint the exact tiles consumed by a future TMA load into L2.  This has

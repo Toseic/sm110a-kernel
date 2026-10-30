@@ -536,6 +536,7 @@ void mxfp4_fc2_kernel(
     int n,
     int k,
     int topk) {
+    sm110a::pdl_trigger<SM110A_MXFP4_FC2_PDL>();
     using Config = Mxfp4Fc2Config<kTileM, kTileN, kTileK, kClusterM>;
     constexpr int kClusterTileM = Config::kClusterTileM;
     constexpr int kStageCount = Config::kStageCount;
@@ -660,7 +661,7 @@ void mxfp4_fc2_kernel(
     asm volatile("barrier.cluster.wait.acquire.aligned;");
 
     if constexpr (SM110A_MXFP4_FC2_PDL && !SM110A_MXFP4_FC2_PDL_WAIT_BEFORE_A) {
-        cudaGridDependencySynchronize();
+        sm110a::pdl_wait<SM110A_MXFP4_FC2_PDL>();
     }
 
     const int tmem_addr = tmem_base[0];
@@ -920,7 +921,7 @@ void mxfp4_fc2_kernel(
                             }
                         }
                         if (!pdl_dependency_ready) {
-                            cudaGridDependencySynchronize();
+                            sm110a::pdl_wait<SM110A_MXFP4_FC2_PDL>();
                             pdl_dependency_ready = true;
                         }
                     }
@@ -1583,6 +1584,7 @@ void launch_mxfp4_fc2_entry(
 __global__ void mxfp4_fc2_finalize_deterministic(
     const __nv_bfloat16* assignments, __nv_bfloat16* output,
     int tokens, int n, int topk) {
+    sm110a::pdl_entry<SM110A_MXFP4_FC2_PDL>();
     const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= static_cast<size_t>(tokens) * n) return;
     const int token = index / n;
@@ -1625,7 +1627,8 @@ void launch_mxfp4_fc2_main(
     if constexpr (SM110A_MXFP4_FC2_DETERMINISTIC != 0) {
         constexpr int threads = 256;
         const int blocks = (static_cast<size_t>(tokens) * n + threads - 1) / threads;
-        mxfp4_fc2_finalize_deterministic<<<blocks, threads, 0, stream>>>(
+        sm110a::launch_kernel<SM110A_MXFP4_FC2_PDL>(
+            mxfp4_fc2_finalize_deterministic, blocks, threads, 0, stream,
             assignment_scratch, c, tokens, n, topk);
     }
 }

@@ -7,6 +7,7 @@ import torch
 
 from ..jit_runtime import SplitCudaJit, source_digest
 from ..runner import BaseKernelRunner, PreparedKernel
+from .pdl import validate_pdl
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE = _ROOT / "csrc/mxfp4_indexer_score/src"
@@ -37,6 +38,7 @@ def pack_indexer_score_prefill_scales(scales):
 
 class IndexerScoreModule:
     def __init__(self, binding, library, _config):
+        self.pdl = _config
         self._binding = binding
         self._launcher = library.entry_address
         self._cluster_m_cache = {}
@@ -82,6 +84,7 @@ class IndexerScoreModule:
             max_q_len=q_len,
             max_kv_len=kv_len,
             _module=self,
+            pdl=self.pdl,
         )
         key = runner.workload_key
         if options is None and key in self._cluster_m_cache:
@@ -236,13 +239,14 @@ _JIT = SplitCudaJit(
     kernel_dependencies=(),
     kernel_symbol="sm110a_indexer_score_prefill_launch",
     config_key=lambda config: config,
-    kernel_cflags=lambda _config, _variant: (),
+    kernel_cflags=lambda pdl, _variant: (f"-DSM110A_PDL={int(pdl)}",),
     make_facade=IndexerScoreModule,
 )
 
 
-def compile_indexer_score_prefill() -> IndexerScoreModule:
-    return _JIT.compile(None)
+def compile_indexer_score_prefill(*, pdl=False) -> IndexerScoreModule:
+    validate_pdl(pdl)
+    return _JIT.compile(pdl)
 
 
 def select_indexer_score_prefill_cluster_m(
@@ -260,8 +264,9 @@ def select_indexer_score_prefill_cluster_m(
     max_q_len=None,
     max_kv_len=None,
     options=None,
+    pdl=False,
 ):
-    return compile_indexer_score_prefill().select_cluster_m(
+    return compile_indexer_score_prefill(pdl=pdl).select_cluster_m(
         q,
         k,
         q_scales,
@@ -292,8 +297,9 @@ def indexer_score_prefill(
     kv_seqlens=None,
     max_q_len=None,
     max_kv_len=None,
+    pdl=False,
 ):
-    return compile_indexer_score_prefill().indexer_score_prefill(
+    return compile_indexer_score_prefill(pdl=pdl).indexer_score_prefill(
         q,
         k,
         q_scales,
@@ -324,8 +330,9 @@ def indexer_score_prefill_out(
     kv_seqlens=None,
     max_q_len=None,
     max_kv_len=None,
+    pdl=False,
 ):
-    return compile_indexer_score_prefill().indexer_score_prefill_out(
+    return compile_indexer_score_prefill(pdl=pdl).indexer_score_prefill_out(
         q,
         k,
         q_scales,
@@ -344,6 +351,7 @@ def indexer_score_prefill_out(
 
 class IndexerScoreDecodeModule:
     def __init__(self, binding, library, _config):
+        self.pdl = _config
         self._binding = binding
         self._launcher = library.entry_address
         self._split_kv_cache = {}
@@ -378,6 +386,7 @@ class IndexerScoreDecodeModule:
             kv_seqlens=kv_seqlens,
             max_kv_len=kv_len,
             _module=self,
+            pdl=self.pdl,
         )
         key = runner.workload_key
         if options is None and key in self._split_kv_cache:
@@ -489,13 +498,14 @@ _DECODE_JIT = SplitCudaJit(
     kernel_dependencies=(),
     kernel_symbol="sm110a_indexer_score_decode_launch",
     config_key=lambda config: config,
-    kernel_cflags=lambda _config, _variant: (),
+    kernel_cflags=lambda pdl, _variant: (f"-DSM110A_PDL={int(pdl)}",),
     make_facade=IndexerScoreDecodeModule,
 )
 
 
-def compile_indexer_score_decode() -> IndexerScoreDecodeModule:
-    return _DECODE_JIT.compile(None)
+def compile_indexer_score_decode(*, pdl=False) -> IndexerScoreDecodeModule:
+    validate_pdl(pdl)
+    return _DECODE_JIT.compile(pdl)
 
 
 def select_indexer_score_decode_split_kv(
@@ -510,8 +520,9 @@ def select_indexer_score_decode_split_kv(
     kv_seqlens=None,
     max_kv_len=None,
     options=None,
+    pdl=False,
 ):
-    return compile_indexer_score_decode().select_split_kv(
+    return compile_indexer_score_decode(pdl=pdl).select_split_kv(
         q,
         k,
         q_scales,
@@ -536,8 +547,9 @@ def indexer_score_decode(
     block_table=None,
     kv_seqlens=None,
     max_kv_len=None,
+    pdl=False,
 ):
-    return compile_indexer_score_decode().indexer_score_decode(
+    return compile_indexer_score_decode(pdl=pdl).indexer_score_decode(
         q,
         k,
         q_scales,
@@ -562,8 +574,9 @@ def indexer_score_decode_out(
     block_table=None,
     kv_seqlens=None,
     max_kv_len=None,
+    pdl=False,
 ):
-    return compile_indexer_score_decode().indexer_score_decode_out(
+    return compile_indexer_score_decode(pdl=pdl).indexer_score_decode_out(
         q,
         k,
         q_scales,
@@ -596,7 +609,9 @@ class IndexerScorePrefillRunner(BaseKernelRunner):
         max_q_len=None,
         max_kv_len=None,
         _module=None,
+        pdl=False,
     ):
+        validate_pdl(pdl)
         super().__init__(q.device)
         self.q, self.k, self.q_scales, self.k_scales, self.head_weight, self.out = (
             q,
@@ -616,11 +631,13 @@ class IndexerScorePrefillRunner(BaseKernelRunner):
             q, k, block_table, cu_seqlens_q, max_q_len, max_kv_len
         )
         self.module = _module
+        self.pdl = pdl
 
     @property
     def workload_key(self):
         return (
             self.device.index,
+            self.pdl,
             self.batch,
             self.q_len,
             self.kv_len,
@@ -636,7 +653,7 @@ class IndexerScorePrefillRunner(BaseKernelRunner):
         )
 
     def pre_jit(self, candidate):
-        return self.module or compile_indexer_score_prefill()
+        return self.module or compile_indexer_score_prefill(pdl=self.pdl)
 
     def prepare(self, candidate):
         module = self.pre_jit(candidate)
@@ -676,7 +693,9 @@ class IndexerScoreDecodeRunner(BaseKernelRunner):
         kv_seqlens=None,
         max_kv_len=None,
         _module=None,
+        pdl=False,
     ):
+        validate_pdl(pdl)
         super().__init__(q.device)
         self.q, self.k, self.q_scales, self.k_scales, self.head_weight, self.out = (
             q,
@@ -689,11 +708,13 @@ class IndexerScoreDecodeRunner(BaseKernelRunner):
         self.block_table, self.kv_seqlens = block_table, kv_seqlens
         self.kv_len = _decode_kv_len(k, block_table, max_kv_len)
         self.module = _module
+        self.pdl = pdl
 
     @property
     def workload_key(self):
         return (
             self.device.index,
+            self.pdl,
             self.q.size(0),
             self.kv_len,
             self.k.size(1) if self.block_table is not None else 0,
@@ -708,7 +729,7 @@ class IndexerScoreDecodeRunner(BaseKernelRunner):
         )
 
     def pre_jit(self, candidate):
-        return self.module or compile_indexer_score_decode()
+        return self.module or compile_indexer_score_decode(pdl=self.pdl)
 
     def prepare(self, candidate):
         module = self.pre_jit(candidate)

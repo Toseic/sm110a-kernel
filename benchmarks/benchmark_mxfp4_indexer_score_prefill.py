@@ -367,6 +367,9 @@ class IndexerScoreBenchmark(BenchmarkBase):
     def build_parser(self):
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument(
+            "--pdl", action="store_true", help="enable programmatic dependent launch"
+        )
+        parser.add_argument(
             "--seq-lens",
             type=int,
             nargs="+",
@@ -568,6 +571,7 @@ class IndexerScoreBenchmark(BenchmarkBase):
                 out,
                 causal=not args.non_causal,
                 **extra,
+                pdl=args.pdl,
             )
             if args.cluster_m:
                 from sm110a_kernel.kernels.mxfp4_indexer_score import (

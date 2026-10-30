@@ -131,6 +131,9 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
 
     def add_arguments(self, parser):
         parser.add_argument(
+            "--pdl", action="store_true", help="enable programmatic dependent launch"
+        )
+        parser.add_argument(
             "--output-fp32",
             action="store_true",
             help="store FP32 accumulators directly (currently requires --baseline torch)",
@@ -351,7 +354,11 @@ class Bf16GemmBenchmark(GemmBenchmarkBase):
 
     def resolve_kernel(self, a, b_kernel, out, m, n, k, args):
         kernel_runner = Bf16GemmRunner(
-            a, b_kernel, out, max_active_clusters=args.max_active_clusters or None
+            a,
+            b_kernel,
+            out,
+            max_active_clusters=args.max_active_clusters or None,
+            pdl=args.pdl,
         )
         candidates = kernel_runner.compatible_candidates()
         options = self.make_tune_options(

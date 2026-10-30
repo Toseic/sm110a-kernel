@@ -4,8 +4,12 @@
 # ruff: noqa: E402, I001
 
 import argparse
+import contextlib
+import dataclasses
 import gc
+import hashlib
 import json
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -113,7 +117,17 @@ def parse_args() -> argparse.Namespace:
         "--pdl",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="enable quant->GEMM and quant->FC1->FC2 PDL in graphed decode (default: on)",
+        help="enable native-kernel PDL in graphed decode (default: on)",
+    )
+    parser.add_argument(
+        "--kernel-configs",
+        type=Path,
+        help="Record selected kernel configurations, or reuse an existing manifest ignoring PDL fields",
+    )
+    parser.add_argument(
+        "--results-json",
+        type=Path,
+        help="Write individual cold-L2 decode samples and output hashes",
     )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
@@ -150,6 +164,66 @@ def parse_args() -> argparse.Namespace:
     if args.profile_phase == "prefill" and args.decode_only:
         parser.error("--profile-phase prefill requires --no-decode-only")
     return args
+
+
+def _comparison_value(value):
+    if dataclasses.is_dataclass(value):
+        return {
+            k: v
+            for k, v in dataclasses.asdict(value).items()
+            if not k.startswith("pdl")
+        }
+    if isinstance(value, bool):
+        return "<bool>"
+    if isinstance(value, (tuple, list)):
+        return [_comparison_value(v) for v in value]
+    if isinstance(value, dict):
+        return {
+            k: _comparison_value(v) for k, v in value.items() if not k.startswith("pdl")
+        }
+    return value
+
+
+@contextlib.contextmanager
+def fixed_kernel_configs(path):
+    """Keep shape and kernel configuration fixed across separate PDL runs."""
+    if path is None:
+        yield
+        return
+    from sm110a_kernel.runner import BaseKernelRunner
+
+    existing = path.exists()
+    manifest = json.loads(path.read_text()) if existing else {}
+    original = BaseKernelRunner.tune
+
+    def tune(runner, *args, **kwargs):
+        key = json.dumps(
+            [runner.namespace, _comparison_value(runner.workload_key)], sort_keys=True
+        )
+        if key in manifest:
+            candidates = kwargs.get("candidates")
+            if candidates is None:
+                candidates = runner.compatible_candidates()
+            matches = [c for c in candidates if _comparison_value(c) == manifest[key]]
+            if not matches:
+                raise RuntimeError(
+                    f"No matching fixed configuration for {key}: {manifest[key]}"
+                )
+            kwargs["candidates"] = matches[:1]
+        elif existing:
+            raise RuntimeError(f"Missing fixed configuration for {key}")
+        selection = original(runner, *args, **kwargs)
+        manifest[key] = _comparison_value(selection.candidate)
+        if not existing:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        return selection
+
+    BaseKernelRunner.tune = tune
+    try:
+        yield
+    finally:
+        BaseKernelRunner.tune = original
 
 
 def benchmark_config(args: argparse.Namespace) -> dict:
@@ -545,6 +619,7 @@ def run_decode_only_iteration(
     """Time one replay of a decode-only CUDA Graph."""
     decode_graph.reset_cache()
     decode_graph.static_tokens.copy_(tokens)
+    decode_graph.eviction.zero_()
     torch.cuda.synchronize()
     start = time.perf_counter()
     decode_graph.graph.replay()
@@ -591,17 +666,20 @@ def _measure_sm110a(config, checkpoint, args, prompt, tokens, decode_start_pos):
         f"FC2 reduction={args.fc2_reduction}; decode PDL={args.pdl}"
     )
     decode_graph = DecodeCudaGraph(model, graph_seed, decode_start_pos, args.decode_len)
+    decode_graph.eviction = torch.empty(
+        max(64 << 20, 2 * torch.cuda.get_device_properties(0).L2_cache_size),
+        dtype=torch.uint8,
+        device="cuda",
+    )
 
     if args.decode_only:
         for _ in range(args.warmup):
             run_decode_only_iteration(decode_graph, tokens)
-        decode_seconds = (
-            sum(
-                run_decode_only_iteration(decode_graph, tokens)
-                for _ in range(args.iters)
-            )
-            / args.iters
-        )
+        decode_samples = [
+            run_decode_only_iteration(decode_graph, tokens) for _ in range(args.iters)
+        ]
+        decode_seconds = statistics.median(decode_samples)
+        print(f"[decode samples ms] {[round(t * 1000, 4) for t in decode_samples]}")
         prefill_seconds = None
     else:
         for _ in range(args.warmup):
@@ -633,6 +711,31 @@ def _measure_sm110a(config, checkpoint, args, prompt, tokens, decode_start_pos):
                 torch.cuda.profiler.stop()
         print(f"[profile] collected {args.iters} cold-L2 {args.profile_phase} passes")
 
+    if args.results_json is not None:
+
+        def digest(tensor):
+            return hashlib.sha256(
+                tensor.detach().view(torch.uint8).cpu().numpy().tobytes()
+            ).hexdigest()
+
+        args.results_json.parent.mkdir(parents=True, exist_ok=True)
+        args.results_json.write_text(
+            json.dumps(
+                {
+                    "args": {
+                        k: str(v) if isinstance(v, Path) else v
+                        for k, v in vars(args).items()
+                    },
+                    "decode_samples_ms": [t * 1000 for t in decode_samples]
+                    if args.decode_only
+                    else [],
+                    "first_logits_sha256": digest(decode_graph.static_first_logits),
+                    "final_logits_sha256": digest(decode_graph.static_logits),
+                    "final_tokens": decode_graph.static_output.tolist(),
+                },
+                indent=2,
+            )
+        )
     result = {
         "label": "sm110a",
         "prefill_seconds": prefill_seconds,
@@ -764,7 +867,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
-    with B300Sim(args):
+    with B300Sim(args), fixed_kernel_configs(args.kernel_configs):
         run_benchmark(args)
 
 

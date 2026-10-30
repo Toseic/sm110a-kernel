@@ -1,3 +1,4 @@
+#include "../../../include/pdl.h"
 #include <cassert>
 #include <cstdint>
 
@@ -134,6 +135,7 @@ __global__ void indexer_score_decode_kernel(
     __nv_bfloat16* __restrict__ out, int kv_count, int page_size,
     const int32_t* __restrict__ block_table, int block_table_stride,
     const int32_t* __restrict__ kv_seqlens) {
+    sm110a::pdl_entry();
     constexpr int kPipelineStages = kKVStages;
     constexpr int kMainloopSmemBytes = kQSmemBytes + kKVStages * kKVStageSmemBytes;
     constexpr int kScaleTmemCol = kResultStages * kTileM;
@@ -475,7 +477,7 @@ void launch_decode(const CUtensorMap& q_map, const CUtensorMap& k_map,
     cluster_attr.val.clusterDim.z = 1;
     config.attrs = &cluster_attr;
     config.numAttrs = 1;
-    cudaLaunchKernelEx(&config, indexer_score_decode_kernel<SplitKV, kDense, kPageSize, kKVStages, kResultStages>,
+    sm110a::launch_pdl<SM110A_PDL>(&config, indexer_score_decode_kernel<SplitKV, kDense, kPageSize, kKVStages, kResultStages>,
                        q_map, k_map, qs_map, ks_map,
                        head_weight, out, kv_count, page_size, block_table,
                        block_table_stride, kv_seqlens);

@@ -39,6 +39,9 @@ class Fp8KvSparseMlaBenchmark(BenchmarkBase):
     def build_parser(self):
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument(
+            "--pdl", action="store_true", help="enable programmatic dependent launch"
+        )
+        parser.add_argument(
             "--single", action="store_true", help="run one custom shape"
         )
         parser.add_argument(
@@ -138,7 +141,15 @@ class Fp8KvSparseMlaBenchmark(BenchmarkBase):
         kernel_indices = indices[:, 0].contiguous() if case.q_len == 1 else indices
         out = torch.empty_like(q)
         kernel = Fp8KvFa4SparseMlaRunner(
-            q, values, scales, rope, kernel_indices, sink, out, scale=args.scale
+            q,
+            values,
+            scales,
+            rope,
+            kernel_indices,
+            sink,
+            out,
+            scale=args.scale,
+            pdl=args.pdl,
         ).run
         baseline_out = torch.empty_like(q)
         baseline_runner = (

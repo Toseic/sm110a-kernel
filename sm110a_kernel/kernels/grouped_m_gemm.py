@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import ctypes
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from ..jit_runtime import SplitCudaJit
 from ..runner import BaseKernelRunner, PreparedKernel
+from .pdl import validate_pdl
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_DIR = _ROOT / "csrc/bf16_grouped_m_gemm/src"
@@ -25,7 +26,10 @@ class GroupedMConfig:
     mode: int = 0
     direct_gmem: bool = False
 
+    pdl: bool = False
+
     def validate(self) -> None:
+        validate_pdl(self.pdl)
         if self.tile_m != 128:
             raise ValueError("tile_m must be 128 for the current four-warp mainloop")
         if self.cluster_m not in (1, 2):
@@ -119,6 +123,7 @@ class GroupedMModule:
 
 def _kernel_cflags(config: GroupedMConfig, variant):
     return (
+        f"-DSM110A_PDL={int(config.pdl)}",
         f"-DSM110A_GROUPED_TILE_M={config.tile_m}",
         f"-DSM110A_GROUPED_TILE_N={config.tile_n}",
         f"-DSM110A_GROUPED_TILE_K={config.tile_k}",
@@ -230,7 +235,7 @@ def format_config(config):
     base = (
         f"{config.tile_m}x{config.tile_n}x{config.tile_k}"
         f"/e{config.epilogue_tile_n}/c{config.cluster_m}"
-        f"/{_MODE_LABELS[config.mode]}"
+        f"/{_MODE_LABELS[config.mode]}/pdl{int(config.pdl)}"
     )
     return base + "+dg" if getattr(config, "direct_gmem", False) else base
 
@@ -242,8 +247,10 @@ def format_candidate(config, swap_ab):
 class Bf16GroupedMGemmRunner(BaseKernelRunner):
     namespace = "bf16_grouped_m_gemm"
 
-    def __init__(self, a, b, layout, out, *, dynamic_metadata=False):
+    def __init__(self, a, b, layout, out, *, dynamic_metadata=False, pdl=False):
+        validate_pdl(pdl)
         super().__init__(a.device)
+        self.pdl = pdl
         self.a, self.b, self.layout, self.out = a, b, layout, out
         self.dynamic_metadata = dynamic_metadata
         if dynamic_metadata:
@@ -253,11 +260,19 @@ class Bf16GroupedMGemmRunner(BaseKernelRunner):
     @property
     def workload_key(self):
         if self.dynamic_metadata:
-            return (tuple(self.a.shape), tuple(self.b.shape))
-        return (self.b.size(1), self.a.size(1), self.layout.numel() // self.b.size(0))
+            return (tuple(self.a.shape), tuple(self.b.shape), self.pdl)
+        return (
+            self.b.size(1),
+            self.a.size(1),
+            self.layout.numel() // self.b.size(0),
+            self.pdl,
+        )
 
     def compatible_candidates(self):
-        return compatible_candidates(self.b.size(1), self.a.size(1))
+        return tuple(
+            (replace(c, pdl=self.pdl), swap)
+            for c, swap in compatible_candidates(self.b.size(1), self.a.size(1))
+        )
 
     @staticmethod
     def format_candidate(candidate):

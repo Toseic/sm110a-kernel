@@ -81,18 +81,22 @@ def compile_fp8_act_quant(
     return _JIT.compile((block_size, scale, blocked, pdl))
 
 
-def fp8_act_quant(input, block_size=128, scale="ue8m0"):
+def fp8_act_quant(input, block_size=128, scale="ue8m0", *, pdl=False):
     """Return E4M3 values and one scale per contiguous ``block_size`` block.
 
     ``scale="ue8m0"`` stores power-of-two scales as ``torch.float8_e8m0fnu``;
     ``scale="fp32"`` stores ``max(amax, 1e-4) / 448`` as ``torch.float32``.
     """
-    return compile_fp8_act_quant(block_size, scale).quantize(input)
+    return compile_fp8_act_quant(block_size, scale, pdl=pdl).quantize(input)
 
 
-def fp8_act_quant_out(input, output, scales, block_size=128, scale="ue8m0"):
+def fp8_act_quant_out(
+    input, output, scales, block_size=128, scale="ue8m0", *, pdl=False
+):
     """Out variant of :func:`fp8_act_quant`."""
-    return compile_fp8_act_quant(block_size, scale).quantize_out(input, output, scales)
+    return compile_fp8_act_quant(block_size, scale, pdl=pdl).quantize_out(
+        input, output, scales
+    )
 
 
 class Fp8ActQuantRunner(FixedKernelRunner):

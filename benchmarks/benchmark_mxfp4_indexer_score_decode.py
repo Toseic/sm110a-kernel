@@ -132,6 +132,9 @@ def make_paged_k(k, k_scales, page_size):
 class IndexerScoreDecodeBenchmark(BenchmarkBase):
     def build_parser(self):
         parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument(
+            "--pdl", action="store_true", help="enable programmatic dependent launch"
+        )
         parser.add_argument("--batches", type=int, nargs="+", default=BATCHES)
         parser.add_argument("--kv-lens", type=int, nargs="+", default=KV_LENGTHS)
         parser.add_argument(
@@ -312,6 +315,7 @@ class IndexerScoreDecodeBenchmark(BenchmarkBase):
                     block_table=block_table,
                     kv_seqlens=kv_seqlens,
                     max_kv_len=kv_capacity,
+                    pdl=args.pdl,
                 )
                 cases = [
                     (str(split), runner.prepare(IndexerScoreDecodeConfig(split)))

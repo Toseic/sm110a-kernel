@@ -7,6 +7,7 @@ import torch
 
 from ..jit_runtime import SplitCudaJit
 from ..runner import BaseKernelRunner, PreparedKernel
+from .pdl import validate_pdl
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE = _ROOT / "csrc/topk/src"
@@ -50,6 +51,7 @@ class TopKModule:
             k,
             stages=self._config[0],
             copy_engine=self._config[1],
+            pdl=self._config[2],
             _module=self,
         )
         key = runner.workload_key
@@ -90,6 +92,7 @@ _JIT = SplitCudaJit(
     kernel_symbol="sm110a_topk_launch",
     config_key=lambda config: config,
     kernel_cflags=lambda config, _variant: (
+        f"-DSM110A_PDL={int(config[2])}",
         f"-DSM110A_TOPK_STAGES={config[0]}",
         f"-DSM110A_TOPK_TMA={int(config[1] == 'tma')}",
     ),
@@ -97,16 +100,17 @@ _JIT = SplitCudaJit(
 )
 
 
-def compile_topk(*, stages=2, copy_engine="ldgsts") -> TopKModule:
+def compile_topk(*, stages=2, copy_engine="ldgsts", pdl=False) -> TopKModule:
     """Compile staging/copy choices and all four CGA split-K variants."""
+    validate_pdl(pdl)
     if isinstance(stages, bool) or not isinstance(stages, int) or not 2 <= stages <= 8:
         raise ValueError("stages must be an integer in [2, 8]")
     if copy_engine not in ("tma", "ldgsts"):
         raise ValueError("copy_engine must be 'tma' or 'ldgsts'")
-    return _JIT.compile((stages, copy_engine))
+    return _JIT.compile((stages, copy_engine, pdl))
 
 
-def topk(scores, k=512, *, split_k=None):
+def topk(scores, k=512, *, split_k=None, pdl=False):
     """Return unordered int32 [Qlen, min(512, KVlen)] indices.
 
     k may be 512 (default) or min(512, KVlen). KVlen <= 512 returns all
@@ -114,24 +118,34 @@ def topk(scores, k=512, *, split_k=None):
     Otherwise split_k=None autotunes 1/2/4/8. Ties choose smaller indices;
     NaNs rank above +inf. Masked -inf entries participate when necessary.
     """
-    return compile_topk().topk(scores, k, split_k=split_k)
+    return compile_topk(pdl=pdl).topk(scores, k, split_k=split_k)
 
 
-def topk_out(scores, out, k=512, *, split_k=None):
+def topk_out(scores, out, k=512, *, split_k=None, pdl=False):
     """Reuse output; prewarm autotuning or fix split_k before graph capture."""
-    return compile_topk().topk_out(scores, out, k, split_k=split_k)
+    return compile_topk(pdl=pdl).topk_out(scores, out, k, split_k=split_k)
 
 
 class TopKRunner(BaseKernelRunner):
     namespace = "topk512_cga_stored_keys_v5"
 
     def __init__(
-        self, scores, out, k=512, *, stages=2, copy_engine="ldgsts", _module=None
+        self,
+        scores,
+        out,
+        k=512,
+        *,
+        stages=2,
+        copy_engine="ldgsts",
+        pdl=False,
+        _module=None,
     ):
+        validate_pdl(pdl)
         super().__init__(scores.device)
         _check_scores(scores, k)
         self.scores, self.out, self.k = scores, out, k
         self.stages, self.copy_engine, self.module = stages, copy_engine, _module
+        self.pdl = pdl
 
     @property
     def workload_key(self):
@@ -141,7 +155,7 @@ class TopKRunner(BaseKernelRunner):
             str(self.scores.dtype),
             self.k,
             self.scores.data_ptr() % 16,
-            (self.stages, self.copy_engine),
+            (self.stages, self.copy_engine, self.pdl),
         )
 
     def compatible_candidates(self):
@@ -155,7 +169,7 @@ class TopKRunner(BaseKernelRunner):
 
     def pre_jit(self, candidate):
         return self.module or compile_topk(
-            stages=self.stages, copy_engine=self.copy_engine
+            stages=self.stages, copy_engine=self.copy_engine, pdl=self.pdl
         )
 
     def prepare(self, candidate):

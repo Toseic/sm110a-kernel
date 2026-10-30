@@ -391,4 +391,18 @@ conversions and output/scheduler preparation precede the chain on every
 CUDA Graph replay. Prefill uses the existing serial backend. Eager decode
 also executes the selected kernels to warm up and validate graph capture;
 performance comparisons target fixed decode CUDA Graphs. The deterministic
-FC2 finalize kernel remains serial after FC2.
+FC2 finalize kernel also uses PDL to wait on FC2 and trigger a downstream consumer.
+
+
+The decode PDL switch also covers RMSNorm, HC pre/head + norm (including
+its internal projection/finish edge), HC post, BF16 GEMM projections and LM
+head, grouped wo_a GEMM and its metadata kernels, FP4 packing/QAT including
+tails, FP8 KV sparse MLA, indexer scoring, and TopK. FP8 quantizers wait on
+incoming dependencies, while FP8 GEMM/shared FC1 and routed FC2 trigger
+outgoing consumers. New operators share the conservative input-wait/output-
+trigger implementation in `include/pdl.h`; existing deferred GEMM/MoE waits
+remain. PDL participates in JIT and runner selection keys. Standalone kernel
+benchmarks accept `--pdl`, while model prefill retains its serial setting.
+PyTorch processing between native operators still introduces ordinary stream
+dependencies; fused compressor/cache/router work is outside this support.
+See [the shared PDL interface](../../docs/pdl.md#shared-kernel-interface).

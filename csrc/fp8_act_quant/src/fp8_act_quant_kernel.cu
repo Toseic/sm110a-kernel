@@ -1,3 +1,4 @@
+#include "pdl.h"
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -96,9 +97,7 @@ void fp8_act_quant_kernel(const __grid_constant__ CUtensorMap input_map,
                           uint8_t* __restrict__ ue8m0_scales,
                           float* __restrict__ fp32_scales,
                           int tokens, int d, int tiles, int stages) {
-    if constexpr (SM110A_QUANT_PDL) {
-        if (threadIdx.x == 0) cudaTriggerProgrammaticLaunchCompletion();
-    }
+    sm110a::pdl_entry<SM110A_QUANT_PDL>();
 
     constexpr int kLanesPerRow = lanes_per_row(kBlockSize);
     constexpr int kValuesPerLane = kBlockSize / kLanesPerRow;
@@ -366,7 +365,7 @@ static void launch_fp8_act_quant_impl(const __nv_bfloat16* input, uint8_t* outpu
     const int stages = std::min({max_stages, 4, (tiles + ctas - 1) / ctas});
     const int shared_bytes = stages *
         (kStageBytes + kBarrierCount * sizeof(uint64_t));
-    fp8_act_quant_kernel<kBlockSize, kScaleMode><<<ctas, kThreads, shared_bytes, stream>>>(
+    sm110a::launch_kernel<SM110A_QUANT_PDL>(fp8_act_quant_kernel<kBlockSize, kScaleMode>, ctas, kThreads, shared_bytes, stream,
         input_map, output_map, ue8m0_scales, fp32_scales, tokens, d, tiles, stages);
 }
 

@@ -1,3 +1,4 @@
+#include "../../../include/pdl.h"
 #include <cassert>
 #include <cstdint>
 
@@ -168,6 +169,7 @@ void indexer_score_prefill_kernel(
     const int32_t* __restrict__ cu_seqlens_q,
     const int32_t* __restrict__ kv_seqlens,
     bool causal, bool compact_scales) {
+    sm110a::pdl_entry();
     static_assert(!kDenseCompactCausal || kClusterM == 1);
     // Fold layout/mask choices for the common 1CTA path. KV lengths remain
     // dynamic: dense batches may still have shorter logical KV sequences.
@@ -643,7 +645,7 @@ extern "C" void sm110a_indexer_score_prefill_launch(
                                : indexer_score_prefill_kernel<1>;
     cudaFuncSetAttribute(kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
-    kernel<<<grid, kThreads, kSmemBytes, stream>>>(
+    sm110a::launch_kernel(kernel, grid, kThreads, kSmemBytes, stream,
         q_map, k_map, q_scales, k_scales, head_weight, out,
         query_count, kv_count, batch_count, page_size, block_table_stride,
         block_table, cu_seqlens_q, kv_seqlens, causal, compact_scales);

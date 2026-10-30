@@ -25,6 +25,9 @@ def reference(x, weight, eps):
 class RmsNormBenchmark(BenchmarkBase):
     def build_parser(self):
         parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument(
+            "--pdl", action="store_true", help="enable programmatic dependent launch"
+        )
         parser.add_argument("--d", type=int, nargs="+", default=[1024, 4096, 8192])
         parser.add_argument("--tokens", type=int, nargs="+", default=[1, 16, 256, 4096])
         parser.add_argument(
@@ -79,7 +82,10 @@ class RmsNormBenchmark(BenchmarkBase):
             for rows in args.sweep_rows or [args.rows_per_cta]:
                 try:
                     module = compile_rmsnorm(
-                        d, warps_per_row=args.warps_per_row, rows_per_cta=rows
+                        d,
+                        warps_per_row=args.warps_per_row,
+                        rows_per_cta=rows,
+                        pdl=args.pdl,
                     )
                 except ValueError as error:
                     if args.sweep_rows:

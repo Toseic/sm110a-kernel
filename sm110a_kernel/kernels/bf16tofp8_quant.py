@@ -55,14 +55,14 @@ def compile_bf16tofp8_quant(*, blocked=False, pdl=False) -> Bf16ToFp8QuantModule
     return _JIT.compile((blocked, pdl))
 
 
-def bf16tofp8_quant(input):
+def bf16tofp8_quant(input, *, pdl=False):
     """Return E4M3 values and one E8M0 scale per contiguous 128-value block."""
-    return compile_bf16tofp8_quant().quantize(input)
+    return compile_bf16tofp8_quant(pdl=pdl).quantize(input)
 
 
-def bf16tofp8_quant_out(input, output, scales):
+def bf16tofp8_quant_out(input, output, scales, *, pdl=False):
     """Out variant of :func:`bf16tofp8_quant`."""
-    return compile_bf16tofp8_quant().quantize_out(input, output, scales)
+    return compile_bf16tofp8_quant(pdl=pdl).quantize_out(input, output, scales)
 
 
 class Bf16ToFp8QuantRunner(FixedKernelRunner):

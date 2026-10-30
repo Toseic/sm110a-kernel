@@ -1,3 +1,4 @@
+#include "../../../include/pdl.h"
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -723,6 +724,7 @@ __global__ __launch_bounds__(512, 1) void fa_sparse_mla_fp8_kv_kernel_m64(
     int cache_len,
     int selected_len,
     float scale) {
+    sm110a::pdl_entry();
     scales_fp32 = ScalesFp32;
     constexpr int TileQ = 64;
     constexpr int TileKV = 64;
@@ -1337,13 +1339,11 @@ cudaError_t fp8_kv_fa4_sparse_mla_cuda(
     const dim3 block(kPrefillWarps * 32);
     const dim3 grid(batch * query_groups * query_len);
     if (scales_fp32) {
-        fa_sparse_mla_fp8_kv_kernel_m64<true>
-            <<<grid, block, smem_layout.dynamic_bytes, stream>>>(
+        sm110a::launch_kernel(fa_sparse_mla_fp8_kv_kernel_m64<true>, grid, block, smem_layout.dynamic_bytes, stream,
                 q_tmap, kv, kv_scales, kv_rope, scales_fp32, topk_idxs, attn_sink, out_tmap,
                 batch, heads, query_len, cache_len, selected_len, scale);
     } else {
-        fa_sparse_mla_fp8_kv_kernel_m64<false>
-            <<<grid, block, smem_layout.dynamic_bytes, stream>>>(
+        sm110a::launch_kernel(fa_sparse_mla_fp8_kv_kernel_m64<false>, grid, block, smem_layout.dynamic_bytes, stream,
                 q_tmap, kv, kv_scales, kv_rope, scales_fp32, topk_idxs, attn_sink, out_tmap,
                 batch, heads, query_len, cache_len, selected_len, scale);
     }

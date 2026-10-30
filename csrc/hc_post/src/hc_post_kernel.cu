@@ -1,3 +1,4 @@
+#include "../../../include/pdl.h"
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -89,6 +90,7 @@ __global__ __launch_bounds__(kThreads)
 void hc_post_kernel(const T* __restrict__ x, const T* __restrict__ residual,
                     const float* __restrict__ post, const float* __restrict__ comb,
                     T* __restrict__ output) {
+    sm110a::pdl_entry();
     constexpr int V = Aligned ? kBytes / sizeof(T) : 1;
     constexpr int Tiles = (kD + kThreads * V - 1) / (kThreads * V);
     const int64_t row = blockIdx.x / Tiles;
@@ -158,21 +160,27 @@ extern "C" void sm110a_hc_post_launch(
     do {                                                                                           \
         constexpr int V = kBytes / sizeof(T);                                                      \
         if (kD % V == 0 && aligned)                                                                \
-            hc_post_kernel<T, true>                                                                \
-                <<<rows *((kD + kThreads * V - 1) / (kThreads * V)), kThreads, 0, stream>>>(       \
-                    static_cast<const T *>(x),                                                     \
-                    static_cast<const T *>(residual),                                              \
-                    post,                                                                          \
-                    comb,                                                                          \
-                    static_cast<T *>(output));                                                     \
+            sm110a::launch_kernel(hc_post_kernel<T, true>,                                         \
+                rows * ((kD + kThreads * V - 1) / (kThreads * V)),                                 \
+                kThreads,                                                                          \
+                0,                                                                                 \
+                stream,                                                                            \
+                static_cast<const T *>(x),                                                         \
+                static_cast<const T *>(residual),                                                  \
+                post,                                                                              \
+                comb,                                                                              \
+                static_cast<T *>(output));                                                         \
         else                                                                                       \
-            hc_post_kernel<T, false>                                                               \
-                <<<rows *((kD + kThreads - 1) / kThreads), kThreads, 0, stream>>>(                 \
-                    static_cast<const T *>(x),                                                     \
-                    static_cast<const T *>(residual),                                              \
-                    post,                                                                          \
-                    comb,                                                                          \
-                    static_cast<T *>(output));                                                     \
+            sm110a::launch_kernel(hc_post_kernel<T, false>,                                        \
+                rows * ((kD + kThreads - 1) / kThreads),                                           \
+                kThreads,                                                                          \
+                0,                                                                                 \
+                stream,                                                                            \
+                static_cast<const T *>(x),                                                         \
+                static_cast<const T *>(residual),                                                  \
+                post,                                                                              \
+                comb,                                                                              \
+                static_cast<T *>(output));                                                         \
     } while (0)
     if (dtype == 0) {
         LAUNCH(__nv_bfloat16);

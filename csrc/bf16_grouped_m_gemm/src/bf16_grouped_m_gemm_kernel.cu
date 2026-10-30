@@ -1,3 +1,4 @@
+#include "../../../include/pdl.h"
 /*
  * bf16_grouped_m_gemm_kernel.cu — SM110A / Blackwell BF16 grouped-M GEMM kernel.
  *
@@ -586,6 +587,7 @@ __launch_bounds__(kBlockThreads) void bf16_grouped_m_gemm_kernel(
     nv_bfloat16 *c,
     int n,
     int k) {
+    sm110a::pdl_entry();
     using Config = KernelConfig<kTileM, kTileN, kTileK, kEpilogueTileN, kClusterM>;
     constexpr int kClusterTileM = Config::kClusterTileM;
     constexpr int kStageCount = Config::kStageCount;
@@ -1281,7 +1283,7 @@ void launch_bf16_grouped_m_gemm_impl(
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 kDynamicSmemBytes);
         }
-        kernel<<<kClusterM * worker_clusters, kBlockThreads, kDynamicSmemBytes, stream>>>(
+        sm110a::launch_kernel(kernel, kClusterM * worker_clusters, kBlockThreads, kDynamicSmemBytes, stream,
             a_tensor_map, b_tensor_map, c_tensor_map, tasks, task_count,
             next_cluster_tile, d_c, n, k);
     } else if constexpr (SM110A_GROUPED_MODE == 1) {
@@ -1318,7 +1320,7 @@ void launch_bf16_grouped_m_gemm_impl(
         }
         const int launched_clusters =
             resident_clusters < persistent_clusters ? resident_clusters : persistent_clusters;
-        kernel<<<kClusterM * launched_clusters, kBlockThreads, kDynamicSmemBytes, stream>>>(
+        sm110a::launch_kernel(kernel, kClusterM * launched_clusters, kBlockThreads, kDynamicSmemBytes, stream,
             a_tensor_map, b_tensor_map, c_tensor_map, tasks, task_count,
             next_cluster_tile, d_c, n, k);
     } else {
@@ -1336,7 +1338,7 @@ void launch_bf16_grouped_m_gemm_impl(
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 kDynamicSmemBytes);
         }
-        kernel<<<kClusterM * max_tasks, kBlockThreads, kDynamicSmemBytes, stream>>>(
+        sm110a::launch_kernel(kernel, kClusterM * max_tasks, kBlockThreads, kDynamicSmemBytes, stream,
             a_tensor_map, b_tensor_map, c_tensor_map, tasks, task_count,
             next_cluster_tile, d_c, n, k);
     }
