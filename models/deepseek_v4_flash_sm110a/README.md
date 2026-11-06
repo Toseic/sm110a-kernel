@@ -66,6 +66,18 @@ These projections change the previous FP32 computation: compressor output
 now rounds to BF16, and FP32 checkpoint projection weights round to BF16 on
 load. Prior full-model precision measurements do not validate this path.
 
+Compressor positional scoring, pooling and incremental state updates now use
+[`CompressorPoolRunner`](../../csrc/compressor_pool/README.md) for CUDA BF16
+ratio-4 overlap and ratio-128 projections. Prefill handles complete groups and
+retains the incomplete tail; decode updates state every token and emits only
+on compression boundaries. Pooling and state use FP32, with BF16 rounding
+before the existing native RMSNorm and RoPE. No overlap tensors or Torch
+softmax/pooling intermediates are materialized. Unsupported formats retain the
+functional Torch path. Counters are `sm110a.compressor_pool_prefill`,
+`sm110a.compressor_pool_decode` (including state-only updates), and
+`torch.compressor_pool_fallback`. Hadamard and final compressed-cache writes
+remain separate, and indexer KV repacking is unchanged.
+
 Shared experts use `Fp8SharedFc1Runner` by default for CUDA BF16 inputs
 with supported E4M3 weights, E8M0 scales and 128-aligned dimensions. This
 applies to both decoder and MTP blocks. `prepare_for_inference()` packs

@@ -101,6 +101,12 @@ from .kernels.bf16tonvfp4_quant import (
     bf16tonvfp4_quant_out,
     compile_bf16tonvfp4_quant,
 )
+from .kernels.compressor_pool import (
+    CompressorPoolConfig,
+    CompressorPoolRunner,
+    compile_compressor_pool,
+    compressor_pool_out,
+)
 from .kernels.cublaslt import (
     cublaslt_gemm,
     cublaslt_gemm_out,

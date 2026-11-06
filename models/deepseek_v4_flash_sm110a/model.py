@@ -7,8 +7,7 @@ checkpoints load without another conversion step.
 
 # Remaining native-kernel support (including inherited reference operators):
 # TODO(sm110a): tune HC pre/head for large-M prefill.
-# TODO(sm110a): implement fused ratio-4 overlap /
-# ratio-128 pooling, incremental state updates, and compressed KV cache writes.
+# TODO(sm110a): fuse compressor pooling with norm/RoPE and compressed KV cache writes.
 # TODO(sm110a): add Hadamard rotation
 # (currently an external extension or a PyTorch fallback).
 # TODO(sm110a): tune FP8 KV sparse MLA long-prefill/full-selection append
@@ -55,6 +54,7 @@ from sm110a_kernel import (
     Bf16GemmRunner,
     Bf16GroupedMGemmRunner,
     Bf16ToFp4QuantRunner,
+    CompressorPoolRunner,
     Fp8ActQuantRunner,
     Fp8GemmRunner,
     Fp8KvFa4SparseMlaRunner,
@@ -550,58 +550,83 @@ class Sm110aCompressor(_official.Compressor):
         ratio, d, rd = self.compress_ratio, self.head_dim, self.rope_head_dim
         dtype = x.dtype
         kv, score = self.project_kv_score(x)
-        # Projection rounds to BF16; positional scoring and pooling use FP32.
-        kv, score = kv.float(), score.float()
-        if start_pos == 0:
-            should_compress = seqlen >= ratio
-            remainder = seqlen % ratio
-            cutoff = seqlen - remainder
-            offset = ratio if self.overlap else 0
-            if self.overlap and cutoff >= ratio:
-                self.kv_state[:bsz, :ratio] = kv[:, cutoff - ratio : cutoff]
-                self.score_state[:bsz, :ratio] = (
-                    score[:, cutoff - ratio : cutoff] + self.ape
-                )
-            if remainder > 0:
-                self.kv_state[:bsz, offset : offset + remainder] = kv[:, cutoff:]
-                self.score_state[:bsz, offset : offset + remainder] = (
-                    score[:, cutoff:] + self.ape[:remainder]
-                )
-                kv, score = kv[:, :cutoff], score[:, :cutoff]
-            kv = kv.unflatten(1, (-1, ratio))
-            score = score.unflatten(1, (-1, ratio)) + self.ape
-            if self.overlap:
-                kv = self.overlap_transform(kv, 0)
-                score = self.overlap_transform(score, float("-inf"))
-            kv = (kv * score.softmax(dim=2)).sum(dim=2)
+        native = (
+            kv.is_cuda and dtype == kv.dtype == score.dtype == torch.bfloat16
+            and ratio in (4, 128) and self.overlap == (ratio == 4)
+            and 1 <= d <= 32768 and bsz <= 65535
+            and (start_pos == 0 or seqlen == 1)
+            and seqlen // ratio < 65535
+            and kv.stride(-1) == 1 and score.stride() == kv.stride()
+            and all(t.is_contiguous() and t.dtype == torch.float32
+                    and t.device == kv.device
+                    for t in (self.ape, self.kv_state, self.score_state))
+        )
+        if native:
+            groups = seqlen // ratio if start_pos == 0 else int((start_pos + 1) % ratio == 0)
+            should_compress = groups > 0
+            cutoff = seqlen - seqlen % ratio
+            pooled = torch.empty((bsz, groups, d), device=kv.device, dtype=kv.dtype)
+            CompressorPoolRunner(
+                kv, score, self.ape, self.kv_state, self.score_state, pooled,
+                start_pos, ratio=ratio, pdl=_DECODE_PDL,
+            ).run()
+            kv = pooled
+            _STATS["sm110a.compressor_pool_prefill" if start_pos == 0
+                   else "sm110a.compressor_pool_decode"] += 1
         else:
-            should_compress = (start_pos + 1) % ratio == 0
-            score = score + self.ape[start_pos % ratio]
-            offset = ratio if self.overlap else 0
-            self.kv_state[:bsz, offset + start_pos % ratio] = kv.squeeze(1)
-            self.score_state[:bsz, offset + start_pos % ratio] = score.squeeze(1)
-            if should_compress:
-                if self.overlap:
-                    kv_state = torch.cat(
-                        (
-                            self.kv_state[:bsz, :ratio, :d],
-                            self.kv_state[:bsz, ratio:, d:],
-                        ),
-                        dim=1,
+            _STATS["torch.compressor_pool_fallback"] += 1
+            # Projection rounds to BF16; positional scoring and pooling use FP32.
+            kv, score = kv.float(), score.float()
+            if start_pos == 0:
+                should_compress = seqlen >= ratio
+                remainder = seqlen % ratio
+                cutoff = seqlen - remainder
+                offset = ratio if self.overlap else 0
+                if self.overlap and cutoff >= ratio:
+                    self.kv_state[:bsz, :ratio] = kv[:, cutoff - ratio : cutoff]
+                    self.score_state[:bsz, :ratio] = (
+                        score[:, cutoff - ratio : cutoff] + self.ape
                     )
-                    score_state = torch.cat(
-                        (
-                            self.score_state[:bsz, :ratio, :d],
-                            self.score_state[:bsz, ratio:, d:],
-                        ),
-                        dim=1,
+                if remainder > 0:
+                    self.kv_state[:bsz, offset : offset + remainder] = kv[:, cutoff:]
+                    self.score_state[:bsz, offset : offset + remainder] = (
+                        score[:, cutoff:] + self.ape[:remainder]
                     )
-                else:
-                    kv_state, score_state = self.kv_state[:bsz], self.score_state[:bsz]
-                kv = (kv_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
+                    kv, score = kv[:, :cutoff], score[:, :cutoff]
+                kv = kv.unflatten(1, (-1, ratio))
+                score = score.unflatten(1, (-1, ratio)) + self.ape
                 if self.overlap:
-                    self.kv_state[:bsz, :ratio] = self.kv_state[:bsz, ratio:]
-                    self.score_state[:bsz, :ratio] = self.score_state[:bsz, ratio:]
+                    kv = self.overlap_transform(kv, 0)
+                    score = self.overlap_transform(score, float("-inf"))
+                kv = (kv * score.softmax(dim=2)).sum(dim=2)
+            else:
+                should_compress = (start_pos + 1) % ratio == 0
+                score = score + self.ape[start_pos % ratio]
+                offset = ratio if self.overlap else 0
+                self.kv_state[:bsz, offset + start_pos % ratio] = kv.squeeze(1)
+                self.score_state[:bsz, offset + start_pos % ratio] = score.squeeze(1)
+                if should_compress:
+                    if self.overlap:
+                        kv_state = torch.cat(
+                            (
+                                self.kv_state[:bsz, :ratio, :d],
+                                self.kv_state[:bsz, ratio:, d:],
+                            ),
+                            dim=1,
+                        )
+                        score_state = torch.cat(
+                            (
+                                self.score_state[:bsz, :ratio, :d],
+                                self.score_state[:bsz, ratio:, d:],
+                            ),
+                            dim=1,
+                        )
+                    else:
+                        kv_state, score_state = self.kv_state[:bsz], self.score_state[:bsz]
+                    kv = (kv_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
+                    if self.overlap:
+                        self.kv_state[:bsz, :ratio] = self.kv_state[:bsz, ratio:]
+                        self.score_state[:bsz, :ratio] = self.score_state[:bsz, ratio:]
         if not should_compress:
             return
         kv = self.norm(kv.to(dtype))
