@@ -41,8 +41,10 @@ MLA kernel is unchanged. Unsupported layouts retain the chunked Torch fallback.
 Native dispatch counters are `sm110a.sparse_mla_fp8_kv_prefill` and
 `sm110a.sparse_mla_fp8_kv_decode`; the fallback is
 `torch.sparse_mla_fp8_cache_todo`. Quantization uses `sm110a.fp8_act_quant`,
-and cache writes still use `torch.fp8_kv_cache_store_todo`. Fused FP8 cache
-writes and additional head/layout support remain in `TODO(sm110a)`.
+and sliding-window cache writes still use `torch.fp8_kv_cache_store_todo`.
+Main-attention compressor writes fuse RMSNorm, RoPE and FP8 quantization as
+described below. Fused sliding-window/ring writes and additional head/layout
+support remain in `TODO(sm110a)`.
 Benchmark CUDA Graph snapshots restore FP8 bytes, scales, RoPE and
 compressor/indexer state together. Memory budgets use the packed layout.
 HBM SOL counts logical selected-cache bytes, excluding repeated loads and
@@ -75,8 +77,19 @@ before the existing native RMSNorm and RoPE. No overlap tensors or Torch
 softmax/pooling intermediates are materialized. Unsupported formats retain the
 functional Torch path. Counters are `sm110a.compressor_pool_prefill`,
 `sm110a.compressor_pool_decode` (including state-only updates), and
-`torch.compressor_pool_fallback`. Hadamard and final compressed-cache writes
-remain separate, and indexer KV repacking is unchanged.
+`torch.compressor_pool_fallback`.
+
+Main-attention compressors use
+[`CompressorStoreRunner`](../../csrc/compressor_store/README.md) immediately
+after pooling for BF16 D=512 / RoPE=64 with FP32 RMSNorm weights. One launch
+fuses RMSNorm, RoPE, block-64 FP8 quantization and direct values/scales/RoPE
+cache writes. Both E8M0 and FP32 scales are supported, with optional decode
+PDL. Prefill simultaneously emits packed output for attention; decode needs
+only the cache stores. The kernel preserves the existing native RMSNorm
+reduction order and BF16 rounding after norm and RoPE. Counters are
+`sm110a.compressor_store_prefill` and `sm110a.compressor_store_decode`.
+Unsupported formats and custom norms retain the separate operators. Indexer
+Hadamard, FP4 QAT/cache writes and KV repacking are unchanged.
 
 Shared experts use `Fp8SharedFc1Runner` by default for CUDA BF16 inputs
 with supported E4M3 weights, E8M0 scales and 128-aligned dimensions. This

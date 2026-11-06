@@ -14,7 +14,7 @@ checkpoints load without another conversion step.
 # performance; current cold-L2 wins are workload dependent.
 # TODO(sm110a): extend native FP8 KV sparse MLA beyond H=64/D=512,
 # block-64 E4M3 non-RoPE + BF16 RoPE layouts (Torch handles other shapes).
-# TODO(sm110a): fuse FP8 cache quantization, scale/RoPE stores and ring writes.
+# TODO(sm110a): fuse sliding-window FP8 quantization, scale/RoPE stores and ring writes.
 # TODO(sm110a): fuse indexer KV packing with compressor cache writes instead
 # of repacking the valid BF16/QAT cache on every invocation.
 # TODO(sm110a): fuse MoE gate projection and metadata construction
@@ -55,6 +55,7 @@ from sm110a_kernel import (
     Bf16GroupedMGemmRunner,
     Bf16ToFp4QuantRunner,
     CompressorPoolRunner,
+    CompressorStoreRunner,
     Fp8ActQuantRunner,
     Fp8GemmRunner,
     Fp8KvFa4SparseMlaRunner,
@@ -629,11 +630,43 @@ class Sm110aCompressor(_official.Compressor):
                         self.score_state[:bsz, :ratio] = self.score_state[:bsz, ratio:]
         if not should_compress:
             return
-        kv = self.norm(kv.to(dtype))
         if start_pos == 0:
             freqs_cis = self.freqs_cis[:cutoff:ratio]
         else:
             freqs_cis = self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0)
+        if (
+            not self.rotate and isinstance(self.kv_cache, _Fp8KvCacheView)
+            and type(self.norm) is Sm110aRMSNorm
+            and math.isfinite(self.norm.eps) and self.norm.eps > 0
+            and kv.is_cuda and dtype == kv.dtype == torch.bfloat16
+            and kv.is_contiguous() and d == 512 and rd == 64
+            and self.norm.weight.dtype == torch.float32
+            and self.norm.weight.is_contiguous()
+            and freqs_cis.dtype == torch.complex64 and freqs_cis.stride(-1) == 1
+            and self.kv_cache.cache.kv_cache_scale.dtype in (torch.float8_e8m0fnu, torch.float32)
+        ):
+            cache = self.kv_cache.cache
+            position = self.kv_cache.offset + (0 if start_pos == 0 else start_pos // ratio)
+            scale_mode = "ue8m0" if cache.kv_cache_scale.dtype == torch.float8_e8m0fnu else "fp32"
+            packed = None
+            if start_pos == 0:
+                packed = (
+                    torch.empty((*kv.shape[:2], 448), device=kv.device, dtype=torch.float8_e4m3fn),
+                    torch.empty((*kv.shape[:2], 7), device=kv.device, dtype=cache.kv_cache_scale.dtype),
+                    torch.empty((*kv.shape[:2], 64), device=kv.device, dtype=torch.bfloat16),
+                )
+            CompressorStoreRunner(
+                kv, self.norm.weight, freqs_cis, cache.kv_cache, cache.kv_cache_scale,
+                cache.kv_cache_rope, position, self.norm.eps, packed=packed,
+                scale=scale_mode, pdl=_DECODE_PDL,
+            ).run()
+            _STATS["sm110a.compressor_store_prefill" if start_pos == 0
+                   else "sm110a.compressor_store_decode"] += 1
+            if packed is not None:
+                return packed
+            return tuple(t[:bsz, position:position + kv.size(1)] for t in
+                         (cache.kv_cache, cache.kv_cache_scale, cache.kv_cache_rope))
+        kv = self.norm(kv.to(dtype))
         _official.apply_rotary_emb(kv[..., -rd:], freqs_cis)
         if self.rotate:
             kv = _official.rotate_activation(kv)

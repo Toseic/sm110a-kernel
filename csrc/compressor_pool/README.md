@@ -2,8 +2,10 @@
 
 `CompressorPoolRunner` fuses positional scoring, gated pooling and incremental
 FP32 state updates for DeepSeek-V4-Flash ratio-4 and ratio-128 compressors.
-The model invokes it after its joint BF16 KV/gate GEMM. RMSNorm, RoPE,
-quantization and final cache stores remain separate.
+The model invokes it after its joint BF16 KV/gate GEMM. Main-attention
+compressors then use the separate [fused store kernel](../compressor_store/README.md)
+for RMSNorm, RoPE, FP8 quantization and cache stores. Indexer postprocessing
+retains its separate operators.
 
 Inputs are BF16 KV and score projections `[B,S,W]`, including identically
 strided halves of a joint GEMM output. Positional scores are FP32 `[ratio,W]`.

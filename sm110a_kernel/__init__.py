@@ -107,6 +107,12 @@ from .kernels.compressor_pool import (
     compile_compressor_pool,
     compressor_pool_out,
 )
+from .kernels.compressor_store import (
+    CompressorStoreConfig,
+    CompressorStoreRunner,
+    compile_compressor_store,
+    compressor_store_out,
+)
 from .kernels.cublaslt import (
     cublaslt_gemm,
     cublaslt_gemm_out,
